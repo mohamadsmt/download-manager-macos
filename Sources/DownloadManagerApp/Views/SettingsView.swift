@@ -44,7 +44,7 @@ struct SettingsView: View {
 
             Section("aria2") {
                 LabeledContent("Bundled path", value: AppPaths.bundledAria2.path)
-                Text(FileManager.default.isExecutableFile(atPath: AppPaths.bundledAria2.path) ? "aria2 is available." : "aria2 binary is not bundled yet; Automatic mode will use the native engine.")
+                Text(FileManager.default.isExecutableFile(atPath: AppPaths.bundledAria2.path) ? "aria2 is available only when selected explicitly. Automatic mode uses the native engine." : "aria2 binary is not bundled yet; Automatic mode uses the native engine.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

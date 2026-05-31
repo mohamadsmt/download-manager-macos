@@ -16,7 +16,7 @@ certificate.
 - HTTP download support in the generated app bundle through `NSAppTransportSecurity/NSAllowsArbitraryLoads`, because many direct file mirrors still use plain HTTP.
 - Batch URL entry, text-file import, clipboard monitoring, browser inbox monitoring, per-app speed limit setting, segment count setting, history persistence, and sidecar manifests.
 - Chrome WebExtension/native-messaging assets and Safari WebExtension wrapper notes.
-- Optional aria2 engine path. Automatic mode uses bundled `aria2c` only when an executable exists at `Vendor/aria2/aria2c` in the app bundle.
+- Optional aria2 engine path. Automatic mode uses the native engine; bundled `aria2c` is used only when the user explicitly selects the aria2 engine.
 - English and Persian localization resources.
 
 ## Requirements

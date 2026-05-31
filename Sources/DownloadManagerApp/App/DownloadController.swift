@@ -296,9 +296,6 @@ final class DownloadController: ObservableObject {
         case .aria2:
             return Aria2DownloadEngine(executableURL: AppPaths.bundledAria2)
         case .automatic:
-            if FileManager.default.isExecutableFile(atPath: AppPaths.bundledAria2.path) {
-                return Aria2DownloadEngine(executableURL: AppPaths.bundledAria2)
-            }
             return NativeSegmentedDownloadEngine()
         }
     }
