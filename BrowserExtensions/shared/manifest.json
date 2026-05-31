@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Download Manager Capture",
+  "version": "0.1.0",
+  "description": "Send HTTP and HTTPS links to the native Download Manager app.",
+  "permissions": ["contextMenus", "nativeMessaging", "activeTab"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

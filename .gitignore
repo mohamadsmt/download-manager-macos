@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+.codex/
+dist/
+.DS_Store
+*.xcuserstate
+DerivedData/
+Vendor/aria2/aria2c
+Vendor/aria2/lib/
+*.dmg
+*.zip

@@ -1,0 +1,18 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Download Manager" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Download Manager" } },
+        "fa" : { "stringUnit" : { "state" : "translated", "value" : "مدیریت دانلود" } }
+      }
+    },
+    "Add Downloads" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Add Downloads" } },
+        "fa" : { "stringUnit" : { "state" : "translated", "value" : "افزودن دانلودها" } }
+      }
+    }
+  },
+  "version" : "1.0"
+}

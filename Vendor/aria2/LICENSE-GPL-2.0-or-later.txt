@@ -1,0 +1,7 @@
+aria2 is distributed under the GNU General Public License version 2 or later.
+
+This repository intentionally does not vendor a third-party aria2 binary unless
+the release builder supplies one from a trusted build source. When `aria2c` is
+bundled in `Vendor/aria2/aria2c`, the release package must include the complete
+GPL license text and corresponding source availability information for that
+binary.
