@@ -71,16 +71,18 @@ def _reap_direct_child(pid: int) -> None:
         time.sleep(0.01)
 
 
-def _kill_fixture_group(pid_file: Path) -> None:
-    if not pid_file.exists():
-        return
-    pid = int(pid_file.read_text("ascii"))
+def _kill_fixture_process_group(pid: int) -> None:
     try:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     _reap_direct_child(pid)
     _assert_pid_gone(pid)
+
+
+def _kill_fixture_group(pid_file: Path) -> None:
+    if pid_file.exists():
+        _kill_fixture_process_group(int(pid_file.read_text("ascii")))
 
 
 def _assert_public_error(error: BaseException, reason: str, *markers: str) -> None:
@@ -689,6 +691,122 @@ def test_binding_base_exception_reaps_spawned_leader_and_propagates_interrupt(
         _assert_pid_gone(spawned_pids[0])
     finally:
         _kill_fixture_group(leader_pid_file)
+
+
+def test_post_popen_base_exception_reaps_spawned_leader_and_propagates_interrupt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    processes = _processes()
+    leader_pid_file = tmp_path / "post-popen-interrupt-leader.pid"
+    spawned_pids: list[int] = []
+    original_popen = processes.subprocess.Popen
+    interrupt = KeyboardInterrupt("fixture-post-popen-base-exception")
+    injected = False
+
+    def capture_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def interrupt_after_popen_return(frame, event, _arg):
+        nonlocal injected
+        if (
+            event == "line"
+            and not injected
+            and spawned_pids
+            and frame.f_code is processes.run_contained.__code__
+            and frame.f_locals.get("process") is not None
+        ):
+            injected = True
+            raise interrupt
+        return interrupt_after_popen_return
+
+    monkeypatch.setattr(processes.subprocess, "Popen", capture_popen)
+    previous_trace = sys.gettrace()
+    sys.settrace(interrupt_after_popen_return)
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            processes.run_contained(
+                (
+                    sys.executable,
+                    str(FIXTURE),
+                    "term-resistant-leader",
+                    str(leader_pid_file),
+                ),
+                cwd=tmp_path,
+                timeout=1.0,
+                output_limit=1024,
+            )
+
+        assert raised.value is interrupt
+        assert injected
+        assert len(spawned_pids) == 1
+        _assert_pid_reaped(spawned_pids[0])
+        _assert_pid_gone(spawned_pids[0])
+    finally:
+        sys.settrace(previous_trace)
+        for pid in spawned_pids:
+            _kill_fixture_process_group(pid)
+
+
+def test_term_grace_base_exception_kills_term_resistant_leader_and_propagates_interrupt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    processes = _processes()
+    leader_pid_file = tmp_path / "term-grace-interrupt-leader.pid"
+    spawned_pids: list[int] = []
+    signals: list[signal.Signals] = []
+    original_popen = processes.subprocess.Popen
+    original_signal_group = processes._signal_group
+    original_wait_for_group_absence = processes._wait_for_group_absence
+    interrupt = KeyboardInterrupt("fixture-term-grace-base-exception")
+    interrupted = False
+
+    def capture_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def record_group_signal(group_id: int, signal_number: signal.Signals) -> bool:
+        signals.append(signal_number)
+        return original_signal_group(group_id, signal_number)
+
+    def interrupt_term_grace(group_id: int, deadline: float) -> bool:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            assert leader_pid_file.exists()
+            assert signals == [signal.SIGTERM]
+            raise interrupt
+        return original_wait_for_group_absence(group_id, deadline)
+
+    monkeypatch.setattr(processes.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(processes, "_signal_group", record_group_signal)
+    monkeypatch.setattr(processes, "_wait_for_group_absence", interrupt_term_grace)
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            processes.run_contained(
+                (
+                    sys.executable,
+                    str(FIXTURE),
+                    "term-resistant-leader",
+                    str(leader_pid_file),
+                ),
+                cwd=tmp_path,
+                timeout=0.15,
+                output_limit=1024,
+            )
+
+        assert raised.value is interrupt
+        assert interrupted
+        assert signals == [signal.SIGTERM, signal.SIGKILL]
+        assert len(spawned_pids) == 1
+        _assert_pid_reaped(spawned_pids[0])
+        _assert_pid_gone(spawned_pids[0])
+    finally:
+        for pid in spawned_pids:
+            _kill_fixture_process_group(pid)
 
 
 def test_surrogate_argv_fails_closed_before_fixture_launch(tmp_path: Path) -> None:
