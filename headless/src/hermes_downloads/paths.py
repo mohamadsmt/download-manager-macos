@@ -187,6 +187,8 @@ def _require_root(value: str | os.PathLike[str]) -> Path:
         raise PathValidationError("root must be an absolute path")
     if any(part in {".", ".."} for part in root.parts):
         raise PathValidationError("root must not contain traversal components")
+    if root != Path.home() / "Downloads" / "Hermes":
+        raise PathValidationError("root must be the canonical Downloads/Hermes directory")
     return root
 
 

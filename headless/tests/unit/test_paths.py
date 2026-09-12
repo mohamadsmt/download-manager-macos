@@ -19,8 +19,8 @@ def _paths():
     return importlib.import_module("hermes_downloads.paths")
 
 
-def _root(tmp_path: Path) -> Path:
-    root = tmp_path / "Downloads" / "Hermes"
+def _root() -> Path:
+    root = Path.home() / "Downloads" / "Hermes"
     root.mkdir(parents=True, mode=0o700)
     return root
 
@@ -41,7 +41,7 @@ def test_resolves_each_exact_type_category_under_the_supplied_root(
     tmp_path: Path, category: str
 ) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
 
     destination = _resolve(paths, root, category=category)
 
@@ -55,7 +55,7 @@ def test_resolves_each_exact_type_category_under_the_supplied_root(
 
 def test_explicit_collection_takes_precedence_over_type_category(tmp_path: Path) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
 
     destination = _resolve(
         paths,
@@ -71,7 +71,7 @@ def test_explicit_collection_takes_precedence_over_type_category(tmp_path: Path)
 
 def test_preserves_valid_persian_unicode_and_selected_extension(tmp_path: Path) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
     collection = "مجموعه\u200cی آموزشی"
     filename = "ویدیوی نمونه.webm"
 
@@ -110,7 +110,7 @@ def test_rejects_reserved_dot_absolute_and_multicomponent_names(
     tmp_path: Path, field: str, value: str
 ) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
 
     with pytest.raises(paths.PathValidationError):
         _resolve(paths, root, **{field: value})
@@ -123,14 +123,28 @@ def test_rejects_categories_outside_the_fixed_contract(
     paths = _paths()
 
     with pytest.raises(paths.PathValidationError):
-        _resolve(paths, _root(tmp_path), category=category)
+        _resolve(paths, _root(), category=category)
+
+
+def test_rejects_a_writable_noncanonical_root_even_with_a_private_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths()
+    root = tmp_path / "cache" / "output"
+    root.mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HERMES_DOWNLOADS_OUTPUT_ROOT", str(root))
+
+    assert root != Path.home() / "Downloads" / "Hermes"
+    assert os.access(root, os.W_OK | os.X_OK)
+    with pytest.raises(paths.PathValidationError):
+        _resolve(paths, root)
 
 
 def test_rejects_a_destination_root_that_is_not_a_writable_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
     fallback = tmp_path / "unexpected-fallback"
     monkeypatch.setenv("HERMES_DOWNLOADS_OUTPUT_ROOT", str(fallback))
     root.chmod(0o500)
@@ -148,18 +162,18 @@ def test_rejects_a_symlink_in_the_supplied_root_chain(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "Hermes").mkdir()
-    linked_parent = tmp_path / "linked-parent"
-    linked_parent.symlink_to(outside, target_is_directory=True)
+    downloads = Path.home() / "Downloads"
+    downloads.symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(paths.UnsafePathError):
-        _resolve(paths, linked_parent / "Hermes")
+        _resolve(paths, downloads / "Hermes")
 
 
 def test_rejects_existing_symlink_destination_and_incomplete_components(
     tmp_path: Path,
 ) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
     outside = tmp_path / "outside"
     outside.mkdir()
     (root / "Videos").symlink_to(outside, target_is_directory=True)
@@ -177,7 +191,7 @@ def test_rejects_an_existing_final_symlink_instead_of_following_it(
     tmp_path: Path,
 ) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
     video_directory = root / "Videos"
     video_directory.mkdir()
     outside = tmp_path / "outside-final"
@@ -194,7 +208,7 @@ def test_claims_a_collision_name_without_overwriting_the_existing_final(
     tmp_path: Path,
 ) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
     video_directory = root / "Videos"
     video_directory.mkdir()
     existing = video_directory / "selected.webm"
@@ -212,7 +226,7 @@ def test_claims_a_collision_name_without_overwriting_the_existing_final(
 
 def test_claim_never_overwrites_an_existing_resolved_final(tmp_path: Path) -> None:
     paths = _paths()
-    root = _root(tmp_path)
+    root = _root()
     destination = _resolve(paths, root)
     destination.final_path.parent.mkdir(exist_ok=True)
     destination.final_path.write_bytes(b"already complete")
