@@ -1,7 +1,10 @@
-"""Bootstrap packaging and isolation tests for the headless service."""
+"""Packaging, isolation, and immutable model tests for the headless service."""
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+import importlib
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -19,6 +22,7 @@ EXPECTED_WHEEL_MODULES = {
     "hermes_downloads/__init__.py",
     "hermes_downloads/cli.py",
     "hermes_downloads/mcp_server.py",
+    "hermes_downloads/models.py",
     "hermes_downloads/worker.py",
 }
 ENTRYPOINTS = (
@@ -229,3 +233,151 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
         assert "-I" not in script_text
 
     _assert_runtime_roots_are_empty(private_roots)
+
+
+def _models():
+    spec = importlib.util.find_spec("hermes_downloads.models")
+    assert spec is not None, "hermes_downloads.models must provide the public models"
+    return importlib.import_module("hermes_downloads.models")
+
+
+def test_job_states_are_exactly_the_planned_public_states() -> None:
+    job_state = _models().JobState
+    expected = {
+        "queued",
+        "resolving",
+        "downloading",
+        "pausing",
+        "paused",
+        "retry_wait",
+        "needs_link",
+        "needs_auth",
+        "blocked",
+        "finalizing",
+        "completed",
+        "cancelled",
+        "removed",
+        "failed",
+    }
+
+    assert {state.value for state in job_state} == expected
+    assert len(job_state.__members__) == len(expected)
+
+
+def test_all_open_admission_gates_allow_transfer() -> None:
+    admission = _models().Admission(
+        queue_running=True,
+        collection_held=False,
+        authorized=True,
+        item_held=False,
+        due=True,
+    )
+
+    assert admission.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("closed_field", "closed_value"),
+    (
+        ("queue_running", False),
+        ("collection_held", True),
+        ("authorized", False),
+        ("item_held", True),
+        ("due", False),
+    ),
+)
+def test_each_independent_admission_gate_closes_transfer(
+    closed_field: str, closed_value: bool
+) -> None:
+    values = {
+        "queue_running": True,
+        "collection_held": False,
+        "authorized": True,
+        "item_held": False,
+        "due": True,
+    }
+    values[closed_field] = closed_value
+
+    assert _models().Admission(**values).allowed is False
+
+
+def test_due_time_never_authorizes_transfer() -> None:
+    admission = _models().Admission(
+        queue_running=True,
+        collection_held=False,
+        authorized=False,
+        item_held=False,
+        due=True,
+    )
+
+    assert admission.allowed is False
+
+
+def test_manual_hold_survives_queue_resume():
+    _models()
+    from hermes_downloads.models import Admission
+
+    admission = Admission(queue_running=True, collection_held=False,
+                          authorized=True, item_held=True, due=True)
+    assert admission.allowed is False
+
+
+def _download_intent(**overrides):
+    values = {
+        "job_id": "job-1",
+        "request_id": "request-1",
+        "payload_digest": "a" * 64,
+        "source_url": b"https://example.test/%2Fsource?copy=1&copy=1",
+        "expected_revision": None,
+        "generation": 0,
+        "revision": 0,
+    }
+    values.update(overrides)
+    return _models().DownloadIntent(**values)
+
+
+def test_download_intent_is_immutable_and_preserves_raw_source_bytes() -> None:
+    submitted = bytearray(b"https://example.test/%2Fsource?copy=1&copy=1")
+    intent = _download_intent(
+        source_url=submitted,
+        expected_revision=4,
+        generation=5,
+        revision=6,
+    )
+    submitted[-1] = ord("2")
+
+    assert intent.job_id == "job-1"
+    assert intent.request_id == "request-1"
+    assert intent.payload_digest == "a" * 64
+    assert intent.expected_revision == 4
+    assert intent.generation == 5
+    assert intent.revision == 6
+    assert type(intent.source_url) is bytes
+    assert intent.source_url == b"https://example.test/%2Fsource?copy=1&copy=1"
+    with pytest.raises(FrozenInstanceError):
+        intent.revision = 7
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"job_id": ""},
+        {"job_id": " job-1"},
+        {"request_id": "request id"},
+        {"payload_digest": "a" * 63},
+        {"payload_digest": "A" * 64},
+        {"source_url": b""},
+        {"source_url": "https://example.test/source"},
+        {"expected_revision": -1},
+        {"expected_revision": float("inf")},
+        {"generation": -1},
+        {"generation": float("inf")},
+        {"revision": -1},
+        {"revision": float("nan")},
+    ),
+)
+def test_download_intent_rejects_malformed_or_nonfinite_values(
+    overrides: dict[str, object]
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        _download_intent(**overrides)
