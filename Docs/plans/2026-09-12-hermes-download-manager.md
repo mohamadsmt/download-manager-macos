@@ -14,7 +14,7 @@
 
 **Date:** 2026-09-12 / 1405-06-21.
 
-**Status:** Plan documented, NOT implemented or benchmarked. **G0 security decision is a stop gate before network-enabled implementation.** This is a conditional execution plan, not a claim that every approved guarantee is already feasible.
+**Status:** Ready to execute after the user resolved G0 by selecting trusted, user-vetted links. No additional egress proxy/guard is required. The service and benchmarks are NOT implemented; all execution acceptance gates remain.
 
 **Additional user instructions:** Clear the current legacy download queue while preserving payload files; if the existing application is changed, build the latest version and install it in Applications; commit and push completed repository changes. Queue maintenance is a separate local operation; raw state, personal queue inventory and backups must stay outside Git. No application code or installed bundle is changed by a documentation-only update.
 
@@ -75,21 +75,15 @@ Candidate Python dependencies: `mcp[cli]==1.29.1` (proven local MCP packaging pr
 
 Use explicit executable paths, `--ignore-config`, `--no-plugin-dirs`, `--no-update`, `--no-remote-components`, local EJS, `--no-js-runtimes --js-runtimes deno:<path>`, and explicit FFmpeg location. Disable implicit cookies, netrc, environment proxies and arbitrary extra CLI arguments. Never self-update a Homebrew installation behind the user's back.
 
-## 2. G0 — Material security decision, before implementation
+## 2. G0 — Resolved: trusted user-provided links, no extra network guard
 
-Approved design section 8 requires rejection of internal/private destinations across URLs and redirects. Stock aria2 and yt-dlp do their own DNS/socket work, and extractor-discovered media/manifests add more destinations. A parent preflight cannot guarantee that the engine later connects only to vetted public addresses.
+The user explicitly stated that they vet submitted links and do not require special protection against malicious links. This supersedes the previous all-hop private-network rejection requirement. The decision is recorded in `Docs/plans/download-network-decision.md` and the approved spec has been amended consistently.
 
-**Current verdict: BLOCKED with stock options alone.** Neither a successful preflight nor post-download inspection proves the guarantee.
+Use stock engine networking with initial bounded HTTP/HTTPS URL validation. Reject malformed URLs, control characters, embedded credentials and unsupported schemes; preserve valid signed URL bytes. Basic initial-host screening may reject literal loopback/private targets by default, with explicit local-fixture grants in tests, but it must not be presented as a guarantee about later DNS resolution, redirects or extractor-discovered destinations. Do not build/install an egress proxy, add root/VPN/system-routing changes, or block implementation on full SSRF protection.
 
-User decision:
+Residual risk is explicit: a trusted source can be compromised or redirect unexpectedly; subprocess engines can resolve/connect independently. The application does not guarantee prevention of private/internal connections across that chain. Normal TLS certificate verification stays enabled. Essential filesystem containment, no-clobber publication, subprocess argument validation, secret redaction, cookie consent and no automatic execution remain mandatory.
 
-1. **Recommended:** authorize a bounded evaluation of a maintained local user-space egress guard/proxy. No new proxy implementation, root changes, VPN setting changes, TLS interception, or system-wide routing. Evaluate DNS-to-socket pinning, HTTP/CONNECT, every engine path, redirect and fragment destinations, local-only exposure, and no bypass. Only install if exact reviewed configuration passes disposable end-to-end probes. If no maintained solution meets the contract, return with evidence rather than build a large custom network layer.
-2. Explicitly narrow the threat model to user-provided/trusted sources plus initial URL/DNS screening, accepting that later internal-network connections cannot be guaranteed blocked. This requires a user-approved spec amendment; it is **not** compliant with the current approved spec.
-3. Keep the existing guarantee and do not add a guard: network-enabled delivery remains blocked.
-
-No branch is selected by this document. G0 decision and resulting concrete transport/configuration paths must be recorded in `Docs/plans/download-network-decision.md` before T07 or any live payload test. After guard selection, review its dependency/license/privacy contracts and extend the exact fixture list below; do not pretend a placeholder adapter closes the gate.
-
-A separate acceptance boundary also needs acknowledgement: D2 is a smoothed **payload** speed limit with a measured tolerance, not a machine-wide instantaneous network shaper. The plan's final user summary must state this distinction.
+D2 remains a smoothed **payload** speed limit with measured tolerance, not a machine-wide instantaneous network shaper. Report actual measured behavior and short-window bursts; no extra approval gate is needed for the already disclosed ordinary download-manager semantics.
 
 ## 3. Files, contracts, and limits
 
@@ -181,17 +175,17 @@ The first lock generation is deliberate; subsequent acceptance uses `--locked --
 
 ## 5. Ordered implementation tasks
 
-### T01 — Record G0 decision and freeze acceptance boundaries
+### T01 — Record G0 decision and freeze acceptance boundaries (completed in documentation)
 
 **Files:** `Docs/plans/download-network-decision.md`, this plan, approved spec only for an explicitly approved amendment.
 
-1. Present G0 choices and D2 payload-rate semantics to the user.
-2. Record exact choice; if unchanged guarantee/no guard, mark network execution blocked.
-3. If guard evaluation approved, review candidates read-only first; select a bounded disposable proof, not a new subsystem.
-4. Require a verifiable source/locked version/config path and forbidden-destination connection ledger before declaring feasibility.
-5. Commit documentation only: `docs: lock download network and bandwidth boundaries`.
+1. Record the user-vetted-link decision and explicit residual DNS/redirect risk.
+2. Amend spec section 8, this G0 section and T07 so they do not contradict one another.
+3. Preserve non-network protections and ordinary measured payload-rate semantics.
+4. Check that no active task still demands a proxy or full SSRF acceptance.
+5. Commit/push the documentation amendment; continue with T02 without re-asking the same security choice.
 
-**Gate:** Do not start T07/T10/T12/live tests without this outcome. Safe local tests may proceed after explicit execution authorization; they cannot imply network capability.
+**Gate outcome:** G0 is resolved. No proxy research/installation or full-chain private-destination denial is required. Live tests still require their explicit source/traffic scope.
 
 ### T02 — Bootstrap isolated package and harness
 
@@ -256,17 +250,17 @@ Priority descending, explicit order key within equal priority, FIFO default. Tes
 
 Commit: `feat: add deterministic queue scheduling and persistent pause gates`.
 
-### T07 — Gated outbound policy integration
+### T07 — Bounded URL and credential handling for trusted sources
 
-**Files:** exact integration paths from the completed G0 decision; `tests/integration/test_network_policy.py`, `tests/fixtures/http_origin.py`.
+**Files:** `headless/src/hermes_downloads/network.py`, `headless/tests/integration/test_network_policy.py`, `headless/tests/fixtures/http_origin.py`.
 
 **Test:** `headless/scripts/run-tests tests/integration/test_network_policy.py`.
 
-Test initial URL, redirect, every new DNS connection, IPv4/IPv6/mapped addresses, mixed DNS answers, public-to-private redirect, rebinding, private manifest/fragment/key URLs, default proxy bypass, and TLS hostname verification. Assert zero connections to forbidden fixture endpoints, not just an exception message. Test explicit test-only endpoint grants isolated from production settings.
+Implement bounded HTTP/HTTPS parsing, unsupported-scheme/control-character/userinfo rejection and exact signed-query preservation. Test literal loopback/private initial-host screening and explicit local-origin fixture grants if that basic screen is enabled. Do not implement DNS pinning, a custom transport/proxy, or claim all-hop SSRF prevention. Standard engine redirects remain inside the explicitly trusted-source model.
 
-No credential-bearing cross-origin headers without explicit origin-bound contract. Never log full signed URLs or subprocess stderr. If security guarantee is narrowed by explicit user choice, update spec/test names and report the uncovered risk rather than label this test full SSRF protection.
+Disable ambient netrc/cookies/proxies by default; use credentials only after explicit user consent through a scoped supported mechanism. Never forward a generic Authorization header to arbitrary redirected origins. If a specific engine/auth path cannot uphold credential scope, reject that auth mode rather than disable TLS or leak credentials. Redact signed URL queries and child diagnostics in public output. Tests cover malformed input, redaction, credential opt-in and TLS verification, not an unimplemented private-network guarantee.
 
-Commit: `feat: enforce approved downloader outbound policy`.
+Commit: `feat: validate trusted download sources and protect credentials`.
 
 ### T08 — Contained engine processes
 
@@ -284,7 +278,7 @@ Commit: `feat: contain engine lifecycles and redact bounded diagnostics`.
 
 **Test:** `headless/scripts/run-tests tests/integration/test_direct.py -k fixture`.
 
-Standard-library local origin with deterministic generated bytes, known hash, request/byte/connection ledger, Range/no-Range, ETag change at same size, delayed chunks, disconnect, 403, 404, 429 Retry-After and 503 sequences. Explicit test-only origin exception; never alter production private-address policy. Fixture is labelled synthetic, not benchmark evidence from the internet.
+Standard-library local origin with deterministic generated bytes, known hash, request/byte/connection ledger, Range/no-Range, ETag change at same size, delayed chunks, disconnect, 403, 404, 429 Retry-After and 503 sequences. Explicit test-only local-origin grant if basic initial-host screening is enabled; no privileged network policy changes. Fixture is labelled synthetic, not benchmark evidence from the internet.
 
 Commit: `test: add deterministic download fault origin`.
 
@@ -513,9 +507,9 @@ Commit documentation/evidence summaries: `docs: record canonical Hermes download
 
 ## 7. Planning verification and remaining decisions
 
-Completed planning evidence: approved spec read, prior Swift controllers/models/store/naming/tests inspected, existing local MCP launcher precedent read, official notification SDK/source verified, installed yt-dlp command builder tested without network. Neither the service, plugin, G0 guard nor benchmark harness has been created or run.
+Completed planning evidence: approved spec read, prior Swift controllers/models/store/naming/tests inspected, existing local MCP launcher precedent read, official notification SDK/source verified, installed yt-dlp command builder tested without network. The user resolved G0 in favor of trusted sources and no extra guard. Neither the service, plugin nor benchmark harness has been created or run.
 
-Remaining consequential choice before implementation: **G0**. Recommended next user question asks permission to evaluate a small maintained local egress guard while retaining the approved network guarantee. Also disclose in-app notifications replay after full app exit and the smoothed payload speed semantics. No need to ask the user to choose Python, database schema, file names or task ordering.
+No remaining G0 choice blocks implementation. Continue at T02 with fresh execution context. Do not re-ask about malicious links or add a proxy. The actual live-source/credential and disruptive app-restart gates still apply when reached; Python, schema, file names and task order are implementation decisions.
 
 ## Sources and exact discovery references
 
