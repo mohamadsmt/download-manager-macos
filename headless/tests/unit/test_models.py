@@ -27,9 +27,9 @@ ENTRYPOINTS = (
     "hermes-downloads-worker",
 )
 LAUNCHERS = {
-    "run-tests": ("--version",),
-    "run-mcp": (),
-    "run-worker": (),
+    "run-tests": (("--version",),),
+    "run-mcp": ((),),
+    "run-worker": ((),),
 }
 
 
@@ -94,7 +94,9 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
 
     uv = shutil.which("uv")
     assert uv is not None
-    environment = _environment(private_roots)
+    clean_environment = _environment(private_roots)
+    assert "PYTHONPATH" not in clean_environment
+    assert "PYTHONHOME" not in clean_environment
     artifact_root = private_roots["artifact"]
     wheel_root = artifact_root / "wheel"
     scratch = artifact_root / "scratch"
@@ -105,7 +107,7 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     _run(
         [uv, "build", "--wheel", "--out-dir", str(wheel_root)],
         cwd=HEADLESS_ROOT,
-        environment=environment,
+        environment=clean_environment,
     )
     wheels = sorted(wheel_root.glob("*.whl"))
     assert len(wheels) == 1
@@ -114,7 +116,7 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     _run(
         [uv, "venv", "--python", "3.12", str(venv)],
         cwd=artifact_root,
-        environment=environment,
+        environment=clean_environment,
     )
     installed_python = venv / "bin" / "python"
     _run(
@@ -128,40 +130,31 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
             str(wheel),
         ],
         cwd=artifact_root,
-        environment=environment,
+        environment=clean_environment,
     )
     _run(
         [
             str(installed_python),
-            "-I",
             "-c",
             "import sys; assert sys.version_info[:2] == (3, 12)",
         ],
         cwd=scratch,
-        environment=environment,
+        environment=clean_environment,
     )
 
-    ambient = artifact_root / "ambient"
-    canary_package = ambient / "hermes_downloads"
-    canary_package.mkdir(parents=True, mode=0o700)
-    (canary_package / "__init__.py").write_text(
-        "raise RuntimeError('ambient hermes_downloads was imported')\n", encoding="utf-8"
+    installed_package = (
+        next((venv / "lib").glob("python*/site-packages")) / "hermes_downloads"
     )
-    contaminated = dict(environment)
-    contaminated["PYTHONPATH"] = str(ambient)
-    contaminated["PYTHONHOME"] = str(private_roots["invalid_pythonhome"])
     probe = _run(
         [
             str(installed_python),
-            "-I",
             "-c",
             "from pathlib import Path; import hermes_downloads; "
             "print(Path(hermes_downloads.__file__).resolve())",
         ],
         cwd=scratch,
-        environment=contaminated,
+        environment=clean_environment,
     )
-    installed_package = next((venv / "lib").glob("python*/site-packages")) / "hermes_downloads"
     assert Path(probe.stdout.strip()) == (installed_package / "__init__.py").resolve()
     assert not Path(probe.stdout.strip()).is_relative_to(SOURCE_PACKAGE.resolve())
     with zipfile.ZipFile(wheel) as archive:
@@ -174,19 +167,18 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     for entrypoint in ENTRYPOINTS:
         command = venv / "bin" / entrypoint
         assert command.is_file() and os.access(command, os.X_OK)
-        _run([str(command)], cwd=scratch, environment=environment)
+        _run([str(command)], cwd=scratch, environment=clean_environment)
 
     canonical_python = HEADLESS_ROOT / ".venv" / "bin" / "python"
     canonical_probe = _run(
         [
             str(canonical_python),
-            "-I",
             "-c",
             "from pathlib import Path; import hermes_downloads; "
             "print(Path(hermes_downloads.__file__).resolve())",
         ],
         cwd=scratch,
-        environment=contaminated,
+        environment=clean_environment,
     )
     canonical_origin = Path(canonical_probe.stdout.strip())
     assert canonical_origin.is_relative_to(HEADLESS_ROOT / ".venv")
@@ -200,10 +192,40 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
             SOURCE_PACKAGE / relative_module
         ).read_bytes()
 
-    for launcher, arguments in LAUNCHERS.items():
+    ambient = artifact_root / "ambient"
+    canary_package = ambient / "hermes_downloads"
+    canary_package.mkdir(parents=True, mode=0o700)
+    canary_message = "ambient hermes_downloads was imported"
+    (canary_package / "__init__.py").write_text(
+        f"raise RuntimeError({canary_message!r})\n", encoding="utf-8"
+    )
+    contaminated = dict(clean_environment)
+    contaminated["PYTHONPATH"] = str(ambient)
+    contaminated["PYTHONHOME"] = str(private_roots["invalid_pythonhome"])
+    launcher_probe = artifact_root / "test_launcher_import.py"
+    launcher_probe.write_text(
+        "def test_imports_hermes_downloads() -> None:\n"
+        "    import hermes_downloads\n"
+        "\n"
+        "    assert hermes_downloads.__file__\n",
+        encoding="utf-8",
+    )
+
+    for launcher, argument_sets in LAUNCHERS.items():
         script = HEADLESS_ROOT / "scripts" / launcher
         assert script.is_file()
         assert stat.S_IMODE(script.stat().st_mode) == 0o755
-        _run([str(script), *arguments], cwd=scratch, environment=contaminated)
+        if launcher == "run-tests":
+            argument_sets = (*argument_sets, (str(launcher_probe),))
+        for arguments in argument_sets:
+            completed = _run(
+                [str(script), *arguments], cwd=scratch, environment=contaminated
+            )
+            assert canary_message not in completed.stdout
+            assert canary_message not in completed.stderr
+        script_text = script.read_text("utf-8")
+        assert "unset PYTHONPATH PYTHONHOME" in script_text
+        assert script_text.index("unset PYTHONPATH PYTHONHOME") < script_text.index("exec ")
+        assert "-I" not in script_text
 
     _assert_runtime_roots_are_empty(private_roots)
