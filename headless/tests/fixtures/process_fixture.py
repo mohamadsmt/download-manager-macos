@@ -113,6 +113,22 @@ def _term_resistant_leader(arguments: list[str]) -> int:
         signal.pause()
 
 
+def _close_pipes_then_finish(arguments: list[str]) -> int:
+    completed_path, term_path = arguments[1:]
+
+    def _on_term(_signal_number: int, _frame: object) -> None:
+        Path(term_path).write_text("term", encoding="ascii")
+        os._exit(36)
+
+    signal.signal(signal.SIGTERM, _on_term)
+    _write_pid(arguments[0])
+    os.close(sys.stdout.fileno())
+    os.close(sys.stderr.fileno())
+    time.sleep(0.05)
+    Path(completed_path).write_text("completed", encoding="ascii")
+    os._exit(0)
+
+
 def _exit_with_descendant(arguments: list[str]) -> int:
     _write_pid(arguments[0])
     _spawn_detached_descendant(arguments[1])
@@ -194,6 +210,8 @@ def main() -> int:
         return _descendant_and_sleep(arguments)
     if mode == "term-resistant-leader" and len(arguments) == 1:
         return _term_resistant_leader(arguments)
+    if mode == "close-pipes-then-finish" and len(arguments) == 3:
+        return _close_pipes_then_finish(arguments)
     if mode == "exit-with-descendant" and len(arguments) == 2:
         return _exit_with_descendant(arguments)
     if mode == "term-aware-descendant" and len(arguments) == 3:

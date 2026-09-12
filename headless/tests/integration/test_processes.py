@@ -411,6 +411,37 @@ def test_term_resistant_leader_is_killed_and_reaped(tmp_path: Path) -> None:
         _kill_fixture_group(leader_pid_file)
 
 
+def test_pipe_eof_waits_for_non_reaping_leader_completion(tmp_path: Path) -> None:
+    processes = _processes()
+    leader_pid_file = tmp_path / "pipe-eof-leader.pid"
+    completed_file = tmp_path / "pipe-eof-completed"
+    term_file = tmp_path / "pipe-eof-term"
+
+    try:
+        result = processes.run_contained(
+            (
+                sys.executable,
+                str(FIXTURE),
+                "close-pipes-then-finish",
+                str(leader_pid_file),
+                str(completed_file),
+                str(term_file),
+            ),
+            cwd=tmp_path,
+            timeout=1.0,
+            output_limit=1024,
+        )
+
+        assert result.returncode == 0
+        assert result.stdout == ""
+        assert result.stderr == ""
+        assert completed_file.read_text("ascii") == "completed"
+        assert not term_file.exists()
+        _assert_pid_gone(int(leader_pid_file.read_text("ascii")))
+    finally:
+        _kill_fixture_group(leader_pid_file)
+
+
 def test_lifecycle_signals_bound_group_before_any_leader_reap(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -445,12 +476,18 @@ def test_lifecycle_signals_bound_group_before_any_leader_reap(
         def close(self) -> None:
             pass
 
+    class FinishedObserver:
+        def close(self) -> None:
+            pass
+
     process = FakeProcess()
     signals: list[signal.Signals] = []
     group_absences = iter((False,))
 
     monkeypatch.setattr(processes.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(processes.selectors, "DefaultSelector", EmptySelector)
+    monkeypatch.setattr(processes, "_open_exit_observer", lambda _process: FinishedObserver())
+    monkeypatch.setattr(processes, "_wait_for_observed_exit", lambda *_args: True)
     monkeypatch.setattr(
         processes,
         "_bind_process_group",

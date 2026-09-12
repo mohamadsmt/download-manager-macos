@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+import select
 import selectors
 import signal
 import subprocess
@@ -120,6 +121,41 @@ def _bind_process_group(process: subprocess.Popen[bytes]) -> int | None:
     if process_group_id != process.pid or session_id != process.pid:
         return None
     return process_group_id
+
+
+def _open_exit_observer(process: subprocess.Popen[bytes]):
+    """Observe leader exit without consuming its wait status on macOS."""
+
+    observer = None
+    try:
+        observer = select.kqueue()
+        observer.control(
+            [
+                select.kevent(
+                    process.pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_ONESHOT,
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+            ],
+            0,
+            0,
+        )
+    except (AttributeError, OSError):
+        if observer is not None:
+            try:
+                observer.close()
+            except (AttributeError, OSError):
+                pass
+        return None
+    return observer
+
+
+def _wait_for_observed_exit(observer, deadline: float) -> bool:
+    try:
+        return bool(observer.control(None, 1, max(0.0, deadline - time.monotonic())))
+    except OSError:
+        return False
 
 
 def _close_streams(process: subprocess.Popen[bytes]) -> bool:
@@ -272,13 +308,20 @@ def run_contained(
     stdout = bytearray()
     stderr = bytearray()
     cleaned = False
+    exit_observer = None
     try:
         process_group_id = _bind_process_group(active_process)
         if process_group_id is None:
             reason = "command_failed"
-        elif active_process.stdout is None or active_process.stderr is None:
-            reason = "command_failed"
         else:
+            exit_observer = _open_exit_observer(active_process)
+            if exit_observer is None:
+                reason = "command_failed"
+        if reason is None and (active_process.stdout is None or active_process.stderr is None):
+            reason = "command_failed"
+        if reason is None:
+            assert active_process.stdout is not None
+            assert active_process.stderr is not None
             active_selector.register(active_process.stdout, selectors.EVENT_READ, "stdout")
             active_selector.register(active_process.stderr, selectors.EVENT_READ, "stderr")
             while active_selector.get_map() and reason is None:
@@ -306,13 +349,18 @@ def run_contained(
                         reason = "command_output_too_large"
                         break
                     target.extend(chunk)
-            if reason is None and active_selector.get_map():
+            if reason is None and not _wait_for_observed_exit(exit_observer, deadline):
                 reason = "command_timeout"
     except Exception:
         reason = "command_failed"
     finally:
         try:
             active_selector.close()
+        except BaseException:
+            reason = reason or "command_failed"
+        try:
+            if exit_observer is not None:
+                exit_observer.close()
         except BaseException:
             reason = reason or "command_failed"
         try:
