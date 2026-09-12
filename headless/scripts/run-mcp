@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+unset PYTHONPATH PYTHONHOME
+exec "$ROOT/.venv/bin/hermes-downloads-mcp" "$@"

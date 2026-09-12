@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-downloads"
+version = "0.0.0"
+description = "Headless Hermes download service"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.scripts]
+hermes-downloads = "hermes_downloads.cli:main"
+hermes-downloads-mcp = "hermes_downloads.mcp_server:main"
+hermes-downloads-worker = "hermes_downloads.worker:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_downloads"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

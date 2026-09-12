@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+unset PYTHONPATH PYTHONHOME
+umask 077
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/hermes-downloads-tests.XXXXXX")"
+mkdir -p "$TEST_ROOT/home" "$TEST_ROOT/hermes-home" "$TEST_ROOT/state" "$TEST_ROOT/output"
+export HOME="$TEST_ROOT/home"
+export HERMES_HOME="$TEST_ROOT/hermes-home"
+export HERMES_DOWNLOADS_STATE_ROOT="$TEST_ROOT/state"
+export HERMES_DOWNLOADS_OUTPUT_ROOT="$TEST_ROOT/output"
+export HERMES_DOWNLOADS_DISABLE_NETWORK=1
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
+cd "$ROOT"
+exec "$ROOT/.venv/bin/pytest" --basetemp "$TEST_ROOT/pytest" -p no:cacheprovider "$@"
