@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+import hermes_downloads.store as store_module
 from hermes_downloads.models import DownloadIntent
 from hermes_downloads.store import RequestConflictError, SQLiteStore
 
@@ -23,6 +24,41 @@ def _intent(**overrides: Any) -> DownloadIntent:
     }
     values.update(overrides)
     return DownloadIntent(**values)
+
+
+def _add_page_of_jobs(store: SQLiteStore) -> None:
+    for index in range(101):
+        store.apply_add(
+            _intent(
+                job_id=f"job-{index:03d}",
+                request_id=f"request-{index:03d}",
+            )
+        )
+
+
+class _BootstrapFailureConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.closed = False
+
+    @property
+    def row_factory(self) -> Any:
+        return self._connection.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value: Any) -> None:
+        self._connection.row_factory = value
+
+    def executescript(self, script: str) -> None:
+        self._connection.execute("BEGIN EXCLUSIVE")
+        raise sqlite3.OperationalError("injected bootstrap failure")
+
+    def close(self) -> None:
+        self.closed = True
+        self._connection.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 def _install_failing_insert_trigger(
@@ -97,6 +133,87 @@ def test_duplicate_exact_request_is_idempotent_without_extra_queue_mutation(
         assert [event.kind for event in store.list_events()] == ["job_added"]
     finally:
         store.close()
+
+
+def test_list_jobs_uses_an_exact_fixed_page_size(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _add_page_of_jobs(store)
+
+        assert [job.job for job in store.list_jobs()] == [
+            f"job-{index:03d}" for index in range(100)
+        ]
+    finally:
+        store.close()
+
+
+def test_list_events_uses_an_exact_fixed_page_size(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _add_page_of_jobs(store)
+
+        assert [event.event_id for event in store.list_events()] == list(range(1, 101))
+    finally:
+        store.close()
+
+
+def test_list_jobs_resumes_after_the_previous_page_cursor(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _add_page_of_jobs(store)
+
+        first_page = store.list_jobs()
+        next_page = store.list_jobs(cursor=first_page[-1].job)
+
+        assert [job.job for job in next_page] == ["job-100"]
+    finally:
+        store.close()
+
+
+def test_list_events_resumes_after_the_previous_page_cursor(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _add_page_of_jobs(store)
+
+        first_page = store.list_events()
+        next_page = store.list_events(cursor=first_page[-1].event_id)
+
+        assert [event.event_id for event in next_page] == [101]
+    finally:
+        store.close()
+
+
+def test_failed_bootstrap_closes_the_connection_before_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    original_connect = sqlite3.connect
+    failed_connection: _BootstrapFailureConnection | None = None
+    connection_count = 0
+
+    def connect_with_first_bootstrap_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal connection_count, failed_connection
+        kwargs["timeout"] = 0
+        connection = original_connect(*args, **kwargs)
+        if connection_count == 0:
+            connection_count += 1
+            failed_connection = _BootstrapFailureConnection(connection)
+            return failed_connection
+        connection_count += 1
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_first_bootstrap_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected bootstrap failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    retried = SQLiteStore(database_path)
+    try:
+        assert failed_connection.closed is True
+        assert retried.queue_gate() is None
+    finally:
+        retried.close()
 
 
 def test_reused_request_with_different_payload_conflicts_without_mutation(

@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 """
 
+_PAGE_SIZE: Final = 100
+
 
 class RequestConflictError(ValueError):
     """Raised when a request ID is reused with a different payload digest."""
@@ -104,10 +106,18 @@ class SQLiteStore:
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
-        self._connection = sqlite3.connect(self.database_path, isolation_level=None)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.executescript(_SCHEMA)
+        connection = sqlite3.connect(self.database_path, isolation_level=None)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript(_SCHEMA)
+        except BaseException:
+            try:
+                connection.close()
+            except BaseException:
+                pass
+            raise
+        self._connection = connection
 
     def close(self) -> None:
         """Release the SQLite connection."""
@@ -241,16 +251,30 @@ class SQLiteStore:
         ).fetchone()
         return None if row is None else self._job_record(row)
 
-    def list_jobs(self) -> tuple[JobRecord, ...]:
-        """Read all persisted jobs in stable job-ID order."""
+    def list_jobs(self, *, cursor: str | None = None) -> tuple[JobRecord, ...]:
+        """Read one bounded page of jobs after a stable job-ID cursor."""
 
-        rows = self._connection.execute(
-            """
-            SELECT job_id, source_url, generation, revision, state
-            FROM jobs
-            ORDER BY job_id
-            """
-        ).fetchall()
+        if cursor is None:
+            rows = self._connection.execute(
+                """
+                SELECT job_id, source_url, generation, revision, state
+                FROM jobs
+                ORDER BY job_id
+                LIMIT ?
+                """,
+                (_PAGE_SIZE,),
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                """
+                SELECT job_id, source_url, generation, revision, state
+                FROM jobs
+                WHERE job_id > ?
+                ORDER BY job_id
+                LIMIT ?
+                """,
+                (cursor, _PAGE_SIZE),
+            ).fetchall()
         return tuple(self._job_record(row) for row in rows)
 
     def get_command(self, request_id: str) -> CommandRecord | None:
@@ -274,16 +298,30 @@ class SQLiteStore:
             revision=row["revision"],
         )
 
-    def list_events(self) -> tuple[EventRecord, ...]:
-        """Read durable events in insertion order."""
+    def list_events(self, *, cursor: int | None = None) -> tuple[EventRecord, ...]:
+        """Read one bounded page of events after an insertion-order cursor."""
 
-        rows = self._connection.execute(
-            """
-            SELECT event_id, kind, job_id, generation, revision
-            FROM events
-            ORDER BY event_id
-            """
-        ).fetchall()
+        if cursor is None:
+            rows = self._connection.execute(
+                """
+                SELECT event_id, kind, job_id, generation, revision
+                FROM events
+                ORDER BY event_id
+                LIMIT ?
+                """,
+                (_PAGE_SIZE,),
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                """
+                SELECT event_id, kind, job_id, generation, revision
+                FROM events
+                WHERE event_id > ?
+                ORDER BY event_id
+                LIMIT ?
+                """,
+                (cursor, _PAGE_SIZE),
+            ).fetchall()
         return tuple(
             EventRecord(
                 event_id=row["event_id"],
