@@ -207,9 +207,17 @@ def _cleanup_process_group(process: subprocess.Popen[bytes], process_group_id: i
         return _cleanup_unbound_process(process)
 
     term_deadline = time.monotonic() + _TERM_GRACE_SECONDS
-    success = _signal_group(process_group_id, signal.SIGTERM)
-    if not _wait_for_group_absence(process_group_id, term_deadline):
-        success = _signal_group(process_group_id, signal.SIGKILL) and success
+    _signal_group(process_group_id, signal.SIGTERM)
+    interruption: BaseException | None = None
+    try:
+        group_absent_after_term = _wait_for_group_absence(
+            process_group_id, term_deadline
+        )
+    except BaseException as raised:
+        interruption = raised
+        group_absent_after_term = False
+    if not group_absent_after_term:
+        _signal_group(process_group_id, signal.SIGKILL)
 
     # No group signal is permitted after this wait: process.pid can be recycled once reaped.
     leader_reaped = _wait_for_leader(process, time.monotonic() + _KILL_GRACE_SECONDS)
@@ -220,6 +228,8 @@ def _cleanup_process_group(process: subprocess.Popen[bytes], process_group_id: i
     else:
         final_absence = True
     streams_closed = _close_streams(process)
+    if interruption is not None:
+        raise interruption
     # macOS can report transient EPERM after a successful signal; final absence is authoritative.
     return leader_reaped and final_absence and streams_closed
 
@@ -278,31 +288,6 @@ def run_contained(
         _raise_public("command_failed")
 
     process: subprocess.Popen[bytes] | None = None
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=working_directory,
-            env=_filtered_environment(environment),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-            close_fds=True,
-            bufsize=0,
-        )
-    except (OSError, ValueError):
-        pass
-    except Exception:
-        pass
-    if process is None:
-        try:
-            active_selector.close()
-        except Exception:
-            pass
-        _raise_public("command_unavailable")
-    active_process = process
-
     process_group_id: int | None = None
     reason: str | None = None
     stdout = bytearray()
@@ -310,67 +295,90 @@ def run_contained(
     cleaned = False
     exit_observer = None
     try:
-        process_group_id = _bind_process_group(active_process)
-        if process_group_id is None:
-            reason = "command_failed"
-        else:
-            exit_observer = _open_exit_observer(active_process)
-            if exit_observer is None:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=working_directory,
+                env=_filtered_environment(environment),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                start_new_session=True,
+                close_fds=True,
+                bufsize=0,
+            )
+        except (OSError, ValueError):
+            pass
+        except Exception:
+            pass
+        if process is not None:
+            process_group_id = _bind_process_group(process)
+            if process_group_id is None:
                 reason = "command_failed"
-        if reason is None and (active_process.stdout is None or active_process.stderr is None):
-            reason = "command_failed"
-        if reason is None:
-            assert active_process.stdout is not None
-            assert active_process.stderr is not None
-            active_selector.register(active_process.stdout, selectors.EVENT_READ, "stdout")
-            active_selector.register(active_process.stderr, selectors.EVENT_READ, "stderr")
-            while active_selector.get_map() and reason is None:
-                if cancel_event is not None and cancel_event.is_set():
-                    reason = "command_cancelled"
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    reason = "command_timeout"
-                    break
-                events = active_selector.select(remaining)
-                if not events:
-                    continue
-                for key, _ in events:
-                    try:
-                        chunk = os.read(key.fd, _CHUNK_SIZE)
-                    except OSError:
-                        reason = "command_failed"
+            else:
+                exit_observer = _open_exit_observer(process)
+                if exit_observer is None:
+                    reason = "command_failed"
+            if reason is None and (process.stdout is None or process.stderr is None):
+                reason = "command_failed"
+            if reason is None:
+                assert process.stdout is not None
+                assert process.stderr is not None
+                active_selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+                active_selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+                while active_selector.get_map() and reason is None:
+                    if cancel_event is not None and cancel_event.is_set():
+                        reason = "command_cancelled"
                         break
-                    if not chunk:
-                        active_selector.unregister(key.fileobj)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        reason = "command_timeout"
+                        break
+                    events = active_selector.select(remaining)
+                    if not events:
                         continue
-                    target = stdout if key.data == "stdout" else stderr
-                    if len(target) + len(chunk) > output_limit:
-                        reason = "command_output_too_large"
-                        break
-                    target.extend(chunk)
-            if reason is None and not _wait_for_observed_exit(exit_observer, deadline):
-                reason = "command_timeout"
+                    for key, _ in events:
+                        try:
+                            chunk = os.read(key.fd, _CHUNK_SIZE)
+                        except OSError:
+                            reason = "command_failed"
+                            break
+                        if not chunk:
+                            active_selector.unregister(key.fileobj)
+                            continue
+                        target = stdout if key.data == "stdout" else stderr
+                        if len(target) + len(chunk) > output_limit:
+                            reason = "command_output_too_large"
+                            break
+                        target.extend(chunk)
+                if reason is None and not _wait_for_observed_exit(exit_observer, deadline):
+                    reason = "command_timeout"
     except Exception:
-        reason = "command_failed"
+        if process is not None:
+            reason = "command_failed"
     finally:
         try:
             active_selector.close()
-        except BaseException:
-            reason = reason or "command_failed"
-        try:
-            if exit_observer is not None:
-                exit_observer.close()
-        except BaseException:
-            reason = reason or "command_failed"
-        try:
-            cleaned = _cleanup_process_group(active_process, process_group_id)
-        except BaseException:
-            cleaned = False
+        except Exception:
+            if process is not None:
+                reason = reason or "command_failed"
+        finally:
+            try:
+                if exit_observer is not None:
+                    exit_observer.close()
+            except Exception:
+                if process is not None:
+                    reason = reason or "command_failed"
+            finally:
+                if process is not None:
+                    cleaned = _cleanup_process_group(process, process_group_id)
 
+    if process is None:
+        _raise_public("command_unavailable")
     if not cleaned:
         reason = reason or "command_failed"
-    if reason is None and active_process.returncode != 0:
+    if reason is None and process.returncode != 0:
         reason = "command_failed"
 
     decoded_stdout = ""
@@ -387,14 +395,14 @@ def run_contained(
     if process_group_id is None:
         _raise_public("command_failed")
     identity = EngineIdentity(
-        leader_pid=active_process.pid,
+        leader_pid=process.pid,
         process_group_id=process_group_id,
         started_monotonic_ns=started_monotonic_ns,
         argv_sha256=hashlib.sha256(command_bytes).hexdigest(),
     )
     return EngineResult(
         identity=identity,
-        returncode=active_process.returncode,
+        returncode=process.returncode,
         stdout=decoded_stdout,
         stderr=decoded_stderr,
     )
