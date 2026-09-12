@@ -15,6 +15,13 @@ import pytest
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "process_fixture.py"
+_FINITE_STREAM_BYTES = 2 * 1024 * 1024
+
+
+def _finite_stream_output(name: str, fill: str) -> str:
+    prefix = f"fixture-finite-{name}-saturation:"
+    suffix = ":complete\n"
+    return prefix + (fill * (_FINITE_STREAM_BYTES - len(prefix) - len(suffix))) + suffix
 
 
 def _processes():
@@ -161,6 +168,37 @@ def test_dual_stream_flood_hits_the_bounded_cap_and_cleans_the_group(
         _kill_fixture_group(pid_file)
 
 
+def test_finite_two_stream_saturation_drains_each_pipe_to_exact_completion(
+    tmp_path: Path,
+) -> None:
+    processes = _processes()
+    pid_file = tmp_path / "finite-flood.pid"
+
+    try:
+        result = processes.run_contained(
+            (
+                sys.executable,
+                str(FIXTURE),
+                "finite-flood-both",
+                str(pid_file),
+                str(_FINITE_STREAM_BYTES),
+            ),
+            cwd=tmp_path,
+            timeout=3.0,
+            output_limit=_FINITE_STREAM_BYTES,
+        )
+
+        leader_pid = int(pid_file.read_text("ascii"))
+        assert result.returncode == 0
+        assert result.identity.leader_pid == leader_pid
+        assert result.identity.process_group_id == leader_pid
+        assert result.stdout == _finite_stream_output("stdout", "o")
+        assert result.stderr == _finite_stream_output("stderr", "e")
+        _assert_pid_gone(leader_pid)
+    finally:
+        _kill_fixture_group(pid_file)
+
+
 @pytest.mark.parametrize(
     ("mode", "marker"),
     (
@@ -262,6 +300,49 @@ def test_normal_exit_reaps_detached_descendant_by_exact_pid(tmp_path: Path) -> N
         assert result.stdout == "descendant-ok\n"
         assert result.identity.leader_pid == leader_pid
         assert result.identity.process_group_id == leader_pid
+        _assert_pid_gone(leader_pid)
+        _assert_pid_gone(descendant_pid)
+    finally:
+        _kill_fixture_group(leader_pid_file)
+
+
+def test_normal_leader_exit_gives_term_aware_group_descendant_grace(
+    tmp_path: Path,
+) -> None:
+    processes = _processes()
+    leader_pid_file = tmp_path / "term-aware-leader.pid"
+    descendant_identity_file = tmp_path / "term-aware-descendant.identity"
+    descendant_ready_file = tmp_path / "term-aware-descendant.ready"
+    cleanup_file = tmp_path / "term-aware-descendant.cleanup"
+
+    try:
+        result = processes.run_contained(
+            (
+                sys.executable,
+                str(FIXTURE),
+                "exit-with-term-aware-descendant",
+                str(leader_pid_file),
+                str(descendant_identity_file),
+                str(descendant_ready_file),
+                str(cleanup_file),
+            ),
+            cwd=tmp_path,
+            timeout=1.0,
+            output_limit=1024,
+        )
+
+        leader_pid = int(leader_pid_file.read_text("ascii"))
+        descendant_pid, descendant_group_id = map(
+            int, descendant_identity_file.read_text("ascii").split(":")
+        )
+        assert result.returncode == 0
+        assert result.stdout == "term-aware-descendant-ok\n"
+        assert result.identity.leader_pid == leader_pid
+        assert result.identity.process_group_id == leader_pid
+        assert descendant_group_id == leader_pid
+        assert cleanup_file.read_text("ascii") == (
+            f"{descendant_pid}:{leader_pid}:{int(signal.SIGTERM)}"
+        )
         _assert_pid_gone(leader_pid)
         _assert_pid_gone(descendant_pid)
     finally:

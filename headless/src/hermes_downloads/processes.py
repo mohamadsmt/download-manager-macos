@@ -125,14 +125,15 @@ def _cleanup_process_group(process: subprocess.Popen[bytes]) -> bool:
     """Reap the complete session, including descendants after leader exit."""
 
     process_group_id = process.pid
+    term_deadline = time.monotonic() + _TERM_GRACE_SECONDS
     success = _signal_group(process_group_id, signal.SIGTERM)
     try:
-        process.wait(timeout=_TERM_GRACE_SECONDS)
+        process.wait(timeout=max(0.0, term_deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         success = False
     except OSError:
         success = False
-    if _group_exists(process_group_id):
+    if not _wait_for_group_absence(process_group_id, term_deadline):
         success = _signal_group(process_group_id, signal.SIGKILL) and success
         if not _wait_for_group_absence(
             process_group_id, time.monotonic() + _KILL_GRACE_SECONDS

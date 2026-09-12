@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
+
+
+_FINITE_STREAM_CHUNK_SIZE = 4096
+_TERM_AWARE_CLEANUP_SECONDS = 0.05
+_READY_WAIT_SECONDS = 1.0
 
 
 def _write_pid(path: str) -> None:
@@ -34,6 +40,39 @@ def _flood_both(arguments: list[str]) -> int:
         os.write(sys.stdout.fileno(), stdout_chunk)
         os.write(sys.stderr.fileno(), stderr_chunk)
         time.sleep(0.005)
+
+
+def _write_all(file_descriptor: int, payload: bytes) -> None:
+    remaining = payload
+    while remaining:
+        written = os.write(file_descriptor, remaining)
+        if written <= 0:
+            raise RuntimeError("fixture write failed")
+        remaining = remaining[written:]
+
+
+def _finite_stream_payload(prefix: bytes, fill_byte: bytes, total_bytes: int) -> bytes:
+    suffix = b":complete\n"
+    return prefix + (fill_byte * (total_bytes - len(prefix) - len(suffix))) + suffix
+
+
+def _finite_flood_both(arguments: list[str]) -> int:
+    _write_pid(arguments[0])
+    total_bytes = int(arguments[1])
+    stdout_prefix = b"fixture-finite-stdout-saturation:"
+    stderr_prefix = b"fixture-finite-stderr-saturation:"
+    if total_bytes < max(len(stdout_prefix), len(stderr_prefix)) + len(b":complete\n"):
+        return 34
+    stdout_payload = _finite_stream_payload(stdout_prefix, b"o", total_bytes)
+    stderr_payload = _finite_stream_payload(stderr_prefix, b"e", total_bytes)
+    for offset in range(0, total_bytes, _FINITE_STREAM_CHUNK_SIZE):
+        _write_all(
+            sys.stdout.fileno(), stdout_payload[offset : offset + _FINITE_STREAM_CHUNK_SIZE]
+        )
+        _write_all(
+            sys.stderr.fileno(), stderr_payload[offset : offset + _FINITE_STREAM_CHUNK_SIZE]
+        )
+    return 0
 
 
 def _invalid_utf8(arguments: list[str], *, stderr: bool) -> int:
@@ -75,6 +114,56 @@ def _exit_with_descendant(arguments: list[str]) -> int:
     return 0
 
 
+def _wait_for_file(path: str) -> bool:
+    deadline = time.monotonic() + _READY_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if Path(path).exists():
+            return True
+        time.sleep(0.005)
+    return Path(path).exists()
+
+
+def _term_aware_descendant(arguments: list[str]) -> int:
+    identity_path, ready_path, cleanup_path = arguments
+    identity = f"{os.getpid()}:{os.getpgrp()}"
+
+    def _on_term(signal_number: int, _frame: object) -> None:
+        time.sleep(_TERM_AWARE_CLEANUP_SECONDS)
+        Path(cleanup_path).write_text(
+            f"{identity}:{signal_number}", encoding="ascii"
+        )
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
+    Path(identity_path).write_text(identity, encoding="ascii")
+    Path(ready_path).write_text("ready", encoding="ascii")
+    while True:
+        signal.pause()
+
+
+def _exit_with_term_aware_descendant(arguments: list[str]) -> int:
+    _write_pid(arguments[0])
+    descendant = subprocess.Popen(
+        (
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "term-aware-descendant",
+            *arguments[1:],
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    if not _wait_for_file(arguments[2]):
+        descendant.kill()
+        descendant.wait()
+        return 35
+    sys.stdout.buffer.write(b"term-aware-descendant-ok\n")
+    sys.stdout.buffer.flush()
+    return 0
+
+
 def _nonzero(arguments: list[str]) -> int:
     _write_pid(arguments[0])
     sys.stderr.buffer.write(b"fixture-nonzero-marker\n")
@@ -88,6 +177,8 @@ def main() -> int:
         return _probe(arguments)
     if mode == "flood-both" and len(arguments) == 1:
         return _flood_both(arguments)
+    if mode == "finite-flood-both" and len(arguments) == 2:
+        return _finite_flood_both(arguments)
     if mode == "invalid-stdout" and len(arguments) == 1:
         return _invalid_utf8(arguments, stderr=False)
     if mode == "invalid-stderr" and len(arguments) == 1:
@@ -96,6 +187,10 @@ def main() -> int:
         return _descendant_and_sleep(arguments)
     if mode == "exit-with-descendant" and len(arguments) == 2:
         return _exit_with_descendant(arguments)
+    if mode == "term-aware-descendant" and len(arguments) == 3:
+        return _term_aware_descendant(arguments)
+    if mode == "exit-with-term-aware-descendant" and len(arguments) == 4:
+        return _exit_with_term_aware_descendant(arguments)
     if mode == "nonzero" and len(arguments) == 1:
         return _nonzero(arguments)
     return 64
