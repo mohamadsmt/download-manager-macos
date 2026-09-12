@@ -56,6 +56,32 @@ def test_valid_signed_url_preserves_exact_raw_query_bytes() -> None:
     assert "duplicate=1" not in repr(source)
 
 
+def test_source_url_cannot_be_directly_constructed_to_leak_private_url_parts() -> None:
+    network = _network()
+    forged_public_url = (
+        "https://alice:example-password@downloads.example.test/release?"
+        "X-Amz-Signature=synthetic-secret#fragment-secret"
+    )
+
+    with pytest.raises(TypeError):
+        network.SourceURL(
+            raw_url=forged_public_url.encode("utf-8"),
+            origin=network.Origin(
+                scheme="https", host="downloads.example.test", port=443
+            ),
+            public_url=forged_public_url,
+        )
+
+    source = network.validate_source_url(
+        b"https://downloads.example.test/release?X-Amz-Signature=synthetic-secret"
+    )
+
+    assert source.public_url == "https://downloads.example.test/release"
+    assert str(source) == "https://downloads.example.test/release"
+    assert network.redact_url(source) == "https://downloads.example.test/release"
+    assert "synthetic-secret" not in repr(source)
+
+
 def test_source_url_rejects_input_beyond_its_fixed_byte_bound() -> None:
     network = _network()
     submitted = b"https://downloads.example.test/?" + b"a" * network.MAX_SOURCE_URL_BYTES
@@ -160,6 +186,8 @@ def test_credentials_need_explicit_consent_and_never_cross_origins() -> None:
     source = network.validate_source_url(b"https://downloads.example.test/file")
     redirect_target = network.validate_source_url(b"https://other.example.test/file")
 
+    with pytest.raises(TypeError):
+        network.CredentialScope(origin=source.origin)
     with pytest.raises(network.CredentialPolicyError):
         network.CredentialScope.for_source(source, user_consented=False)
 

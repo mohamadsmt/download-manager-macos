@@ -50,19 +50,32 @@ class Origin:
     port: int
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, slots=True, repr=False, init=False)
 class SourceURL:
     """Validated source bytes with a display value that never includes a query."""
 
     raw_url: bytes = field(repr=False)
     origin: Origin
-    public_url: str
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("SourceURL values must be created by validate_source_url")
+
+    @property
+    def public_url(self) -> str:
+        return _redact_parts(urlsplit(self.raw_url.decode("utf-8")))
 
     def __str__(self) -> str:
         return self.public_url
 
     def __repr__(self) -> str:
         return f"SourceURL(public_url={self.public_url!r})"
+
+
+def _source_url_from_validated_parts(raw_url: bytes, origin: Origin) -> SourceURL:
+    source = object.__new__(SourceURL)
+    object.__setattr__(source, "raw_url", raw_url)
+    object.__setattr__(source, "origin", origin)
+    return source
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,28 +122,33 @@ class NetworkPolicy:
             raise CredentialPolicyError("TLS verification is required")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class CredentialScope:
     """Explicit origin-bound credential consent without any credential material."""
 
     origin: Origin
 
-    def __post_init__(self) -> None:
-        if type(self.origin) is not Origin:
-            raise TypeError("origin must be a parsed Origin")
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("CredentialScope values must be created by for_source")
 
     @classmethod
-    def for_source(cls, source: SourceURL, *, user_consented: bool) -> Self:
+    def for_source(cls, source: SourceURL, *, user_consented: bool) -> CredentialScope:
         if type(source) is not SourceURL:
             raise TypeError("source must be a validated SourceURL")
         if user_consented is not True:
             raise CredentialPolicyError("credentials require explicit user consent")
-        return cls(source.origin)
+        return _credential_scope_from_validated_source(source.origin)
 
     def permits(self, source: SourceURL) -> bool:
         if type(source) is not SourceURL:
             raise TypeError("source must be a validated SourceURL")
         return self.origin == source.origin
+
+
+def _credential_scope_from_validated_source(origin: Origin) -> CredentialScope:
+    scope = object.__new__(CredentialScope)
+    object.__setattr__(scope, "origin", origin)
+    return scope
 
 
 def validate_source_url(
@@ -180,7 +198,7 @@ def _parse_source_url(value: str | bytes | bytearray) -> SourceURL:
         raise SourcePolicyError("source URL has an invalid host")
     _reject_ambiguous_numeric_ipv4_host(host)
     origin = Origin(scheme=scheme, host=host, port=port if port is not None else _DEFAULT_PORTS[scheme])
-    return SourceURL(raw_url=raw_url, origin=origin, public_url=_redact_parts(parts))
+    return _source_url_from_validated_parts(raw_url, origin)
 
 
 def _coerce_url(value: str | bytes | bytearray) -> tuple[bytes, str]:
