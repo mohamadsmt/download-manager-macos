@@ -370,10 +370,16 @@ def test_download_intent_is_immutable_and_preserves_raw_source_bytes() -> None:
         {"source_url": "https://example.test/source"},
         {"expected_revision": -1},
         {"expected_revision": float("inf")},
+        {"expected_revision": True},
+        {"expected_revision": False},
         {"generation": -1},
         {"generation": float("inf")},
+        {"generation": True},
+        {"generation": False},
         {"revision": -1},
         {"revision": float("nan")},
+        {"revision": True},
+        {"revision": False},
     ),
 )
 def test_download_intent_rejects_malformed_or_nonfinite_values(
