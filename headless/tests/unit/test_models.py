@@ -79,9 +79,10 @@ def _run(
     return completed
 
 
-def _assert_runtime_roots_are_empty(private_roots: dict[str, Path]) -> None:
-    for name in ("home", "hermes_home", "state", "output"):
+def _assert_runtime_roots_are_isolated(private_roots: dict[str, Path]) -> None:
+    for name in ("home", "hermes_home", "output"):
         assert list(private_roots[name].iterdir()) == []
+    assert [path.name for path in private_roots["state"].iterdir()] == ["state.db"]
 
 
 def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
@@ -233,7 +234,7 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
         assert script_text.index("unset PYTHONPATH PYTHONHOME") < script_text.index("exec ")
         assert "-I" not in script_text
 
-    _assert_runtime_roots_are_empty(private_roots)
+    _assert_runtime_roots_are_isolated(private_roots)
 
 
 def _models():

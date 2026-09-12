@@ -140,24 +140,37 @@ def test_injected_command_write_failure_rolls_back_the_entire_transaction(
         store.close()
 
 
-def test_sqlite_full_like_event_write_failure_never_returns_partial_success(
+def test_sqlite_full_during_event_write_rolls_back_job_command_and_event(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "queue.sqlite3"
-    initialized = SQLiteStore(database_path)
-    initialized.close()
-    _install_failing_insert_trigger(
-        database_path,
-        table="events",
-        trigger_name="fail_event_insert_as_full",
-        message="database or disk is full",
-    )
-
     store = SQLiteStore(database_path)
     try:
-        with pytest.raises(sqlite3.DatabaseError, match="database or disk is full"):
+        connection = store._connection
+        connection.execute("CREATE TABLE space_probe (payload BLOB NOT NULL)")
+        connection.execute(
+            """
+            CREATE TRIGGER fill_database_before_event
+            BEFORE INSERT ON events
+            BEGIN
+                INSERT INTO space_probe (payload) VALUES (randomblob(65536));
+            END
+            """
+        )
+        page_count = connection.execute("PRAGMA page_count").fetchone()[0]
+        max_page_count = connection.execute(
+            f"PRAGMA max_page_count = {page_count}"
+        ).fetchone()[0]
+        assert max_page_count == page_count
+
+        # The trigger allocates pages while SQLite processes the real events INSERT;
+        # it does not inject a synthetic RAISE failure.
+        with pytest.raises(sqlite3.OperationalError) as failure:
             store.apply_add(_intent())
 
+        assert failure.value.sqlite_errorcode == sqlite3.SQLITE_FULL
+        assert failure.value.sqlite_errorname == "SQLITE_FULL"
+        assert store.list_jobs() == ()
         assert store.get_job("job-1") is None
         assert store.get_command("request-1") is None
         assert store.list_events() == ()
