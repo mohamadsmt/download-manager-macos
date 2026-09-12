@@ -119,6 +119,24 @@ def test_local_literal_hosts_require_an_exact_fixture_origin_grant(
         )
 
 
+@pytest.mark.parametrize(
+    "submitted",
+    (
+        "http://127.0.0.1./fixture",
+        "http://127.1/fixture",
+        "http://2130706433/fixture",
+        "http://0x7f000001/fixture",
+    ),
+)
+def test_source_url_rejects_ambiguous_numeric_ipv4_initial_hosts(
+    submitted: str,
+) -> None:
+    network = _network()
+
+    with pytest.raises(network.SourcePolicyError):
+        network.validate_source_url(submitted)
+
+
 def test_safe_transport_policy_refuses_ambient_state_and_requires_tls() -> None:
     network = _network()
     policy = network.NetworkPolicy()

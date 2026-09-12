@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import ipaddress
+import socket
 from typing import Final, Self
 import unicodedata
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -177,6 +178,7 @@ def _parse_source_url(value: str | bytes | bytearray) -> SourceURL:
         raise SourcePolicyError("source URL must have an authority without userinfo")
     if "/" in host or "\\" in host:
         raise SourcePolicyError("source URL has an invalid host")
+    _reject_ambiguous_numeric_ipv4_host(host)
     origin = Origin(scheme=scheme, host=host, port=port if port is not None else _DEFAULT_PORTS[scheme])
     return SourceURL(raw_url=raw_url, origin=origin, public_url=_redact_parts(parts))
 
@@ -210,6 +212,15 @@ def _require_complete_percent_escapes(raw_url: bytes) -> None:
             or raw_url[index + 2] not in _HEX_DIGITS
         ):
             raise SourcePolicyError("source URL has an incomplete percent escape")
+
+
+def _reject_ambiguous_numeric_ipv4_host(host: str) -> None:
+    try:
+        canonical_host = socket.inet_ntoa(socket.inet_aton(host.rstrip(".")))
+    except (OSError, UnicodeError):
+        return
+    if canonical_host != host:
+        raise SourcePolicyError("source URL has an ambiguous numeric IPv4 host")
 
 
 def _is_literal_local_host(host: str) -> bool:
