@@ -612,6 +612,48 @@ def test_selector_base_exception_reaps_group_and_propagates_original_interrupt(
         _kill_fixture_group(leader_pid_file)
 
 
+def test_binding_base_exception_reaps_spawned_leader_and_propagates_interrupt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    processes = _processes()
+    leader_pid_file = tmp_path / "binding-interrupt-leader.pid"
+    spawned_pids: list[int] = []
+    original_popen = processes.subprocess.Popen
+    interrupt = KeyboardInterrupt("fixture-binding-base-exception")
+
+    def capture_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def raise_interrupt(_process) -> None:
+        raise interrupt
+
+    monkeypatch.setattr(processes.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(processes, "_bind_process_group", raise_interrupt)
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            processes.run_contained(
+                (
+                    sys.executable,
+                    str(FIXTURE),
+                    "term-resistant-leader",
+                    str(leader_pid_file),
+                ),
+                cwd=tmp_path,
+                timeout=1.0,
+                output_limit=1024,
+            )
+
+        assert raised.value is interrupt
+        assert len(spawned_pids) == 1
+        _assert_pid_reaped(spawned_pids[0])
+        _assert_pid_gone(spawned_pids[0])
+    finally:
+        _kill_fixture_group(leader_pid_file)
+
+
 def test_surrogate_argv_fails_closed_before_fixture_launch(tmp_path: Path) -> None:
     processes = _processes()
     pid_file = tmp_path / "surrogate-never-launched.pid"

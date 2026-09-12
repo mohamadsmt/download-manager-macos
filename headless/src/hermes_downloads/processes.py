@@ -267,12 +267,13 @@ def run_contained(
         _raise_public("command_unavailable")
     active_process = process
 
-    process_group_id = _bind_process_group(active_process)
+    process_group_id: int | None = None
     reason: str | None = None
     stdout = bytearray()
     stderr = bytearray()
     cleaned = False
     try:
+        process_group_id = _bind_process_group(active_process)
         if process_group_id is None:
             reason = "command_failed"
         elif active_process.stdout is None or active_process.stderr is None:
