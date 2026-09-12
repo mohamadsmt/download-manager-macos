@@ -106,6 +106,13 @@ def _descendant_and_sleep(arguments: list[str]) -> int:
     return 0
 
 
+def _term_resistant_leader(arguments: list[str]) -> int:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _write_pid(arguments[0])
+    while True:
+        signal.pause()
+
+
 def _exit_with_descendant(arguments: list[str]) -> int:
     _write_pid(arguments[0])
     _spawn_detached_descendant(arguments[1])
@@ -185,6 +192,8 @@ def main() -> int:
         return _invalid_utf8(arguments, stderr=True)
     if mode == "descendant-and-sleep" and len(arguments) == 2:
         return _descendant_and_sleep(arguments)
+    if mode == "term-resistant-leader" and len(arguments) == 1:
+        return _term_resistant_leader(arguments)
     if mode == "exit-with-descendant" and len(arguments) == 2:
         return _exit_with_descendant(arguments)
     if mode == "term-aware-descendant" and len(arguments) == 3:

@@ -49,6 +49,16 @@ def _assert_pid_gone(pid: int) -> None:
     pytest.fail("fixture process survived containment")
 
 
+def _assert_pid_reaped(pid: int) -> None:
+    try:
+        waited, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return
+    if waited == 0:
+        pytest.fail("contained leader remained live after cleanup")
+    pytest.fail("contained leader was left unreaped after cleanup")
+
+
 def _reap_direct_child(pid: int) -> None:
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
@@ -373,3 +383,250 @@ def test_selector_creation_failure_prevents_fixture_launch(
 
     _assert_public_error(raised.value, "command_failed", marker)
     assert not pid_file.exists()
+
+
+def test_term_resistant_leader_is_killed_and_reaped(tmp_path: Path) -> None:
+    processes = _processes()
+    leader_pid_file = tmp_path / "term-resistant-leader.pid"
+
+    try:
+        with pytest.raises(processes.EngineProcessError) as raised:
+            processes.run_contained(
+                (
+                    sys.executable,
+                    str(FIXTURE),
+                    "term-resistant-leader",
+                    str(leader_pid_file),
+                ),
+                cwd=tmp_path,
+                timeout=0.15,
+                output_limit=1024,
+            )
+
+        _assert_public_error(raised.value, "command_timeout")
+        leader_pid = int(leader_pid_file.read_text("ascii"))
+        _assert_pid_reaped(leader_pid)
+        _assert_pid_gone(leader_pid)
+    finally:
+        _kill_fixture_group(leader_pid_file)
+
+
+def test_lifecycle_signals_bound_group_before_any_leader_reap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    processes = _processes()
+    leader_pid = 424242
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = leader_pid
+            self.stdout = object()
+            self.stderr = object()
+            self.returncode: int | None = None
+            self.reaped = False
+            self.wait_calls = 0
+
+        def poll(self) -> int | None:
+            pytest.fail("lifecycle must not poll before group cleanup")
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            self.reaped = True
+            self.returncode = 0
+            return self.returncode
+
+    class EmptySelector:
+        def register(self, *_args, **_kwargs) -> None:
+            pass
+
+        def get_map(self) -> dict[object, object]:
+            return {}
+
+        def close(self) -> None:
+            pass
+
+    process = FakeProcess()
+    signals: list[signal.Signals] = []
+    group_absences = iter((False,))
+
+    monkeypatch.setattr(processes.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(processes.selectors, "DefaultSelector", EmptySelector)
+    monkeypatch.setattr(
+        processes,
+        "_bind_process_group",
+        lambda active_process: leader_pid if active_process is process else None,
+        raising=False,
+    )
+    monkeypatch.setattr(processes, "_close_streams", lambda _process: True)
+    monkeypatch.setattr(
+        processes,
+        "_wait_for_group_absence",
+        lambda _group_id, _deadline: next(group_absences),
+    )
+    monkeypatch.setattr(processes, "_group_exists", lambda _group_id: False)
+
+    def _signal_bound_group(group_id: int, signal_number: signal.Signals) -> bool:
+        assert group_id == leader_pid
+        assert not process.reaped, "group signal used after the leader was reaped"
+        signals.append(signal_number)
+        return True
+
+    monkeypatch.setattr(processes, "_signal_group", _signal_bound_group)
+
+    result = processes.run_contained(
+        ("validated-engine",),
+        cwd=tmp_path,
+        timeout=1.0,
+        output_limit=1,
+    )
+
+    assert result.returncode == 0
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process.reaped
+    assert process.wait_calls == 1
+
+
+def test_unestablished_group_fails_closed_without_group_signal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    processes = _processes()
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = 424243
+            self.stdout = object()
+            self.stderr = object()
+            self.returncode: int | None = None
+            self.direct_signals: list[str] = []
+
+        def terminate(self) -> None:
+            self.direct_signals.append("terminate")
+
+        def kill(self) -> None:
+            self.direct_signals.append("kill")
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.returncode = -int(signal.SIGTERM)
+            return self.returncode
+
+    class EmptySelector:
+        def get_map(self) -> dict[object, object]:
+            return {}
+
+        def close(self) -> None:
+            pass
+
+    process = FakeProcess()
+    group_signals: list[signal.Signals] = []
+
+    monkeypatch.setattr(processes.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(processes.selectors, "DefaultSelector", EmptySelector)
+    monkeypatch.setattr(
+        processes,
+        "_bind_process_group",
+        lambda _active_process: None,
+        raising=False,
+    )
+    monkeypatch.setattr(processes, "_close_streams", lambda _process: True)
+    monkeypatch.setattr(
+        processes,
+        "_wait_for_group_absence",
+        lambda _group_id, _deadline: True,
+    )
+    monkeypatch.setattr(processes, "_group_exists", lambda _group_id: False)
+
+    def _record_group_signal(_group_id: int, signal_number: signal.Signals) -> bool:
+        group_signals.append(signal_number)
+        return True
+
+    monkeypatch.setattr(processes, "_signal_group", _record_group_signal)
+
+    with pytest.raises(processes.EngineProcessError) as raised:
+        processes.run_contained(
+            ("validated-engine",),
+            cwd=tmp_path,
+            timeout=1.0,
+            output_limit=1,
+        )
+
+    _assert_public_error(raised.value, "command_failed")
+    assert group_signals == []
+    assert process.direct_signals == ["terminate"]
+
+
+@pytest.mark.parametrize("interrupt_type", (KeyboardInterrupt, SystemExit))
+def test_selector_base_exception_reaps_group_and_propagates_original_interrupt(
+    tmp_path: Path, monkeypatch, interrupt_type: type[BaseException]
+) -> None:
+    processes = _processes()
+    leader_pid_file = tmp_path / f"{interrupt_type.__name__}-leader.pid"
+    descendant_pid_file = tmp_path / f"{interrupt_type.__name__}-descendant.pid"
+    original_selector = processes.selectors.DefaultSelector
+    interrupt = interrupt_type("fixture-selector-base-exception")
+
+    class InterruptingSelector:
+        def __init__(self) -> None:
+            self._selector = original_selector()
+
+        def register(self, *args, **kwargs):
+            return self._selector.register(*args, **kwargs)
+
+        def unregister(self, *args, **kwargs):
+            return self._selector.unregister(*args, **kwargs)
+
+        def get_map(self):
+            return self._selector.get_map()
+
+        def select(self, _timeout: float):
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if leader_pid_file.exists() and descendant_pid_file.exists():
+                    raise interrupt
+                time.sleep(0.005)
+            pytest.fail("fixture did not start before selector interrupt")
+
+        def close(self) -> None:
+            self._selector.close()
+
+    monkeypatch.setattr(processes.selectors, "DefaultSelector", InterruptingSelector)
+
+    try:
+        with pytest.raises(interrupt_type) as raised:
+            processes.run_contained(
+                (
+                    sys.executable,
+                    str(FIXTURE),
+                    "descendant-and-sleep",
+                    str(leader_pid_file),
+                    str(descendant_pid_file),
+                ),
+                cwd=tmp_path,
+                timeout=2.0,
+                output_limit=1024,
+            )
+
+        assert raised.value is interrupt
+        _assert_pid_gone(int(leader_pid_file.read_text("ascii")))
+        _assert_pid_gone(int(descendant_pid_file.read_text("ascii")))
+    finally:
+        _kill_fixture_group(leader_pid_file)
+
+
+def test_surrogate_argv_fails_closed_before_fixture_launch(tmp_path: Path) -> None:
+    processes = _processes()
+    pid_file = tmp_path / "surrogate-never-launched.pid"
+    marker = "fixture-surrogate-argv-marker-\udcff"
+
+    try:
+        with pytest.raises(processes.EngineProcessError) as raised:
+            processes.run_contained(
+                (sys.executable, str(FIXTURE), "probe", str(pid_file), marker),
+                cwd=tmp_path,
+                timeout=1.0,
+                output_limit=1024,
+            )
+
+        _assert_public_error(raised.value, "command_failed", marker)
+        assert not pid_file.exists()
+    finally:
+        _kill_fixture_group(pid_file)

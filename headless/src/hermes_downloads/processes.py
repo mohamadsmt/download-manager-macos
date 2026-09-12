@@ -109,6 +109,19 @@ def _wait_for_group_absence(process_group_id: int, deadline: float) -> bool:
     return not _group_exists(process_group_id)
 
 
+def _bind_process_group(process: subprocess.Popen[bytes]) -> int | None:
+    """Bind the fresh session before any operation can reap its leader."""
+
+    try:
+        process_group_id = os.getpgid(process.pid)
+        session_id = os.getsid(process.pid)
+    except OSError:
+        return None
+    if process_group_id != process.pid or session_id != process.pid:
+        return None
+    return process_group_id
+
+
 def _close_streams(process: subprocess.Popen[bytes]) -> bool:
     success = True
     for stream in (process.stdout, process.stderr):
@@ -116,35 +129,68 @@ def _close_streams(process: subprocess.Popen[bytes]) -> bool:
             continue
         try:
             stream.close()
-        except OSError:
+        except (OSError, AttributeError):
             success = False
     return success
 
 
-def _cleanup_process_group(process: subprocess.Popen[bytes]) -> bool:
-    """Reap the complete session, including descendants after leader exit."""
+def _wait_for_leader(process: subprocess.Popen[bytes], deadline: float) -> bool:
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    except OSError:
+        return False
+    return True
 
-    process_group_id = process.pid
+
+def _cleanup_unbound_process(process: subprocess.Popen[bytes]) -> bool:
+    """Terminate only the known leader when session ownership was not proven."""
+
+    try:
+        process.terminate()
+    except (OSError, AttributeError):
+        return False
+    if _wait_for_leader(process, time.monotonic() + _TERM_GRACE_SECONDS):
+        _close_streams(process)
+        return False
+    try:
+        process.kill()
+    except (OSError, AttributeError):
+        _close_streams(process)
+        return False
+    _wait_for_leader(process, time.monotonic() + _KILL_GRACE_SECONDS)
+    _close_streams(process)
+    return False
+
+
+def _cleanup_process_group(process: subprocess.Popen[bytes], process_group_id: int | None) -> bool:
+    """Signal an owned group before reaping its leader, then prove final absence."""
+
+    if process_group_id is None:
+        return _cleanup_unbound_process(process)
+
     term_deadline = time.monotonic() + _TERM_GRACE_SECONDS
     success = _signal_group(process_group_id, signal.SIGTERM)
-    try:
-        process.wait(timeout=max(0.0, term_deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        success = False
-    except OSError:
-        success = False
     if not _wait_for_group_absence(process_group_id, term_deadline):
         success = _signal_group(process_group_id, signal.SIGKILL) and success
-        if not _wait_for_group_absence(
+
+    # No group signal is permitted after this wait: process.pid can be recycled once reaped.
+    leader_reaped = _wait_for_leader(process, time.monotonic() + _KILL_GRACE_SECONDS)
+    if _group_exists(process_group_id):
+        final_absence = _wait_for_group_absence(
             process_group_id, time.monotonic() + _KILL_GRACE_SECONDS
-        ):
-            success = False
-    return _close_streams(process) and success and not _group_exists(process_group_id)
+        )
+    else:
+        final_absence = True
+    streams_closed = _close_streams(process)
+    # macOS can report transient EPERM after a successful signal; final absence is authoritative.
+    return leader_reaped and final_absence and streams_closed
 
 
 def _snapshot_invocation(
     argv: Sequence[str], cwd: Path, timeout: float, output_limit: int
-) -> tuple[tuple[str, ...], str] | None:
+) -> tuple[tuple[str, ...], str, bytes] | None:
     if os.name != "posix":
         return None
     if type(timeout) not in {int, float} or timeout <= 0:
@@ -160,7 +206,11 @@ def _snapshot_invocation(
         return None
     if type(working_directory) is not str:
         return None
-    return command, working_directory
+    try:
+        command_bytes = b"\0".join(argument.encode("utf-8", "strict") for argument in command)
+    except UnicodeEncodeError:
+        return None
+    return command, working_directory, command_bytes
 
 
 def run_contained(
@@ -179,18 +229,17 @@ def run_contained(
     invocation = _snapshot_invocation(argv, cwd, timeout, output_limit)
     if invocation is None:
         _raise_public("command_failed")
-    command, working_directory = invocation
+    command, working_directory, command_bytes = invocation
     started_monotonic_ns = time.monotonic_ns()
     deadline = time.monotonic() + timeout
 
-    selector: selectors.BaseSelector | None = None
+    active_selector: selectors.BaseSelector | None = None
     try:
-        selector = selectors.DefaultSelector()
+        active_selector = selectors.DefaultSelector()
     except Exception:
         pass
-    if selector is None:
+    if active_selector is None:
         _raise_public("command_failed")
-    active_selector = selector
 
     process: subprocess.Popen[bytes] | None = None
     try:
@@ -206,19 +255,27 @@ def run_contained(
             close_fds=True,
             bufsize=0,
         )
-    except OSError:
-        active_selector.close()
+    except (OSError, ValueError):
+        pass
     except Exception:
-        active_selector.close()
+        pass
     if process is None:
+        try:
+            active_selector.close()
+        except Exception:
+            pass
         _raise_public("command_unavailable")
     active_process = process
 
+    process_group_id = _bind_process_group(active_process)
     reason: str | None = None
     stdout = bytearray()
     stderr = bytearray()
+    cleaned = False
     try:
-        if active_process.stdout is None or active_process.stderr is None:
+        if process_group_id is None:
+            reason = "command_failed"
+        elif active_process.stdout is None or active_process.stderr is None:
             reason = "command_failed"
         else:
             active_selector.register(active_process.stdout, selectors.EVENT_READ, "stdout")
@@ -248,26 +305,20 @@ def run_contained(
                         reason = "command_output_too_large"
                         break
                     target.extend(chunk)
-            if reason is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    reason = "command_timeout"
-                else:
-                    try:
-                        active_process.wait(timeout=remaining)
-                    except subprocess.TimeoutExpired:
-                        reason = "command_timeout"
-                    except OSError:
-                        reason = "command_failed"
+            if reason is None and active_selector.get_map():
+                reason = "command_timeout"
     except Exception:
         reason = "command_failed"
     finally:
         try:
             active_selector.close()
-        except Exception:
+        except BaseException:
             reason = reason or "command_failed"
+        try:
+            cleaned = _cleanup_process_group(active_process, process_group_id)
+        except BaseException:
+            cleaned = False
 
-    cleaned = _cleanup_process_group(active_process)
     if not cleaned:
         reason = reason or "command_failed"
     if reason is None and active_process.returncode != 0:
@@ -284,10 +335,11 @@ def run_contained(
 
     if reason is not None:
         _raise_public(reason)
-    command_bytes = b"\0".join(argument.encode("utf-8") for argument in command)
+    if process_group_id is None:
+        _raise_public("command_failed")
     identity = EngineIdentity(
         leader_pid=active_process.pid,
-        process_group_id=active_process.pid,
+        process_group_id=process_group_id,
         started_monotonic_ns=started_monotonic_ns,
         argv_sha256=hashlib.sha256(command_bytes).hexdigest(),
     )
