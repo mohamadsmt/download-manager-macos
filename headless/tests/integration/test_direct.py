@@ -59,7 +59,7 @@ def _ledger_after_requests(origin: Any, expected_request_count: int) -> Any:
     pytest.fail("fixture did not record the completed HTTP request")
 
 
-def test_fixture_keeps_literal_network_policy_origin_and_is_synthetic() -> None:
+def test_fixture_keeps_literal_network_policy_origin_and_serves_real_loopback_request() -> None:
     assert LocalHttpOrigin().origin == "http://127.0.0.1:18080"
     assert LocalHttpOrigin().url() == "http://127.0.0.1:18080/fixture"
 
@@ -75,69 +75,68 @@ def test_fixture_keeps_literal_network_policy_origin_and_is_synthetic() -> None:
         assert origin.port != 0
         assert origin.origin == f"http://127.0.0.1:{origin.port}"
 
-
-def test_fixture_ignores_an_unsafe_host_override() -> None:
-    origin_type = _origin_type()
-
-    class UnsafeSyntheticHttpOrigin(origin_type):
-        host = "192.0.2.1"
-
-    with UnsafeSyntheticHttpOrigin() as origin:
-        server = origin._server
-        assert server is not None
-        assert origin.host == "127.0.0.1"
-        assert origin.origin == f"http://127.0.0.1:{origin.port}"
-        assert server.server_address[0] == "127.0.0.1"
-
         status, _, body = _request(origin, "/range")
         assert (status, body) == (200, origin.payload)
         ledger = _ledger_after_requests(origin, 1)
         assert (ledger.request_count, ledger.connection_count) == (1, 1)
 
 
-def test_fixture_ignores_post_creation_unsafe_host_override() -> None:
+def test_fixture_rejects_direct_class_body_subclass() -> None:
     origin_type = _origin_type()
 
-    class UnsafeSyntheticHttpOrigin(origin_type):
-        pass
+    with pytest.raises(TypeError):
 
-    UnsafeSyntheticHttpOrigin.host = "192.0.2.1"
+        class UnsafeSyntheticHttpOrigin(origin_type):
+            host = "192.0.2.1"
 
-    with UnsafeSyntheticHttpOrigin() as origin:
-        server = origin._server
-        assert server is not None
-        assert origin.origin == f"http://127.0.0.1:{origin.port}"
-        assert server.server_address[0] == "127.0.0.1"
-        assert origin.host == "127.0.0.1"
-
-        status, _, body = _request(origin, "/range")
-        assert (status, body) == (200, origin.payload)
-        ledger = _ledger_after_requests(origin, 1)
-        assert (ledger.request_count, ledger.connection_count) == (1, 1)
+    assert "UnsafeSyntheticHttpOrigin" not in locals()
 
 
-def test_fixture_ignores_unsafe_host_override_when_intermediate_subclass_omits_super() -> None:
+def test_fixture_rejects_subclass_before_post_class_host_override() -> None:
+    origin_type = _origin_type()
+    post_class_override_reached = False
+
+    with pytest.raises(TypeError):
+
+        class UnsafeSyntheticHttpOrigin(origin_type):
+            pass
+
+        UnsafeSyntheticHttpOrigin.host = "192.0.2.1"
+        post_class_override_reached = True
+
+    assert post_class_override_reached is False
+    assert "UnsafeSyntheticHttpOrigin" not in locals()
+
+
+def test_fixture_rejects_intermediate_subclass_that_omits_super() -> None:
+    origin_type = _origin_type()
+    nested_subclass_attempt_reached = False
+
+    with pytest.raises(TypeError):
+
+        class IntermediateSyntheticHttpOrigin(origin_type):
+            def __init_subclass__(cls, **kwargs: object) -> None:
+                cls.host = "192.0.2.1"
+
+        class UnsafeSyntheticHttpOrigin(IntermediateSyntheticHttpOrigin):
+            pass
+
+        nested_subclass_attempt_reached = True
+
+    assert nested_subclass_attempt_reached is False
+    assert "IntermediateSyntheticHttpOrigin" not in locals()
+    assert "UnsafeSyntheticHttpOrigin" not in locals()
+
+
+def test_fixture_rejects_slots_subclass_before_host_slot_can_exist() -> None:
     origin_type = _origin_type()
 
-    class IntermediateSyntheticHttpOrigin(origin_type):
-        def __init_subclass__(cls, **kwargs: object) -> None:
-            # Deliberately omit super(): this is the bypass under test.
-            cls.host = "192.0.2.1"
+    with pytest.raises(TypeError):
 
-    class UnsafeSyntheticHttpOrigin(IntermediateSyntheticHttpOrigin):
-        pass
+        class UnsafeSyntheticHttpOrigin(origin_type):
+            __slots__ = ("host",)
 
-    with UnsafeSyntheticHttpOrigin() as origin:
-        server = origin._server
-        assert server is not None
-        assert origin.origin == f"http://127.0.0.1:{origin.port}"
-        assert server.server_address[0] == "127.0.0.1"
-        assert origin.host == "127.0.0.1"
-
-        status, _, body = _request(origin, "/range")
-        assert (status, body) == (200, origin.payload)
-        ledger = _ledger_after_requests(origin, 1)
-        assert (ledger.request_count, ledger.connection_count) == (1, 1)
+    assert "UnsafeSyntheticHttpOrigin" not in locals()
 
 
 def test_fixture_closes_stalled_tcp_handler_when_context_exits() -> None:

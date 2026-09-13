@@ -73,27 +73,11 @@ class _LoopbackHttpServer(ThreadingHTTPServer):
     block_on_close = True
 
 
-class _LoopbackOriginMeta(type):
-    """Keep subclass attributes from shadowing the loopback host property."""
-
-    def __new__(
-        mcls,
-        name: str,
-        bases: tuple[type[object], ...],
-        namespace: dict[str, object],
-        **kwargs: object,
-    ) -> type:
-        if bases:
-            namespace.pop("host", None)
-        return super().__new__(mcls, name, bases, namespace, **kwargs)
-
-    def __setattr__(cls, name: str, value: object) -> None:
-        if name != "host":
-            super().__setattr__(name, value)
-
-
-class SyntheticHttpOrigin(metaclass=_LoopbackOriginMeta):
+class SyntheticHttpOrigin:
     """A context-managed local origin with deterministic download faults."""
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("SyntheticHttpOrigin does not support subclassing")
 
     @property
     def host(self) -> str:
