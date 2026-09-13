@@ -176,6 +176,19 @@ def test_remove_tombstones_a_job_and_it_never_dispatches() -> None:
     assert next_job.job_id == "job-fallback"
 
 
+def test_reorder_keeps_tombstone_and_live_order_keys_unique() -> None:
+    queue = _queue()
+    queue.enqueue("job-a")
+    queue.enqueue("job-b")
+    queue.enqueue("job-c")
+
+    queue.remove("job-a")
+    queue.reorder("job-c", before_job_id="job-b")
+
+    jobs = tuple(queue.job(job_id) for job_id in ("job-a", "job-b", "job-c"))
+    assert len({job.order_key for job in jobs}) == len(jobs)
+
+
 def test_resume_all_opens_the_global_gate_without_clearing_manual_item_holds() -> None:
     queue = _queue(running=False)
     queue.enqueue("job-held", priority=10, authorized=True)
