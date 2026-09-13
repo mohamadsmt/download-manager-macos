@@ -73,11 +73,21 @@ class _LoopbackHttpServer(ThreadingHTTPServer):
     block_on_close = True
 
 
-class SyntheticHttpOrigin:
-    """A context-managed local origin with deterministic download faults."""
+class _SyntheticHttpOriginMeta(type):
+    def __new__(
+        metaclass: type[_SyntheticHttpOriginMeta],
+        name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, object],
+        **kwargs: object,
+    ) -> _SyntheticHttpOriginMeta:
+        if any(isinstance(base, _SyntheticHttpOriginMeta) for base in bases):
+            raise TypeError("SyntheticHttpOrigin does not support subclassing")
+        return super().__new__(metaclass, name, bases, namespace, **kwargs)
 
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        raise TypeError("SyntheticHttpOrigin does not support subclassing")
+
+class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
+    """A context-managed local origin with deterministic download faults."""
 
     @property
     def host(self) -> str:

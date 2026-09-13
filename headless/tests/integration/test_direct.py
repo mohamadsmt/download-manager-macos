@@ -92,6 +92,26 @@ def test_fixture_rejects_direct_class_body_subclass() -> None:
     assert "UnsafeSyntheticHttpOrigin" not in locals()
 
 
+def test_fixture_rejects_subclass_before_descriptor_set_name_can_run() -> None:
+    origin_type = _origin_type()
+
+    class HostDescriptor:
+        def __init__(self) -> None:
+            self.set_name_calls: list[tuple[type[Any], str]] = []
+
+        def __set_name__(self, owner: type[Any], name: str) -> None:
+            self.set_name_calls.append((owner, name))
+
+    descriptor = HostDescriptor()
+    with pytest.raises(TypeError):
+
+        class UnsafeSyntheticHttpOrigin(origin_type):
+            host = descriptor
+
+    assert descriptor.set_name_calls == []
+    assert "UnsafeSyntheticHttpOrigin" not in locals()
+
+
 def test_fixture_rejects_subclass_before_post_class_host_override() -> None:
     origin_type = _origin_type()
     post_class_override_reached = False
