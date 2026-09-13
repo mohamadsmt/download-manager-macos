@@ -6,7 +6,9 @@ import hashlib
 import http.client
 import importlib.util
 from pathlib import Path
+import socket
 import sys
+import threading
 import time
 from typing import Any
 
@@ -72,6 +74,50 @@ def test_fixture_keeps_literal_network_policy_origin_and_is_synthetic() -> None:
         assert origin.host == "127.0.0.1"
         assert origin.port != 0
         assert origin.origin == f"http://127.0.0.1:{origin.port}"
+
+
+def test_fixture_ignores_an_unsafe_host_override_when_binding() -> None:
+    origin_type = _origin_type()
+
+    class UnsafeSyntheticHttpOrigin(origin_type):
+        host = "0.0.0.0"
+
+    with UnsafeSyntheticHttpOrigin() as origin:
+        server = origin._server
+        assert server is not None
+        assert server.server_address[0] == "127.0.0.1"
+        assert origin.origin == f"http://127.0.0.1:{origin.port}"
+
+
+def test_fixture_closes_stalled_tcp_handler_when_context_exits() -> None:
+    origin = _origin_type()()
+    peer: socket.socket | None = None
+    preexisting_threads = set(threading.enumerate())
+    try:
+        with origin:
+            peer = socket.create_connection(("127.0.0.1", origin.port), timeout=1)
+            deadline = time.monotonic() + 1
+            while origin.ledger.connection_count < 1 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert origin.ledger.connection_count == 1
+
+            handler_threads = [
+                thread
+                for thread in threading.enumerate()
+                if thread not in preexisting_threads
+                and thread.name != "synthetic-http-origin"
+            ]
+            assert len(handler_threads) == 1
+            handler_thread = handler_threads[0]
+            assert handler_thread.is_alive()
+            close_started = time.monotonic()
+
+        assert time.monotonic() - close_started < 1
+        assert not handler_thread.is_alive()
+        assert peer.recv(1) == b""
+    finally:
+        if peer is not None:
+            peer.close()
 
 
 def test_fixture_serves_real_range_and_no_range_responses() -> None:
