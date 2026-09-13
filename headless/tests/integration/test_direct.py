@@ -76,17 +76,23 @@ def test_fixture_keeps_literal_network_policy_origin_and_is_synthetic() -> None:
         assert origin.origin == f"http://127.0.0.1:{origin.port}"
 
 
-def test_fixture_ignores_an_unsafe_host_override_when_binding() -> None:
+def test_fixture_ignores_an_unsafe_host_override() -> None:
     origin_type = _origin_type()
 
     class UnsafeSyntheticHttpOrigin(origin_type):
-        host = "0.0.0.0"
+        host = "192.0.2.1"
 
     with UnsafeSyntheticHttpOrigin() as origin:
         server = origin._server
         assert server is not None
-        assert server.server_address[0] == "127.0.0.1"
+        assert origin.host == "127.0.0.1"
         assert origin.origin == f"http://127.0.0.1:{origin.port}"
+        assert server.server_address[0] == "127.0.0.1"
+
+        status, _, body = _request(origin, "/range")
+        assert (status, body) == (200, origin.payload)
+        ledger = _ledger_after_requests(origin, 1)
+        assert (ledger.request_count, ledger.connection_count) == (1, 1)
 
 
 def test_fixture_closes_stalled_tcp_handler_when_context_exits() -> None:
