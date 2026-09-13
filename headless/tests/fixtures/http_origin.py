@@ -76,7 +76,12 @@ class _LoopbackHttpServer(ThreadingHTTPServer):
 class SyntheticHttpOrigin:
     """A context-managed local origin with deterministic download faults."""
 
-    host = "127.0.0.1"
+    host = _LOOPBACK_HOST
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        cls.host = _LOOPBACK_HOST
+
     payload = _generated_payload("synthetic-http-origin-v1")
     changed_payload = _generated_payload("synthetic-http-origin-v2")
     chunk_delay_seconds = 0.01
