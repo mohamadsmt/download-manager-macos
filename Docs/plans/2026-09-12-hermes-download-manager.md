@@ -288,7 +288,7 @@ Commit: `test: add deterministic download fault origin`.
 
 **Test:** `headless/scripts/run-tests tests/integration/test_direct.py`.
 
-Create a worker-owned authenticated loopback aria2 daemon with `--no-conf`, `--no-netrc`, `--file-allocation=none`, RPC local-only, explicit concurrency and no automatic session resurrection. Read secrets from private config, not model-visible argv. Controller admits only authorized jobs; aria2 must not independently start queued intent. Incomplete outputs stay job-owned.
+Create a worker-owned authenticated loopback aria2 daemon with an owner-only explicit `--conf-path`, `--no-netrc`, `--file-allocation=none`, RPC local-only, explicit concurrency and no automatic session resurrection. Read secrets from private config, not model-visible argv. `aria2c 1.37` makes literal `--no-conf` incompatible with loading an explicit private config, so no ambient config path may be used and the owner-only `--conf-path` is the approved replacement. Controller admits only authorized jobs; aria2 must not independently start queued intent. Incomplete outputs stay job-owned.
 
 Prove add-paused causes zero body bytes, initial pause persists, Range fallback and segmented successful hash, GID mapping, stale callback rejection and safe restart. RPC request success is followed by state readback. Do not count size alone as byte-identical validation where expected hash is supplied.
 
