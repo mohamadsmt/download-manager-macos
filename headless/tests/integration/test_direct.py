@@ -95,6 +95,51 @@ def test_fixture_ignores_an_unsafe_host_override() -> None:
         assert (ledger.request_count, ledger.connection_count) == (1, 1)
 
 
+def test_fixture_ignores_post_creation_unsafe_host_override() -> None:
+    origin_type = _origin_type()
+
+    class UnsafeSyntheticHttpOrigin(origin_type):
+        pass
+
+    UnsafeSyntheticHttpOrigin.host = "192.0.2.1"
+
+    with UnsafeSyntheticHttpOrigin() as origin:
+        server = origin._server
+        assert server is not None
+        assert origin.origin == f"http://127.0.0.1:{origin.port}"
+        assert server.server_address[0] == "127.0.0.1"
+        assert origin.host == "127.0.0.1"
+
+        status, _, body = _request(origin, "/range")
+        assert (status, body) == (200, origin.payload)
+        ledger = _ledger_after_requests(origin, 1)
+        assert (ledger.request_count, ledger.connection_count) == (1, 1)
+
+
+def test_fixture_ignores_unsafe_host_override_when_intermediate_subclass_omits_super() -> None:
+    origin_type = _origin_type()
+
+    class IntermediateSyntheticHttpOrigin(origin_type):
+        def __init_subclass__(cls, **kwargs: object) -> None:
+            # Deliberately omit super(): this is the bypass under test.
+            cls.host = "192.0.2.1"
+
+    class UnsafeSyntheticHttpOrigin(IntermediateSyntheticHttpOrigin):
+        pass
+
+    with UnsafeSyntheticHttpOrigin() as origin:
+        server = origin._server
+        assert server is not None
+        assert origin.origin == f"http://127.0.0.1:{origin.port}"
+        assert server.server_address[0] == "127.0.0.1"
+        assert origin.host == "127.0.0.1"
+
+        status, _, body = _request(origin, "/range")
+        assert (status, body) == (200, origin.payload)
+        ledger = _ledger_after_requests(origin, 1)
+        assert (ledger.request_count, ledger.connection_count) == (1, 1)
+
+
 def test_fixture_closes_stalled_tcp_handler_when_context_exits() -> None:
     origin = _origin_type()()
     peer: socket.socket | None = None
