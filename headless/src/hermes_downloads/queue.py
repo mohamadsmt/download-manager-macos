@@ -259,7 +259,7 @@ class DownloadQueue:
             raise ValueError("reorder requires jobs with the same priority")
 
         ordered = sorted(
-            (job for job in self._jobs.values() if not job.removed),
+            self._jobs.values(),
             key=lambda job: (job.order_key, job.job_id),
         )
         ordered = [job for job in ordered if job.job_id != moving.job_id]
