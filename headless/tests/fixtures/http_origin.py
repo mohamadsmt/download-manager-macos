@@ -20,6 +20,8 @@ SYNTHETIC_ORIGIN_NOTICE = (
 )
 LEDGER_CAPACITY = 16
 _PAYLOAD_BYTES = 1024
+_LOOPBACK_HOST = "127.0.0.1"
+_HANDLER_IDLE_TIMEOUT_SECONDS = 0.1
 
 
 def _generated_payload(label: str) -> bytes:
@@ -67,8 +69,8 @@ class RequestLedger:
 
 
 class _LoopbackHttpServer(ThreadingHTTPServer):
-    daemon_threads = True
-    block_on_close = False
+    daemon_threads = False
+    block_on_close = True
 
 
 class SyntheticHttpOrigin:
@@ -97,7 +99,7 @@ class SyntheticHttpOrigin:
 
     @property
     def origin(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"http://{_LOOPBACK_HOST}:{self.port}"
 
     def url(self, path: str = "/range") -> str:
         if not path.startswith("/"):
@@ -118,7 +120,7 @@ class SyntheticHttpOrigin:
     def __enter__(self) -> SyntheticHttpOrigin:
         if self._server is not None:
             raise RuntimeError("synthetic origin is already running")
-        server = _LoopbackHttpServer((self.host, 0), self._handler_type())
+        server = _LoopbackHttpServer((_LOOPBACK_HOST, 0), self._handler_type())
         thread = threading.Thread(
             target=server.serve_forever,
             kwargs={"poll_interval": 0.01},
@@ -157,6 +159,7 @@ class SyntheticHttpOrigin:
             protocol_version = "HTTP/1.0"
 
             def setup(self) -> None:
+                self.request.settimeout(_HANDLER_IDLE_TIMEOUT_SECONDS)
                 super().setup()
                 origin._record_connection()
 
