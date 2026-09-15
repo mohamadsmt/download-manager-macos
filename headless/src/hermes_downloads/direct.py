@@ -199,8 +199,6 @@ class DirectAria2Controller:
             self._process = process
             self._port = port
             self._secret = secret
-            self._private_runtime_path = runtime_path
-            self._private_config_path = config_path
             self._launch_argv = argv
             process_group_id = _bind_process_group(process)
             if process_group_id is None:
@@ -217,9 +215,8 @@ class DirectAria2Controller:
         except (OSError, ValueError):
             stopped, interruption = _stop_process(process, process_group_id)
             if stopped:
-                if runtime_path is not None:
-                    _remove_private_runtime(runtime_path)
-                self._clear_runtime_state()
+                self._clear_stopped_process_state()
+                self._cleanup_owned_private_runtime(preserve_primary=True)
             if interruption is not None:
                 raise interruption
             if not stopped:
@@ -229,28 +226,19 @@ class DirectAria2Controller:
             stopped, _cleanup_interruption = _stop_process(process, process_group_id)
             if stopped:
                 self._clear_stopped_process_state()
-                try:
-                    if runtime_path is not None:
-                        _remove_private_runtime(runtime_path)
-                except BaseException:
-                    # The original process-control exception wins.  Leave only
-                    # the private paths so close() can retry their deletion.
-                    pass
-                else:
-                    self._clear_runtime_state()
+                self._cleanup_owned_private_runtime(preserve_primary=True)
             raise
 
     def close(self) -> None:
         """Stop the owned daemon and erase its secret-bearing temporary config."""
 
-        runtime_path = self._private_runtime_path
         stopped, interruption = self._stop_owned_process()
         if stopped:
             self._clear_mappings()
             self._clear_stopped_process_state()
-            if runtime_path is not None:
-                _remove_private_runtime(runtime_path)
-            self._clear_runtime_state()
+            self._cleanup_owned_private_runtime(
+                preserve_primary=interruption is not None
+            )
         if interruption is not None:
             raise interruption
         if not stopped:
@@ -433,15 +421,12 @@ class DirectAria2Controller:
         runtime_path = Path(
             tempfile.mkdtemp(prefix="aria2-", dir=str(self._runtime_root))
         )
-        try:
-            os.chmod(runtime_path, 0o700)
-            config_path = runtime_path / "aria2.conf"
-            secret = secrets.token_urlsafe(32)
-            _write_private_file(config_path, f"rpc-secret={secret}\n".encode("ascii"))
-            return runtime_path, config_path, secret
-        except BaseException:
-            _remove_private_runtime(runtime_path)
-            raise
+        config_path = runtime_path / "aria2.conf"
+        self._own_private_runtime(runtime_path, config_path)
+        os.chmod(runtime_path, 0o700)
+        secret = secrets.token_urlsafe(32)
+        _write_private_file(config_path, f"rpc-secret={secret}\n".encode("ascii"))
+        return runtime_path, config_path, secret
 
     def _build_argv(self, config_path: Path, port: int) -> tuple[str, ...]:
         # aria2 1.37's --no-conf disables even an explicit --conf-path.  The
@@ -551,10 +536,31 @@ class DirectAria2Controller:
         self._secret = None
         self._launch_argv = ()
 
-    def _clear_runtime_state(self) -> None:
-        self._clear_stopped_process_state()
+    def _own_private_runtime(self, runtime_path: Path, config_path: Path) -> None:
+        self._private_runtime_path = runtime_path
+        self._private_config_path = config_path
+
+    def _cleanup_owned_private_runtime(self, *, preserve_primary: bool) -> None:
+        runtime_path = self._private_runtime_path
+        if runtime_path is None:
+            return
+        try:
+            _remove_private_runtime(runtime_path)
+        except BaseException:
+            if preserve_primary:
+                # Cleanup failure cannot mask a primary exception.  The paths
+                # stay owned so close() can retry deletion.
+                return
+            raise
+        self._clear_private_runtime_state()
+
+    def _clear_private_runtime_state(self) -> None:
         self._private_runtime_path = None
         self._private_config_path = None
+
+    def _clear_runtime_state(self) -> None:
+        self._clear_stopped_process_state()
+        self._clear_private_runtime_state()
 
 
 def _require_executable(value: str | os.PathLike[str]) -> Path:

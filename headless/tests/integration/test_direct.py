@@ -1257,3 +1257,223 @@ def test_direct_close_defers_cleanup_interrupt_until_group_is_reaped_and_state_i
         assert _group_is_gone(identity.process_group_id)
         assert controller.engine_identity is None
         assert not runtime_path.exists()
+
+
+def test_direct_start_retains_private_runtime_after_ordinary_startup_cleanup_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    runtime_paths: list[Path] = []
+    cleanup_paths: list[Path] = []
+    original_remove = direct._remove_private_runtime
+
+    def fail_popen(*_args: Any, **kwargs: Any) -> Any:
+        runtime_paths.append(Path(kwargs["cwd"]))
+        raise OSError("fixture ordinary startup failure")
+
+    def fail_once(path: Path) -> None:
+        cleanup_paths.append(path)
+        if len(cleanup_paths) == 1:
+            raise direct.DirectEngineError("fixture private runtime cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(direct.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(direct, "_remove_private_runtime", fail_once)
+
+    try:
+        with pytest.raises(direct.DirectEngineError) as raised:
+            controller.start()
+
+        runtime_path = runtime_paths[0]
+        config_path = runtime_path / "aria2.conf"
+        assert str(raised.value) == "aria2 could not start"
+        assert cleanup_paths == [runtime_path]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+        assert config_path.exists()
+
+        controller.close()
+
+        assert cleanup_paths == [runtime_path, runtime_path]
+        assert not runtime_path.exists()
+        with pytest.raises(direct.DirectEngineError):
+            _ = controller.private_runtime_path
+    finally:
+        controller._clear_runtime_state()
+        for runtime_path in runtime_paths:
+            if runtime_path.exists():
+                original_remove(runtime_path)
+
+
+def test_direct_start_preserves_prelaunch_interrupt_when_private_runtime_cleanup_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    primary = KeyboardInterrupt("fixture prelaunch interrupt")
+    cleanup_paths: list[Path] = []
+    original_remove = direct._remove_private_runtime
+
+    def raise_primary() -> int:
+        raise primary
+
+    def fail_once(path: Path) -> None:
+        cleanup_paths.append(path)
+        if len(cleanup_paths) == 1:
+            raise direct.DirectEngineError("fixture private runtime cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(direct, "_reserve_loopback_port", raise_primary)
+    monkeypatch.setattr(direct, "_remove_private_runtime", fail_once)
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            controller.start()
+
+        runtime_path = cleanup_paths[0]
+        config_path = runtime_path / "aria2.conf"
+        assert raised.value is primary
+        assert cleanup_paths == [runtime_path]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+        assert config_path.exists()
+
+        controller.close()
+
+        assert cleanup_paths == [runtime_path, runtime_path]
+        assert not runtime_path.exists()
+        with pytest.raises(direct.DirectEngineError):
+            _ = controller.private_runtime_path
+    finally:
+        controller._clear_runtime_state()
+        for runtime_path in cleanup_paths:
+            if runtime_path.exists():
+                original_remove(runtime_path)
+
+
+def test_direct_start_preserves_config_creation_interrupt_when_private_runtime_cleanup_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    primary = KeyboardInterrupt("fixture private config interrupt")
+    cleanup_paths: list[Path] = []
+    original_remove = direct._remove_private_runtime
+
+    def raise_primary(_bytes: int) -> str:
+        raise primary
+
+    def fail_once(path: Path) -> None:
+        cleanup_paths.append(path)
+        if len(cleanup_paths) == 1:
+            raise direct.DirectEngineError("fixture private runtime cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(direct.secrets, "token_urlsafe", raise_primary)
+    monkeypatch.setattr(direct, "_remove_private_runtime", fail_once)
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            controller.start()
+
+        runtime_path = cleanup_paths[0]
+        config_path = runtime_path / "aria2.conf"
+        assert raised.value is primary
+        assert cleanup_paths == [runtime_path]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+        assert not config_path.exists()
+
+        controller.close()
+
+        assert cleanup_paths == [runtime_path, runtime_path]
+        assert not runtime_path.exists()
+        with pytest.raises(direct.DirectEngineError):
+            _ = controller.private_runtime_path
+    finally:
+        controller._clear_runtime_state()
+        for runtime_path in cleanup_paths:
+            if runtime_path.exists():
+                original_remove(runtime_path)
+
+
+def test_direct_close_preserves_primary_interrupt_when_private_runtime_cleanup_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+
+    class FakeProcess:
+        pid = 4747
+
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    runtime_path, config_path, secret = controller._create_private_config()
+    process = FakeProcess()
+    primary = KeyboardInterrupt("fixture close interrupt")
+    cleanup_paths: list[Path] = []
+    original_remove = direct._remove_private_runtime
+    stop_results = [(True, primary), (True, None)]
+    controller._process = process
+    controller._identity = direct.EngineIdentity(
+        leader_pid=process.pid,
+        process_group_id=process.pid,
+        started_monotonic_ns=1,
+        argv_sha256="0" * 64,
+    )
+    controller._port = 4321
+    controller._secret = secret
+    controller._private_runtime_path = runtime_path
+    controller._private_config_path = config_path
+
+    def fail_once(path: Path) -> None:
+        cleanup_paths.append(path)
+        if len(cleanup_paths) == 1:
+            raise direct.DirectEngineError("fixture private runtime cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(controller, "_stop_owned_process", lambda: stop_results.pop(0))
+    monkeypatch.setattr(direct, "_remove_private_runtime", fail_once)
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            controller.close()
+
+        assert raised.value is primary
+        assert cleanup_paths == [runtime_path]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+
+        controller.close()
+
+        assert cleanup_paths == [runtime_path, runtime_path]
+        assert not runtime_path.exists()
+        with pytest.raises(direct.DirectEngineError):
+            _ = controller.private_runtime_path
+    finally:
+        controller._clear_runtime_state()
+        if runtime_path.exists():
+            original_remove(runtime_path)
