@@ -20,19 +20,22 @@ SYNTHETIC_ORIGIN_NOTICE = (
 )
 LEDGER_CAPACITY = 16
 _PAYLOAD_BYTES = 1024
+_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 _LOOPBACK_HOST = "127.0.0.1"
 _HANDLER_IDLE_TIMEOUT_SECONDS = 0.1
+_RANGE_PACED_CHUNK_BYTES = 32 * 1024
+_RANGE_PACED_CHUNK_DELAY_SECONDS = 0.005
 
 
-def _generated_payload(label: str) -> bytes:
+def _generated_payload(label: str, payload_size: int = _PAYLOAD_BYTES) -> bytes:
     payload = bytearray()
     index = 0
-    while len(payload) < _PAYLOAD_BYTES:
+    while len(payload) < payload_size:
         payload.extend(
             hashlib.sha256(label.encode("ascii") + index.to_bytes(4, "big")).digest()
         )
         index += 1
-    return bytes(payload[:_PAYLOAD_BYTES])
+    return bytes(payload[:payload_size])
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,7 @@ class RequestLedgerEntry:
     endpoint: str
     body_bytes: int
     chunk_count: int
+    range_header: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +104,12 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
     disconnect_after = 256
     service_unavailable_failures = 2
 
-    def __init__(self) -> None:
+    def __init__(self, *, payload_size: int = _PAYLOAD_BYTES) -> None:
+        if type(payload_size) is not int or not 1 <= payload_size <= _MAX_PAYLOAD_BYTES:
+            raise ValueError("payload_size is outside the synthetic fixture limit")
         self.port = 0
+        self.payload = _generated_payload("synthetic-http-origin-v1", payload_size)
+        self.changed_payload = _generated_payload("synthetic-http-origin-v2", payload_size)
         self._lock = threading.Lock()
         self._entries: deque[RequestLedgerEntry] = deque(maxlen=LEDGER_CAPACITY)
         self._request_count = 0
@@ -197,8 +205,14 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
             return
 
         status, headers, body = self._response_for(endpoint, handler.headers.get("Range"))
-        self._send_response(handler, status, headers, body)
-        self._record_request(endpoint, len(body), 0)
+        self._send_response(
+            handler,
+            status,
+            headers,
+            body,
+            pace_large_range=(endpoint == "range" and len(self.payload) > _PAYLOAD_BYTES),
+        )
+        self._record_request(endpoint, len(body), 0, handler.headers.get("Range"))
 
     def _response_for(
         self, endpoint: str, range_header: str | None
@@ -226,11 +240,11 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
         if range_header is None:
             return 200, headers, self.payload
         if not range_header.startswith("bytes=") or "," in range_header:
-            return 416, {**headers, "Content-Range": "bytes */1024"}, b""
+            return 416, {**headers, "Content-Range": f"bytes */{len(self.payload)}"}, b""
 
         start_text, separator, end_text = range_header[6:].partition("-")
         if not separator:
-            return 416, {**headers, "Content-Range": "bytes */1024"}, b""
+            return 416, {**headers, "Content-Range": f"bytes */{len(self.payload)}"}, b""
         try:
             if start_text:
                 start = int(start_text)
@@ -244,13 +258,13 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
             else:
                 raise ValueError
         except ValueError:
-            return 416, {**headers, "Content-Range": "bytes */1024"}, b""
+            return 416, {**headers, "Content-Range": f"bytes */{len(self.payload)}"}, b""
 
         if start >= len(self.payload) or end < start:
-            return 416, {**headers, "Content-Range": "bytes */1024"}, b""
+            return 416, {**headers, "Content-Range": f"bytes */{len(self.payload)}"}, b""
         end = min(end, len(self.payload) - 1)
         body = self.payload[start : end + 1]
-        return 206, {**headers, "Content-Range": f"bytes {start}-{end}/1024"}, body
+        return 206, {**headers, "Content-Range": f"bytes {start}-{end}/{len(self.payload)}"}, body
 
     def _etag_change_response(self) -> tuple[int, dict[str, str], bytes]:
         with self._lock:
@@ -275,6 +289,7 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
         body: bytes,
         *,
         content_length: int | None = None,
+        pace_large_range: bool = False,
     ) -> None:
         handler.send_response(status)
         for name, value in headers.items():
@@ -283,9 +298,20 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
             "Content-Length", str(len(body) if content_length is None else content_length)
         )
         handler.end_headers()
-        if body:
-            handler.wfile.write(body)
-            handler.wfile.flush()
+        if not body:
+            return
+        try:
+            if pace_large_range:
+                for start in range(0, len(body), _RANGE_PACED_CHUNK_BYTES):
+                    handler.wfile.write(body[start : start + _RANGE_PACED_CHUNK_BYTES])
+                    handler.wfile.flush()
+                    if start + _RANGE_PACED_CHUNK_BYTES < len(body):
+                        time.sleep(_RANGE_PACED_CHUNK_DELAY_SECONDS)
+            else:
+                handler.wfile.write(body)
+                handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _send_delayed(self, handler: BaseHTTPRequestHandler, endpoint: str) -> None:
         handler.send_response(200)
@@ -301,22 +327,30 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
             chunks += 1
             if start + chunk_size < len(self.payload):
                 time.sleep(self.chunk_delay_seconds)
-        self._record_request(endpoint, len(self.payload), chunks)
+        self._record_request(endpoint, len(self.payload), chunks, handler.headers.get("Range"))
 
     def _send_disconnect(self, handler: BaseHTTPRequestHandler, endpoint: str) -> None:
         body = self.payload[: self.disconnect_after]
         handler.close_connection = True
         self._send_response(handler, 200, {}, body, content_length=len(self.payload))
-        self._record_request(endpoint, len(body), 1)
+        self._record_request(endpoint, len(body), 1, handler.headers.get("Range"))
 
     def _record_connection(self) -> None:
         with self._lock:
             self._connection_count += 1
 
-    def _record_request(self, endpoint: str, body_bytes: int, chunk_count: int) -> None:
+    def _record_request(
+        self,
+        endpoint: str,
+        body_bytes: int,
+        chunk_count: int,
+        range_header: str | None,
+    ) -> None:
         with self._lock:
             self._request_count += 1
             self._response_body_bytes += body_bytes
             if len(self._entries) == LEDGER_CAPACITY:
                 self._dropped_entries += 1
-            self._entries.append(RequestLedgerEntry(endpoint, body_bytes, chunk_count))
+            self._entries.append(
+                RequestLedgerEntry(endpoint, body_bytes, chunk_count, range_header)
+            )
