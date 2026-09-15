@@ -134,8 +134,12 @@ class DirectAria2Controller:
         self.start()
         return self
 
-    def __exit__(self, *_: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, *_: object) -> None:
+        try:
+            self.close()
+        except BaseException:
+            if exc_type is None:
+                raise
 
     @property
     def engine_identity(self) -> EngineIdentity | None:

@@ -1538,3 +1538,55 @@ def test_direct_close_preserves_primary_interrupt_when_private_runtime_cleanup_f
         controller._clear_runtime_state()
         if runtime_path.exists():
             original_remove(runtime_path)
+
+
+def test_direct_context_manager_preserves_body_interrupt_when_runtime_cleanup_fails_and_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    primary = KeyboardInterrupt("fixture context body interrupt")
+    cleanup_paths: list[Path] = []
+    original_remove = direct._remove_private_runtime
+    runtime_path: Path | None = None
+    config_path: Path | None = None
+
+    def fail_once(path: Path) -> None:
+        cleanup_paths.append(path)
+        if len(cleanup_paths) == 1:
+            raise direct.DirectEngineError("fixture private runtime cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(direct, "_remove_private_runtime", fail_once)
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            with controller:
+                runtime_path = controller.private_runtime_path
+                config_path = controller.private_config_path
+                raise primary
+
+        assert runtime_path is not None
+        assert config_path is not None
+        assert raised.value is primary
+        assert cleanup_paths == [runtime_path]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+        assert config_path.exists()
+
+        controller.close()
+
+        assert cleanup_paths == [runtime_path, runtime_path]
+        assert not runtime_path.exists()
+        with pytest.raises(direct.DirectEngineError):
+            _ = controller.private_runtime_path
+    finally:
+        controller._clear_runtime_state()
+        if runtime_path is not None and runtime_path.exists():
+            original_remove(runtime_path)
