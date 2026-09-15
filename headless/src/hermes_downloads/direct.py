@@ -151,7 +151,7 @@ class DirectAria2Controller:
 
     @property
     def private_runtime_path(self) -> Path:
-        """Return the owner-only transient runtime directory while the daemon runs."""
+        """Return the owner-only transient runtime directory while it is owned."""
 
         if self._private_runtime_path is None:
             raise DirectEngineError("aria2 is not running")
@@ -159,7 +159,7 @@ class DirectAria2Controller:
 
     @property
     def private_config_path(self) -> Path:
-        """Return the owner-only configuration pathname, never its contents."""
+        """Return the owner-only configuration pathname while it is owned."""
 
         if self._private_config_path is None:
             raise DirectEngineError("aria2 is not running")
@@ -176,6 +176,8 @@ class DirectAria2Controller:
 
         if self._process is not None:
             raise DirectEngineError("aria2 is already running")
+        if self._private_runtime_path is not None or self._private_config_path is not None:
+            raise DirectEngineError("aria2 private runtime cleanup is pending")
         runtime_path: Path | None = None
         process: subprocess.Popen[bytes] | None = None
         process_group_id: int | None = None
@@ -238,11 +240,10 @@ class DirectAria2Controller:
         stopped, interruption = self._stop_owned_process()
         if stopped:
             self._clear_mappings()
-            try:
-                if runtime_path is not None:
-                    _remove_private_runtime(runtime_path)
-            finally:
-                self._clear_runtime_state()
+            self._clear_stopped_process_state()
+            if runtime_path is not None:
+                _remove_private_runtime(runtime_path)
+            self._clear_runtime_state()
         if interruption is not None:
             raise interruption
         if not stopped:
@@ -536,14 +537,17 @@ class DirectAria2Controller:
         self._by_job_id.clear()
         self._by_gid.clear()
 
-    def _clear_runtime_state(self) -> None:
+    def _clear_stopped_process_state(self) -> None:
         self._process = None
         self._identity = None
         self._port = None
         self._secret = None
+        self._launch_argv = ()
+
+    def _clear_runtime_state(self) -> None:
+        self._clear_stopped_process_state()
         self._private_runtime_path = None
         self._private_config_path = None
-        self._launch_argv = ()
 
 
 def _require_executable(value: str | os.PathLike[str]) -> Path:
@@ -620,10 +624,13 @@ def _require_source(source: object) -> SourceURL:
 def _require_destination(destination: object, job_id: str) -> DestinationIntent:
     if type(destination) is not DestinationIntent:
         raise TypeError("destination must be a DestinationIntent")
+    expected_incomplete_dir = destination.root / ".incomplete" / job_id
     if (
         destination.job_id != job_id
         or destination.partial_path.parent != destination.incomplete_dir
         or destination.partial_path.name != destination.filename
+        or destination.incomplete_dir != expected_incomplete_dir
+        or destination.partial_path != expected_incomplete_dir / destination.filename
         or not destination.partial_path.is_absolute()
         or not destination.final_path.is_absolute()
     ):

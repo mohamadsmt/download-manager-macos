@@ -528,6 +528,53 @@ def test_direct_admission_adds_paused_then_explicit_resume_hash_verifies_payload
         assert controller.private_config_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_direct_rejects_forged_incomplete_destination_before_rpc_or_origin_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    paths = _paths_module()
+    job_id = "direct-forged-destination"
+    queue = _admitted_queue(job_id)
+    root = Path.home() / "Downloads" / "Hermes"
+    outside_incomplete_dir = tmp_path / "outside" / job_id
+    destination = paths.DestinationIntent(
+        root=root,
+        category="Other",
+        collection=None,
+        filename="forged.bin",
+        job_id=job_id,
+        final_path=root / "Other" / "forged.bin",
+        incomplete_dir=outside_incomplete_dir,
+        partial_path=outside_incomplete_dir / "forged.bin",
+    )
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    rpc_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def unexpected_rpc(*args: Any, **kwargs: Any) -> Any:
+        rpc_calls.append((args, kwargs))
+        raise AssertionError("forged destination reached aria2 RPC")
+
+    monkeypatch.setattr(controller, "_require_running", lambda: (object(), 4321, "secret"))
+    monkeypatch.setattr(controller, "_rpc", unexpected_rpc)
+
+    with _origin_type()() as origin:
+        with pytest.raises(direct.DirectTransferError):
+            controller.add_paused(
+                job_id=job_id,
+                generation=1,
+                source=_source(origin, "/range"),
+                destination=destination,
+                expected_sha256=hashlib.sha256(origin.payload).hexdigest(),
+                admission=_admission(queue, job_id),
+            )
+
+        assert rpc_calls == []
+        assert origin.ledger.response_body_bytes == 0
+
+
 @pytest.mark.parametrize(
     ("endpoint", "requires_range"),
     (("range", True), ("no-range", False)),
@@ -838,6 +885,81 @@ def test_direct_close_keeps_daemon_owned_when_group_cleanup_fails(
         controller._clear_runtime_state()
         if runtime_path.exists():
             direct._remove_private_runtime(runtime_path)
+
+
+def test_direct_close_retains_private_runtime_after_cleanup_failure_for_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+
+    class FakeProcess:
+        pid = 4443
+
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    runtime_path, config_path, secret = controller._create_private_config()
+    process = FakeProcess()
+    identity = direct.EngineIdentity(
+        leader_pid=process.pid,
+        process_group_id=process.pid,
+        started_monotonic_ns=1,
+        argv_sha256="0" * 64,
+    )
+    controller._process = process
+    controller._identity = identity
+    controller._port = 4321
+    controller._secret = secret
+    controller._private_runtime_path = runtime_path
+    controller._private_config_path = config_path
+    removal_paths: list[Path] = []
+    original_remove = direct._remove_private_runtime
+
+    def fail_once(path: Path) -> None:
+        removal_paths.append(path)
+        if len(removal_paths) == 1:
+            raise direct.DirectEngineError("aria2 private runtime cleanup failed")
+        original_remove(path)
+
+    monkeypatch.setattr(controller, "_stop_owned_process", lambda: (True, None))
+    monkeypatch.setattr(direct, "_remove_private_runtime", fail_once)
+
+    try:
+        with pytest.raises(direct.DirectEngineError) as raised:
+            controller.close()
+
+        assert str(raised.value) == "aria2 private runtime cleanup failed"
+        assert secret not in str(raised.value)
+        assert removal_paths == [runtime_path]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        start_attempts: list[None] = []
+
+        def unexpected_create_private_config() -> tuple[Path, Path, str]:
+            start_attempts.append(None)
+            raise AssertionError("cleanup-pending controller started a new runtime")
+
+        monkeypatch.setattr(
+            controller, "_create_private_config", unexpected_create_private_config
+        )
+        with pytest.raises(direct.DirectEngineError):
+            controller.start()
+        assert start_attempts == []
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+
+        controller.close()
+
+        assert removal_paths == [runtime_path, runtime_path]
+        assert not runtime_path.exists()
+        assert controller.engine_identity is None
+        with pytest.raises(direct.DirectEngineError):
+            _ = controller.private_runtime_path
+    finally:
+        if runtime_path.exists():
+            original_remove(runtime_path)
 
 
 def test_direct_start_keeps_daemon_owned_when_bound_cleanup_fails(
