@@ -575,6 +575,67 @@ def test_direct_rejects_forged_incomplete_destination_before_rpc_or_origin_bytes
         assert origin.ledger.response_body_bytes == 0
 
 
+def test_direct_rejects_canonical_partial_symlink_before_aria2_rpc_or_origin_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    paths = _paths_module()
+    job_id = "direct-partial-symlink"
+    filename = "partial-symlink.bin"
+    queue = _admitted_queue(job_id)
+
+    with _origin_type()() as origin, _running_direct_controller(direct, tmp_path) as (
+        controller,
+        _,
+    ):
+        prepared = _destination(job_id, filename)
+        destination = paths.DestinationIntent(
+            root=prepared.root,
+            category=prepared.category,
+            collection=prepared.collection,
+            filename=prepared.filename,
+            job_id=prepared.job_id,
+            final_path=prepared.final_path,
+            incomplete_dir=prepared.incomplete_dir,
+            partial_path=prepared.partial_path,
+        )
+        canonical_root = Path.home() / "Downloads" / "Hermes"
+        assert destination.root == canonical_root
+        assert destination.incomplete_dir == canonical_root / ".incomplete" / job_id
+        assert destination.partial_path == destination.incomplete_dir / filename
+
+        outside_canary = tmp_path / "outside-canary.bin"
+        canary_bytes = b"outside direct partial canary"
+        outside_canary.write_bytes(canary_bytes)
+        destination.partial_path.symlink_to(outside_canary)
+        assert destination.partial_path.is_symlink()
+
+        rpc_calls: list[tuple[str, list[Any]]] = []
+        original_rpc = controller._rpc
+
+        def unexpected_rpc(method: str, params: list[Any]) -> Any:
+            rpc_calls.append((method, params))
+            raise AssertionError("canonical partial symlink reached aria2 RPC")
+
+        monkeypatch.setattr(controller, "_rpc", unexpected_rpc)
+        try:
+            with pytest.raises(direct.DirectTransferError):
+                controller.add_paused(
+                    job_id=job_id,
+                    generation=1,
+                    source=_source(origin, "/range"),
+                    destination=destination,
+                    expected_sha256=hashlib.sha256(origin.payload).hexdigest(),
+                    admission=_admission(queue, job_id),
+                )
+        finally:
+            monkeypatch.setattr(controller, "_rpc", original_rpc)
+
+        assert rpc_calls == []
+        assert outside_canary.read_bytes() == canary_bytes
+        assert origin.ledger.response_body_bytes == 0
+
+
 def test_direct_rejects_forged_noncanonical_root_before_rpc_or_origin_bytes(
     tmp_path: Path, monkeypatch
 ) -> None:

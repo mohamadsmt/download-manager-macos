@@ -650,7 +650,34 @@ def _require_destination(destination: object, job_id: str) -> DestinationIntent:
         or not destination.final_path.is_absolute()
     ):
         raise DirectTransferError("destination is not a job-owned T05 path")
+    _require_safe_partial_output(destination)
     return destination
+
+
+def _require_safe_partial_output(destination: DestinationIntent) -> None:
+    current = Path(destination.root.anchor)
+    for component in destination.root.parts[1:]:
+        current /= component
+        _require_real_directory(current)
+    _require_real_directory(destination.root / ".incomplete")
+    _require_real_directory(destination.incomplete_dir)
+    try:
+        details = os.lstat(destination.partial_path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise DirectTransferError("destination partial output is inaccessible") from None
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise DirectTransferError("destination partial output is unsafe")
+
+
+def _require_real_directory(path: Path) -> None:
+    try:
+        details = os.lstat(path)
+    except OSError:
+        raise DirectTransferError("destination directory is inaccessible") from None
+    if not stat.S_ISDIR(details.st_mode):
+        raise DirectTransferError("destination directory is unsafe")
 
 
 def _parse_counter(value: object) -> int:
