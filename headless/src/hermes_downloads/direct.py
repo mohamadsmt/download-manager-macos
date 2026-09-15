@@ -228,9 +228,16 @@ class DirectAria2Controller:
         except BaseException:
             stopped, _cleanup_interruption = _stop_process(process, process_group_id)
             if stopped:
-                if runtime_path is not None:
-                    _remove_private_runtime(runtime_path)
-                self._clear_runtime_state()
+                self._clear_stopped_process_state()
+                try:
+                    if runtime_path is not None:
+                        _remove_private_runtime(runtime_path)
+                except BaseException:
+                    # The original process-control exception wins.  Leave only
+                    # the private paths so close() can retry their deletion.
+                    pass
+                else:
+                    self._clear_runtime_state()
             raise
 
     def close(self) -> None:
@@ -624,9 +631,11 @@ def _require_source(source: object) -> SourceURL:
 def _require_destination(destination: object, job_id: str) -> DestinationIntent:
     if type(destination) is not DestinationIntent:
         raise TypeError("destination must be a DestinationIntent")
-    expected_incomplete_dir = destination.root / ".incomplete" / job_id
+    canonical_root = Path.home() / "Downloads" / "Hermes"
+    expected_incomplete_dir = canonical_root / ".incomplete" / job_id
     if (
-        destination.job_id != job_id
+        destination.root != canonical_root
+        or destination.job_id != job_id
         or destination.partial_path.parent != destination.incomplete_dir
         or destination.partial_path.name != destination.filename
         or destination.incomplete_dir != expected_incomplete_dir
