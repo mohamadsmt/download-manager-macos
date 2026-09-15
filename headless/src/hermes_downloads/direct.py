@@ -21,7 +21,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from hermes_downloads.models import Admission
 from hermes_downloads.network import SourceURL
@@ -194,6 +194,12 @@ class DirectAria2Controller:
                 start_new_session=True,
                 close_fds=True,
             )
+            self._process = process
+            self._port = port
+            self._secret = secret
+            self._private_runtime_path = runtime_path
+            self._private_config_path = config_path
+            self._launch_argv = argv
             process_group_id = _bind_process_group(process)
             if process_group_id is None:
                 raise DirectEngineError("aria2 containment failed")
@@ -203,45 +209,42 @@ class DirectAria2Controller:
                 started_monotonic_ns=time.monotonic_ns(),
                 argv_sha256=_argv_sha256(argv),
             )
-            self._process = process
             self._identity = identity
-            self._port = port
-            self._secret = secret
-            self._private_runtime_path = runtime_path
-            self._private_config_path = config_path
-            self._launch_argv = argv
             self._wait_for_rpc_ready()
             return identity
         except (OSError, ValueError):
-            if process is not None:
-                if process_group_id is None:
-                    _stop_unbound_process(process)
-                else:
-                    _stop_process_group(process, process_group_id)
-            if runtime_path is not None:
-                _remove_private_runtime(runtime_path)
-            self._clear_runtime_state()
+            stopped, interruption = _stop_process(process, process_group_id)
+            if stopped:
+                if runtime_path is not None:
+                    _remove_private_runtime(runtime_path)
+                self._clear_runtime_state()
+            if interruption is not None:
+                raise interruption
+            if not stopped:
+                raise DirectEngineError("aria2 containment failed") from None
             raise DirectEngineError("aria2 could not start") from None
         except BaseException:
-            if process is not None:
-                if process_group_id is None:
-                    _stop_unbound_process(process)
-                else:
-                    _stop_process_group(process, process_group_id)
-            if runtime_path is not None:
-                _remove_private_runtime(runtime_path)
-            self._clear_runtime_state()
+            stopped, _cleanup_interruption = _stop_process(process, process_group_id)
+            if stopped:
+                if runtime_path is not None:
+                    _remove_private_runtime(runtime_path)
+                self._clear_runtime_state()
             raise
 
     def close(self) -> None:
         """Stop the owned daemon and erase its secret-bearing temporary config."""
 
-        stopped = self._stop_owned_process()
         runtime_path = self._private_runtime_path
-        self._clear_mappings()
-        self._clear_runtime_state()
-        if runtime_path is not None:
-            _remove_private_runtime(runtime_path)
+        stopped, interruption = self._stop_owned_process()
+        if stopped:
+            self._clear_mappings()
+            try:
+                if runtime_path is not None:
+                    _remove_private_runtime(runtime_path)
+            finally:
+                self._clear_runtime_state()
+        if interruption is not None:
+            raise interruption
         if not stopped:
             raise DirectEngineError("aria2 containment failed")
 
@@ -500,8 +503,6 @@ class DirectAria2Controller:
                 raise DirectEngineError("aria2 RPC failed")
             return parsed["result"]
         except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
-            if process.poll() is not None:
-                raise DirectEngineError("aria2 exited unexpectedly") from None
             raise DirectEngineError("aria2 RPC failed") from None
 
     def _discard_unreadable_gid(self, gid: str) -> None:
@@ -515,17 +516,21 @@ class DirectAria2Controller:
             raise DirectEngineError("aria2 is not running")
         return self._process, self._port, self._secret
 
-    def _stop_owned_process(self) -> bool:
+    def _stop_owned_process(self) -> tuple[bool, BaseException | None]:
         process, identity = self._process, self._identity
         if process is None:
-            return True
+            return True, None
+        interruption: BaseException | None = None
         try:
             self._rpc("aria2.forceShutdown", [])
         except DirectEngineError:
             pass
-        if identity is None:
-            return _stop_unbound_process(process)
-        return _stop_process_group(process, identity.process_group_id)
+        except BaseException as raised:
+            interruption = raised
+        stopped, cleanup_interruption = _stop_process(
+            process, None if identity is None else identity.process_group_id
+        )
+        return stopped, interruption or cleanup_interruption
 
     def _clear_mappings(self) -> None:
         self._by_job_id.clear()
@@ -736,6 +741,25 @@ def _wait_for_leader(process: subprocess.Popen[bytes], deadline: float) -> bool:
     return True
 
 
+def _stop_process(
+    process: subprocess.Popen[bytes] | None, process_group_id: int | None
+) -> tuple[bool, BaseException | None]:
+    if process is None:
+        return True, None
+    if process_group_id is None:
+        try:
+            return _stop_unbound_process(process), None
+        except BaseException as raised:
+            return False, raised
+    try:
+        result = _stop_process_group(process, process_group_id)
+    except BaseException as raised:
+        return False, raised
+    if type(result) is tuple:
+        return result
+    return result, None
+
+
 def _stop_unbound_process(process: subprocess.Popen[bytes]) -> bool:
     try:
         process.terminate()
@@ -750,29 +774,56 @@ def _stop_unbound_process(process: subprocess.Popen[bytes]) -> bool:
     return _wait_for_leader(process, time.monotonic() + _GROUP_KILL_GRACE_SECONDS)
 
 
-def _stop_process_group(process: subprocess.Popen[bytes], process_group_id: int) -> bool:
+def _stop_process_group(
+    process: subprocess.Popen[bytes], process_group_id: int
+) -> tuple[bool, BaseException | None]:
     """Contain the bound group before reaping its leader or reusing its PID."""
 
+    interruption: BaseException | None = None
     term_deadline = time.monotonic() + _GROUP_STOP_GRACE_SECONDS
-    term_sent = _signal_group(process_group_id, signal.SIGTERM)
-    group_absent_before_reap = _wait_for_group_absence(process_group_id, term_deadline)
+    try:
+        _signal_group(process_group_id, signal.SIGTERM)
+    except BaseException as raised:
+        interruption = raised
+    try:
+        group_absent_before_reap = _wait_for_group_absence(process_group_id, term_deadline)
+    except BaseException as raised:
+        if interruption is None:
+            interruption = raised
+        group_absent_before_reap = False
     if not group_absent_before_reap:
-        kill_sent = _signal_group(process_group_id, signal.SIGKILL)
-        _wait_for_group_absence(
-            process_group_id, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
+        try:
+            _signal_group(process_group_id, signal.SIGKILL)
+        except BaseException as raised:
+            if interruption is None:
+                interruption = raised
+        try:
+            _wait_for_group_absence(
+                process_group_id, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
+            )
+        except BaseException as raised:
+            if interruption is None:
+                interruption = raised
+    try:
+        leader_reaped = _wait_for_leader(
+            process, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
         )
-    else:
-        kill_sent = True
-    leader_reaped = _wait_for_leader(
-        process, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
-    )
+    except BaseException as raised:
+        if interruption is None:
+            interruption = raised
+        leader_reaped = False
     # A just-exited leader can remain a zombie during the pre-reap observation,
     # so only absence after reaping is authoritative.  Never signal after this
     # point: the numerical process-group ID could have been recycled.
-    final_absence = _wait_for_group_absence(
-        process_group_id, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
-    )
+    try:
+        final_absence = _wait_for_group_absence(
+            process_group_id, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
+        )
+    except BaseException as raised:
+        if interruption is None:
+            interruption = raised
+        final_absence = False
     # A final absent group proves there is no process left to signal.  On macOS
     # an already-exiting group can report a transient signal error in this
     # window, so the intermediate signal result is not authoritative.
-    return leader_reaped and final_absence
+    return leader_reaped and final_absence, interruption

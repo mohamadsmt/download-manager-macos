@@ -714,3 +714,283 @@ def test_direct_binding_interrupt_reaps_spawned_daemon_and_removes_private_runti
         for runtime_path in private_runtime_paths:
             if runtime_path.exists():
                 direct._remove_private_runtime(runtime_path)
+
+
+def test_direct_rpc_failure_signals_saved_group_before_reaping_its_leader(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    events: list[object] = []
+
+    class FakeProcess:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.poll_calls = 0
+
+        def poll(self) -> int:
+            self.poll_calls += 1
+            events.append("poll")
+            return 0
+
+    class FailingConnection:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, *_args: Any, **_kwargs: Any) -> None:
+            raise OSError
+
+        def close(self) -> None:
+            events.append("connection-close")
+
+    process = FakeProcess()
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    controller._process = process
+    controller._identity = direct.EngineIdentity(
+        leader_pid=process.pid,
+        process_group_id=process.pid,
+        started_monotonic_ns=1,
+        argv_sha256="0" * 64,
+    )
+    controller._port = 4321
+    controller._secret = "fixture-rpc-secret"
+    group_absences = iter((False, True, True))
+
+    def record_group_signal(
+        process_group_id: int, signal_number: signal.Signals
+    ) -> bool:
+        events.append(("signal", process_group_id, signal_number))
+        return True
+
+    def record_group_absence(_process_group_id: int, _deadline: float) -> bool:
+        events.append("absence")
+        return next(group_absences)
+
+    def record_leader_reap(_process: Any, _deadline: float) -> bool:
+        events.append("reap")
+        return True
+
+    monkeypatch.setattr(direct.http.client, "HTTPConnection", FailingConnection)
+    monkeypatch.setattr(direct, "_signal_group", record_group_signal)
+    monkeypatch.setattr(direct, "_wait_for_group_absence", record_group_absence)
+    monkeypatch.setattr(direct, "_wait_for_leader", record_leader_reap)
+
+    controller.close()
+
+    assert process.poll_calls == 0
+    assert events == [
+        "connection-close",
+        ("signal", process.pid, signal.SIGTERM),
+        "absence",
+        ("signal", process.pid, signal.SIGKILL),
+        "absence",
+        "reap",
+        "absence",
+    ]
+
+
+def test_direct_close_keeps_daemon_owned_when_group_cleanup_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+
+    class FakeProcess:
+        pid = 4343
+
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    runtime_path, config_path, secret = controller._create_private_config()
+    process = FakeProcess()
+    identity = direct.EngineIdentity(
+        leader_pid=process.pid,
+        process_group_id=process.pid,
+        started_monotonic_ns=1,
+        argv_sha256="0" * 64,
+    )
+    controller._process = process
+    controller._identity = identity
+    controller._port = 4321
+    controller._secret = secret
+    controller._private_runtime_path = runtime_path
+    controller._private_config_path = config_path
+
+    def unavailable_rpc(*_args: Any, **_kwargs: Any) -> Any:
+        raise direct.DirectEngineError("fixture RPC unavailable")
+
+    monkeypatch.setattr(controller, "_rpc", unavailable_rpc)
+    monkeypatch.setattr(direct, "_stop_process_group", lambda *_args: False)
+
+    try:
+        with pytest.raises(direct.DirectEngineError):
+            controller.close()
+
+        assert controller._process is process
+        assert controller.engine_identity is identity
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+    finally:
+        controller._clear_runtime_state()
+        if runtime_path.exists():
+            direct._remove_private_runtime(runtime_path)
+
+
+def test_direct_start_keeps_daemon_owned_when_bound_cleanup_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    private_runtime_paths: list[Path] = []
+    readiness_failure = direct.DirectEngineError("fixture readiness failure")
+
+    class FakeProcess:
+        pid = 4444
+
+    process = FakeProcess()
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+
+    def capture_popen(*_args: Any, **kwargs: Any) -> Any:
+        private_runtime_paths.append(Path(kwargs["cwd"]))
+        return process
+
+    def fail_ready() -> None:
+        raise readiness_failure
+
+    monkeypatch.setattr(direct.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(direct, "_bind_process_group", lambda _process: process.pid)
+    monkeypatch.setattr(direct, "_stop_process_group", lambda *_args: False)
+    monkeypatch.setattr(controller, "_wait_for_rpc_ready", fail_ready)
+
+    try:
+        with pytest.raises(direct.DirectEngineError):
+            controller.start()
+
+        assert controller._process is process
+        identity = controller.engine_identity
+        assert identity is not None
+        assert identity.process_group_id == process.pid
+        assert controller.private_runtime_path == private_runtime_paths[0]
+        assert controller.private_config_path.exists()
+        assert private_runtime_paths[0].exists()
+    finally:
+        controller._clear_runtime_state()
+        for runtime_path in private_runtime_paths:
+            if runtime_path.exists():
+                direct._remove_private_runtime(runtime_path)
+
+
+def test_direct_start_preserves_primary_interrupt_over_cleanup_interrupt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    primary = KeyboardInterrupt("fixture-primary-interrupt")
+    cleanup_interrupt = KeyboardInterrupt("fixture-cleanup-interrupt")
+    runtime_paths: list[Path] = []
+
+    class FakeProcess:
+        pid = 4545
+
+    process = FakeProcess()
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+
+    def capture_popen(*_args: Any, **kwargs: Any) -> Any:
+        runtime_paths.append(Path(kwargs["cwd"]))
+        return process
+
+    def raise_primary() -> None:
+        raise primary
+
+    def raise_cleanup(*_args: Any) -> tuple[bool, BaseException | None]:
+        raise cleanup_interrupt
+
+    monkeypatch.setattr(direct.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(direct, "_bind_process_group", lambda _process: process.pid)
+    monkeypatch.setattr(controller, "_wait_for_rpc_ready", raise_primary)
+    monkeypatch.setattr(direct, "_stop_process_group", raise_cleanup)
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            controller.start()
+
+        assert raised.value is primary
+        assert controller._process is process
+        assert controller.engine_identity is not None
+    finally:
+        controller._clear_runtime_state()
+        for runtime_path in runtime_paths:
+            if runtime_path.exists():
+                direct._remove_private_runtime(runtime_path)
+
+
+def test_direct_close_defers_cleanup_interrupt_until_group_is_reaped_and_state_is_cleared(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    interrupt = KeyboardInterrupt("fixture-direct-term-grace-interrupt")
+    events: list[object] = []
+    interruption_injected = False
+    original_signal_group = direct._signal_group
+    original_wait_for_group_absence = direct._wait_for_group_absence
+    original_wait_for_leader = direct._wait_for_leader
+
+    def unavailable_rpc(*_args: Any, **_kwargs: Any) -> Any:
+        raise direct.DirectEngineError("fixture RPC unavailable")
+
+    def record_group_signal(
+        process_group_id: int, signal_number: signal.Signals
+    ) -> bool:
+        events.append(("signal", process_group_id, signal_number))
+        return original_signal_group(process_group_id, signal_number)
+
+    def interrupt_term_grace(process_group_id: int, deadline: float) -> bool:
+        nonlocal interruption_injected
+        events.append("absence")
+        if not interruption_injected:
+            interruption_injected = True
+            raise interrupt
+        return original_wait_for_group_absence(process_group_id, deadline)
+
+    def record_leader_reap(process: Any, deadline: float) -> bool:
+        events.append("reap")
+        return original_wait_for_leader(process, deadline)
+
+    with _running_direct_controller(direct, tmp_path) as (controller, _):
+        process = controller._process
+        identity = controller.engine_identity
+        assert process is not None
+        assert identity is not None
+        runtime_path = controller.private_runtime_path
+        monkeypatch.setattr(controller, "_rpc", unavailable_rpc)
+        monkeypatch.setattr(direct, "_signal_group", record_group_signal)
+        monkeypatch.setattr(
+            direct, "_wait_for_group_absence", interrupt_term_grace
+        )
+        monkeypatch.setattr(direct, "_wait_for_leader", record_leader_reap)
+
+        with pytest.raises(KeyboardInterrupt) as raised:
+            controller.close()
+
+        assert raised.value is interrupt
+        assert interruption_injected
+        assert events == [
+            ("signal", identity.process_group_id, signal.SIGTERM),
+            "absence",
+            ("signal", identity.process_group_id, signal.SIGKILL),
+            "absence",
+            "reap",
+            "absence",
+        ]
+        assert process.returncode is not None
+        assert _group_is_gone(identity.process_group_id)
+        assert controller.engine_identity is None
+        assert not runtime_path.exists()
