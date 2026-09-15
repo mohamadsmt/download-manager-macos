@@ -21,6 +21,7 @@ SOURCE_PACKAGE = HEADLESS_ROOT / "src" / "hermes_downloads"
 EXPECTED_WHEEL_MODULES = {
     "hermes_downloads/__init__.py",
     "hermes_downloads/cli.py",
+    "hermes_downloads/direct.py",
     "hermes_downloads/mcp_server.py",
     "hermes_downloads/models.py",
     "hermes_downloads/network.py",
