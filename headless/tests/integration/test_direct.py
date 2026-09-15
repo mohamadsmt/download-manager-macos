@@ -117,6 +117,19 @@ def _assert_group_gone(process_group_id: int) -> None:
     pytest.fail("aria2 process group survived controller cleanup")
 
 
+def _assert_pid_gone(pid: int) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        time.sleep(0.01)
+    pytest.fail("aria2 leader survived controller cleanup")
+
+
 def _force_stop_group(process_group_id: int) -> None:
     try:
         os.killpg(process_group_id, signal.SIGKILL)
@@ -641,3 +654,63 @@ def test_direct_stop_and_restart_do_not_resurrect_paused_transfer(tmp_path: Path
         assert controller.active_job_ids == ()
         time.sleep(0.05)
         assert origin.ledger.response_body_bytes == 0
+
+
+def test_direct_binding_interrupt_reaps_spawned_daemon_and_removes_private_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    runtime_root = tmp_path / "aria2-private-runtime"
+    private_runtime_paths: list[Path] = []
+    spawned_processes: list[Any] = []
+    launch_argvs: list[tuple[str, ...]] = []
+    launch_options: list[dict[str, Any]] = []
+    secret_marker = "fixture-direct-binding-rpc-secret"
+    interrupt = KeyboardInterrupt("fixture-direct-binding-interrupt")
+    original_popen = direct.subprocess.Popen
+
+    def capture_popen(*args: Any, **kwargs: Any) -> Any:
+        process = original_popen(*args, **kwargs)
+        spawned_processes.append(process)
+        launch_argvs.append(tuple(args[0]))
+        launch_options.append(kwargs)
+        private_runtime_paths.append(Path(kwargs["cwd"]))
+        return process
+
+    def raise_interrupt(process: Any) -> None:
+        assert process is spawned_processes[0]
+        raise interrupt
+
+    monkeypatch.setattr(direct.secrets, "token_urlsafe", lambda _bytes: secret_marker)
+    monkeypatch.setattr(direct.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(direct, "_bind_process_group", raise_interrupt)
+
+    try:
+        controller = direct.DirectAria2Controller(
+            executable=_ARIA2C,
+            runtime_root=runtime_root,
+        )
+        with pytest.raises(KeyboardInterrupt) as raised:
+            controller.start()
+
+        assert raised.value is interrupt
+        assert len(spawned_processes) == 1
+        assert len(private_runtime_paths) == 1
+        assert len(launch_argvs) == len(launch_options) == 1
+        process = spawned_processes[0]
+        assert process.poll() is not None
+        _assert_pid_gone(process.pid)
+        _assert_group_gone(process.pid)
+        assert not private_runtime_paths[0].exists()
+        assert secret_marker not in launch_argvs[0]
+        assert launch_options[0]["stdout"] is direct.subprocess.DEVNULL
+        assert launch_options[0]["stderr"] is direct.subprocess.DEVNULL
+        assert secret_marker not in str(raised.value)
+        assert secret_marker not in repr(raised.value)
+    finally:
+        for process in spawned_processes:
+            if process.poll() is None:
+                direct._stop_process_group(process, process.pid)
+        for runtime_path in private_runtime_paths:
+            if runtime_path.exists():
+                direct._remove_private_runtime(runtime_path)

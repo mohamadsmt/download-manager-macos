@@ -178,6 +178,7 @@ class DirectAria2Controller:
             raise DirectEngineError("aria2 is already running")
         runtime_path: Path | None = None
         process: subprocess.Popen[bytes] | None = None
+        process_group_id: int | None = None
         try:
             runtime_path, config_path, secret = self._create_private_config()
             port = _reserve_loopback_port()
@@ -195,7 +196,6 @@ class DirectAria2Controller:
             )
             process_group_id = _bind_process_group(process)
             if process_group_id is None:
-                _stop_unbound_process(process)
                 raise DirectEngineError("aria2 containment failed")
             identity = EngineIdentity(
                 leader_pid=process.pid,
@@ -214,13 +214,22 @@ class DirectAria2Controller:
             return identity
         except (OSError, ValueError):
             if process is not None:
-                _stop_unbound_process(process)
+                if process_group_id is None:
+                    _stop_unbound_process(process)
+                else:
+                    _stop_process_group(process, process_group_id)
             if runtime_path is not None:
                 _remove_private_runtime(runtime_path)
             self._clear_runtime_state()
             raise DirectEngineError("aria2 could not start") from None
         except BaseException:
-            self._stop_owned_process()
+            if process is not None:
+                if process_group_id is None:
+                    _stop_unbound_process(process)
+                else:
+                    _stop_process_group(process, process_group_id)
+            if runtime_path is not None:
+                _remove_private_runtime(runtime_path)
             self._clear_runtime_state()
             raise
 
