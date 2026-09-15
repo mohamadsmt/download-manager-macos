@@ -500,7 +500,8 @@ class DirectAria2Controller:
                 raise DirectEngineError("aria2 RPC failed")
             return parsed["result"]
         except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
-            raise DirectEngineError("aria2 RPC failed") from None
+            pass
+        raise DirectEngineError("aria2 RPC failed")
 
     def _discard_unreadable_gid(self, gid: str) -> None:
         try:
@@ -665,14 +666,24 @@ def _require_safe_partial_output(destination: DestinationIntent) -> None:
         _require_real_directory(current)
     _require_real_directory(destination.root / ".incomplete")
     _require_real_directory(destination.incomplete_dir)
+    _require_safe_regular_or_absent(
+        destination.partial_path, "destination partial output"
+    )
+    _require_safe_regular_or_absent(
+        destination.partial_path.with_name(f"{destination.partial_path.name}.aria2"),
+        "destination aria2 sidecar",
+    )
+
+
+def _require_safe_regular_or_absent(path: Path, name: str) -> None:
     try:
-        details = os.lstat(destination.partial_path)
+        details = os.lstat(path)
     except FileNotFoundError:
         return
     except OSError:
-        raise DirectTransferError("destination partial output is inaccessible") from None
+        raise DirectTransferError(f"{name} is inaccessible") from None
     if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
-        raise DirectTransferError("destination partial output is unsafe")
+        raise DirectTransferError(f"{name} is unsafe")
 
 
 def _require_real_directory(path: Path) -> None:

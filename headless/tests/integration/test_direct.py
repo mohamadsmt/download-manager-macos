@@ -636,6 +636,74 @@ def test_direct_rejects_canonical_partial_symlink_before_aria2_rpc_or_origin_byt
         assert origin.ledger.response_body_bytes == 0
 
 
+@pytest.mark.parametrize("unsafe_shape", ("symlink", "multilink", "directory"))
+def test_direct_rejects_unsafe_aria2_sidecar_before_rpc_or_origin_bytes(
+    tmp_path: Path, monkeypatch, unsafe_shape: str
+) -> None:
+    direct = _direct_module()
+    paths = _paths_module()
+    job_id = f"direct-sidecar-{unsafe_shape}"
+    filename = "sidecar.bin"
+    queue = _admitted_queue(job_id)
+
+    with _origin_type()() as origin, _running_direct_controller(direct, tmp_path) as (
+        controller,
+        _,
+    ):
+        prepared = _destination(job_id, filename)
+        destination = paths.DestinationIntent(
+            root=prepared.root,
+            category=prepared.category,
+            collection=prepared.collection,
+            filename=prepared.filename,
+            job_id=prepared.job_id,
+            final_path=prepared.final_path,
+            incomplete_dir=prepared.incomplete_dir,
+            partial_path=prepared.partial_path,
+        )
+        sidecar = destination.partial_path.with_name(f"{filename}.aria2")
+        assert sidecar == destination.incomplete_dir / f"{filename}.aria2"
+        outside_canary = tmp_path / f"outside-sidecar-{unsafe_shape}.bin"
+        canary_bytes = b"outside direct sidecar canary"
+        outside_canary.write_bytes(canary_bytes)
+        if unsafe_shape == "symlink":
+            sidecar.symlink_to(outside_canary)
+        elif unsafe_shape == "multilink":
+            os.link(outside_canary, sidecar)
+            assert sidecar.stat().st_nlink == 2
+        else:
+            sidecar.mkdir()
+
+        source = _source(origin, "/range")
+        source_bytes = source.raw_url
+        rpc_calls: list[tuple[str, list[Any]]] = []
+        original_rpc = controller._rpc
+
+        def unexpected_rpc(method: str, params: list[Any]) -> Any:
+            rpc_calls.append((method, params))
+            raise AssertionError("unsafe aria2 sidecar reached aria2 RPC")
+
+        monkeypatch.setattr(controller, "_rpc", unexpected_rpc)
+        try:
+            with pytest.raises(direct.DirectTransferError):
+                controller.add_paused(
+                    job_id=job_id,
+                    generation=1,
+                    source=source,
+                    destination=destination,
+                    expected_sha256=hashlib.sha256(origin.payload).hexdigest(),
+                    admission=_admission(queue, job_id),
+                )
+        finally:
+            monkeypatch.setattr(controller, "_rpc", original_rpc)
+
+        assert rpc_calls == []
+        assert outside_canary.read_bytes() == canary_bytes
+        assert source.raw_url == source_bytes
+        assert origin.ledger.request_count == 0
+        assert origin.ledger.response_body_bytes == 0
+
+
 def test_direct_rejects_forged_noncanonical_root_before_rpc_or_origin_bytes(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -945,6 +1013,81 @@ def test_direct_rpc_failure_signals_saved_group_before_reaping_its_leader(
         "reap",
         "absence",
     ]
+
+
+def test_direct_rpc_malformed_response_drops_raw_exception_context(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    marker = "peer-reflected-signed-url-marker"
+
+    class MalformedResponse:
+        status = 200
+
+        def read(self, _amount: int) -> bytes:
+            return f'{{"peer":"{marker}"'.encode("utf-8")
+
+    class MalformedConnection:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def getresponse(self) -> MalformedResponse:
+            return MalformedResponse()
+
+        def close(self) -> None:
+            pass
+
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    monkeypatch.setattr(controller, "_require_running", lambda: (object(), 4321, "secret"))
+    monkeypatch.setattr(direct.http.client, "HTTPConnection", MalformedConnection)
+
+    with pytest.raises(direct.DirectEngineError) as raised:
+        controller._rpc("aria2.tellStatus", [])
+
+    assert type(raised.value) is direct.DirectEngineError
+    assert marker not in str(raised.value)
+    assert marker not in repr(raised.value)
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+
+
+def test_direct_rpc_transport_failure_drops_raw_exception_context(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    marker = "peer-reflected-rpc-secret-marker"
+
+    class FailingConnection:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, *_args: Any, **_kwargs: Any) -> None:
+            raise OSError(marker)
+
+        def close(self) -> None:
+            pass
+
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    monkeypatch.setattr(controller, "_require_running", lambda: (object(), 4321, "secret"))
+    monkeypatch.setattr(direct.http.client, "HTTPConnection", FailingConnection)
+
+    with pytest.raises(direct.DirectEngineError) as raised:
+        controller._rpc("aria2.tellStatus", [])
+
+    assert type(raised.value) is direct.DirectEngineError
+    assert marker not in str(raised.value)
+    assert marker not in repr(raised.value)
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
 
 
 def test_direct_close_keeps_daemon_owned_when_group_cleanup_fails(
