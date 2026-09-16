@@ -445,41 +445,36 @@ def test_fixture_keeps_request_byte_and_connection_evidence_bounded() -> None:
 def test_retry_decisions_classify_real_loopback_fault_statuses_without_downloader_reimplementation() -> None:
     retry = _retry_module()
     policy = retry.RetryPolicy()
-    budget = retry.open_retry_budget(job_id="direct-fault-budget", generation=3)
+    authority = retry.RetryAuthority.open(
+        policy=policy,
+        job_id="direct-fault-budget",
+        generation=3,
+    )
 
     with _origin_type()() as origin:
         status, headers, body = _request(origin, "/too-many-requests")
         assert (status, headers["Retry-After"], body) == (429, "7", b"")
-        throttled = retry.decide_retry(
-            policy,
-            budget,
+        throttled = authority.decide(
             retry.failure_from_http_status(
                 status, retry_after_seconds=int(headers["Retry-After"])
             ),
             generation=3,
-            current_generation=3,
             jitter_seconds=0,
         )
 
         status, headers, body = _request(origin, "/service-unavailable")
         assert (status, body) == (503, b"")
-        transient = retry.decide_retry(
-            policy,
-            throttled.budget,
+        transient = authority.decide(
             retry.failure_from_http_status(status),
             generation=3,
-            current_generation=3,
             jitter_seconds=0,
         )
 
         status, _, body = _request(origin, "/forbidden")
         assert (status, body) == (403, b"")
-        forbidden = retry.decide_retry(
-            policy,
-            transient.budget,
+        forbidden = authority.decide(
             retry.failure_from_http_status(status),
             generation=3,
-            current_generation=3,
         )
 
     assert throttled.action is retry.RetryAction.RETRY_WAIT

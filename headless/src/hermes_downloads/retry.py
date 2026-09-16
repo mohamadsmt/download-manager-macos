@@ -7,16 +7,18 @@ outer attempt budget authoritative.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
 import math
 import re
+from threading import Lock
 from typing import Final, cast
 
 __all__ = [
     "CompletionVerification",
     "FailureKind",
     "RetryAction",
+    "RetryAuthority",
     "RetryAuditEvent",
     "RetryAuditKind",
     "RetryBudget",
@@ -28,15 +30,12 @@ __all__ = [
     "SourceReplacementAction",
     "SourceReplacementDecision",
     "StaleGenerationError",
-    "decide_retry",
     "failure_from_http_status",
-    "open_retry_budget",
-    "pause_retry",
-    "resume_after_exhaustion",
     "validate_source_replacement",
 ]
 
 _MAX_COUNTER: Final = (1 << 63) - 1
+_MAX_ORDINARY_ATTEMPTS: Final = 5
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_STRONG_VALIDATOR_BYTES: Final = 8192
@@ -107,7 +106,7 @@ class SourceIdentityEvidence(str, Enum):
 class RetryPolicy:
     """Fixed upper-bound policy for one direct job's ordinary attempts."""
 
-    max_ordinary_attempts: int = 5
+    max_ordinary_attempts: int = _MAX_ORDINARY_ATTEMPTS
     base_delay_seconds: int = 5
     max_delay_seconds: int = 5 * 60
     max_jitter_fraction: float = 0.1
@@ -117,7 +116,7 @@ class RetryPolicy:
             self.max_ordinary_attempts,
             "max_ordinary_attempts",
             minimum=1,
-            maximum=5,
+            maximum=_MAX_ORDINARY_ATTEMPTS,
         )
         _require_int_in_range(
             self.base_delay_seconds,
@@ -197,7 +196,7 @@ class RetryAuditEvent:
             self.ordinary_attempts,
             "ordinary_attempts",
             minimum=0,
-            maximum=5,
+            maximum=_MAX_ORDINARY_ATTEMPTS,
         )
 
 
@@ -223,7 +222,7 @@ class RetryBudget:
             self.ordinary_attempts,
             "ordinary_attempts",
             minimum=0,
-            maximum=5,
+            maximum=_MAX_ORDINARY_ATTEMPTS,
         )
         if type(self.paused) is not bool or type(self.exhausted) is not bool:
             raise TypeError("paused and exhausted must be booleans")
@@ -231,6 +230,7 @@ class RetryBudget:
             raise ValueError("audit must contain the budget opening")
         if any(type(event) is not RetryAuditEvent for event in self.audit):
             raise TypeError("audit must contain RetryAuditEvent values")
+        _validate_retry_audit(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +249,79 @@ class RetryDecision:
         if self.delay_seconds is None:
             return
         _require_jitter(self.delay_seconds, maximum=float("inf"))
+
+
+class RetryAuthority:
+    """Own one job's current immutable retry budget and generation."""
+
+    __slots__ = ("_budget", "_lock", "_policy")
+
+    def __init__(self, *, policy: RetryPolicy, budget: RetryBudget) -> None:
+        if type(policy) is not RetryPolicy:
+            raise TypeError("policy must be a RetryPolicy")
+        if type(budget) is not RetryBudget:
+            raise TypeError("budget must be a RetryBudget")
+        self._policy = policy
+        self._budget = budget
+        self._lock = Lock()
+
+    @classmethod
+    def open(
+        cls, *, policy: RetryPolicy, job_id: str, generation: int
+    ) -> RetryAuthority:
+        """Open and own the initial retry budget for one job."""
+
+        return cls(
+            policy=policy,
+            budget=_open_retry_budget(job_id=job_id, generation=generation),
+        )
+
+    @property
+    def budget(self) -> RetryBudget:
+        """Return the immutable current snapshot owned by this authority."""
+
+        with self._lock:
+            return self._budget
+
+    def decide(
+        self,
+        failure: RetryFailure,
+        *,
+        generation: int,
+        jitter_seconds: float = 0,
+    ) -> RetryDecision:
+        """Record a callback only when its captured generation is still current."""
+
+        if type(failure) is not RetryFailure:
+            raise TypeError("failure must be a RetryFailure")
+        with self._lock:
+            _require_current_generation(self._budget, generation)
+            decision = _decide_retry(
+                self._policy,
+                self._budget,
+                failure,
+                jitter_seconds=jitter_seconds,
+            )
+            self._budget = decision.budget
+            return decision
+
+    def pause(self, *, generation: int) -> RetryDecision:
+        """Close the current budget before a pending timer may start an engine."""
+
+        with self._lock:
+            _require_current_generation(self._budget, generation)
+            decision = _pause_retry(self._budget)
+            self._budget = decision.budget
+            return decision
+
+    def resume_after_exhaustion(self, *, new_generation: int) -> RetryBudget:
+        """Open a distinct audited budget after an explicit exhausted resume."""
+
+        with self._lock:
+            self._budget = _resume_after_exhaustion(
+                self._budget, new_generation=new_generation
+            )
+            return self._budget
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,7 +364,7 @@ class SourceReplacementDecision:
             raise ValueError("source replacement must preserve the existing partial")
 
 
-def open_retry_budget(*, job_id: str, generation: int) -> RetryBudget:
+def _open_retry_budget(*, job_id: str, generation: int) -> RetryBudget:
     """Open the initial recorded budget for a job generation."""
 
     _require_identifier(job_id, "job_id")
@@ -336,16 +409,14 @@ def failure_from_http_status(
     return RetryFailure(FailureKind.PERMANENT_HOST)
 
 
-def decide_retry(
+def _decide_retry(
     policy: RetryPolicy,
     budget: RetryBudget,
     failure: RetryFailure,
     *,
-    generation: int,
-    current_generation: int,
     jitter_seconds: float = 0,
 ) -> RetryDecision:
-    """Record one current-generation failure and select no more than one retry."""
+    """Record one authority-validated failure and select no more than one retry."""
 
     if type(policy) is not RetryPolicy:
         raise TypeError("policy must be a RetryPolicy")
@@ -353,10 +424,6 @@ def decide_retry(
         raise TypeError("budget must be a RetryBudget")
     if type(failure) is not RetryFailure:
         raise TypeError("failure must be a RetryFailure")
-    _require_generation(current_generation)
-    if generation != current_generation:
-        raise StaleGenerationError("retry callback generation is stale")
-    _require_current_generation(budget, generation)
 
     if budget.paused:
         return RetryDecision(RetryAction.PAUSED, budget, None)
@@ -375,13 +442,24 @@ def decide_retry(
 
     next_attempt = budget.ordinary_attempts + 1
     if next_attempt >= policy.max_ordinary_attempts:
-        exhausted = _record_budget_event(
-            replace(budget, ordinary_attempts=next_attempt, exhausted=True),
-            RetryAuditKind.EXHAUSTED,
+        exhausted = _transition_budget(
+            budget,
+            kind=RetryAuditKind.EXHAUSTED,
+            generation=budget.generation,
+            budget_number=budget.budget_number,
+            ordinary_attempts=next_attempt,
+            paused=False,
+            exhausted=True,
         )
         return RetryDecision(RetryAction.EXHAUSTED, exhausted, None)
-    retrying = _record_budget_event(
-        replace(budget, ordinary_attempts=next_attempt), RetryAuditKind.RETRY_SCHEDULED
+    retrying = _transition_budget(
+        budget,
+        kind=RetryAuditKind.RETRY_SCHEDULED,
+        generation=budget.generation,
+        budget_number=budget.budget_number,
+        ordinary_attempts=next_attempt,
+        paused=False,
+        exhausted=False,
     )
     return RetryDecision(
         RetryAction.RETRY_WAIT,
@@ -394,24 +472,28 @@ def decide_retry(
     )
 
 
-def pause_retry(budget: RetryBudget, *, generation: int) -> RetryDecision:
+def _pause_retry(budget: RetryBudget) -> RetryDecision:
     """Close a pending retry synchronously before a timer may start an engine."""
 
     if type(budget) is not RetryBudget:
         raise TypeError("budget must be a RetryBudget")
-    _require_current_generation(budget, generation)
     if budget.exhausted:
         return RetryDecision(RetryAction.EXHAUSTED, budget, None)
     if budget.paused:
         return RetryDecision(RetryAction.PAUSED, budget, None)
-    paused = _record_budget_event(
-        replace(budget, generation=budget.generation + 1, paused=True),
-        RetryAuditKind.PAUSED,
+    paused = _transition_budget(
+        budget,
+        kind=RetryAuditKind.PAUSED,
+        generation=budget.generation + 1,
+        budget_number=budget.budget_number,
+        ordinary_attempts=budget.ordinary_attempts,
+        paused=True,
+        exhausted=False,
     )
     return RetryDecision(RetryAction.PAUSED, paused, None)
 
 
-def resume_after_exhaustion(
+def _resume_after_exhaustion(
     budget: RetryBudget, *, new_generation: int
 ) -> RetryBudget:
     """Open a distinct audited budget only after an explicit exhausted resume."""
@@ -425,16 +507,15 @@ def resume_after_exhaustion(
         raise ValueError("new_generation must advance the exhausted generation")
     if budget.budget_number >= _MAX_COUNTER:
         raise OverflowError("no retry budget numbers remain")
-    resumed = RetryBudget(
-        job_id=budget.job_id,
+    return _transition_budget(
+        budget,
+        kind=RetryAuditKind.EXPLICIT_RESUME,
         generation=new_generation,
         budget_number=budget.budget_number + 1,
         ordinary_attempts=0,
         paused=False,
         exhausted=False,
-        audit=budget.audit,
     )
-    return _record_budget_event(resumed, RetryAuditKind.EXPLICIT_RESUME)
 
 
 def validate_source_replacement(
@@ -480,14 +561,108 @@ def validate_source_replacement(
     )
 
 
-def _record_budget_event(budget: RetryBudget, kind: RetryAuditKind) -> RetryBudget:
+def _transition_budget(
+    budget: RetryBudget,
+    *,
+    kind: RetryAuditKind,
+    generation: int,
+    budget_number: int,
+    ordinary_attempts: int,
+    paused: bool,
+    exhausted: bool,
+) -> RetryBudget:
     event = RetryAuditEvent(
         kind=kind,
-        generation=budget.generation,
-        budget_number=budget.budget_number,
-        ordinary_attempts=budget.ordinary_attempts,
+        generation=generation,
+        budget_number=budget_number,
+        ordinary_attempts=ordinary_attempts,
     )
-    return replace(budget, audit=(*budget.audit, event))
+    return RetryBudget(
+        job_id=budget.job_id,
+        generation=generation,
+        budget_number=budget_number,
+        ordinary_attempts=ordinary_attempts,
+        paused=paused,
+        exhausted=exhausted,
+        audit=(*budget.audit, event),
+    )
+
+
+def _validate_retry_audit(budget: RetryBudget) -> None:
+    opening = budget.audit[0]
+    if (
+        opening.kind is not RetryAuditKind.OPENED
+        or opening.budget_number != 1
+        or opening.ordinary_attempts != 0
+    ):
+        raise ValueError("audit must begin with an unopened first budget")
+
+    generation = opening.generation
+    budget_number = opening.budget_number
+    ordinary_attempts = opening.ordinary_attempts
+    paused = False
+    exhausted = False
+    for event in budget.audit[1:]:
+        if event.kind is RetryAuditKind.RETRY_SCHEDULED:
+            if (
+                paused
+                or exhausted
+                or event.generation != generation
+                or event.budget_number != budget_number
+                or event.ordinary_attempts != ordinary_attempts + 1
+                or event.ordinary_attempts >= _MAX_ORDINARY_ATTEMPTS
+            ):
+                raise ValueError("audit contains an invalid scheduled retry")
+            ordinary_attempts = event.ordinary_attempts
+            continue
+        if event.kind is RetryAuditKind.EXHAUSTED:
+            if (
+                paused
+                or exhausted
+                or event.generation != generation
+                or event.budget_number != budget_number
+                or event.ordinary_attempts != ordinary_attempts + 1
+            ):
+                raise ValueError("audit contains an invalid exhaustion")
+            ordinary_attempts = event.ordinary_attempts
+            exhausted = True
+            continue
+        if event.kind is RetryAuditKind.PAUSED:
+            if (
+                paused
+                or exhausted
+                or event.generation != generation + 1
+                or event.budget_number != budget_number
+                or event.ordinary_attempts != ordinary_attempts
+            ):
+                raise ValueError("audit contains an invalid pause")
+            generation = event.generation
+            paused = True
+            continue
+        if event.kind is RetryAuditKind.EXPLICIT_RESUME:
+            if (
+                paused
+                or not exhausted
+                or event.generation <= generation
+                or event.budget_number != budget_number + 1
+                or event.ordinary_attempts != 0
+            ):
+                raise ValueError("audit contains an invalid explicit resume")
+            generation = event.generation
+            budget_number = event.budget_number
+            ordinary_attempts = 0
+            exhausted = False
+            continue
+        raise ValueError("audit contains an unexpected opening")
+
+    if (
+        budget.generation != generation
+        or budget.budget_number != budget_number
+        or budget.ordinary_attempts != ordinary_attempts
+        or budget.paused is not paused
+        or budget.exhausted is not exhausted
+    ):
+        raise ValueError("audit does not match retry budget state")
 
 
 def _require_current_generation(budget: RetryBudget, generation: int) -> None:
