@@ -14,8 +14,12 @@ def _retry():
     return importlib.import_module("hermes_downloads.retry")
 
 
-def _budget(retry, *, generation: int = 7):
-    return retry.open_retry_budget(job_id="retry-job", generation=generation)
+def _authority(retry, *, generation: int = 7, policy=None):
+    return retry.RetryAuthority.open(
+        policy=retry.RetryPolicy() if policy is None else policy,
+        job_id="retry-job",
+        generation=generation,
+    )
 
 
 def _failure(retry, kind, **overrides):
@@ -25,16 +29,14 @@ def _failure(retry, kind, **overrides):
 def test_transient_host_failures_consume_at_most_five_outer_attempts() -> None:
     retry = _retry()
     policy = retry.RetryPolicy()
-    budget = _budget(retry)
+    authority = _authority(retry, policy=policy)
+    budget = authority.budget
     decisions = []
 
     for expected_attempt in range(1, policy.max_ordinary_attempts + 1):
-        decision = retry.decide_retry(
-            policy,
-            budget,
+        decision = authority.decide(
             _failure(retry, retry.FailureKind.TRANSIENT_HOST),
             generation=7,
-            current_generation=7,
             jitter_seconds=0,
         )
         decisions.append(decision)
@@ -58,12 +60,9 @@ def test_transient_host_failures_consume_at_most_five_outer_attempts() -> None:
         retry.RetryAuditKind.EXHAUSTED,
     ]
 
-    sixth = retry.decide_retry(
-        policy,
-        budget,
+    sixth = authority.decide(
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=7,
-        current_generation=7,
         jitter_seconds=0,
     )
     assert sixth.action is retry.RetryAction.EXHAUSTED
@@ -86,21 +85,15 @@ def test_backoff_uses_bounded_jitter_retry_after_and_five_minute_cap() -> None:
 def test_offline_wait_is_distinct_from_a_host_failure_and_does_not_spend_budget() -> None:
     retry = _retry()
     policy = retry.RetryPolicy()
-    budget = _budget(retry)
+    authority = _authority(retry, policy=policy)
 
-    offline = retry.decide_retry(
-        policy,
-        budget,
+    offline = authority.decide(
         _failure(retry, retry.FailureKind.OFFLINE),
         generation=7,
-        current_generation=7,
     )
-    host = retry.decide_retry(
-        policy,
-        budget,
+    host = authority.decide(
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=7,
-        current_generation=7,
         jitter_seconds=0,
     )
 
@@ -122,12 +115,9 @@ def test_auth_and_link_needed_stop_ordinary_retries(
     kind: str, action: str
 ) -> None:
     retry = _retry()
-    decision = retry.decide_retry(
-        retry.RetryPolicy(),
-        _budget(retry),
+    decision = _authority(retry).decide(
         _failure(retry, getattr(retry.FailureKind, kind)),
         generation=7,
-        current_generation=7,
     )
 
     assert decision.action is getattr(retry.RetryAction, action)
@@ -139,9 +129,7 @@ def test_forbidden_http_response_stays_ambiguous_and_does_not_assume_expiry() ->
     retry = _retry()
     forbidden = retry.failure_from_http_status(403)
 
-    decision = retry.decide_retry(
-        retry.RetryPolicy(), _budget(retry), forbidden, generation=7, current_generation=7
-    )
+    decision = _authority(retry).decide(forbidden, generation=7)
 
     assert forbidden.kind is retry.FailureKind.FORBIDDEN
     assert decision.action is retry.RetryAction.NEEDS_DECISION
@@ -151,12 +139,9 @@ def test_forbidden_http_response_stays_ambiguous_and_does_not_assume_expiry() ->
 def test_disk_full_is_blocked_without_a_network_retry() -> None:
     retry = _retry()
 
-    decision = retry.decide_retry(
-        retry.RetryPolicy(),
-        _budget(retry),
+    decision = _authority(retry).decide(
         _failure(retry, retry.FailureKind.DISK_FULL),
         generation=7,
-        current_generation=7,
     )
 
     assert decision.action is retry.RetryAction.BLOCKED
@@ -167,22 +152,17 @@ def test_disk_full_is_blocked_without_a_network_retry() -> None:
 def test_pause_closes_a_pending_retry_before_its_timer_can_retry() -> None:
     retry = _retry()
     policy = retry.RetryPolicy()
-    pending = retry.decide_retry(
-        policy,
-        _budget(retry),
+    authority = _authority(retry, policy=policy)
+    pending = authority.decide(
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=7,
-        current_generation=7,
         jitter_seconds=0,
     )
 
-    paused = retry.pause_retry(pending.budget, generation=7)
-    timer = retry.decide_retry(
-        policy,
-        paused.budget,
+    paused = authority.pause(generation=7)
+    timer = authority.decide(
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=paused.budget.generation,
-        current_generation=paused.budget.generation,
         jitter_seconds=0,
     )
 
@@ -196,23 +176,18 @@ def test_pause_closes_a_pending_retry_before_its_timer_can_retry() -> None:
 def test_pause_invalidates_a_pending_timer_holding_the_prior_budget() -> None:
     retry = _retry()
     policy = retry.RetryPolicy()
-    pending = retry.decide_retry(
-        policy,
-        _budget(retry),
+    authority = _authority(retry, policy=policy)
+    pending = authority.decide(
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=7,
-        current_generation=7,
         jitter_seconds=0,
     )
-    paused = retry.pause_retry(pending.budget, generation=7)
+    paused = authority.pause(generation=7)
 
     with pytest.raises(retry.StaleGenerationError):
-        retry.decide_retry(
-            policy,
-            pending.budget,
+        authority.decide(
             _failure(retry, retry.FailureKind.TRANSIENT_HOST),
             generation=7,
-            current_generation=paused.budget.generation,
             jitter_seconds=0,
         )
 
@@ -226,12 +201,9 @@ def test_stale_generation_cannot_change_a_retry_budget() -> None:
     retry = _retry()
 
     with pytest.raises(retry.StaleGenerationError):
-        retry.decide_retry(
-            retry.RetryPolicy(),
-            _budget(retry, generation=7),
+        _authority(retry, generation=7).decide(
             _failure(retry, retry.FailureKind.TRANSIENT_HOST),
             generation=6,
-            current_generation=7,
             jitter_seconds=0,
         )
 
@@ -239,18 +211,16 @@ def test_stale_generation_cannot_change_a_retry_budget() -> None:
 def test_explicit_resume_after_exhaustion_opens_a_new_audited_budget() -> None:
     retry = _retry()
     policy = retry.RetryPolicy()
-    exhausted = _budget(retry, generation=7)
+    authority = _authority(retry, generation=7, policy=policy)
+    exhausted = authority.budget
     for _ in range(policy.max_ordinary_attempts):
-        exhausted = retry.decide_retry(
-            policy,
-            exhausted,
+        exhausted = authority.decide(
             _failure(retry, retry.FailureKind.TRANSIENT_HOST),
             generation=7,
-            current_generation=7,
             jitter_seconds=0,
         ).budget
 
-    resumed = retry.resume_after_exhaustion(exhausted, new_generation=8)
+    resumed = authority.resume_after_exhaustion(new_generation=8)
 
     assert exhausted.exhausted is True
     assert resumed is not exhausted
@@ -261,7 +231,7 @@ def test_explicit_resume_after_exhaustion_opens_a_new_audited_budget() -> None:
     assert resumed.audit[-1].kind is retry.RetryAuditKind.EXPLICIT_RESUME
     assert resumed.audit[-1].generation == 8
     with pytest.raises(ValueError):
-        retry.resume_after_exhaustion(exhausted, new_generation=7)
+        authority.resume_after_exhaustion(new_generation=7)
 
 
 def test_matching_strong_validator_permits_resuming_the_preserved_partial() -> None:
@@ -393,4 +363,188 @@ def test_weak_or_stale_identity_cannot_authorize_source_replacement() -> None:
             unknown,
             current_generation=9,
             callback_generation=8,
+        )
+
+
+def test_retry_authority_rejects_a_callback_forging_the_old_generation_after_pause() -> None:
+    retry = _retry()
+    authority = _authority(retry)
+    pending = authority.decide(
+        _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+        generation=7,
+        jitter_seconds=0,
+    )
+    paused = authority.pause(generation=7)
+
+    with pytest.raises(retry.StaleGenerationError):
+        authority.decide(
+            _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+            generation=7,
+            jitter_seconds=0,
+        )
+    with pytest.raises(TypeError):
+        authority.decide(
+            _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+            generation=7,
+            current_generation=7,
+        )
+
+    assert pending.action is retry.RetryAction.RETRY_WAIT
+    assert paused.action is retry.RetryAction.PAUSED
+    assert authority.budget == paused.budget
+
+
+def test_retry_module_exposes_no_free_retry_state_transition_bypass() -> None:
+    retry = _retry()
+
+    for name in (
+        "open_retry_budget",
+        "decide_retry",
+        "pause_retry",
+        "resume_after_exhaustion",
+    ):
+        assert name not in retry.__all__
+        assert not hasattr(retry, name)
+
+
+def test_retry_budget_rejects_hydrated_exhaustion_audit_with_false_terminal_flag() -> None:
+    retry = _retry()
+    audit = (
+        retry.RetryAuditEvent(
+            retry.RetryAuditKind.OPENED,
+            generation=7,
+            budget_number=1,
+            ordinary_attempts=0,
+        ),
+        retry.RetryAuditEvent(
+            retry.RetryAuditKind.EXHAUSTED,
+            generation=7,
+            budget_number=1,
+            ordinary_attempts=1,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="audit"):
+        retry.RetryBudget(
+            job_id="retry-job",
+            generation=7,
+            budget_number=1,
+            ordinary_attempts=1,
+            paused=False,
+            exhausted=False,
+            audit=audit,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "audit_spec",
+        "generation",
+        "budget_number",
+        "ordinary_attempts",
+        "paused",
+        "exhausted",
+    ),
+    (
+        (
+            (("RETRY_SCHEDULED", 7, 1, 1),),
+            7,
+            1,
+            1,
+            False,
+            False,
+        ),
+        (
+            (("OPENED", 7, 1, 0), ("OPENED", 7, 1, 0)),
+            7,
+            1,
+            0,
+            False,
+            False,
+        ),
+        (
+            (("OPENED", 7, 1, 0), ("RETRY_SCHEDULED", 7, 1, 2)),
+            7,
+            1,
+            2,
+            False,
+            False,
+        ),
+        (
+            (("OPENED", 7, 1, 0), ("EXHAUSTED", 7, 1, 0)),
+            7,
+            1,
+            0,
+            False,
+            True,
+        ),
+        (
+            (("OPENED", 7, 1, 0), ("PAUSED", 7, 1, 0)),
+            7,
+            1,
+            0,
+            True,
+            False,
+        ),
+        (
+            (("OPENED", 7, 1, 0), ("EXPLICIT_RESUME", 8, 2, 0)),
+            8,
+            2,
+            0,
+            False,
+            False,
+        ),
+        (
+            (
+                ("OPENED", 7, 1, 0),
+                ("EXHAUSTED", 7, 1, 1),
+                ("EXPLICIT_RESUME", 8, 1, 0),
+            ),
+            8,
+            1,
+            0,
+            False,
+            False,
+        ),
+        ((("OPENED", 7, 1, 0),), 8, 1, 0, False, False),
+    ),
+    ids=(
+        "missing-opening",
+        "duplicate-opening",
+        "retry-skips-attempt",
+        "exhaustion-does-not-advance-attempt",
+        "pause-does-not-advance-generation",
+        "resume-without-exhaustion",
+        "resume-does-not-advance-budget-number",
+        "snapshot-does-not-match-terminal-event",
+    ),
+)
+def test_retry_budget_rejects_nonrepresentable_hydrated_audit_history(
+    audit_spec,
+    generation: int,
+    budget_number: int,
+    ordinary_attempts: int,
+    paused: bool,
+    exhausted: bool,
+) -> None:
+    retry = _retry()
+    audit = tuple(
+        retry.RetryAuditEvent(
+            getattr(retry.RetryAuditKind, kind),
+            generation=event_generation,
+            budget_number=event_budget_number,
+            ordinary_attempts=event_attempts,
+        )
+        for kind, event_generation, event_budget_number, event_attempts in audit_spec
+    )
+
+    with pytest.raises(ValueError, match="audit"):
+        retry.RetryBudget(
+            job_id="retry-job",
+            generation=generation,
+            budget_number=budget_number,
+            ordinary_attempts=ordinary_attempts,
+            paused=paused,
+            exhausted=exhausted,
+            audit=audit,
         )
