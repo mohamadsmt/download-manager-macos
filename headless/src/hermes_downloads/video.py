@@ -647,7 +647,7 @@ def _run_ytdlp_metadata(
         playlist_option = "--playlist-items=" + ",".join(
             str(position) for position in selection.positions
         )
-    return run_contained(
+    result = run_contained(
         (
             python_executable,
             "-m",
@@ -660,6 +660,8 @@ def _run_ytdlp_metadata(
         timeout=30.0,
         output_limit=MAX_METADATA_BYTES,
     )
+    print(f"DEBUG_CONTAINED_RESULT={result!r}")
+    return result
 
 
 def _metadata_options(request: VideoRequest) -> dict[str, object]:
@@ -773,7 +775,9 @@ def _metadata_helper_envelope(argv: tuple[object, ...]) -> dict[str, object]:
             metadata = downloader.extract_info(url, download=False)
     except UnsupportedError:
         return {"outcome": "failure", "status": "unsupported"}
-    except DownloadError:
+    except DownloadError as error:
+        if _download_error_status(error) is VideoStatus.UNSUPPORTED:
+            return {"outcome": "failure", "status": "unsupported"}
         return {"outcome": "failure", "status": "transient"}
     except Exception:
         return {"outcome": "failure", "status": "transient"}

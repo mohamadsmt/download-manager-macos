@@ -6,8 +6,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
+import textwrap
 
 import pytest
 from yt_dlp.utils import DownloadError, UnsupportedError
@@ -354,6 +356,78 @@ def test_metadata_adapter_classifies_trusted_ytdlp_unsupported_error_without_dia
     assert result.status is video.VideoStatus.UNSUPPORTED
     assert result.selection is None
     assert "error-private" not in repr(result)
+
+
+def test_default_metadata_client_maps_contained_wrapped_unsupported_error_without_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = _video()
+    child = tmp_path / "wrapped_unsupported_child.py"
+    child.write_text(
+        textwrap.dedent(
+            """\
+            import sys
+
+            import hermes_downloads.video as video
+
+
+            class WrappedUnsupportedYoutubeDL:
+                def __init__(self, *_args: object, **_kwargs: object) -> None:
+                    pass
+
+                def __enter__(self) -> object:
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    return None
+
+                def extract_info(self, *_args: object, **_kwargs: object) -> object:
+                    try:
+                        raise video.UnsupportedError(
+                            "https://video.example.test/unsupported?token=child-source-private"
+                        )
+                    except video.UnsupportedError as error:
+                        raise video.DownloadError(
+                            "child-error-private",
+                            (video.UnsupportedError, error, error.__traceback__),
+                        )
+
+
+            if tuple(sys.argv[1:3]) != ("-m", "hermes_downloads.video"):
+                raise SystemExit(1)
+            video.YoutubeDL = WrappedUnsupportedYoutubeDL
+            sys.argv = ["hermes_downloads.video", *sys.argv[3:]]
+            raise SystemExit(video.main())
+            """
+        ),
+        encoding="utf-8",
+    )
+    runner = tmp_path / "run-wrapped-unsupported-child"
+    runner.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(child))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o700)
+
+    monkeypatch.delenv("HERMES_DOWNLOADS_DISABLE_NETWORK", raising=False)
+    result = video.YtDlpMetadataClient(python_executable=str(runner)).resolve(
+        video.VideoRequest(
+            source=_source(
+                "https://video.example.test/watch?v=one&signature=source-private"
+            )
+        ),
+        job_id="job-contained-wrapped-unsupported",
+    )
+
+    assert result.status is video.VideoStatus.UNSUPPORTED
+    assert result.selection is None
+    for marker in (
+        "child-error-private",
+        "child-source-private",
+        "source-private",
+    ):
+        assert marker not in repr(result)
 
 
 @pytest.mark.parametrize(
