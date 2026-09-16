@@ -400,7 +400,10 @@ def pause_retry(budget: RetryBudget, *, generation: int) -> RetryDecision:
         return RetryDecision(RetryAction.EXHAUSTED, budget, None)
     if budget.paused:
         return RetryDecision(RetryAction.PAUSED, budget, None)
-    paused = _record_budget_event(replace(budget, paused=True), RetryAuditKind.PAUSED)
+    paused = _record_budget_event(
+        replace(budget, generation=budget.generation + 1, paused=True),
+        RetryAuditKind.PAUSED,
+    )
     return RetryDecision(RetryAction.PAUSED, paused, None)
 
 
