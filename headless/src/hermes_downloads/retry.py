@@ -15,6 +15,8 @@ import re
 from threading import Lock
 from typing import Final, cast
 
+from hermes_downloads.network import SourceURL
+
 __all__ = [
     "CompletionVerification",
     "FailureKind",
@@ -381,14 +383,17 @@ class RetryAuthority:
 
 @dataclass(frozen=True, slots=True)
 class SourceIdentity:
-    """Identity evidence for a direct source; name and length are not proof."""
+    """Identity evidence for a validated direct source; name and length are not proof."""
 
+    source: SourceURL
     strong_validator: str | None
     trusted_sha256: str | None
     filename: str | None = None
     total_length: int | None = None
 
     def __post_init__(self) -> None:
+        if type(self.source) is not SourceURL:
+            raise TypeError("source must be a validated SourceURL")
         _require_optional_strong_validator(self.strong_validator)
         _require_optional_sha256(self.trusted_sha256, "trusted_sha256")
         if self.filename is not None and type(self.filename) is not str:
@@ -544,6 +549,7 @@ def validate_source_replacement(
     if (
         previous.strong_validator is not None
         and previous.strong_validator == replacement.strong_validator
+        and previous.source.raw_url == replacement.source.raw_url
     ):
         return SourceReplacementDecision(
             SourceReplacementAction.RESUME, SourceIdentityEvidence.STRONG_VALIDATOR

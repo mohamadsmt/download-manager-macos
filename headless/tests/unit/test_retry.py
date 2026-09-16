@@ -19,6 +19,13 @@ def _retry():
     return importlib.import_module("hermes_downloads.retry")
 
 
+def _source(resource: str, *, query: str = ""):
+    suffix = f"?{query}" if query else ""
+    return importlib.import_module("hermes_downloads.network").validate_source_url(
+        f"https://downloads.example.test/{resource}{suffix}"
+    )
+
+
 def _authority(retry, *, generation: int = 7, policy=None):
     return retry.RetryAuthority.open(
         policy=retry.RetryPolicy() if policy is None else policy,
@@ -477,15 +484,29 @@ def test_explicit_resume_after_exhaustion_opens_a_new_audited_budget() -> None:
         authority.resume_after_exhaustion(new_generation=7)
 
 
-def test_matching_strong_validator_permits_resuming_the_preserved_partial() -> None:
+def test_source_identity_requires_a_validated_direct_source() -> None:
     retry = _retry()
+
+    with pytest.raises(TypeError, match="validated SourceURL"):
+        retry.SourceIdentity(
+            source=object(),
+            strong_validator='"revision-1"',
+            trusted_sha256=None,
+        )
+
+
+def test_matching_strong_validator_permits_resuming_the_same_direct_resource() -> None:
+    retry = _retry()
+    source = _source("same-resource.bin")
     previous = retry.SourceIdentity(
+        source=source,
         strong_validator='"revision-1"',
         trusted_sha256=None,
         filename="same-name.bin",
         total_length=1024,
     )
     replacement = retry.SourceIdentity(
+        source=source,
         strong_validator='"revision-1"',
         trusted_sha256=None,
         filename="renamed.bin",
@@ -504,15 +525,58 @@ def test_matching_strong_validator_permits_resuming_the_preserved_partial() -> N
     assert decision.preserve_partial is True
 
 
+def test_matching_strong_validator_for_different_resources_needs_decision() -> None:
+    retry = _retry()
+    previous = retry.SourceIdentity(
+        source=_source("first-resource.bin"),
+        strong_validator='"revision-1"',
+        trusted_sha256=None,
+        filename="same-name.bin",
+        total_length=1024,
+    )
+    replacement = retry.SourceIdentity(
+        source=_source("second-resource.bin"),
+        strong_validator='"revision-1"',
+        trusted_sha256=None,
+        filename="same-name.bin",
+        total_length=1024,
+    )
+
+    decision = retry.validate_source_replacement(
+        previous,
+        replacement,
+        current_generation=9,
+        callback_generation=9,
+    )
+
+    assert decision.action is retry.SourceReplacementAction.NEEDS_DECISION
+    assert decision.evidence is retry.SourceIdentityEvidence.UNKNOWN
+    assert decision.preserve_partial is True
+
+
+def test_source_identity_repr_does_not_leak_signed_resource_query() -> None:
+    retry = _retry()
+    marker = "fixture-signed-resource-marker"
+    identity = retry.SourceIdentity(
+        source=_source("payload.bin", query=f"signature={marker}"),
+        strong_validator='"revision-1"',
+        trusted_sha256=None,
+    )
+
+    assert marker not in repr(identity)
+
+
 def test_matching_trusted_digest_permits_resume_when_validators_differ() -> None:
     retry = _retry()
     previous = retry.SourceIdentity(
+        source=_source("old-resource.bin"),
         strong_validator='"old-validator"',
         trusted_sha256="a" * 64,
         filename="old.bin",
         total_length=1024,
     )
     replacement = retry.SourceIdentity(
+        source=_source("new-resource.bin"),
         strong_validator='"new-validator"',
         trusted_sha256="a" * 64,
         filename="new.bin",
@@ -534,12 +598,14 @@ def test_matching_trusted_digest_permits_resume_when_validators_differ() -> None
 def test_same_name_and_size_without_identity_proof_preserves_partial_for_decision() -> None:
     retry = _retry()
     previous = retry.SourceIdentity(
+        source=_source("first-resource.bin"),
         strong_validator=None,
         trusted_sha256=None,
         filename="same-name.bin",
         total_length=1024,
     )
     replacement = retry.SourceIdentity(
+        source=_source("second-resource.bin"),
         strong_validator=None,
         trusted_sha256=None,
         filename="same-name.bin",
@@ -560,13 +626,16 @@ def test_same_name_and_size_without_identity_proof_preserves_partial_for_decisio
 
 def test_conflicting_trusted_digests_override_matching_validator() -> None:
     retry = _retry()
+    source = _source("same-resource.bin")
     previous = retry.SourceIdentity(
+        source=source,
         strong_validator='"same-validator"',
         trusted_sha256="a" * 64,
         filename="same-name.bin",
         total_length=1024,
     )
     replacement = retry.SourceIdentity(
+        source=source,
         strong_validator='"same-validator"',
         trusted_sha256="b" * 64,
         filename="same-name.bin",
@@ -588,6 +657,7 @@ def test_weak_or_stale_identity_cannot_authorize_source_replacement() -> None:
     retry = _retry()
     with pytest.raises(ValueError):
         retry.SourceIdentity(
+            source=_source("payload.bin"),
             strong_validator='W/"weak"',
             trusted_sha256=None,
             filename="payload.bin",
@@ -595,6 +665,7 @@ def test_weak_or_stale_identity_cannot_authorize_source_replacement() -> None:
         )
 
     unknown = retry.SourceIdentity(
+        source=_source("payload.bin"),
         strong_validator=None,
         trusted_sha256=None,
         filename="payload.bin",
