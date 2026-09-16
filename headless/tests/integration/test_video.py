@@ -4,6 +4,10 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 from yt_dlp.utils import DownloadError, UnsupportedError
@@ -278,55 +282,55 @@ def test_metadata_adapter_returns_requested_order_from_reversed_playlist_metadat
     assert "--playlist-items=2,4" in runner.commands[0]
 
 
-@pytest.mark.parametrize(
-    ("metadata_overrides", "status"),
-    (
-        ({"_has_drm": True}, "DRM"),
-        ({"availability": "needs_auth"}, "AUTH_NEEDED"),
-        ({"availability": "premium_only"}, "AUTH_NEEDED"),
-        ({"availability": "subscriber_only"}, "AUTH_NEEDED"),
-        ({"availability": "private"}, "AUTH_NEEDED"),
-    ),
-)
-def test_default_metadata_adapter_classifies_ytdlp_structured_metadata_fields(
+def test_default_metadata_client_uses_bounded_contained_child_api_envelope(
     monkeypatch: pytest.MonkeyPatch,
-    metadata_overrides: dict[str, object],
-    status: str,
 ) -> None:
     video = _video()
-    expected = video.VideoStatus[status]
-    sessions: list[dict[str, object]] = []
-    extractions: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    source = _source("https://video.example.test/watch?v=one&signature=source-private")
+    calls: list[tuple[tuple[str, ...], Path, float, int]] = []
 
-    class OfficialMetadataSession:
-        def __init__(self, params: dict[str, object]) -> None:
-            sessions.append(params)
+    def contained(
+        command: tuple[str, ...], *, cwd: Path, timeout: float, output_limit: int
+    ) -> object:
+        calls.append((command, cwd, timeout, output_limit))
+        return _engine_result(
+            json.dumps(
+                {
+                    "outcome": "metadata",
+                    "metadata": json.loads(_metadata_json()),
+                }
+            )
+        )
 
-        def __enter__(self) -> OfficialMetadataSession:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-        def extract_info(self, *args: object, **kwargs: object) -> object:
-            extractions.append((args, kwargs))
-            return json.loads(_metadata_json(**metadata_overrides))
+    class UnexpectedInProcessYoutubeDL:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("default metadata resolution must use the child API")
 
     monkeypatch.delenv("HERMES_DOWNLOADS_DISABLE_NETWORK", raising=False)
-    monkeypatch.setattr(video, "YoutubeDL", OfficialMetadataSession)
+    monkeypatch.setattr(video, "YoutubeDL", UnexpectedInProcessYoutubeDL)
+    monkeypatch.setattr(video, "run_contained", contained, raising=False)
 
-    result = video.YtDlpMetadataClient().resolve(
-        video.VideoRequest(
-            source=_source("https://video.example.test/watch?v=one&token=source-private")
-        ),
-        job_id="job-structured-failure",
+    result = video.YtDlpMetadataClient(python_executable="/fixed/python").resolve(
+        video.VideoRequest(source=source), job_id="job-contained-default"
     )
 
-    assert result.status is expected
-    assert result.selection is None
-    assert len(sessions) == 1
-    assert len(extractions) == 1
-    assert extractions[0][1] == {"download": False}
+    assert result.status is video.VideoStatus.READY
+    assert result.selection is not None
+    assert len(calls) == 1
+    command, cwd, timeout, output_limit = calls[0]
+    assert command == (
+        "/fixed/python",
+        "-m",
+        "hermes_downloads.video",
+        "--metadata-helper",
+        "--no-playlist",
+        source.raw_url.decode("utf-8"),
+    )
+    module_path = video.__file__
+    assert module_path is not None
+    assert cwd == Path(module_path).resolve().parent
+    assert timeout == 30.0
+    assert output_limit == video.MAX_METADATA_BYTES
     assert "source-private" not in repr(result)
 
 
@@ -352,98 +356,118 @@ def test_metadata_adapter_classifies_trusted_ytdlp_unsupported_error_without_dia
     assert "error-private" not in repr(result)
 
 
-def test_default_metadata_client_uses_official_api_for_typed_unsupported_outcome(
+@pytest.mark.parametrize(
+    ("envelope", "status"),
+    (
+        pytest.param(
+            {"outcome": "failure", "status": "unsupported"},
+            "UNSUPPORTED",
+            id="typed-unsupported",
+        ),
+        pytest.param(
+            {"outcome": "failure", "status": "transient"},
+            "TRANSIENT",
+            id="typed-transient",
+        ),
+        pytest.param(
+            {
+                "outcome": "metadata",
+                "metadata": json.loads(_metadata_json(_has_drm=True)),
+            },
+            "DRM",
+            id="structured-drm",
+        ),
+        pytest.param(
+            {
+                "outcome": "metadata",
+                "metadata": json.loads(_metadata_json(availability="needs_auth")),
+            },
+            "AUTH_NEEDED",
+            id="structured-auth-needed",
+        ),
+    ),
+)
+def test_default_metadata_client_maps_contained_engine_result_envelopes(
     monkeypatch: pytest.MonkeyPatch,
+    envelope: dict[str, object],
+    status: str,
 ) -> None:
     video = _video()
-    sessions: list[dict[str, object]] = []
-    extractions: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    cli_calls = 0
+    calls: list[tuple[str, ...]] = []
 
-    class _OfficialMetadataSession:
-        def __init__(self, params: dict[str, object]) -> None:
-            sessions.append(params)
+    def contained(
+        command: tuple[str, ...], *, cwd: Path, timeout: float, output_limit: int
+    ) -> object:
+        del cwd, timeout, output_limit
+        calls.append(command)
+        return _engine_result(json.dumps(envelope))
 
-        def __enter__(self) -> _OfficialMetadataSession:
-            return self
+    class UnexpectedInProcessYoutubeDL:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("default metadata resolution must use the child API")
 
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-        def extract_info(self, *args: object, **kwargs: object) -> object:
-            extractions.append((args, kwargs))
-            try:
-                raise UnsupportedError(
-                    "https://video.example.test/unsupported?token=error-private"
-                )
-            except UnsupportedError as error:
-                assert error.__traceback__ is not None
-                raise DownloadError(
-                    "diagnostic-private",
-                    (UnsupportedError, error, error.__traceback__),
-                )
-
-    def contained(*_args: object, **_kwargs: object) -> object:
-        nonlocal cli_calls
-        cli_calls += 1
-        raise AssertionError("the default metadata client must not use the CLI")
-
-    source = _source("https://video.example.test/watch?v=one&signature=source-private")
     monkeypatch.delenv("HERMES_DOWNLOADS_DISABLE_NETWORK", raising=False)
-    monkeypatch.setattr(video, "YoutubeDL", _OfficialMetadataSession, raising=False)
+    monkeypatch.setattr(video, "YoutubeDL", UnexpectedInProcessYoutubeDL)
     monkeypatch.setattr(video, "run_contained", contained, raising=False)
 
     result = video.YtDlpMetadataClient().resolve(
-        video.VideoRequest(source=source), job_id="job-default-unsupported"
+        video.VideoRequest(
+            source=_source("https://video.example.test/watch?v=one&signature=source-private")
+        ),
+        job_id="job-contained-envelope",
     )
 
-    assert result.status is video.VideoStatus.UNSUPPORTED
-    assert cli_calls == 0
-    assert extractions == [((source.raw_url.decode("utf-8"),), {"download": False})]
-    assert len(sessions) == 1
-    assert {
-        name: sessions[0][name]
-        for name in (
-            "cachedir",
-            "config_locations",
-            "cookiefile",
-            "cookiesfrombrowser",
-            "ignoreconfig",
-            "logger",
-            "netrc_cmd",
-            "noplaylist",
-            "no_warnings",
-            "noprogress",
-            "plugin_dirs",
-            "quiet",
-            "remote_components",
-            "simulate",
-            "skip_download",
-            "update_self",
-            "usenetrc",
-        )
-    } == {
-        "cachedir": False,
-        "config_locations": None,
-        "cookiefile": None,
-        "cookiesfrombrowser": None,
-        "ignoreconfig": True,
-        "logger": sessions[0]["logger"],
-        "netrc_cmd": None,
-        "noplaylist": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "plugin_dirs": [],
-        "quiet": True,
-        "remote_components": (),
-        "simulate": True,
-        "skip_download": True,
-        "update_self": False,
-        "usenetrc": False,
+    assert len(calls) == 1
+    assert result.status is video.VideoStatus[status]
+    assert result.selection is None
+    assert "source-private" not in repr(result)
+
+
+def test_default_metadata_client_rejects_raw_metadata_without_child_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = _video()
+    calls: list[tuple[str, ...]] = []
+
+    def contained(
+        command: tuple[str, ...], *, cwd: Path, timeout: float, output_limit: int
+    ) -> object:
+        del cwd, timeout, output_limit
+        calls.append(command)
+        return _engine_result(_metadata_json())
+
+    monkeypatch.delenv("HERMES_DOWNLOADS_DISABLE_NETWORK", raising=False)
+    monkeypatch.setattr(video, "run_contained", contained, raising=False)
+
+    result = video.YtDlpMetadataClient().resolve(
+        video.VideoRequest(source=_source("https://video.example.test/watch?v=one")),
+        job_id="job-raw-metadata",
+    )
+
+    assert len(calls) == 1
+    assert result.status is video.VideoStatus.TRANSIENT
+    assert result.selection is None
+
+
+def test_metadata_helper_invalid_protocol_emits_fixed_transient_envelope(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        (sys.executable, "-m", "hermes_downloads.video", "--metadata-helper"),
+        capture_output=True,
+        check=False,
+        cwd=tmp_path,
+        env={"PATH": os.environ.get("PATH", "")},
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        "outcome": "failure",
+        "status": "transient",
     }
-    for secret in ("diagnostic-private", "error-private", "source-private"):
-        assert secret not in str(result)
-        assert secret not in repr(result)
 
 
 def test_metadata_adapter_leaves_generic_ytdlp_errors_transient_without_diagnostics() -> None:

@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import re
 import sys
 from typing import Final, Protocol
@@ -17,8 +18,13 @@ from urllib.parse import urlsplit
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, UnsupportedError
 
-from hermes_downloads.network import CredentialPolicyError, CredentialScope, SourceURL
-from hermes_downloads.processes import EngineResult
+from hermes_downloads.network import (
+    CredentialPolicyError,
+    CredentialScope,
+    SourceURL,
+    validate_source_url,
+)
+from hermes_downloads.processes import EngineResult, run_contained
 
 __all__ = [
     "AudioChoice",
@@ -345,9 +351,20 @@ class YtDlpMetadataClient:
 
     def _metadata_response(self, request: VideoRequest) -> object:
         if self._uses_default_runner:
-            return _run_ytdlp_metadata(request)
+            return _run_ytdlp_metadata(
+                request, python_executable=self._python_executable
+            )
         assert self._runner is not None
         return self._runner(_metadata_command(self._python_executable, request))
+
+    def _parsed_metadata_response(
+        self, response: object
+    ) -> dict[str, object] | MetadataFailure | None:
+        if type(response) is MetadataFailure:
+            return response
+        if self._uses_default_runner:
+            return _parse_metadata_envelope(response)
+        return _parse_metadata_response(response)
 
     def resolve(self, request: VideoRequest, *, job_id: str) -> VideoResolution:
         """Return metadata selection without starting a media payload."""
@@ -406,10 +423,10 @@ class YtDlpMetadataClient:
                 None,
                 (),
             )
-        if type(response) is MetadataFailure:
-            return _unavailable(response.status, request.source, provisional, None, ())
-        metadata = _parse_metadata_response(response)
-        if metadata is None:
+        parsed = self._parsed_metadata_response(response)
+        if type(parsed) is MetadataFailure:
+            return _unavailable(parsed.status, request.source, provisional, None, ())
+        if type(parsed) is not dict:
             return _unavailable(
                 VideoStatus.TRANSIENT,
                 request.source,
@@ -417,6 +434,7 @@ class YtDlpMetadataClient:
                 None,
                 (),
             )
+        metadata = parsed
         if is_playlist:
             unavailable_status = _structured_metadata_status(metadata)
             if unavailable_status is not None:
@@ -476,19 +494,20 @@ class YtDlpMetadataClient:
                 request.source,
                 provisional_filenames,
             )
-        if type(response) is MetadataFailure:
+        parsed = self._parsed_metadata_response(response)
+        if type(parsed) is MetadataFailure:
             return _playlist_unavailable(
-                response.status,
+                parsed.status,
                 request.source,
                 provisional_filenames,
             )
-        metadata = _parse_metadata_response(response)
-        if metadata is None:
+        if type(parsed) is not dict:
             return _playlist_unavailable(
                 VideoStatus.TRANSIENT,
                 request.source,
                 provisional_filenames,
             )
+        metadata = parsed
         unavailable_status = _structured_metadata_status(metadata)
         if unavailable_status is not None:
             return _playlist_unavailable(
@@ -617,21 +636,30 @@ def _contains_unsupported_error(error: DownloadError) -> bool:
     return False
 
 
-def _run_ytdlp_metadata(request: VideoRequest) -> object:
-    plugins_were_disabled = "YTDLP_NO_PLUGINS" in os.environ
-    prior_plugin_setting = os.environ.get("YTDLP_NO_PLUGINS")
-    os.environ["YTDLP_NO_PLUGINS"] = "1"
-    try:
-        with YoutubeDL(_metadata_options(request)) as downloader:
-            return downloader.extract_info(
-                request.source.raw_url.decode("utf-8"), download=False
-            )
-    finally:
-        if plugins_were_disabled:
-            assert prior_plugin_setting is not None
-            os.environ["YTDLP_NO_PLUGINS"] = prior_plugin_setting
-        else:
-            os.environ.pop("YTDLP_NO_PLUGINS", None)
+def _run_ytdlp_metadata(
+    request: VideoRequest, *, python_executable: str = sys.executable
+) -> object:
+    playlist_option = "--no-playlist"
+    if _is_pure_playlist(request.source):
+        selection = request.playlist_selection
+        if selection is None:
+            raise ValueError("playlist selection is required")
+        playlist_option = "--playlist-items=" + ",".join(
+            str(position) for position in selection.positions
+        )
+    return run_contained(
+        (
+            python_executable,
+            "-m",
+            "hermes_downloads.video",
+            "--metadata-helper",
+            playlist_option,
+            request.source.raw_url.decode("utf-8"),
+        ),
+        cwd=Path(__file__).resolve().parent,
+        timeout=30.0,
+        output_limit=MAX_METADATA_BYTES,
+    )
 
 
 def _metadata_options(request: VideoRequest) -> dict[str, object]:
@@ -679,6 +707,89 @@ def _metadata_command(python_executable: str, request: VideoRequest) -> tuple[st
         playlist_option,
         request.source.raw_url.decode("utf-8"),
     )
+
+
+def _parse_metadata_envelope(
+    response: object,
+) -> dict[str, object] | MetadataFailure | None:
+    envelope = _parse_metadata_response(response)
+    if type(envelope) is not dict:
+        return None
+    if set(envelope) == {"outcome", "metadata"}:
+        metadata = envelope.get("metadata")
+        if envelope.get("outcome") == "metadata" and type(metadata) is dict:
+            return metadata
+    if set(envelope) == {"outcome", "status"}:
+        status = envelope.get("status")
+        if envelope.get("outcome") == "failure" and status == "unsupported":
+            return MetadataFailure(VideoStatus.UNSUPPORTED)
+        if envelope.get("outcome") == "failure" and status == "transient":
+            return MetadataFailure(VideoStatus.TRANSIENT)
+    return None
+
+
+def _metadata_helper_request(
+    argv: tuple[object, ...],
+) -> tuple[VideoRequest, str] | None:
+    if len(argv) != 3:
+        return None
+    helper_flag, playlist_option, url = argv
+    if (
+        helper_flag != "--metadata-helper"
+        or type(playlist_option) is not str
+        or type(url) is not str
+    ):
+        return None
+    try:
+        source = validate_source_url(url)
+        if playlist_option == "--no-playlist":
+            if _is_pure_playlist(source):
+                return None
+            return VideoRequest(source=source), url
+        prefix = "--playlist-items="
+        if not playlist_option.startswith(prefix):
+            return None
+        encoded_positions = playlist_option.removeprefix(prefix).split(",")
+        if not encoded_positions or any(
+            not position.isascii()
+            or not position.isdecimal()
+            or str(int(position)) != position
+            for position in encoded_positions
+        ):
+            return None
+        selection = PlaylistSelection(tuple(int(position) for position in encoded_positions))
+        return VideoRequest(source=source, playlist_selection=selection), url
+    except Exception:
+        return None
+
+
+def _metadata_helper_envelope(argv: tuple[object, ...]) -> dict[str, object]:
+    request_and_url = _metadata_helper_request(argv)
+    if request_and_url is None:
+        return {"outcome": "failure", "status": "transient"}
+    request, url = request_and_url
+    try:
+        with YoutubeDL(_metadata_options(request)) as downloader:
+            metadata = downloader.extract_info(url, download=False)
+    except UnsupportedError:
+        return {"outcome": "failure", "status": "unsupported"}
+    except DownloadError:
+        return {"outcome": "failure", "status": "transient"}
+    except Exception:
+        return {"outcome": "failure", "status": "transient"}
+    if type(metadata) is not dict:
+        return {"outcome": "failure", "status": "transient"}
+    return {"outcome": "metadata", "metadata": metadata}
+
+
+def main() -> int:
+    try:
+        envelope = _metadata_helper_envelope(tuple(sys.argv[1:]))
+        output = json.dumps(envelope, allow_nan=False, separators=(",", ":"))
+    except Exception:
+        output = '{"outcome":"failure","status":"transient"}'
+    sys.stdout.write(output)
+    return 0
 
 
 def _is_pure_playlist(source: SourceURL) -> bool:
@@ -964,3 +1075,7 @@ def _safe_title(value: object) -> str:
         for character in value
     )
     return " ".join(safe.split()).strip(". ")[:_MAX_TITLE_CHARACTERS].rstrip(". ")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
