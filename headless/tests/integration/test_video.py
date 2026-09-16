@@ -53,7 +53,7 @@ def _engine_result(stdout: str) -> processes.EngineResult:
     )
 
 
-def _playlist_metadata_json(*positions: int) -> str:
+def _playlist_metadata_json(*positions: object) -> str:
     return json.dumps(
         {
             "_type": "playlist",
@@ -214,6 +214,68 @@ def test_metadata_adapter_requires_bounded_explicit_playlist_selection() -> None
         video.PlaylistSelection(tuple(range(1, 27)))
     with pytest.raises(ValueError):
         video.PlaylistSelection((1, 1))
+
+
+@pytest.mark.parametrize(
+    "metadata_positions",
+    (
+        pytest.param((2,), id="missing-selected-entry"),
+        pytest.param((2, 4, 6), id="extra-entry-cardinality-mismatch"),
+        pytest.param((2, 2), id="duplicate-position"),
+        pytest.param((2, 6), id="unselected-position"),
+        pytest.param((2, "4"), id="non-integer-position"),
+    ),
+)
+def test_metadata_adapter_rejects_malformed_playlist_shapes_before_ready(
+    metadata_positions: tuple[object, ...],
+) -> None:
+    video = _video()
+    runner = _MetadataRunner(_playlist_metadata_json(*metadata_positions))
+    resolutions: tuple[object, ...] | None = None
+
+    with pytest.raises(
+        ValueError,
+        match=r"^playlist metadata does not match selected items$",
+    ):
+        resolutions = video.YtDlpMetadataClient(runner=runner).resolve_many(
+            video.VideoRequest(
+                source=_source("https://video.example.test/playlist?list=playlist-1"),
+                playlist_selection=video.PlaylistSelection((2, 4)),
+            ),
+            job_id="job-malformed-playlist-shape",
+        )
+
+    assert resolutions is None
+    assert len(runner.commands) == 1
+    assert "--playlist-items=2,4" in runner.commands[0]
+
+
+def test_metadata_adapter_returns_requested_order_from_reversed_playlist_metadata() -> None:
+    video = _video()
+    runner = _MetadataRunner(_playlist_metadata_json(4, 2))
+
+    resolutions = video.YtDlpMetadataClient(runner=runner).resolve_many(
+        video.VideoRequest(
+            source=_source("https://video.example.test/playlist?list=playlist-1"),
+            playlist_selection=video.PlaylistSelection((2, 4)),
+        ),
+        job_id="job-reversed-playlist-metadata",
+    )
+
+    assert [resolution.status for resolution in resolutions] == [
+        video.VideoStatus.READY,
+        video.VideoStatus.READY,
+    ]
+    assert [resolution.content_id for resolution in resolutions] == [
+        "content-2",
+        "content-4",
+    ]
+    assert [resolution.provisional_filename for resolution in resolutions] == [
+        "job-reversed-playlist-metadata--playlist-2--metadata-pending",
+        "job-reversed-playlist-metadata--playlist-4--metadata-pending",
+    ]
+    assert len(runner.commands) == 1
+    assert "--playlist-items=2,4" in runner.commands[0]
 
 
 @pytest.mark.parametrize(
