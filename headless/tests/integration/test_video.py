@@ -359,7 +359,7 @@ def test_metadata_adapter_classifies_trusted_ytdlp_unsupported_error_without_dia
 
 
 def test_default_metadata_client_maps_contained_wrapped_unsupported_error_without_diagnostics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     video = _video()
     child = tmp_path / "wrapped_unsupported_child.py"
@@ -422,6 +422,9 @@ def test_default_metadata_client_maps_contained_wrapped_unsupported_error_withou
 
     assert result.status is video.VideoStatus.UNSUPPORTED
     assert result.selection is None
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
     for marker in (
         "child-error-private",
         "child-source-private",

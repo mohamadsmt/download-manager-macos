@@ -647,7 +647,7 @@ def _run_ytdlp_metadata(
         playlist_option = "--playlist-items=" + ",".join(
             str(position) for position in selection.positions
         )
-    result = run_contained(
+    return run_contained(
         (
             python_executable,
             "-m",
@@ -660,8 +660,7 @@ def _run_ytdlp_metadata(
         timeout=30.0,
         output_limit=MAX_METADATA_BYTES,
     )
-    print(f"DEBUG_CONTAINED_RESULT={result!r}")
-    return result
+
 
 
 def _metadata_options(request: VideoRequest) -> dict[str, object]:
