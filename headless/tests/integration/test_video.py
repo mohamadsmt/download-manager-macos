@@ -295,14 +295,25 @@ def test_default_metadata_adapter_classifies_ytdlp_structured_metadata_fields(
 ) -> None:
     video = _video()
     expected = video.VideoStatus[status]
-    commands: list[tuple[str, ...]] = []
+    sessions: list[dict[str, object]] = []
+    extractions: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-    def contained(command: tuple[str, ...], **_kwargs: object) -> processes.EngineResult:
-        commands.append(command)
-        return _engine_result(_metadata_json(**metadata_overrides))
+    class OfficialMetadataSession:
+        def __init__(self, params: dict[str, object]) -> None:
+            sessions.append(params)
+
+        def __enter__(self) -> OfficialMetadataSession:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def extract_info(self, *args: object, **kwargs: object) -> object:
+            extractions.append((args, kwargs))
+            return json.loads(_metadata_json(**metadata_overrides))
 
     monkeypatch.delenv("HERMES_DOWNLOADS_DISABLE_NETWORK", raising=False)
-    monkeypatch.setattr(video, "run_contained", contained)
+    monkeypatch.setattr(video, "YoutubeDL", OfficialMetadataSession)
 
     result = video.YtDlpMetadataClient().resolve(
         video.VideoRequest(
@@ -313,7 +324,9 @@ def test_default_metadata_adapter_classifies_ytdlp_structured_metadata_fields(
 
     assert result.status is expected
     assert result.selection is None
-    assert len(commands) == 1
+    assert len(sessions) == 1
+    assert len(extractions) == 1
+    assert extractions[0][1] == {"download": False}
     assert "source-private" not in repr(result)
 
 
@@ -337,6 +350,100 @@ def test_metadata_adapter_classifies_trusted_ytdlp_unsupported_error_without_dia
     assert result.status is video.VideoStatus.UNSUPPORTED
     assert result.selection is None
     assert "error-private" not in repr(result)
+
+
+def test_default_metadata_client_uses_official_api_for_typed_unsupported_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = _video()
+    sessions: list[dict[str, object]] = []
+    extractions: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    cli_calls = 0
+
+    class _OfficialMetadataSession:
+        def __init__(self, params: dict[str, object]) -> None:
+            sessions.append(params)
+
+        def __enter__(self) -> _OfficialMetadataSession:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def extract_info(self, *args: object, **kwargs: object) -> object:
+            extractions.append((args, kwargs))
+            try:
+                raise UnsupportedError(
+                    "https://video.example.test/unsupported?token=error-private"
+                )
+            except UnsupportedError as error:
+                assert error.__traceback__ is not None
+                raise DownloadError(
+                    "diagnostic-private",
+                    (UnsupportedError, error, error.__traceback__),
+                )
+
+    def contained(*_args: object, **_kwargs: object) -> object:
+        nonlocal cli_calls
+        cli_calls += 1
+        raise AssertionError("the default metadata client must not use the CLI")
+
+    source = _source("https://video.example.test/watch?v=one&signature=source-private")
+    monkeypatch.delenv("HERMES_DOWNLOADS_DISABLE_NETWORK", raising=False)
+    monkeypatch.setattr(video, "YoutubeDL", _OfficialMetadataSession, raising=False)
+    monkeypatch.setattr(video, "run_contained", contained, raising=False)
+
+    result = video.YtDlpMetadataClient().resolve(
+        video.VideoRequest(source=source), job_id="job-default-unsupported"
+    )
+
+    assert result.status is video.VideoStatus.UNSUPPORTED
+    assert cli_calls == 0
+    assert extractions == [((source.raw_url.decode("utf-8"),), {"download": False})]
+    assert len(sessions) == 1
+    assert {
+        name: sessions[0][name]
+        for name in (
+            "cachedir",
+            "config_locations",
+            "cookiefile",
+            "cookiesfrombrowser",
+            "ignoreconfig",
+            "logger",
+            "netrc_cmd",
+            "noplaylist",
+            "no_warnings",
+            "noprogress",
+            "plugin_dirs",
+            "quiet",
+            "remote_components",
+            "simulate",
+            "skip_download",
+            "update_self",
+            "usenetrc",
+        )
+    } == {
+        "cachedir": False,
+        "config_locations": None,
+        "cookiefile": None,
+        "cookiesfrombrowser": None,
+        "ignoreconfig": True,
+        "logger": sessions[0]["logger"],
+        "netrc_cmd": None,
+        "noplaylist": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "plugin_dirs": [],
+        "quiet": True,
+        "remote_components": (),
+        "simulate": True,
+        "skip_download": True,
+        "update_self": False,
+        "usenetrc": False,
+    }
+    for secret in ("diagnostic-private", "error-private", "source-private"):
+        assert secret not in str(result)
+        assert secret not in repr(result)
 
 
 def test_metadata_adapter_leaves_generic_ytdlp_errors_transient_without_diagnostics() -> None:
@@ -371,13 +478,13 @@ def test_metadata_adapter_bounds_response_before_decoding_and_honors_network_dis
 
     attempted = False
 
-    def unexpected_runner(*_args: object, **_kwargs: object) -> object:
+    def unexpected_session(*_args: object, **_kwargs: object) -> object:
         nonlocal attempted
         attempted = True
-        raise AssertionError("metadata runner must not launch while network is disabled")
+        raise AssertionError("metadata API must not launch while network is disabled")
 
     monkeypatch.setenv("HERMES_DOWNLOADS_DISABLE_NETWORK", "1")
-    monkeypatch.setattr(video, "run_contained", unexpected_runner)
+    monkeypatch.setattr(video, "YoutubeDL", unexpected_session)
     disabled = video.YtDlpMetadataClient().resolve(
         video.VideoRequest(source=source), job_id="job-disabled"
     )

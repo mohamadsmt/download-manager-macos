@@ -5,19 +5,20 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 import json
+import logging
 import math
 import os
-from pathlib import Path
 import re
 import sys
 from typing import Final, Protocol
 import unicodedata
 from urllib.parse import urlsplit
 
+from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, UnsupportedError
 
 from hermes_downloads.network import CredentialPolicyError, CredentialScope, SourceURL
-from hermes_downloads.processes import EngineResult, run_contained
+from hermes_downloads.processes import EngineResult
 
 __all__ = [
     "AudioChoice",
@@ -47,8 +48,6 @@ _MAX_TITLE_CHARACTERS: Final = 180
 MAX_METADATA_BYTES: Final = 64 * 1024
 _MAX_PLAYLIST_ITEMS: Final = 25
 _MAX_EXCEPTION_GRAPH_NODES: Final = 16
-_METADATA_TIMEOUT_SECONDS: Final = 15.0
-_METADATA_CWD: Final = Path("/")
 _METADATA_FLAGS: Final = (
     "--dump-single-json",
     "--skip-download",
@@ -59,6 +58,8 @@ _METADATA_FLAGS: Final = (
     "--no-netrc",
     "--no-cookies",
 )
+_METADATA_LOGGER: Final = logging.Logger("hermes_downloads.video.metadata")
+_METADATA_LOGGER.disabled = True
 
 
 class VideoQuality(str, Enum):
@@ -339,8 +340,14 @@ class YtDlpMetadataClient:
         if type(python_executable) is not str or not os.path.isabs(python_executable):
             raise ValueError("python_executable must be an absolute path")
         self._uses_default_runner = runner is None
-        self._runner: MetadataRunner = _run_ytdlp_metadata if runner is None else runner
+        self._runner = runner
         self._python_executable = python_executable
+
+    def _metadata_response(self, request: VideoRequest) -> object:
+        if self._uses_default_runner:
+            return _run_ytdlp_metadata(request)
+        assert self._runner is not None
+        return self._runner(_metadata_command(self._python_executable, request))
 
     def resolve(self, request: VideoRequest, *, job_id: str) -> VideoResolution:
         """Return metadata selection without starting a media payload."""
@@ -374,7 +381,7 @@ class YtDlpMetadataClient:
                 (),
             )
         try:
-            response = self._runner(_metadata_command(self._python_executable, request))
+            response = self._metadata_response(request)
         except UnsupportedError:
             return _unavailable(
                 VideoStatus.UNSUPPORTED,
@@ -450,7 +457,7 @@ class YtDlpMetadataClient:
                 provisional_filenames,
             )
         try:
-            response = self._runner(_metadata_command(self._python_executable, request))
+            response = self._metadata_response(request)
         except UnsupportedError:
             return _playlist_unavailable(
                 VideoStatus.UNSUPPORTED,
@@ -610,14 +617,49 @@ def _contains_unsupported_error(error: DownloadError) -> bool:
     return False
 
 
-def _run_ytdlp_metadata(command: tuple[str, ...]) -> EngineResult:
-    return run_contained(
-        command,
-        cwd=_METADATA_CWD,
-        timeout=_METADATA_TIMEOUT_SECONDS,
-        output_limit=MAX_METADATA_BYTES,
-        environment={},
-    )
+def _run_ytdlp_metadata(request: VideoRequest) -> object:
+    plugins_were_disabled = "YTDLP_NO_PLUGINS" in os.environ
+    prior_plugin_setting = os.environ.get("YTDLP_NO_PLUGINS")
+    os.environ["YTDLP_NO_PLUGINS"] = "1"
+    try:
+        with YoutubeDL(_metadata_options(request)) as downloader:
+            return downloader.extract_info(
+                request.source.raw_url.decode("utf-8"), download=False
+            )
+    finally:
+        if plugins_were_disabled:
+            assert prior_plugin_setting is not None
+            os.environ["YTDLP_NO_PLUGINS"] = prior_plugin_setting
+        else:
+            os.environ.pop("YTDLP_NO_PLUGINS", None)
+
+
+def _metadata_options(request: VideoRequest) -> dict[str, object]:
+    options: dict[str, object] = {
+        "cachedir": False,
+        "config_locations": None,
+        "cookiefile": None,
+        "cookiesfrombrowser": None,
+        "ignoreconfig": True,
+        "logger": _METADATA_LOGGER,
+        "netrc_cmd": None,
+        "noplaylist": not _is_pure_playlist(request.source),
+        "no_warnings": True,
+        "noprogress": True,
+        "plugin_dirs": [],
+        "quiet": True,
+        "remote_components": (),
+        "simulate": True,
+        "skip_download": True,
+        "update_self": False,
+        "usenetrc": False,
+        "warn_when_outdated": False,
+    }
+    if request.playlist_selection is not None:
+        options["playlist_items"] = ",".join(
+            str(position) for position in request.playlist_selection.positions
+        )
+    return options
 
 
 def _metadata_command(python_executable: str, request: VideoRequest) -> tuple[str, ...]:
@@ -650,6 +692,11 @@ def _parse_metadata_response(response: object) -> dict[str, object] | None:
         if response.returncode != 0:
             return None
         response = response.stdout
+    if type(response) is dict:
+        try:
+            response = json.dumps(response, allow_nan=False, separators=(",", ":"))
+        except Exception:
+            return None
     if type(response) is str:
         try:
             encoded = response.encode("utf-8", "strict")
