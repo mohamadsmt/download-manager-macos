@@ -164,6 +164,29 @@ def test_retry_module_has_no_free_decision_callable_with_policy_and_budget() -> 
     assert bare_budget_deciders == []
 
 
+def test_retry_authority_exposes_no_callable_bare_failure_or_budget_decider() -> None:
+    retry = _retry()
+    authority = _authority(retry)
+    direct_decider = getattr(authority, "_decide_locked", None)
+
+    if direct_decider is not None:
+        bypassed = direct_decider(
+            _failure(retry, retry.FailureKind.TRANSIENT_HOST), jitter_seconds=0
+        )
+        assert authority.budget is bypassed.budget, (
+            "_decide_locked bypassed RetryAuthority's current-budget update"
+        )
+
+    decision_methods = {
+        name: tuple(inspect.signature(method).parameters)
+        for name, method in inspect.getmembers(authority, inspect.ismethod)
+        if {"failure", "budget"} & set(inspect.signature(method).parameters)
+    }
+
+    assert direct_decider is None
+    assert decision_methods == {"decide": ("failure", "generation", "jitter_seconds")}
+
+
 def test_retry_authority_rejects_a_legacy_fork_before_stale_callbacks_can_bypass_it() -> None:
     retry = _retry()
     policy = retry.RetryPolicy()
