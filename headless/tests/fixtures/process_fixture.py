@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -15,8 +16,20 @@ _TERM_AWARE_CLEANUP_SECONDS = 0.05
 _READY_WAIT_SECONDS = 1.0
 
 
-def _write_pid(path: str) -> None:
-    Path(path).write_text(str(os.getpid()), encoding="ascii")
+def _write_pid(path: str, pid: int | None = None) -> None:
+    target = Path(path)
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(file_descriptor, "wb") as temporary_file:
+            temporary_file.write(str(os.getpid() if pid is None else pid).encode("ascii"))
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, target)
+    except BaseException:
+        Path(temporary_path).unlink(missing_ok=True)
+        raise
 
 
 def _probe(arguments: list[str]) -> int:
@@ -96,7 +109,7 @@ def _spawn_detached_descendant(path: str) -> None:
         stderr=subprocess.DEVNULL,
         close_fds=True,
     )
-    Path(path).write_text(str(descendant.pid), encoding="ascii")
+    _write_pid(path, descendant.pid)
 
 
 def _descendant_and_sleep(arguments: list[str]) -> int:

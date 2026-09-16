@@ -16,6 +16,29 @@ import pytest
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "process_fixture.py"
 _FINITE_STREAM_BYTES = 2 * 1024 * 1024
+_STARTUP_INTERRUPT_REPETITIONS = 25
+_DELAY_DESCENDANT_PID_WRITE = """
+import pathlib
+import runpy
+import sys
+import time
+
+target = pathlib.Path(sys.argv[1])
+original_open = pathlib.Path.open
+
+
+def delayed_open(path, *args, **kwargs):
+    opened = original_open(path, *args, **kwargs)
+    if path == target:
+        time.sleep(0.05)
+    return opened
+
+
+pathlib.Path.open = delayed_open
+fixture, *arguments = sys.argv[2:]
+sys.argv = [fixture, *arguments]
+runpy.run_path(fixture, run_name="__main__")
+"""
 
 
 def _finite_stream_output(name: str, fill: str) -> str:
@@ -594,14 +617,16 @@ def test_unestablished_group_fails_closed_without_group_signal(
 
 
 @pytest.mark.parametrize("interrupt_type", (KeyboardInterrupt, SystemExit))
+@pytest.mark.parametrize("attempt", range(_STARTUP_INTERRUPT_REPETITIONS))
 def test_selector_base_exception_reaps_group_and_propagates_original_interrupt(
-    tmp_path: Path, monkeypatch, interrupt_type: type[BaseException]
+    tmp_path: Path, monkeypatch, interrupt_type: type[BaseException], attempt: int
 ) -> None:
     processes = _processes()
-    leader_pid_file = tmp_path / f"{interrupt_type.__name__}-leader.pid"
-    descendant_pid_file = tmp_path / f"{interrupt_type.__name__}-descendant.pid"
+    leader_pid_file = tmp_path / f"{attempt}-{interrupt_type.__name__}-leader.pid"
+    descendant_pid_file = tmp_path / f"{attempt}-{interrupt_type.__name__}-descendant.pid"
     original_selector = processes.selectors.DefaultSelector
     interrupt = interrupt_type("fixture-selector-base-exception")
+    observed_pid_contents: list[tuple[str, str]] = []
 
     class InterruptingSelector:
         def __init__(self) -> None:
@@ -620,8 +645,14 @@ def test_selector_base_exception_reaps_group_and_propagates_original_interrupt(
             deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline:
                 if leader_pid_file.exists() and descendant_pid_file.exists():
-                    raise interrupt
-                time.sleep(0.005)
+                    contents = (
+                        leader_pid_file.read_text("ascii"),
+                        descendant_pid_file.read_text("ascii"),
+                    )
+                    observed_pid_contents.append(contents)
+                    if all(content.isdecimal() for content in contents):
+                        raise interrupt
+                time.sleep(0)
             pytest.fail("fixture did not start before selector interrupt")
 
         def close(self) -> None:
@@ -634,6 +665,9 @@ def test_selector_base_exception_reaps_group_and_propagates_original_interrupt(
             processes.run_contained(
                 (
                     sys.executable,
+                    "-c",
+                    _DELAY_DESCENDANT_PID_WRITE,
+                    str(descendant_pid_file),
                     str(FIXTURE),
                     "descendant-and-sleep",
                     str(leader_pid_file),
@@ -645,6 +679,12 @@ def test_selector_base_exception_reaps_group_and_propagates_original_interrupt(
             )
 
         assert raised.value is interrupt
+        assert observed_pid_contents
+        assert all(
+            content.isdecimal()
+            for contents in observed_pid_contents
+            for content in contents
+        )
         _assert_pid_gone(int(leader_pid_file.read_text("ascii")))
         _assert_pid_gone(int(descendant_pid_file.read_text("ascii")))
     finally:
