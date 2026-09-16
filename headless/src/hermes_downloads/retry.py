@@ -7,6 +7,7 @@ outer attempt budget authoritative.
 
 from __future__ import annotations
 
+from _thread import LockType
 from dataclasses import dataclass
 from enum import Enum
 import math
@@ -40,7 +41,6 @@ _MAX_ORDINARY_ATTEMPTS: Final = 5
 # hydrated snapshots and transition-time tuple copies while retaining dozens
 # of explicit exhausted-resume cycles for one job.
 _MAX_RETRY_AUDIT_EVENTS: Final = 256
-_RETRY_AUTHORITY_FACTORY_TOKEN: Final = object()
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_STRONG_VALIDATOR_BYTES: Final = 8192
@@ -261,27 +261,19 @@ class RetryDecision:
 class RetryAuthority:
     """Own one job's current immutable retry budget and generation.
 
-    Authorities are opened only through :meth:`open`; a snapshot cannot be
-    reused to create a second mutable authority for the same retry state.
+    The supported construction path is :meth:`open`, which owns the current
+    budget rather than accepting a snapshot as mutable-state input.
     """
 
+    _budget: RetryBudget
+    _lock: LockType
+    _policy: RetryPolicy
     __slots__ = ("_budget", "_lock", "_policy")
 
-    def __init__(self, *_args: object, **kwargs: object) -> None:
-        factory_token = kwargs.pop("_factory_token", None)
-        policy = kwargs.pop("_policy", None)
-        budget = kwargs.pop("_budget", None)
-        if _args or kwargs or factory_token is not _RETRY_AUTHORITY_FACTORY_TOKEN:
-            raise TypeError(
-                "RetryAuthority instances must be opened with RetryAuthority.open()"
-            )
-        if type(policy) is not RetryPolicy:
-            raise TypeError("policy must be a RetryPolicy")
-        if type(budget) is not RetryBudget:
-            raise TypeError("budget must be a RetryBudget")
-        self._policy = cast(RetryPolicy, policy)
-        self._budget = cast(RetryBudget, budget)
-        self._lock = Lock()
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError(
+            "RetryAuthority instances must be opened with RetryAuthority.open()"
+        )
 
     @classmethod
     def open(
@@ -291,11 +283,11 @@ class RetryAuthority:
 
         if type(policy) is not RetryPolicy:
             raise TypeError("policy must be a RetryPolicy")
-        return cls(
-            _factory_token=_RETRY_AUTHORITY_FACTORY_TOKEN,
-            _policy=policy,
-            _budget=_open_retry_budget(job_id=job_id, generation=generation),
-        )
+        authority = object.__new__(cls)
+        authority._policy = policy
+        authority._budget = _open_retry_budget(job_id=job_id, generation=generation)
+        authority._lock = Lock()
+        return authority
 
     @property
     def budget(self) -> RetryBudget:
@@ -317,14 +309,62 @@ class RetryAuthority:
             raise TypeError("failure must be a RetryFailure")
         with self._lock:
             _require_current_generation(self._budget, generation)
-            decision = _decide_retry(
-                self._policy,
-                self._budget,
-                failure,
-                jitter_seconds=jitter_seconds,
-            )
+            decision = self._decide_locked(failure, jitter_seconds=jitter_seconds)
             self._budget = decision.budget
             return decision
+
+    def _decide_locked(
+        self, failure: RetryFailure, *, jitter_seconds: float = 0
+    ) -> RetryDecision:
+        """Compute :meth:`decide`'s result from this authority under its lock."""
+
+        budget = self._budget
+        policy = self._policy
+        if budget.paused:
+            return RetryDecision(RetryAction.PAUSED, budget, None)
+        if budget.exhausted:
+            return RetryDecision(RetryAction.EXHAUSTED, budget, None)
+        if failure.kind is FailureKind.OFFLINE:
+            return RetryDecision(RetryAction.OFFLINE_WAIT, budget, None)
+        if failure.kind is FailureKind.AUTH_NEEDED:
+            return RetryDecision(RetryAction.NEEDS_AUTH, budget, None)
+        if failure.kind is FailureKind.LINK_NEEDED:
+            return RetryDecision(RetryAction.NEEDS_LINK, budget, None)
+        if failure.kind is FailureKind.FORBIDDEN:
+            return RetryDecision(RetryAction.NEEDS_DECISION, budget, None)
+        if failure.kind in {FailureKind.DISK_FULL, FailureKind.PERMANENT_HOST}:
+            return RetryDecision(RetryAction.BLOCKED, budget, None)
+
+        next_attempt = budget.ordinary_attempts + 1
+        if next_attempt >= policy.max_ordinary_attempts:
+            exhausted = _transition_budget(
+                budget,
+                kind=RetryAuditKind.EXHAUSTED,
+                generation=budget.generation,
+                budget_number=budget.budget_number,
+                ordinary_attempts=next_attempt,
+                paused=False,
+                exhausted=True,
+            )
+            return RetryDecision(RetryAction.EXHAUSTED, exhausted, None)
+        retrying = _transition_budget(
+            budget,
+            kind=RetryAuditKind.RETRY_SCHEDULED,
+            generation=budget.generation,
+            budget_number=budget.budget_number,
+            ordinary_attempts=next_attempt,
+            paused=False,
+            exhausted=False,
+        )
+        return RetryDecision(
+            RetryAction.RETRY_WAIT,
+            retrying,
+            policy.delay_for_attempt(
+                next_attempt,
+                retry_after_seconds=failure.retry_after_seconds,
+                jitter_seconds=jitter_seconds,
+            ),
+        )
 
     def pause(self, *, generation: int) -> RetryDecision:
         """Close the current budget before a pending timer may start an engine."""
@@ -428,69 +468,6 @@ def failure_from_http_status(
             FailureKind.TRANSIENT_HOST, retry_after_seconds=retry_after_seconds
         )
     return RetryFailure(FailureKind.PERMANENT_HOST)
-
-
-def _decide_retry(
-    policy: RetryPolicy,
-    budget: RetryBudget,
-    failure: RetryFailure,
-    *,
-    jitter_seconds: float = 0,
-) -> RetryDecision:
-    """Record one authority-validated failure and select no more than one retry."""
-
-    if type(policy) is not RetryPolicy:
-        raise TypeError("policy must be a RetryPolicy")
-    if type(budget) is not RetryBudget:
-        raise TypeError("budget must be a RetryBudget")
-    if type(failure) is not RetryFailure:
-        raise TypeError("failure must be a RetryFailure")
-
-    if budget.paused:
-        return RetryDecision(RetryAction.PAUSED, budget, None)
-    if budget.exhausted:
-        return RetryDecision(RetryAction.EXHAUSTED, budget, None)
-    if failure.kind is FailureKind.OFFLINE:
-        return RetryDecision(RetryAction.OFFLINE_WAIT, budget, None)
-    if failure.kind is FailureKind.AUTH_NEEDED:
-        return RetryDecision(RetryAction.NEEDS_AUTH, budget, None)
-    if failure.kind is FailureKind.LINK_NEEDED:
-        return RetryDecision(RetryAction.NEEDS_LINK, budget, None)
-    if failure.kind is FailureKind.FORBIDDEN:
-        return RetryDecision(RetryAction.NEEDS_DECISION, budget, None)
-    if failure.kind in {FailureKind.DISK_FULL, FailureKind.PERMANENT_HOST}:
-        return RetryDecision(RetryAction.BLOCKED, budget, None)
-
-    next_attempt = budget.ordinary_attempts + 1
-    if next_attempt >= policy.max_ordinary_attempts:
-        exhausted = _transition_budget(
-            budget,
-            kind=RetryAuditKind.EXHAUSTED,
-            generation=budget.generation,
-            budget_number=budget.budget_number,
-            ordinary_attempts=next_attempt,
-            paused=False,
-            exhausted=True,
-        )
-        return RetryDecision(RetryAction.EXHAUSTED, exhausted, None)
-    retrying = _transition_budget(
-        budget,
-        kind=RetryAuditKind.RETRY_SCHEDULED,
-        generation=budget.generation,
-        budget_number=budget.budget_number,
-        ordinary_attempts=next_attempt,
-        paused=False,
-        exhausted=False,
-    )
-    return RetryDecision(
-        RetryAction.RETRY_WAIT,
-        retrying,
-        policy.delay_for_attempt(
-            next_attempt,
-            retry_after_seconds=failure.retry_after_seconds,
-            jitter_seconds=jitter_seconds,
-        ),
-    )
 
 
 def _pause_retry(budget: RetryBudget) -> RetryDecision:

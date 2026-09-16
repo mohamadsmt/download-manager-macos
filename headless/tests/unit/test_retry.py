@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import importlib
 import importlib.util
+import inspect
 
 import pytest
 
@@ -101,6 +102,90 @@ def test_retry_authority_rejects_direct_construction_from_valid_budget_snapshots
         jitter_seconds=0,
     )
     assert decision.budget.ordinary_attempts == 1
+
+
+@pytest.mark.parametrize(
+    "legacy_keywords",
+    (
+        (),
+        ("policy",),
+        ("budget",),
+        ("policy", "budget"),
+        ("_factory_token",),
+        ("_policy",),
+        ("_budget",),
+        ("_factory_token", "_policy", "_budget"),
+    ),
+    ids=(
+        "no-arguments",
+        "public-policy",
+        "public-budget",
+        "public-policy-and-budget",
+        "private-factory-token",
+        "private-policy",
+        "private-budget",
+        "complete-private-constructor",
+    ),
+)
+def test_retry_authority_constructor_rejects_every_legacy_keyword(
+    legacy_keywords: tuple[str, ...],
+) -> None:
+    retry = _retry()
+    policy = retry.RetryPolicy()
+    snapshot = _authority(retry, policy=policy).budget
+    legacy_values = {
+        "policy": policy,
+        "budget": snapshot,
+        "_factory_token": getattr(retry, "_RETRY_AUTHORITY_FACTORY_TOKEN", object()),
+        "_policy": policy,
+        "_budget": snapshot,
+    }
+
+    with pytest.raises(TypeError, match=r"RetryAuthority\.open"):
+        retry.RetryAuthority(**{name: legacy_values[name] for name in legacy_keywords})
+
+
+def test_retry_module_exposes_no_readable_authority_factory_token() -> None:
+    retry = _retry()
+
+    assert not hasattr(retry, "_RETRY_AUTHORITY_FACTORY_TOKEN")
+
+
+def test_retry_module_has_no_free_decision_callable_with_policy_and_budget() -> None:
+    retry = _retry()
+    bare_budget_deciders = [
+        name
+        for name, value in vars(retry).items()
+        if inspect.isfunction(value)
+        and value.__module__ == retry.__name__
+        and {"policy", "budget"} <= set(inspect.signature(value).parameters)
+    ]
+
+    assert bare_budget_deciders == []
+
+
+def test_retry_authority_rejects_a_legacy_fork_before_stale_callbacks_can_bypass_it() -> None:
+    retry = _retry()
+    policy = retry.RetryPolicy()
+    authority = _authority(retry, policy=policy)
+    opening = authority.budget
+
+    with pytest.raises(TypeError, match=r"RetryAuthority\.open"):
+        retry.RetryAuthority(
+            _factory_token=getattr(retry, "_RETRY_AUTHORITY_FACTORY_TOKEN", object()),
+            _policy=policy,
+            _budget=opening,
+        )
+
+    paused = authority.pause(generation=opening.generation)
+    with pytest.raises(retry.StaleGenerationError):
+        authority.decide(
+            _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+            generation=opening.generation,
+            jitter_seconds=0,
+        )
+
+    assert authority.budget == paused.budget
 
 
 def test_retry_budget_rejects_valid_over_capacity_audit_before_scanning_or_replaying(
