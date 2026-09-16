@@ -183,13 +183,15 @@ def redact_url(value: SourceURL | str | bytes | bytearray) -> str:
 def _parse_source_url(value: str | bytes | bytearray) -> SourceURL:
     raw_url, text = _coerce_url(value)
     _require_complete_percent_escapes(raw_url)
+    parsed: tuple[SplitResult, str, str | None, int | None] | None = None
     try:
         parts = urlsplit(text)
-        scheme = parts.scheme.lower()
-        host = parts.hostname
-        port = parts.port
+        parsed = (parts, parts.scheme.lower(), parts.hostname, parts.port)
     except ValueError:
-        raise SourcePolicyError("source URL is malformed") from None
+        pass
+    if parsed is None:
+        raise SourcePolicyError("source URL is malformed")
+    parts, scheme, host, port = parsed
     if scheme not in _ALLOWED_SCHEMES:
         raise SourcePolicyError("source URL must use HTTP or HTTPS")
     if not parts.netloc or not host or "@" in parts.netloc:
@@ -210,10 +212,13 @@ def _coerce_url(value: str | bytes | bytearray) -> tuple[bytes, str]:
         raise TypeError("source URL must be text or bytes")
     if not raw_url or len(raw_url) > MAX_SOURCE_URL_BYTES:
         raise SourcePolicyError("source URL has an invalid length")
+    text: str | None = None
     try:
         text = raw_url.decode("utf-8")
     except UnicodeDecodeError:
-        raise SourcePolicyError("source URL is not valid UTF-8") from None
+        pass
+    if text is None:
+        raise SourcePolicyError("source URL is not valid UTF-8")
     if any(
         character.isspace() or unicodedata.category(character) in {"Cc", "Cf"}
         for character in text

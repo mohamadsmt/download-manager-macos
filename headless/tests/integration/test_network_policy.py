@@ -213,3 +213,45 @@ def test_public_redaction_removes_userinfo_query_and_fragment() -> None:
     assert "X-Amz-Signature" not in rendered
     assert "synthetic-secret" not in rendered
     assert "fragment-secret" not in rendered
+
+
+def test_non_utf8_source_policy_error_has_no_signed_query_exception_chain() -> None:
+    network = _network()
+    canary = "T07-SIGNED-QUERY-CANARY"
+    submitted = (
+        b"https://downloads.example.test/release?X-Amz-Signature="
+        + canary.encode("ascii")
+        + b"\xff"
+    )
+
+    with pytest.raises(network.SourcePolicyError) as raised:
+        network.validate_source_url(submitted)
+
+    error = raised.value
+
+    assert canary not in str(error)
+    assert canary not in repr(error)
+    assert canary not in repr(error.__context__)
+    assert canary not in repr(error.__cause__)
+    assert error.__context__ is None
+    assert error.__cause__ is None
+
+
+def test_malformed_source_policy_error_has_no_signed_query_exception_chain() -> None:
+    network = _network()
+    canary = "T07-MALFORMED-SIGNED-QUERY-CANARY"
+    submitted = (
+        "https://downloads.example.test:99999/release?X-Amz-Signature=" + canary
+    )
+
+    with pytest.raises(network.SourcePolicyError) as raised:
+        network.validate_source_url(submitted)
+
+    error = raised.value
+
+    assert canary not in str(error)
+    assert canary not in repr(error)
+    assert canary not in repr(error.__context__)
+    assert canary not in repr(error.__cause__)
+    assert error.__context__ is None
+    assert error.__cause__ is None
