@@ -174,7 +174,7 @@ def test_pause_closes_a_pending_retry_before_its_timer_can_retry() -> None:
         policy,
         paused.budget,
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
-        generation=7,
+        generation=paused.budget.generation,
         jitter_seconds=0,
     )
 
@@ -183,6 +183,33 @@ def test_pause_closes_a_pending_retry_before_its_timer_can_retry() -> None:
     assert timer.action is retry.RetryAction.PAUSED
     assert timer.delay_seconds is None
     assert timer.budget.ordinary_attempts == 1
+
+
+def test_pause_invalidates_a_pending_timer_holding_the_prior_budget() -> None:
+    retry = _retry()
+    policy = retry.RetryPolicy()
+    pending = retry.decide_retry(
+        policy,
+        _budget(retry),
+        _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+        generation=7,
+        jitter_seconds=0,
+    )
+    paused = retry.pause_retry(pending.budget, generation=7)
+
+    with pytest.raises(retry.StaleGenerationError):
+        retry.decide_retry(
+            policy,
+            pending.budget,
+            _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+            generation=paused.budget.generation,
+            jitter_seconds=0,
+        )
+
+    assert pending.action is retry.RetryAction.RETRY_WAIT
+    assert paused.action is retry.RetryAction.PAUSED
+    assert paused.budget.ordinary_attempts == pending.budget.ordinary_attempts == 1
+    assert paused.budget.audit[-1].kind is retry.RetryAuditKind.PAUSED
 
 
 def test_stale_generation_cannot_change_a_retry_budget() -> None:
