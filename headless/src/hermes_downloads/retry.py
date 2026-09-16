@@ -342,6 +342,7 @@ def decide_retry(
     failure: RetryFailure,
     *,
     generation: int,
+    current_generation: int,
     jitter_seconds: float = 0,
 ) -> RetryDecision:
     """Record one current-generation failure and select no more than one retry."""
@@ -352,6 +353,9 @@ def decide_retry(
         raise TypeError("budget must be a RetryBudget")
     if type(failure) is not RetryFailure:
         raise TypeError("failure must be a RetryFailure")
+    _require_generation(current_generation)
+    if generation != current_generation:
+        raise StaleGenerationError("retry callback generation is stale")
     _require_current_generation(budget, generation)
 
     if budget.paused:
