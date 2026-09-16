@@ -14,6 +14,8 @@ from typing import Final, Protocol
 import unicodedata
 from urllib.parse import urlsplit
 
+from yt_dlp.utils import DownloadError, UnsupportedError
+
 from hermes_downloads.network import CredentialPolicyError, CredentialScope, SourceURL
 from hermes_downloads.processes import EngineResult, run_contained
 
@@ -44,6 +46,7 @@ _MAX_FORMATS: Final = 128
 _MAX_TITLE_CHARACTERS: Final = 180
 MAX_METADATA_BYTES: Final = 64 * 1024
 _MAX_PLAYLIST_ITEMS: Final = 25
+_MAX_EXCEPTION_GRAPH_NODES: Final = 16
 _METADATA_TIMEOUT_SECONDS: Final = 15.0
 _METADATA_CWD: Final = Path("/")
 _METADATA_FLAGS: Final = (
@@ -272,30 +275,27 @@ def resolve_metadata(
         raise TypeError("request must be a VideoRequest")
     if type(metadata) is not dict:
         raise TypeError("metadata must be a dictionary")
-    provisional = provisional_filename(job_id)
+    return _resolve_parsed_metadata(
+        request,
+        metadata,
+        provisional=provisional_filename(job_id),
+    )
+
+
+def _resolve_parsed_metadata(
+    request: VideoRequest,
+    metadata: dict[str, object],
+    *,
+    provisional: str,
+) -> VideoResolution:
     content_id = _content_id(metadata.get("id"))
     title = metadata.get("title")
     available_qualities = _available_qualities(metadata)
 
-    if metadata.get("has_drm") is True:
+    unavailable_status = _structured_metadata_status(metadata)
+    if unavailable_status is not None:
         return _unavailable(
-            VideoStatus.DRM,
-            request.source,
-            provisional,
-            content_id,
-            available_qualities,
-        )
-    if _needs_auth(metadata.get("availability")):
-        return _unavailable(
-            VideoStatus.AUTH_NEEDED,
-            request.source,
-            provisional,
-            content_id,
-            available_qualities,
-        )
-    if metadata.get("availability") == "unsupported":
-        return _unavailable(
-            VideoStatus.UNSUPPORTED,
+            unavailable_status,
             request.source,
             provisional,
             content_id,
@@ -348,15 +348,24 @@ class YtDlpMetadataClient:
         if type(request) is not VideoRequest:
             raise TypeError("request must be a VideoRequest")
         provisional = provisional_filename(job_id)
-        if _is_pure_playlist(request.source) and request.playlist_selection is None:
-            return _unavailable(
-                VideoStatus.PLAYLIST_SELECTION_REQUIRED,
-                request.source,
-                provisional,
-                None,
-                (),
-            )
-        if self._uses_default_runner and os.environ.get("HERMES_DOWNLOADS_DISABLE_NETWORK") == "1":
+        is_playlist = _is_pure_playlist(request.source)
+        selection = request.playlist_selection
+        if is_playlist:
+            if selection is None:
+                return _unavailable(
+                    VideoStatus.PLAYLIST_SELECTION_REQUIRED,
+                    request.source,
+                    provisional,
+                    None,
+                    (),
+                )
+            if len(selection.positions) > 1:
+                raise ValueError("multiple playlist items require resolve_many")
+            provisional = _playlist_provisional_filename(job_id, selection.positions[0])
+        if (
+            self._uses_default_runner
+            and os.environ.get("HERMES_DOWNLOADS_DISABLE_NETWORK") == "1"
+        ):
             return _unavailable(
                 VideoStatus.TRANSIENT,
                 request.source,
@@ -366,6 +375,22 @@ class YtDlpMetadataClient:
             )
         try:
             response = self._runner(_metadata_command(self._python_executable, request))
+        except UnsupportedError:
+            return _unavailable(
+                VideoStatus.UNSUPPORTED,
+                request.source,
+                provisional,
+                None,
+                (),
+            )
+        except DownloadError as error:
+            return _unavailable(
+                _download_error_status(error),
+                request.source,
+                provisional,
+                None,
+                (),
+            )
         except Exception:
             return _unavailable(
                 VideoStatus.TRANSIENT,
@@ -385,16 +410,204 @@ class YtDlpMetadataClient:
                 None,
                 (),
             )
-        try:
-            return resolve_metadata(request, metadata, job_id=job_id)
-        except Exception:
-            return _unavailable(
+        if is_playlist:
+            unavailable_status = _structured_metadata_status(metadata)
+            if unavailable_status is not None:
+                return _unavailable(
+                    unavailable_status,
+                    request.source,
+                    provisional,
+                    None,
+                    (),
+                )
+            assert selection is not None
+            metadata = _selected_playlist_metadata(metadata, selection.positions)[0]
+        return _resolve_metadata_or_transient(request, metadata, provisional=provisional)
+
+    def resolve_many(
+        self, request: VideoRequest, *, job_id: str
+    ) -> tuple[VideoResolution, ...]:
+        """Resolve every explicitly selected pure-playlist item independently."""
+
+        if type(request) is not VideoRequest:
+            raise TypeError("request must be a VideoRequest")
+        if not _is_pure_playlist(request.source):
+            raise ValueError("resolve_many requires a pure playlist URL")
+        selection = request.playlist_selection
+        if selection is None:
+            raise ValueError("playlist selection is required")
+        positions = selection.positions
+        provisional_filenames = tuple(
+            _playlist_provisional_filename(job_id, position) for position in positions
+        )
+        if (
+            self._uses_default_runner
+            and os.environ.get("HERMES_DOWNLOADS_DISABLE_NETWORK") == "1"
+        ):
+            return _playlist_unavailable(
                 VideoStatus.TRANSIENT,
                 request.source,
-                provisional,
-                None,
-                (),
+                provisional_filenames,
             )
+        try:
+            response = self._runner(_metadata_command(self._python_executable, request))
+        except UnsupportedError:
+            return _playlist_unavailable(
+                VideoStatus.UNSUPPORTED,
+                request.source,
+                provisional_filenames,
+            )
+        except DownloadError as error:
+            return _playlist_unavailable(
+                _download_error_status(error),
+                request.source,
+                provisional_filenames,
+            )
+        except Exception:
+            return _playlist_unavailable(
+                VideoStatus.TRANSIENT,
+                request.source,
+                provisional_filenames,
+            )
+        if type(response) is MetadataFailure:
+            return _playlist_unavailable(
+                response.status,
+                request.source,
+                provisional_filenames,
+            )
+        metadata = _parse_metadata_response(response)
+        if metadata is None:
+            return _playlist_unavailable(
+                VideoStatus.TRANSIENT,
+                request.source,
+                provisional_filenames,
+            )
+        unavailable_status = _structured_metadata_status(metadata)
+        if unavailable_status is not None:
+            return _playlist_unavailable(
+                unavailable_status,
+                request.source,
+                provisional_filenames,
+            )
+        entries = _selected_playlist_metadata(metadata, positions)
+        return tuple(
+            _resolve_metadata_or_transient(
+                request,
+                entry,
+                provisional=provisional,
+            )
+            for entry, provisional in zip(entries, provisional_filenames, strict=True)
+        )
+
+
+def _resolve_metadata_or_transient(
+    request: VideoRequest,
+    metadata: dict[str, object],
+    *,
+    provisional: str,
+) -> VideoResolution:
+    try:
+        return _resolve_parsed_metadata(request, metadata, provisional=provisional)
+    except Exception:
+        return _unavailable(
+            VideoStatus.TRANSIENT,
+            request.source,
+            provisional,
+            None,
+            (),
+        )
+
+
+def _playlist_provisional_filename(job_id: str, position: int) -> str:
+    provisional_filename(job_id)
+    if type(position) is not int or position < 1:
+        raise ValueError("playlist position must be a positive integer")
+    return f"{job_id}--playlist-{position}--metadata-pending"
+
+
+def _playlist_unavailable(
+    status: VideoStatus,
+    source: SourceURL,
+    provisional_filenames: tuple[str, ...],
+) -> tuple[VideoResolution, ...]:
+    return tuple(
+        _unavailable(status, source, provisional, None, ())
+        for provisional in provisional_filenames
+    )
+
+
+def _selected_playlist_metadata(
+    metadata: dict[str, object], positions: tuple[int, ...]
+) -> tuple[dict[str, object], ...]:
+    if metadata.get("_type") != "playlist":
+        raise ValueError("playlist metadata does not match selected items")
+    entries = metadata.get("entries")
+    if type(entries) is not list or len(entries) != len(positions):
+        raise ValueError("playlist metadata does not match selected items")
+    selected: dict[int, dict[str, object]] = {}
+    selected_positions = set(positions)
+    for entry in entries:
+        if type(entry) is not dict:
+            raise ValueError("playlist metadata does not match selected items")
+        position = entry.get("playlist_index")
+        if (
+            type(position) is not int
+            or position not in selected_positions
+            or position in selected
+        ):
+            raise ValueError("playlist metadata does not match selected items")
+        selected[position] = entry
+    if len(selected) != len(positions):
+        raise ValueError("playlist metadata does not match selected items")
+    return tuple(selected[position] for position in positions)
+
+
+def _structured_metadata_status(metadata: dict[str, object]) -> VideoStatus | None:
+    if metadata.get("has_drm") is True or metadata.get("_has_drm") is True:
+        return VideoStatus.DRM
+    if _needs_auth(metadata.get("availability")):
+        return VideoStatus.AUTH_NEEDED
+    if metadata.get("availability") == "unsupported":
+        return VideoStatus.UNSUPPORTED
+    return None
+
+
+def _download_error_status(error: DownloadError) -> VideoStatus:
+    try:
+        if _contains_unsupported_error(error):
+            return VideoStatus.UNSUPPORTED
+    except Exception:
+        pass
+    return VideoStatus.TRANSIENT
+
+
+def _contains_unsupported_error(error: DownloadError) -> bool:
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending and len(seen) < _MAX_EXCEPTION_GRAPH_NODES:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, UnsupportedError):
+            return True
+        for related in (current.__cause__, current.__context__):
+            if isinstance(related, BaseException):
+                pending.append(related)
+        if not isinstance(current, DownloadError):
+            continue
+        exc_info = getattr(current, "exc_info", None)
+        if type(exc_info) is not tuple or len(exc_info) != 3:
+            continue
+        exception_type, nested, _ = exc_info
+        if (
+            type(exception_type) is type
+            and isinstance(nested, BaseException)
+            and isinstance(nested, exception_type)
+        ):
+            pending.append(nested)
+    return False
 
 
 def _run_ytdlp_metadata(command: tuple[str, ...]) -> EngineResult:

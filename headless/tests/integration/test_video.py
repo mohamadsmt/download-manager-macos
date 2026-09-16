@@ -6,8 +6,9 @@ import importlib.util
 import json
 
 import pytest
+from yt_dlp.utils import DownloadError, UnsupportedError
 
-from hermes_downloads import network
+from hermes_downloads import network, processes
 
 
 def _video():
@@ -20,19 +21,62 @@ def _source(url: str) -> network.SourceURL:
     return network.validate_source_url(url)
 
 
-def _metadata_json() -> str:
+def _metadata_json(**overrides: object) -> str:
+    metadata: dict[str, object] = {
+        "id": "content-11",
+        "title": "Metadata only",
+        "formats": [
+            {
+                "format_id": "18",
+                "height": 360,
+                "vcodec": "avc1.42001E",
+                "acodec": "mp4a.40.2",
+                "ext": "mp4",
+            }
+        ],
+    }
+    metadata.update(overrides)
+    return json.dumps(metadata)
+
+
+def _engine_result(stdout: str) -> processes.EngineResult:
+    return processes.EngineResult(
+        identity=processes.EngineIdentity(
+            leader_pid=1,
+            process_group_id=1,
+            started_monotonic_ns=1,
+            argv_sha256="0" * 64,
+        ),
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+
+
+def _playlist_metadata_json(*positions: int) -> str:
     return json.dumps(
         {
-            "id": "content-11",
-            "title": "Metadata only",
-            "formats": [
+            "_type": "playlist",
+            "entries": [
                 {
-                    "format_id": "18",
-                    "height": 360,
-                    "vcodec": "avc1.42001E",
-                    "acodec": "mp4a.40.2",
-                    "ext": "mp4",
+                    "id": f"content-{position}",
+                    "title": f"Playlist item {position}",
+                    "playlist_index": position,
+                    "formats": [
+                        {
+                            "format_id": f"format-{position}",
+                            "height": 360,
+                            "vcodec": "avc1.42001E",
+                            "acodec": "mp4a.40.2",
+                            "ext": "mp4",
+                            "url": (
+                                "https://media.example.test/video?"
+                                f"token=playlist-private-{position}"
+                            ),
+                        }
+                    ],
                 }
+                for position in positions
             ],
         }
     )
@@ -107,8 +151,21 @@ def test_metadata_adapter_requires_bounded_explicit_playlist_selection() -> None
     assert blocked_result.status is video.VideoStatus.PLAYLIST_SELECTION_REQUIRED
     assert blocked_runner.commands == []
 
-    selected_runner = _MetadataRunner(_metadata_json())
-    selected_result = video.YtDlpMetadataClient(runner=selected_runner).resolve(
+    single_selected_runner = _MetadataRunner(_playlist_metadata_json(2))
+    single_selected = video.YtDlpMetadataClient(runner=single_selected_runner).resolve(
+        video.VideoRequest(
+            source=pure_playlist,
+            playlist_selection=video.PlaylistSelection((2,)),
+        ),
+        job_id="job-single-selected",
+    )
+
+    assert single_selected.status is video.VideoStatus.READY
+    assert single_selected.content_id == "content-2"
+    assert "--playlist-items=2" in single_selected_runner.commands[0]
+
+    selected_runner = _MetadataRunner(_playlist_metadata_json(2, 4))
+    selected_results = video.YtDlpMetadataClient(runner=selected_runner).resolve_many(
         video.VideoRequest(
             source=pure_playlist,
             playlist_selection=video.PlaylistSelection((2, 4)),
@@ -116,9 +173,43 @@ def test_metadata_adapter_requires_bounded_explicit_playlist_selection() -> None
         job_id="job-selected",
     )
 
-    assert selected_result.status is video.VideoStatus.READY
+    assert type(selected_results) is tuple
+    assert [result.status for result in selected_results] == [
+        video.VideoStatus.READY,
+        video.VideoStatus.READY,
+    ]
+    assert [result.content_id for result in selected_results] == ["content-2", "content-4"]
+    assert [result.provisional_filename for result in selected_results] == [
+        "job-selected--playlist-2--metadata-pending",
+        "job-selected--playlist-4--metadata-pending",
+    ]
+    assert len({result.provisional_filename for result in selected_results}) == 2
+    assert "playlist-private" not in repr(selected_results)
     assert "--playlist-items=2,4" in selected_runner.commands[0]
     assert "--no-playlist" not in selected_runner.commands[0]
+
+    ambiguous_multi_runner = _MetadataRunner(_playlist_metadata_json(2, 4))
+    with pytest.raises(ValueError, match="multiple playlist items require resolve_many"):
+        video.YtDlpMetadataClient(runner=ambiguous_multi_runner).resolve(
+            video.VideoRequest(
+                source=pure_playlist,
+                playlist_selection=video.PlaylistSelection((2, 4)),
+            ),
+            job_id="job-ambiguous-multi",
+        )
+    assert ambiguous_multi_runner.commands == []
+
+    malformed_runner = _MetadataRunner(_metadata_json())
+    with pytest.raises(ValueError, match="playlist metadata does not match selected items"):
+        video.YtDlpMetadataClient(runner=malformed_runner).resolve_many(
+            video.VideoRequest(
+                source=pure_playlist,
+                playlist_selection=video.PlaylistSelection((2, 4)),
+            ),
+            job_id="job-malformed-playlist",
+        )
+    assert len(malformed_runner.commands) == 1
+
     with pytest.raises(ValueError):
         video.PlaylistSelection(tuple(range(1, 27)))
     with pytest.raises(ValueError):
@@ -126,22 +217,80 @@ def test_metadata_adapter_requires_bounded_explicit_playlist_selection() -> None
 
 
 @pytest.mark.parametrize(
-    "status",
-    ("UNSUPPORTED", "DRM", "AUTH_NEEDED", "TRANSIENT"),
+    ("metadata_overrides", "status"),
+    (
+        ({"_has_drm": True}, "DRM"),
+        ({"availability": "needs_auth"}, "AUTH_NEEDED"),
+        ({"availability": "premium_only"}, "AUTH_NEEDED"),
+        ({"availability": "subscriber_only"}, "AUTH_NEEDED"),
+        ({"availability": "private"}, "AUTH_NEEDED"),
+    ),
 )
-def test_metadata_adapter_distinguishes_typed_unavailable_outcomes(status: str) -> None:
+def test_default_metadata_adapter_classifies_ytdlp_structured_metadata_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_overrides: dict[str, object],
+    status: str,
+) -> None:
     video = _video()
     expected = video.VideoStatus[status]
-    runner = _MetadataRunner(video.MetadataFailure(status=expected))
+    commands: list[tuple[str, ...]] = []
 
-    result = video.YtDlpMetadataClient(runner=runner).resolve(
-        video.VideoRequest(source=_source("https://video.example.test/watch?v=one")),
-        job_id="job-failure",
+    def contained(command: tuple[str, ...], **_kwargs: object) -> processes.EngineResult:
+        commands.append(command)
+        return _engine_result(_metadata_json(**metadata_overrides))
+
+    monkeypatch.delenv("HERMES_DOWNLOADS_DISABLE_NETWORK", raising=False)
+    monkeypatch.setattr(video, "run_contained", contained)
+
+    result = video.YtDlpMetadataClient().resolve(
+        video.VideoRequest(
+            source=_source("https://video.example.test/watch?v=one&token=source-private")
+        ),
+        job_id="job-structured-failure",
     )
 
     assert result.status is expected
     assert result.selection is None
-    assert len(runner.commands) == 1
+    assert len(commands) == 1
+    assert "source-private" not in repr(result)
+
+
+def test_metadata_adapter_classifies_trusted_ytdlp_unsupported_error_without_diagnostics() -> None:
+    video = _video()
+
+    def api_runner(_command: tuple[str, ...]) -> object:
+        try:
+            raise UnsupportedError("https://video.example.test/unsupported?token=error-private")
+        except UnsupportedError as error:
+            assert error.__traceback__ is not None
+            raise DownloadError(
+                "error-private", (UnsupportedError, error, error.__traceback__)
+            )
+
+    result = video.YtDlpMetadataClient(runner=api_runner).resolve(
+        video.VideoRequest(source=_source("https://video.example.test/watch?v=one")),
+        job_id="job-unsupported",
+    )
+
+    assert result.status is video.VideoStatus.UNSUPPORTED
+    assert result.selection is None
+    assert "error-private" not in repr(result)
+
+
+def test_metadata_adapter_leaves_generic_ytdlp_errors_transient_without_diagnostics() -> None:
+    video = _video()
+
+    def api_runner(_command: tuple[str, ...]) -> object:
+        raise DownloadError("unsupported?token=generic-private")
+
+    result = video.YtDlpMetadataClient(runner=api_runner).resolve(
+        video.VideoRequest(source=_source("https://video.example.test/watch?v=one")),
+        job_id="job-generic-error",
+    )
+
+    assert result.status is video.VideoStatus.TRANSIENT
+    assert result.selection is None
+    assert "generic-private" not in repr(result)
 
 
 def test_metadata_adapter_bounds_response_before_decoding_and_honors_network_disable(
