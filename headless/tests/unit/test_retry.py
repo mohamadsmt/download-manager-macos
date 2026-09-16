@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import importlib.util
 
 import pytest
+
+
+_RETRY_AUDIT_CAPACITY = 256
 
 
 def _retry():
@@ -24,6 +28,137 @@ def _authority(retry, *, generation: int = 7, policy=None):
 
 def _failure(retry, kind, **overrides):
     return retry.RetryFailure(kind=kind, **overrides)
+
+
+def _valid_retry_audit(retry, *, event_count: int):
+    assert event_count >= 1
+    generation = 7
+    budget_number = 1
+    ordinary_attempts = 0
+    exhausted = False
+    audit = [
+        retry.RetryAuditEvent(
+            retry.RetryAuditKind.OPENED,
+            generation=generation,
+            budget_number=budget_number,
+            ordinary_attempts=ordinary_attempts,
+        )
+    ]
+    for _ in range(1, event_count):
+        if exhausted:
+            generation += 1
+            budget_number += 1
+            ordinary_attempts = 0
+            exhausted = False
+            kind = retry.RetryAuditKind.EXPLICIT_RESUME
+        elif ordinary_attempts + 1 >= retry.RetryPolicy().max_ordinary_attempts:
+            ordinary_attempts += 1
+            exhausted = True
+            kind = retry.RetryAuditKind.EXHAUSTED
+        else:
+            ordinary_attempts += 1
+            kind = retry.RetryAuditKind.RETRY_SCHEDULED
+        audit.append(
+            retry.RetryAuditEvent(
+                kind,
+                generation=generation,
+                budget_number=budget_number,
+                ordinary_attempts=ordinary_attempts,
+            )
+        )
+    return (
+        tuple(audit),
+        generation,
+        budget_number,
+        ordinary_attempts,
+        exhausted,
+    )
+
+
+def test_retry_authority_rejects_direct_construction_from_valid_budget_snapshots() -> None:
+    retry = _retry()
+    policy = retry.RetryPolicy()
+    authority = _authority(retry, policy=policy)
+    snapshot = authority.budget
+    forged_snapshot = retry.RetryBudget(
+        job_id=snapshot.job_id,
+        generation=snapshot.generation,
+        budget_number=snapshot.budget_number,
+        ordinary_attempts=snapshot.ordinary_attempts,
+        paused=snapshot.paused,
+        exhausted=snapshot.exhausted,
+        audit=snapshot.audit,
+    )
+
+    assert forged_snapshot == snapshot
+    for candidate in (snapshot, forged_snapshot):
+        with pytest.raises(TypeError, match=r"RetryAuthority\.open"):
+            retry.RetryAuthority(policy=policy, budget=candidate)
+
+    decision = authority.decide(
+        _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+        generation=snapshot.generation,
+        jitter_seconds=0,
+    )
+    assert decision.budget.ordinary_attempts == 1
+
+
+def test_retry_budget_rejects_valid_over_capacity_audit_before_scanning_or_replaying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry = _retry()
+    audit, generation, budget_number, ordinary_attempts, exhausted = _valid_retry_audit(
+        retry, event_count=_RETRY_AUDIT_CAPACITY + 1
+    )
+
+    def unexpected_history_work(*_args, **_kwargs):
+        raise AssertionError("over-capacity audit must not be scanned or replayed")
+
+    monkeypatch.setattr(builtins, "any", unexpected_history_work)
+    monkeypatch.setattr(retry, "_validate_retry_audit", unexpected_history_work)
+
+    with pytest.raises(ValueError, match=r"audit.*capacity"):
+        retry.RetryBudget(
+            job_id="retry-job",
+            generation=generation,
+            budget_number=budget_number,
+            ordinary_attempts=ordinary_attempts,
+            paused=False,
+            exhausted=exhausted,
+            audit=audit,
+        )
+
+
+def test_retry_transitions_fail_closed_when_audit_capacity_is_reached() -> None:
+    retry = _retry()
+    authority = _authority(retry)
+
+    while len(authority.budget.audit) < _RETRY_AUDIT_CAPACITY:
+        budget = authority.budget
+        if budget.exhausted:
+            authority.resume_after_exhaustion(new_generation=budget.generation + 1)
+        else:
+            authority.decide(
+                _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+                generation=budget.generation,
+                jitter_seconds=0,
+            )
+
+    at_capacity = authority.budget
+    with pytest.raises(OverflowError, match=r"audit.*capacity"):
+        if at_capacity.exhausted:
+            authority.resume_after_exhaustion(
+                new_generation=at_capacity.generation + 1
+            )
+        else:
+            authority.decide(
+                _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+                generation=at_capacity.generation,
+                jitter_seconds=0,
+            )
+
+    assert authority.budget is at_capacity
+    assert len(authority.budget.audit) == _RETRY_AUDIT_CAPACITY
 
 
 def test_transient_host_failures_consume_at_most_five_outer_attempts() -> None:

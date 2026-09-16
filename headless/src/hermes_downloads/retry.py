@@ -36,6 +36,11 @@ __all__ = [
 
 _MAX_COUNTER: Final = (1 << 63) - 1
 _MAX_ORDINARY_ATTEMPTS: Final = 5
+# Audit snapshots are immutable tuples.  This cap bounds both validation of
+# hydrated snapshots and transition-time tuple copies while retaining dozens
+# of explicit exhausted-resume cycles for one job.
+_MAX_RETRY_AUDIT_EVENTS: Final = 256
+_RETRY_AUTHORITY_FACTORY_TOKEN: Final = object()
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_STRONG_VALIDATOR_BYTES: Final = 8192
@@ -202,7 +207,7 @@ class RetryAuditEvent:
 
 @dataclass(frozen=True, slots=True)
 class RetryBudget:
-    """An immutable, caller-persisted outer job attempt budget."""
+    """An immutable audited outer-job snapshot capped at 256 events."""
 
     job_id: str
     generation: int
@@ -228,6 +233,8 @@ class RetryBudget:
             raise TypeError("paused and exhausted must be booleans")
         if type(self.audit) is not tuple or not self.audit:
             raise ValueError("audit must contain the budget opening")
+        if len(self.audit) > _MAX_RETRY_AUDIT_EVENTS:
+            raise ValueError("audit exceeds the retry audit capacity")
         if any(type(event) is not RetryAuditEvent for event in self.audit):
             raise TypeError("audit must contain RetryAuditEvent values")
         _validate_retry_audit(self)
@@ -252,17 +259,28 @@ class RetryDecision:
 
 
 class RetryAuthority:
-    """Own one job's current immutable retry budget and generation."""
+    """Own one job's current immutable retry budget and generation.
+
+    Authorities are opened only through :meth:`open`; a snapshot cannot be
+    reused to create a second mutable authority for the same retry state.
+    """
 
     __slots__ = ("_budget", "_lock", "_policy")
 
-    def __init__(self, *, policy: RetryPolicy, budget: RetryBudget) -> None:
+    def __init__(self, *_args: object, **kwargs: object) -> None:
+        factory_token = kwargs.pop("_factory_token", None)
+        policy = kwargs.pop("_policy", None)
+        budget = kwargs.pop("_budget", None)
+        if _args or kwargs or factory_token is not _RETRY_AUTHORITY_FACTORY_TOKEN:
+            raise TypeError(
+                "RetryAuthority instances must be opened with RetryAuthority.open()"
+            )
         if type(policy) is not RetryPolicy:
             raise TypeError("policy must be a RetryPolicy")
         if type(budget) is not RetryBudget:
             raise TypeError("budget must be a RetryBudget")
-        self._policy = policy
-        self._budget = budget
+        self._policy = cast(RetryPolicy, policy)
+        self._budget = cast(RetryBudget, budget)
         self._lock = Lock()
 
     @classmethod
@@ -271,9 +289,12 @@ class RetryAuthority:
     ) -> RetryAuthority:
         """Open and own the initial retry budget for one job."""
 
+        if type(policy) is not RetryPolicy:
+            raise TypeError("policy must be a RetryPolicy")
         return cls(
-            policy=policy,
-            budget=_open_retry_budget(job_id=job_id, generation=generation),
+            _factory_token=_RETRY_AUTHORITY_FACTORY_TOKEN,
+            _policy=policy,
+            _budget=_open_retry_budget(job_id=job_id, generation=generation),
         )
 
     @property
@@ -571,6 +592,8 @@ def _transition_budget(
     paused: bool,
     exhausted: bool,
 ) -> RetryBudget:
+    if len(budget.audit) >= _MAX_RETRY_AUDIT_EVENTS:
+        raise OverflowError("retry audit capacity is exhausted")
     event = RetryAuditEvent(
         kind=kind,
         generation=generation,
