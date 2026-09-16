@@ -237,6 +237,27 @@ def test_non_utf8_source_policy_error_has_no_signed_query_exception_chain() -> N
     assert error.__cause__ is None
 
 
+def test_lone_surrogate_source_policy_error_has_no_signed_query_exception_chain() -> None:
+    network = _network()
+    canary = "T07-LONE-SURROGATE-SIGNED-QUERY-CANARY"
+    submitted = (
+        "https://downloads.example.test/release?X-Amz-Signature=" + canary + "\ud800"
+    )
+
+    with pytest.raises(network.SourcePolicyError) as raised:
+        network.validate_source_url(submitted)
+
+    error = raised.value
+
+    assert type(error) is network.SourcePolicyError
+    assert canary not in str(error)
+    assert canary not in repr(error)
+    assert canary not in repr(error.__context__)
+    assert canary not in repr(error.__cause__)
+    assert error.__context__ is None
+    assert error.__cause__ is None
+
+
 def test_malformed_source_policy_error_has_no_signed_query_exception_chain() -> None:
     network = _network()
     canary = "T07-MALFORMED-SIGNED-QUERY-CANARY"

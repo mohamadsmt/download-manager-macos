@@ -204,12 +204,18 @@ def _parse_source_url(value: str | bytes | bytearray) -> SourceURL:
 
 
 def _coerce_url(value: str | bytes | bytearray) -> tuple[bytes, str]:
+    raw_url: bytes | None = None
     if type(value) is str:
-        raw_url = value.encode("utf-8")
+        try:
+            raw_url = value.encode("utf-8")
+        except UnicodeEncodeError:
+            pass
     elif isinstance(value, (bytes, bytearray)):
         raw_url = bytes(value)
     else:
         raise TypeError("source URL must be text or bytes")
+    if raw_url is None:
+        raise SourcePolicyError("source URL is not valid UTF-8")
     if not raw_url or len(raw_url) > MAX_SOURCE_URL_BYTES:
         raise SourcePolicyError("source URL has an invalid length")
     text: str | None = None
