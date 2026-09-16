@@ -28,6 +28,7 @@ EXPECTED_WHEEL_MODULES = {
     "hermes_downloads/paths.py",
     "hermes_downloads/processes.py",
     "hermes_downloads/queue.py",
+    "hermes_downloads/retry.py",
     "hermes_downloads/store.py",
     "hermes_downloads/worker.py",
 }

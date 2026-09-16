@@ -47,6 +47,12 @@ def _direct_module() -> Any:
     return __import__("hermes_downloads.direct", fromlist=["DirectAria2Controller"])
 
 
+def _retry_module() -> Any:
+    spec = importlib.util.find_spec("hermes_downloads.retry")
+    assert spec is not None, "hermes_downloads.retry must provide bounded retry decisions"
+    return __import__("hermes_downloads.retry", fromlist=["RetryPolicy"])
+
+
 def _queue_module() -> Any:
     spec = importlib.util.find_spec("hermes_downloads.queue")
     assert spec is not None
@@ -434,6 +440,81 @@ def test_fixture_keeps_request_byte_and_connection_evidence_bounded() -> None:
         assert len(ledger.entries) == _FIXTURE_MODULE.LEDGER_CAPACITY
         assert ledger.dropped_entries == 1
         assert all(entry.endpoint == "range" for entry in ledger.entries)
+
+
+def test_retry_decisions_classify_real_loopback_fault_statuses_without_downloader_reimplementation() -> None:
+    retry = _retry_module()
+    policy = retry.RetryPolicy()
+    budget = retry.open_retry_budget(job_id="direct-fault-budget", generation=3)
+
+    with _origin_type()() as origin:
+        status, headers, body = _request(origin, "/too-many-requests")
+        assert (status, headers["Retry-After"], body) == (429, "7", b"")
+        throttled = retry.decide_retry(
+            policy,
+            budget,
+            retry.failure_from_http_status(
+                status, retry_after_seconds=int(headers["Retry-After"])
+            ),
+            generation=3,
+            jitter_seconds=0,
+        )
+
+        status, headers, body = _request(origin, "/service-unavailable")
+        assert (status, body) == (503, b"")
+        transient = retry.decide_retry(
+            policy,
+            throttled.budget,
+            retry.failure_from_http_status(status),
+            generation=3,
+            jitter_seconds=0,
+        )
+
+        status, _, body = _request(origin, "/forbidden")
+        assert (status, body) == (403, b"")
+        forbidden = retry.decide_retry(
+            policy,
+            transient.budget,
+            retry.failure_from_http_status(status),
+            generation=3,
+        )
+
+    assert throttled.action is retry.RetryAction.RETRY_WAIT
+    assert throttled.delay_seconds == 7
+    assert transient.action is retry.RetryAction.RETRY_WAIT
+    assert transient.delay_seconds == 10
+    assert forbidden.action is retry.RetryAction.NEEDS_DECISION
+    assert forbidden.budget.ordinary_attempts == 2
+
+
+def test_direct_hashless_completion_is_explicitly_transport_verified(tmp_path: Path) -> None:
+    direct = _direct_module()
+    job_id = "direct-transport-verified"
+    queue = _admitted_queue(job_id)
+
+    with _origin_type()() as origin, _running_direct_controller(direct, tmp_path) as (
+        controller,
+        _,
+    ):
+        destination = _destination(job_id, "transport-verified.bin")
+        added = controller.add_paused(
+            job_id=job_id,
+            generation=5,
+            source=_source(origin, "/range"),
+            destination=destination,
+            expected_sha256=None,
+            admission=_admission(queue, job_id),
+        )
+        assert added.status == "paused"
+        assert added.verification is None
+        controller.resume(job_id=job_id, generation=5, admission=_admission(queue, job_id))
+        completed = controller.wait_for_terminal(job_id=job_id, generation=5, timeout=5)
+
+    assert completed.status == "complete"
+    assert completed.hash_verified is False
+    assert completed.verification is direct.CompletionVerification.TRANSPORT_VERIFIED
+    assert completed.verification.value == "transport-verified"
+    assert completed.partial_path.read_bytes() == origin.payload
 
 
 def test_direct_admission_adds_paused_then_explicit_resume_hash_verifies_payload(

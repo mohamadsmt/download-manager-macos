@@ -27,8 +27,10 @@ from hermes_downloads.models import Admission
 from hermes_downloads.network import SourceURL
 from hermes_downloads.paths import DestinationIntent
 from hermes_downloads.processes import EngineIdentity
+from hermes_downloads.retry import CompletionVerification
 
 __all__ = [
+    "CompletionVerification",
     "DirectAria2Controller",
     "DirectAdmissionError",
     "DirectEngineError",
@@ -82,6 +84,7 @@ class DirectTransfer:
     completed_length: int
     partial_path: Path
     hash_verified: bool
+    verification: CompletionVerification | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +94,7 @@ class _TrackedTransfer:
     gid: str
     source: SourceURL
     destination: DestinationIntent
-    expected_sha256: str
+    expected_sha256: str | None
 
 
 class DirectAria2Controller:
@@ -275,7 +278,7 @@ class DirectAria2Controller:
         generation: int,
         source: SourceURL,
         destination: DestinationIntent,
-        expected_sha256: str,
+        expected_sha256: str | None,
         admission: Admission,
     ) -> DirectTransfer:
         """Add one admitted transfer with aria2 paused before any body request."""
@@ -285,7 +288,7 @@ class DirectAria2Controller:
         _require_generation(generation)
         _require_source(source)
         _require_destination(destination, job_id)
-        _require_sha256(expected_sha256)
+        expected_sha256 = _require_optional_sha256(expected_sha256)
         self._require_running()
         if job_id in self._by_job_id:
             raise DirectTransferError("job already has an aria2 GID")
@@ -296,9 +299,10 @@ class DirectAria2Controller:
             "continue": "true",
             "allow-overwrite": "false",
             "auto-file-renaming": "false",
-            "checksum": f"sha-256={expected_sha256}",
-            "check-integrity": "true",
         }
+        if expected_sha256 is not None:
+            options["checksum"] = f"sha-256={expected_sha256}"
+            options["check-integrity"] = "true"
         gid = self._rpc("aria2.addUri", [[source.raw_url.decode("utf-8")], options])
         _require_gid(gid)
         transfer = _TrackedTransfer(
@@ -346,7 +350,7 @@ class DirectAria2Controller:
     def wait_for_terminal(
         self, *, job_id: str, generation: int, timeout: float
     ) -> DirectTransfer:
-        """Wait for aria2 terminal state and independently verify expected SHA-256."""
+        """Wait for terminal state and verify a supplied SHA-256 when available."""
 
         if type(timeout) not in {int, float} or timeout <= 0:
             raise TypeError("timeout must be a positive number")
@@ -355,7 +359,7 @@ class DirectAria2Controller:
         while True:
             state = self._readback(transfer)
             if state.status == "complete":
-                return self._verify_completed_hash(state, transfer)
+                return self._verify_completed_output(state, transfer)
             if state.status in _TERMINAL_STATUSES:
                 raise DirectTransferError("aria2 transfer failed")
             if time.monotonic() >= deadline:
@@ -403,11 +407,17 @@ class DirectAria2Controller:
             completed_length=completed_length,
             partial_path=transfer.destination.partial_path,
             hash_verified=False,
+            verification=None,
         )
 
-    def _verify_completed_hash(
+    def _verify_completed_output(
         self, state: DirectTransfer, transfer: _TrackedTransfer
     ) -> DirectTransfer:
+        if transfer.expected_sha256 is None:
+            return replace(
+                state,
+                verification=CompletionVerification.TRANSPORT_VERIFIED,
+            )
         try:
             details = state.partial_path.stat()
             if not stat.S_ISREG(details.st_mode):
@@ -418,7 +428,11 @@ class DirectAria2Controller:
             raise DirectTransferError("aria2 output is unavailable") from None
         if actual_sha256 != transfer.expected_sha256:
             raise DirectTransferError("aria2 hash verification failed")
-        return replace(state, hash_verified=True)
+        return replace(
+            state,
+            hash_verified=True,
+            verification=CompletionVerification.CHECKSUM_VERIFIED,
+        )
 
     def _create_private_config(self) -> tuple[Path, Path, str]:
         self._runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -623,6 +637,12 @@ def _require_sha256(value: object) -> str:
     if type(value) is not str or _SHA256.fullmatch(value) is None:
         raise ValueError("expected_sha256 must be a lowercase SHA-256 digest")
     return value
+
+
+def _require_optional_sha256(value: object) -> str | None:
+    if value is None:
+        return None
+    return _require_sha256(value)
 
 
 def _require_admission(admission: object) -> Admission:
