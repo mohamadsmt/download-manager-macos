@@ -457,6 +457,7 @@ def test_retry_decisions_classify_real_loopback_fault_statuses_without_downloade
                 status, retry_after_seconds=int(headers["Retry-After"])
             ),
             generation=3,
+            current_generation=3,
             jitter_seconds=0,
         )
 
@@ -467,6 +468,7 @@ def test_retry_decisions_classify_real_loopback_fault_statuses_without_downloade
             throttled.budget,
             retry.failure_from_http_status(status),
             generation=3,
+            current_generation=3,
             jitter_seconds=0,
         )
 
@@ -477,6 +479,7 @@ def test_retry_decisions_classify_real_loopback_fault_statuses_without_downloade
             transient.budget,
             retry.failure_from_http_status(status),
             generation=3,
+            current_generation=3,
         )
 
     assert throttled.action is retry.RetryAction.RETRY_WAIT

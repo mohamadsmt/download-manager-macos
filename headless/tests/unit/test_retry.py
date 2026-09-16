@@ -34,6 +34,7 @@ def test_transient_host_failures_consume_at_most_five_outer_attempts() -> None:
             budget,
             _failure(retry, retry.FailureKind.TRANSIENT_HOST),
             generation=7,
+            current_generation=7,
             jitter_seconds=0,
         )
         decisions.append(decision)
@@ -62,6 +63,7 @@ def test_transient_host_failures_consume_at_most_five_outer_attempts() -> None:
         budget,
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=7,
+        current_generation=7,
         jitter_seconds=0,
     )
     assert sixth.action is retry.RetryAction.EXHAUSTED
@@ -91,12 +93,14 @@ def test_offline_wait_is_distinct_from_a_host_failure_and_does_not_spend_budget(
         budget,
         _failure(retry, retry.FailureKind.OFFLINE),
         generation=7,
+        current_generation=7,
     )
     host = retry.decide_retry(
         policy,
         budget,
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=7,
+        current_generation=7,
         jitter_seconds=0,
     )
 
@@ -123,6 +127,7 @@ def test_auth_and_link_needed_stop_ordinary_retries(
         _budget(retry),
         _failure(retry, getattr(retry.FailureKind, kind)),
         generation=7,
+        current_generation=7,
     )
 
     assert decision.action is getattr(retry.RetryAction, action)
@@ -135,7 +140,7 @@ def test_forbidden_http_response_stays_ambiguous_and_does_not_assume_expiry() ->
     forbidden = retry.failure_from_http_status(403)
 
     decision = retry.decide_retry(
-        retry.RetryPolicy(), _budget(retry), forbidden, generation=7
+        retry.RetryPolicy(), _budget(retry), forbidden, generation=7, current_generation=7
     )
 
     assert forbidden.kind is retry.FailureKind.FORBIDDEN
@@ -151,6 +156,7 @@ def test_disk_full_is_blocked_without_a_network_retry() -> None:
         _budget(retry),
         _failure(retry, retry.FailureKind.DISK_FULL),
         generation=7,
+        current_generation=7,
     )
 
     assert decision.action is retry.RetryAction.BLOCKED
@@ -166,6 +172,7 @@ def test_pause_closes_a_pending_retry_before_its_timer_can_retry() -> None:
         _budget(retry),
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=7,
+        current_generation=7,
         jitter_seconds=0,
     )
 
@@ -175,6 +182,7 @@ def test_pause_closes_a_pending_retry_before_its_timer_can_retry() -> None:
         paused.budget,
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=paused.budget.generation,
+        current_generation=paused.budget.generation,
         jitter_seconds=0,
     )
 
@@ -193,6 +201,7 @@ def test_pause_invalidates_a_pending_timer_holding_the_prior_budget() -> None:
         _budget(retry),
         _failure(retry, retry.FailureKind.TRANSIENT_HOST),
         generation=7,
+        current_generation=7,
         jitter_seconds=0,
     )
     paused = retry.pause_retry(pending.budget, generation=7)
@@ -202,7 +211,8 @@ def test_pause_invalidates_a_pending_timer_holding_the_prior_budget() -> None:
             policy,
             pending.budget,
             _failure(retry, retry.FailureKind.TRANSIENT_HOST),
-            generation=paused.budget.generation,
+            generation=7,
+            current_generation=paused.budget.generation,
             jitter_seconds=0,
         )
 
@@ -221,6 +231,7 @@ def test_stale_generation_cannot_change_a_retry_budget() -> None:
             _budget(retry, generation=7),
             _failure(retry, retry.FailureKind.TRANSIENT_HOST),
             generation=6,
+            current_generation=7,
             jitter_seconds=0,
         )
 
@@ -235,6 +246,7 @@ def test_explicit_resume_after_exhaustion_opens_a_new_audited_budget() -> None:
             exhausted,
             _failure(retry, retry.FailureKind.TRANSIENT_HOST),
             generation=7,
+            current_generation=7,
             jitter_seconds=0,
         ).budget
 
