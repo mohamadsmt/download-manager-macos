@@ -7,7 +7,7 @@ name = "hermes-downloads"
 version = "0.0.0"
 description = "Headless Hermes download service"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = ["yt-dlp==2026.6.9"]
 
 [project.scripts]
 hermes-downloads = "hermes_downloads.cli:main"
