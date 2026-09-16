@@ -30,6 +30,7 @@ EXPECTED_WHEEL_MODULES = {
     "hermes_downloads/queue.py",
     "hermes_downloads/retry.py",
     "hermes_downloads/store.py",
+    "hermes_downloads/video.py",
     "hermes_downloads/worker.py",
 }
 ENTRYPOINTS = (
@@ -97,7 +98,7 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     """The product must run from a physical wheel, never checkout injection."""
     project = tomllib.loads((HEADLESS_ROOT / "pyproject.toml").read_text("utf-8"))
     assert project["project"]["requires-python"] == ">=3.12,<3.13"
-    assert project["project"]["dependencies"] == []
+    assert project["project"]["dependencies"] == ["yt-dlp==2026.6.9"]
     assert project["project"]["scripts"] == {
         "hermes-downloads": "hermes_downloads.cli:main",
         "hermes-downloads-mcp": "hermes_downloads.mcp_server:main",
