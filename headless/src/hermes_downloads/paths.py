@@ -192,6 +192,7 @@ def observe_job_space(
         output_path=output_path,
     )
 
+    _require_safe_writable_root(root)
     root_fd = _open_root(root)
     try:
         incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)

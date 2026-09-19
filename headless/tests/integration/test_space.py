@@ -300,3 +300,59 @@ def test_rejects_same_inode_lexical_owned_aliases_before_accounting(
         )
 
     assert observed_paths == [first_alias, second_alias]
+
+
+def test_rejects_replaced_downloads_root_chain_without_observing_external_artifacts(
+    tmp_path: Path,
+) -> None:
+    paths = _paths()
+    destination = _destination(paths, job_id="job-space-replaced-downloads")
+    original_owned = destination.incomplete_dir / "owned.part"
+    original_owned_bytes = b"original owned artifact"
+    original_output_bytes = b"original output artifact"
+    original_owned.write_bytes(original_owned_bytes)
+    destination.partial_path.write_bytes(original_output_bytes)
+
+    downloads = destination.root.parent
+    relocated_downloads = tmp_path / "relocated-downloads"
+    external_downloads = tmp_path / "external-downloads"
+    external_incomplete = (
+        external_downloads / "Hermes" / ".incomplete" / destination.job_id
+    )
+    external_owned = external_incomplete / "owned.part"
+    external_output = external_incomplete / destination.filename
+    external_owned_bytes = b"external owned artifact with distinct size"
+    external_output_bytes = b"external output artifact with distinct size"
+    external_incomplete.mkdir(parents=True)
+    external_owned.write_bytes(external_owned_bytes)
+    external_output.write_bytes(external_output_bytes)
+
+    downloads_moved = False
+    try:
+        downloads.rename(relocated_downloads)
+        downloads_moved = True
+        downloads.symlink_to(external_downloads, target_is_directory=True)
+
+        with pytest.raises(paths.PathValidationError):
+            observed = paths.observe_job_space(
+                destination,
+                owned_paths=(original_owned,),
+                output_path=destination.partial_path,
+                expected_output_logical_bytes=len(external_output_bytes),
+            )
+            assert observed.current.logical_bytes == (
+                len(external_owned_bytes) + len(external_output_bytes)
+            )
+            pytest.fail("observer followed the replaced Downloads root chain")
+    finally:
+        if downloads.is_symlink():
+            downloads.unlink()
+        if downloads_moved:
+            relocated_downloads.rename(downloads)
+
+    assert original_owned.read_bytes() == original_owned_bytes
+    assert destination.partial_path.read_bytes() == original_output_bytes
+    assert external_owned.read_bytes() == external_owned_bytes
+    assert external_output.read_bytes() == external_output_bytes
+    assert downloads.is_dir()
+    assert not downloads.is_symlink()
