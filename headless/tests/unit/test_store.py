@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -9,8 +11,41 @@ from typing import Any
 import pytest
 
 import hermes_downloads.store as store_module
-from hermes_downloads.models import DownloadIntent
+from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
 from hermes_downloads.store import RequestConflictError, SQLiteStore
+
+
+_V1_SCHEMA = """
+CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    revision INTEGER NOT NULL
+);
+
+CREATE TABLE jobs (
+    job_id TEXT PRIMARY KEY,
+    source_url BLOB NOT NULL,
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    state TEXT NOT NULL
+);
+
+CREATE TABLE commands (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL
+);
+
+CREATE TABLE events (
+    event_id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL
+);
+"""
 
 
 def _intent(**overrides: Any) -> DownloadIntent:
@@ -24,6 +59,82 @@ def _intent(**overrides: Any) -> DownloadIntent:
     }
     values.update(overrides)
     return DownloadIntent(**values)
+
+
+def _materialized_job(**overrides: Any) -> MaterializedJob:
+    values: dict[str, Any] = {
+        "job_id": "job-1",
+        "intent": _intent(expected_revision=3),
+        "source_kind": SourceKind.VIDEO,
+        "queue_collection_id": "queue-1",
+        "priority": -12,
+        "order_key": 42,
+        "scheduled_for": datetime(
+            2031,
+            7,
+            2,
+            9,
+            30,
+            15,
+            123456,
+            tzinfo=timezone(timedelta(hours=3)),
+        ),
+        "authorized": True,
+        "manual_hold": False,
+        "start_now_requested": True,
+        "category": "Videos",
+        "destination_collection": "Course material",
+        "partial_filename": "selected.webm",
+        "selected_final_filename": "selected--job-1.webm",
+    }
+    values.update(overrides)
+    return MaterializedJob(**values)
+
+
+def _create_v1_database(database_path: Path) -> tuple[object, ...]:
+    raw_source = b"https://example.test/%2Flegacy?signature=unchanged"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(_V1_SCHEMA)
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            """
+            INSERT INTO jobs (job_id, source_url, generation, revision, state)
+            VALUES ('legacy-job', ?, 23, 41, 'downloading')
+            """,
+            (raw_source,),
+        )
+        connection.execute(
+            """
+            INSERT INTO commands (
+                request_id, payload_digest, job_id, generation, revision
+            )
+            VALUES ('legacy-request', ?, 'legacy-job', 23, 41)
+            """,
+            ("b" * 64,),
+        )
+        connection.execute(
+            """
+            INSERT INTO events (kind, job_id, generation, revision)
+            VALUES ('job_added', 'legacy-job', 23, 41)
+            """
+        )
+        return connection.execute(
+            """
+            SELECT job_id, source_url, generation, revision, state
+            FROM jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone()
+
+
+def _table_names(database_path: Path) -> frozenset[str]:
+    with sqlite3.connect(database_path) as connection:
+        return frozenset(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        )
 
 
 def _add_page_of_jobs(store: SQLiteStore) -> None:
@@ -52,6 +163,32 @@ class _BootstrapFailureConnection:
     def executescript(self, script: str) -> None:
         self._connection.execute("BEGIN EXCLUSIVE")
         raise sqlite3.OperationalError("injected bootstrap failure")
+
+    def close(self) -> None:
+        self.closed = True
+        self._connection.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+class _MigrationFailureConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.closed = False
+
+    @property
+    def row_factory(self) -> Any:
+        return self._connection.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value: Any) -> None:
+        self._connection.row_factory = value
+
+    def execute(self, statement: str, *args: Any, **kwargs: Any) -> Any:
+        if statement.lstrip().startswith("CREATE TABLE collection_holds"):
+            raise sqlite3.OperationalError("injected migration failure")
+        return self._connection.execute(statement, *args, **kwargs)
 
     def close(self) -> None:
         self.closed = True
@@ -555,3 +692,201 @@ def test_cold_recovery_epoch_survives_reopen(tmp_path: Path) -> None:
         assert final.worker_epoch() == 2
     finally:
         final.close()
+
+
+def test_v2_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v1_database(database_path)
+    legacy_source_url = expected_legacy_job[1]
+    assert isinstance(legacy_source_url, bytes)
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_job("legacy-job") == store_module.JobRecord(
+            job="legacy-job",
+            source_url=legacy_source_url,
+            generation=23,
+            revision=41,
+            state="downloading",
+        )
+        assert store.get_materialized_job("legacy-job") is None
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute(
+            """
+            SELECT job_id, source_url, generation, revision, state
+            FROM jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone() == expected_legacy_job
+    v1_tables = {"settings", "jobs", "commands", "events"}
+    v2_tables = _table_names(database_path)
+    assert v1_tables <= v2_tables
+    assert "collection_holds" in v2_tables
+    assert len(v2_tables - v1_tables) >= 2
+
+
+def test_v2_migration_failure_leaves_v1_database_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v1_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_migration_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(original_connect(*args, **kwargs))
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_migration_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute(
+            """
+            SELECT job_id, source_url, generation, revision, state
+            FROM jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone() == expected_legacy_job
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        } == {"settings", "jobs", "commands", "events"}
+
+
+def test_materialized_domain_apply_add_reopens_exact_projection(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    materialized = _materialized_job()
+
+    store = SQLiteStore(database_path)
+    try:
+        result = store.apply_add(materialized.intent, materialized=materialized)
+
+        assert result.applied is True
+        assert materialized.scheduled_for == datetime(
+            2031, 7, 2, 6, 30, 15, 123456, tzinfo=UTC
+        )
+        assert materialized.selected_final_filename == "selected--job-1.webm"
+        assert materialized.intent.expected_revision == 3
+        assert store.get_materialized_job(materialized.job_id) == materialized
+    finally:
+        store.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.get_materialized_job(materialized.job_id) == materialized
+    finally:
+        reopened.close()
+
+
+def test_materialized_domain_duplicate_is_idempotent_but_changed_domain_conflicts(
+    tmp_path: Path,
+) -> None:
+    materialized = _materialized_job()
+    changed_domain = replace(materialized, queue_collection_id="queue-2")
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        first = store.apply_add(materialized.intent, materialized=materialized)
+        repeated = store.apply_add(materialized.intent, materialized=materialized)
+
+        assert first.applied is True
+        assert repeated.applied is False
+        assert store.get_materialized_job(materialized.job_id) == materialized
+        before = (
+            store.list_jobs(),
+            store.get_command(materialized.intent.request_id),
+            store.list_events(),
+            store.get_materialized_job(materialized.job_id),
+        )
+
+        with pytest.raises(RequestConflictError):
+            store.apply_add(materialized.intent, materialized=changed_domain)
+
+        assert (
+            store.list_jobs(),
+            store.get_command(materialized.intent.request_id),
+            store.list_events(),
+            store.get_materialized_job(materialized.job_id),
+        ) == before
+    finally:
+        store.close()
+
+
+def test_collection_hold_set_read_reopen_and_clear_are_idempotent(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    try:
+        assert store.collection_hold("collection-1") is False
+        store.set_collection_hold("collection-1", held=True)
+        assert store.collection_hold("collection-1") is True
+    finally:
+        store.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.collection_hold("collection-1") is True
+        reopened.set_collection_hold("collection-1", held=False)
+        reopened.set_collection_hold("collection-1", held=False)
+        assert reopened.collection_hold("collection-1") is False
+    finally:
+        reopened.close()
+
+    cleared = SQLiteStore(database_path)
+    try:
+        assert cleared.collection_hold("collection-1") is False
+    finally:
+        cleared.close()
+
+
+def test_collection_hold_rejects_an_invalid_collection_identifier(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        with pytest.raises((TypeError, ValueError)):
+            store.set_collection_hold("collection/one", held=True)
+    finally:
+        store.close()
+
+
+def test_materialized_domain_cold_recovery_preserves_projection_fields(
+    tmp_path: Path,
+) -> None:
+    materialized = _materialized_job()
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        before_job = store.get_job(materialized.job_id)
+        before_domain = store.get_materialized_job(materialized.job_id)
+
+        assert before_job is not None
+        assert before_domain == materialized
+        assert store.recover_cold_start() == 1
+
+        assert store.get_job(materialized.job_id) == replace(
+            before_job,
+            generation=before_job.generation + 1,
+            revision=before_job.revision + 1,
+            state="paused",
+        )
+        assert before_domain is not None
+        assert store.get_materialized_job(materialized.job_id) == replace(
+            before_domain,
+            intent=replace(
+                before_domain.intent,
+                generation=before_job.generation + 1,
+                revision=before_job.revision + 1,
+            ),
+        )
+    finally:
+        store.close()
