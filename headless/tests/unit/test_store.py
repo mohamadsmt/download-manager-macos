@@ -173,6 +173,15 @@ def _create_v1_database(database_path: Path) -> tuple[object, ...]:
         ).fetchone()
 
 
+def _create_v2_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v1_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._MATERIALIZED_JOBS_SCHEMA)
+        connection.execute(store_module._COLLECTION_HOLDS_SCHEMA)
+        connection.execute("PRAGMA user_version = 2")
+    return legacy_job
+
+
 def _table_names(database_path: Path) -> frozenset[str]:
     with sqlite3.connect(database_path) as connection:
         return frozenset(
@@ -219,9 +228,14 @@ class _BootstrapFailureConnection:
 
 
 class _MigrationFailureConnection:
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        failure_statement_prefix: str = "CREATE TABLE collection_holds",
+    ) -> None:
         self._connection = connection
         self.closed = False
+        self._failure_statement_prefix = failure_statement_prefix
 
     @property
     def row_factory(self) -> Any:
@@ -232,7 +246,7 @@ class _MigrationFailureConnection:
         self._connection.row_factory = value
 
     def execute(self, statement: str, *args: Any, **kwargs: Any) -> Any:
-        if statement.lstrip().startswith("CREATE TABLE collection_holds"):
+        if statement.lstrip().startswith(self._failure_statement_prefix):
             raise sqlite3.OperationalError("injected migration failure")
         return self._connection.execute(statement, *args, **kwargs)
 
@@ -810,6 +824,49 @@ def test_v2_migration_failure_leaves_v1_database_unchanged(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         } == {"settings", "jobs", "commands", "events"}
+
+
+def test_v3_migration_failure_leaves_v2_database_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v2_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_migration_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="CREATE TABLE job_retry_audit",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_migration_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute(
+            """
+            SELECT job_id, source_url, generation, revision, state
+            FROM jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone() == expected_legacy_job
+    monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
+    assert _table_names(database_path) == {
+        "settings",
+        "jobs",
+        "commands",
+        "events",
+        "materialized_jobs",
+        "collection_holds",
+    }
 
 
 def test_v2_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
