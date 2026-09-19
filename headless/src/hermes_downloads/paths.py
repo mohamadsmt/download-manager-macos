@@ -17,9 +17,12 @@ __all__ = [
     "CATEGORIES",
     "DestinationIntent",
     "FinalPathCollisionError",
+    "JobSpace",
     "PathValidationError",
+    "StorageUsage",
     "UnsafePathError",
     "claim_final_path",
+    "observe_job_space",
     "resolve_destination",
 ]
 
@@ -39,6 +42,24 @@ class UnsafePathError(PathValidationError):
 
 class FinalPathCollisionError(PathValidationError):
     """A final name is already occupied and cannot be overwritten."""
+
+
+@dataclass(frozen=True, slots=True)
+class StorageUsage:
+    """Current logical and, when observable, allocated file bytes."""
+
+    logical_bytes: int
+    allocated_bytes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class JobSpace:
+    """Path-scoped current usage and logical output-space expectations."""
+
+    current: StorageUsage
+    available_bytes: int
+    expected_output_logical_bytes: int | None
+    expected_peak_logical_bytes: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +173,50 @@ def claim_final_path(destination: DestinationIntent) -> Path:
     return destination.final_path.parent / name
 
 
+def observe_job_space(
+    destination: DestinationIntent,
+    *,
+    owned_paths: tuple[Path, ...],
+    output_path: Path,
+    expected_output_logical_bytes: int | None,
+) -> JobSpace:
+    """Observe only the explicit job artifacts without creating or changing them."""
+
+    _validate_destination_intent(destination)
+    expected_output_logical_bytes = _require_expected_output_logical_bytes(
+        expected_output_logical_bytes
+    )
+    owned_paths, output_path = _validate_job_artifact_paths(
+        destination.incomplete_dir,
+        owned_paths=owned_paths,
+        output_path=output_path,
+    )
+    _require_real_directory(destination.incomplete_dir)
+
+    owned_details = tuple(_require_job_file(path) for path in owned_paths)
+    output_details = _observe_output_file(output_path)
+    included_details = owned_details + (() if output_details is None else (output_details,))
+
+    owned_logical_bytes = sum(details.st_size for details in owned_details)
+    output_logical_bytes = 0 if output_details is None else output_details.st_size
+    current = StorageUsage(
+        logical_bytes=owned_logical_bytes + output_logical_bytes,
+        allocated_bytes=_allocated_bytes(included_details),
+    )
+    expected_peak_logical_bytes = (
+        None
+        if expected_output_logical_bytes is None
+        else owned_logical_bytes
+        + max(output_logical_bytes, expected_output_logical_bytes)
+    )
+    return JobSpace(
+        current=current,
+        available_bytes=_available_bytes(destination.incomplete_dir),
+        expected_output_logical_bytes=expected_output_logical_bytes,
+        expected_peak_logical_bytes=expected_peak_logical_bytes,
+    )
+
+
 def _validate_destination_intent(destination: DestinationIntent) -> tuple[Path, str]:
     if type(destination) is not DestinationIntent:
         raise TypeError("destination must be a DestinationIntent")
@@ -176,6 +241,118 @@ def _validate_destination_intent(destination: DestinationIntent) -> tuple[Path, 
     ):
         raise PathValidationError("destination intent does not match the managed root")
     return root, final_component
+
+
+def _require_expected_output_logical_bytes(value: object) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise PathValidationError("expected output size must be a nonnegative integer")
+    return value
+
+
+def _validate_job_artifact_paths(
+    incomplete_dir: Path,
+    *,
+    owned_paths: object,
+    output_path: object,
+) -> tuple[tuple[Path, ...], Path]:
+    if type(owned_paths) is not tuple:
+        raise PathValidationError("owned paths must be a tuple")
+
+    output = _require_direct_incomplete_child(output_path, incomplete_dir)
+    owned: list[Path] = []
+    seen: set[Path] = set()
+    for value in owned_paths:
+        path = _require_direct_incomplete_child(value, incomplete_dir)
+        if path == output:
+            raise PathValidationError("output path cannot be an owned artifact")
+        if path in seen:
+            raise PathValidationError("owned artifact paths must be unique")
+        seen.add(path)
+        owned.append(path)
+    return tuple(owned), output
+
+
+def _require_direct_incomplete_child(value: object, incomplete_dir: Path) -> Path:
+    if not isinstance(value, Path):
+        raise PathValidationError("job artifact path must be a Path")
+    if value.parent != incomplete_dir:
+        raise PathValidationError("job artifact must be a direct incomplete child")
+    return value
+
+
+def _require_job_file(path: Path) -> os.stat_result:
+    try:
+        details = os.lstat(path)
+    except FileNotFoundError as error:
+        raise PathValidationError("owned job artifact is missing") from error
+    except OSError as error:
+        raise PathValidationError("owned job artifact is inaccessible") from error
+    return _require_regular_single_link_file(details)
+
+
+def _observe_output_file(path: Path) -> os.stat_result | None:
+    try:
+        details = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PathValidationError("job output artifact is inaccessible") from error
+    return _require_regular_single_link_file(details)
+
+
+def _require_regular_single_link_file(details: os.stat_result) -> os.stat_result:
+    try:
+        mode = details.st_mode
+        links = details.st_nlink
+        logical_bytes = details.st_size
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("job artifact metadata is invalid") from error
+    if type(mode) is not int:
+        raise PathValidationError("job artifact metadata is invalid")
+    if stat.S_ISLNK(mode):
+        raise UnsafePathError("job artifact is a symlink")
+    if not stat.S_ISREG(mode):
+        raise PathValidationError("job artifact is not a regular file")
+    if type(links) is not int or links != 1:
+        raise PathValidationError("job artifact is not a single-link file")
+    if type(logical_bytes) is not int or logical_bytes < 0:
+        raise PathValidationError("job artifact size is invalid")
+    return details
+
+
+def _allocated_bytes(details: tuple[os.stat_result, ...]) -> int | None:
+    allocated_bytes = 0
+    for item in details:
+        try:
+            blocks = item.st_blocks
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if type(blocks) is not int or blocks < 0:
+            return None
+        allocated_bytes += blocks * 512
+    return allocated_bytes
+
+
+def _available_bytes(incomplete_dir: Path) -> int:
+    try:
+        filesystem = os.statvfs(incomplete_dir)
+    except (OSError, TypeError, ValueError) as error:
+        raise PathValidationError("incomplete filesystem is inaccessible") from error
+    try:
+        available_blocks = filesystem.f_bavail
+        fragment_size = filesystem.f_frsize
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("incomplete filesystem statistics are invalid") from error
+    if (
+        type(available_blocks) is not int
+        or available_blocks < 0
+        or type(fragment_size) is not int
+        or fragment_size <= 0
+    ):
+        raise PathValidationError("incomplete filesystem statistics are invalid")
+    return available_blocks * fragment_size
 
 
 def _require_root(value: str | os.PathLike[str]) -> Path:
