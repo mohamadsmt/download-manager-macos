@@ -1,15 +1,27 @@
 """Durable download intent and admission gates, independent of engine observation."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
+from pathlib import Path
 import re
 from typing import Final
+import unicodedata
 
-__all__ = ["Admission", "DownloadIntent", "JobState"]
+__all__ = [
+    "Admission",
+    "DownloadIntent",
+    "JobState",
+    "MaterializedJob",
+    "SourceKind",
+]
 
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_COUNTER: Final = (1 << 63) - 1
+_MIN_PRIORITY: Final = -(1 << 31)
+_MAX_PRIORITY: Final = (1 << 31) - 1
+_CATEGORIES: Final = frozenset({"Videos", "Audio", "Documents", "Software", "Other"})
 
 
 class JobState(str, Enum):
@@ -29,6 +41,13 @@ class JobState(str, Enum):
     CANCELLED = "cancelled"
     REMOVED = "removed"
     FAILED = "failed"
+
+
+class SourceKind(str, Enum):
+    """The immutable source family selected while materializing a job."""
+
+    DIRECT = "direct"
+    VIDEO = "video"
 
 
 def _require_identifier(value: object, name: str) -> str:
@@ -62,6 +81,24 @@ def _snapshot_source_url(value: object) -> bytes:
     if not source_url:
         raise ValueError("source_url must not be empty")
     return source_url
+
+
+def _require_path_component(value: object, name: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    if not value or value in {".", ".."} or value.startswith("."):
+        raise ValueError(f"{name} is not a valid output name")
+    if "/" in value or "\\" in value or "\x00" in value:
+        raise ValueError(f"{name} must be one path component")
+    if any(unicodedata.category(character) in {"Cc", "Cs"} for character in value):
+        raise ValueError(f"{name} contains a control character")
+    return value
+
+
+def _collision_filename(filename: str, job_id: str) -> str:
+    suffix = Path(filename).suffix
+    stem = filename[: -len(suffix)] if suffix else filename
+    return f"{stem}--{job_id}{suffix}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,3 +155,61 @@ class DownloadIntent:
         _require_counter(self.revision, "revision")
         # URL parsing and policy are intentionally deferred to T07.
         object.__setattr__(self, "source_url", _snapshot_source_url(self.source_url))
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedJob:
+    """Durable queue, admission, and destination projections for one intent."""
+
+    job_id: str
+    intent: DownloadIntent
+    source_kind: SourceKind
+    queue_collection_id: str
+    priority: int
+    order_key: int
+    scheduled_for: datetime
+    authorized: bool
+    manual_hold: bool
+    start_now_requested: bool
+    category: str
+    destination_collection: str | None
+    partial_filename: str
+    selected_final_filename: str
+
+    def __post_init__(self) -> None:
+        job_id = _require_identifier(self.job_id, "job_id")
+        if type(self.intent) is not DownloadIntent:
+            raise TypeError("intent must be a DownloadIntent")
+        if self.intent.job_id != job_id:
+            raise ValueError("job_id must match intent.job_id")
+        if type(self.source_kind) is not SourceKind:
+            raise TypeError("source_kind must be a SourceKind")
+        _require_identifier(self.queue_collection_id, "queue_collection_id")
+        if type(self.priority) is not int:
+            raise TypeError("priority must be an integer")
+        if not _MIN_PRIORITY <= self.priority <= _MAX_PRIORITY:
+            raise ValueError("priority must fit a signed 32-bit integer")
+        _require_counter(self.order_key, "order_key")
+        if type(self.scheduled_for) is not datetime:
+            raise TypeError("scheduled_for must be a datetime")
+        if self.scheduled_for.tzinfo is None or self.scheduled_for.utcoffset() is None:
+            raise ValueError("scheduled_for must be timezone-aware")
+        object.__setattr__(self, "scheduled_for", self.scheduled_for.astimezone(UTC))
+        for name in ("authorized", "manual_hold", "start_now_requested"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be a boolean")
+        if type(self.category) is not str or self.category not in _CATEGORIES:
+            raise ValueError("category is not a supported output category")
+        if self.destination_collection is not None:
+            _require_path_component(self.destination_collection, "destination_collection")
+        partial_filename = _require_path_component(
+            self.partial_filename, "partial_filename"
+        )
+        selected_final_filename = _require_path_component(
+            self.selected_final_filename, "selected_final_filename"
+        )
+        if selected_final_filename not in {
+            partial_filename,
+            _collision_filename(partial_filename, job_id),
+        }:
+            raise ValueError("selected_final_filename is not a managed final name")

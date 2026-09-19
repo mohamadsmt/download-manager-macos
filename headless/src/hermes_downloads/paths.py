@@ -23,6 +23,7 @@ __all__ = [
     "UnsafePathError",
     "claim_final_path",
     "observe_job_space",
+    "rehydrate_destination",
     "resolve_destination",
 ]
 
@@ -135,6 +136,44 @@ def resolve_destination(
         final_path=final_path,
         incomplete_dir=incomplete_dir,
         partial_path=partial_path,
+    )
+
+
+def rehydrate_destination(
+    category: str,
+    collection: str | None,
+    partial_filename: str,
+    selected_final_filename: str,
+    job_id: str,
+) -> DestinationIntent:
+    """Reconstruct a persisted managed destination without touching the filesystem."""
+
+    category = _require_category(category)
+    if collection is not None:
+        collection = _require_component(collection, "collection")
+    partial_filename = _require_component(partial_filename, "partial_filename")
+    selected_final_filename = _require_component(
+        selected_final_filename, "selected_final_filename"
+    )
+    job_id = _require_component(job_id, "job_id")
+    if selected_final_filename not in {
+        partial_filename,
+        _collision_name(partial_filename, job_id),
+    }:
+        raise PathValidationError("selected final filename is not a managed output name")
+
+    root = Path.home() / "Downloads" / "Hermes"
+    final_component = collection or category
+    incomplete_dir = root / _INCOMPLETE / job_id
+    return DestinationIntent(
+        root=root,
+        category=category,
+        collection=collection,
+        filename=partial_filename,
+        job_id=job_id,
+        final_path=root / final_component / selected_final_filename,
+        incomplete_dir=incomplete_dir,
+        partial_path=incomplete_dir / partial_filename,
     )
 
 

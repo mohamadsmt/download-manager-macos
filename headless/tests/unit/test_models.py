@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime, timedelta, timezone
 import importlib
 import importlib.util
 import os
@@ -405,3 +406,79 @@ def test_download_intent_rejects_malformed_or_nonfinite_values(
 ) -> None:
     with pytest.raises((TypeError, ValueError)):
         _download_intent(**overrides)
+
+
+def _materialized_job(**overrides):
+    values = {
+        "job_id": "job-1",
+        "intent": _download_intent(),
+        "source_kind": _models().SourceKind.DIRECT,
+        "queue_collection_id": "queue-1",
+        "priority": -12,
+        "order_key": 42,
+        "scheduled_for": datetime(2031, 7, 2, 9, 30, tzinfo=timezone(timedelta(hours=3))),
+        "authorized": True,
+        "manual_hold": False,
+        "start_now_requested": True,
+        "category": "Videos",
+        "destination_collection": "Course material",
+        "partial_filename": "selected.webm",
+        "selected_final_filename": "selected--job-1.webm",
+    }
+    values.update(overrides)
+    return _models().MaterializedJob(**values)
+
+
+def test_materialized_job_binds_intent_and_normalizes_its_projections() -> None:
+    models = _models()
+    intent = _download_intent(generation=5, revision=6)
+
+    materialized = _materialized_job(intent=intent)
+    ordinary = _materialized_job(selected_final_filename="selected.webm")
+
+    assert {kind.value for kind in models.SourceKind} == {"direct", "video"}
+    assert {"MaterializedJob", "SourceKind"} <= set(models.__all__)
+    assert materialized.job_id == intent.job_id
+    assert materialized.intent is intent
+    assert materialized.source_kind is models.SourceKind.DIRECT
+    assert materialized.queue_collection_id == "queue-1"
+    assert materialized.priority == -12
+    assert materialized.order_key == 42
+    assert materialized.scheduled_for == datetime(2031, 7, 2, 6, 30, tzinfo=UTC)
+    assert materialized.authorized is True
+    assert materialized.manual_hold is False
+    assert materialized.start_now_requested is True
+    assert materialized.category == "Videos"
+    assert materialized.destination_collection == "Course material"
+    assert materialized.partial_filename == "selected.webm"
+    assert materialized.selected_final_filename == "selected--job-1.webm"
+    assert ordinary.selected_final_filename == ordinary.partial_filename
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"intent": object()},
+        {"job_id": "other-job"},
+        {"source_kind": "direct"},
+        {"queue_collection_id": "queue/one"},
+        {"queue_collection_id": True},
+        {"priority": True},
+        {"priority": 1 << 31},
+        {"order_key": -1},
+        {"scheduled_for": datetime(2031, 7, 2, 9, 30)},
+        {"authorized": 1},
+        {"manual_hold": 0},
+        {"start_now_requested": "yes"},
+        {"category": "Archive"},
+        {"destination_collection": "../outside"},
+        {"partial_filename": "nested/partial.webm"},
+        {"selected_final_filename": "nested/final.webm"},
+        {"selected_final_filename": "renamed.webm"},
+    ),
+)
+def test_materialized_job_rejects_malformed_queue_or_output_projections(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        _materialized_job(**overrides)

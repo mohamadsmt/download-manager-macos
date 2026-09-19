@@ -91,6 +91,7 @@ class RetryAuditKind(str, Enum):
     RETRY_SCHEDULED = "retry_scheduled"
     EXHAUSTED = "exhausted"
     PAUSED = "paused"
+    FENCED = "fenced"
     EXPLICIT_RESUME = "explicit_resume"
 
 
@@ -291,6 +292,19 @@ class RetryAuthority:
         authority._lock = Lock()
         return authority
 
+    @classmethod
+    def restore(cls, *, policy: RetryPolicy, budget: RetryBudget) -> RetryAuthority:
+        """Re-own one fully validated persisted retry budget snapshot."""
+
+        if type(policy) is not RetryPolicy:
+            raise TypeError("policy must be a RetryPolicy")
+        budget = _revalidate_retry_budget(budget)
+        authority = object.__new__(cls)
+        authority._policy = policy
+        authority._budget = budget
+        authority._lock = Lock()
+        return authority
+
     @property
     def budget(self) -> RetryBudget:
         """Return the immutable current snapshot owned by this authority."""
@@ -380,6 +394,28 @@ class RetryAuthority:
             )
             return self._budget
 
+    def fence_cold_start(self, *, new_generation: int) -> RetryBudget:
+        """Close the restored budget before any callback from its prior life runs."""
+
+        with self._lock:
+            budget = _revalidate_retry_budget(self._budget)
+            _require_generation(new_generation)
+            if budget.exhausted:
+                raise ValueError("an exhausted retry budget cannot be cold-start fenced")
+            if new_generation <= budget.generation:
+                raise ValueError("new_generation must advance the retry generation")
+            fenced = _transition_budget(
+                budget,
+                kind=RetryAuditKind.FENCED,
+                generation=new_generation,
+                budget_number=budget.budget_number,
+                ordinary_attempts=budget.ordinary_attempts,
+                paused=True,
+                exhausted=False,
+            )
+            self._budget = fenced
+            return fenced
+
 
 @dataclass(frozen=True, slots=True)
 class SourceIdentity:
@@ -444,6 +480,26 @@ def _open_retry_budget(*, job_id: str, generation: int) -> RetryBudget:
         exhausted=False,
         audit=(event,),
     )
+
+
+def _revalidate_retry_budget(budget: object) -> RetryBudget:
+    """Validate every persisted field before an authority takes ownership."""
+
+    if type(budget) is not RetryBudget:
+        raise TypeError("budget must be a RetryBudget")
+    try:
+        RetryBudget(
+            job_id=budget.job_id,
+            generation=budget.generation,
+            budget_number=budget.budget_number,
+            ordinary_attempts=budget.ordinary_attempts,
+            paused=budget.paused,
+            exhausted=budget.exhausted,
+            audit=budget.audit,
+        )
+    except AttributeError as error:
+        raise ValueError("audit is not a complete retry budget snapshot") from error
+    return budget
 
 
 def failure_from_http_status(
@@ -626,6 +682,17 @@ def _validate_retry_audit(budget: RetryBudget) -> None:
                 raise ValueError("audit contains an invalid exhaustion")
             ordinary_attempts = event.ordinary_attempts
             exhausted = True
+            continue
+        if event.kind is RetryAuditKind.FENCED:
+            if (
+                exhausted
+                or event.generation <= generation
+                or event.budget_number != budget_number
+                or event.ordinary_attempts != ordinary_attempts
+            ):
+                raise ValueError("audit contains an invalid cold-start fence")
+            generation = event.generation
+            paused = True
             continue
         if event.kind is RetryAuditKind.PAUSED:
             if (

@@ -235,3 +235,75 @@ def test_claim_never_overwrites_an_existing_resolved_final(tmp_path: Path) -> No
         paths.claim_final_path(destination)
 
     assert destination.final_path.read_bytes() == b"already complete"
+
+
+def test_rehydrate_destination_preserves_selected_collision_without_filesystem_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths()
+    home = tmp_path / "cold-home"
+    home.mkdir()
+    root = home / "Downloads" / "Hermes"
+    assert not root.exists()
+    calls: list[str] = []
+
+    def forbidden(name: str):
+        def _forbidden(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"rehydration must not call {name}")
+
+        return _forbidden
+
+    with monkeypatch.context() as patched:
+        patched.setattr(paths.Path, "home", classmethod(lambda _cls: home))
+        for name in ("mkdir", "stat", "lstat", "access", "open", "fstat", "fstatvfs"):
+            patched.setattr(paths.os, name, forbidden(f"os.{name}"))
+        patched.setattr(paths.Path, "resolve", forbidden("Path.resolve"))
+        patched.setattr(paths, "resolve_destination", forbidden("resolve_destination"))
+        patched.setattr(paths, "claim_final_path", forbidden("claim_final_path"))
+        patched.setattr(paths, "_select_available_name", forbidden("_select_available_name"))
+
+        destination = paths.rehydrate_destination(
+            category="Videos",
+            collection="Course material",
+            partial_filename="selected.webm",
+            selected_final_filename="selected--job-42.webm",
+            job_id="job-42",
+        )
+
+    assert calls == []
+    assert destination.root == root
+    assert destination.category == "Videos"
+    assert destination.collection == "Course material"
+    assert destination.filename == "selected.webm"
+    assert destination.job_id == "job-42"
+    assert destination.final_path == root / "Course material" / "selected--job-42.webm"
+    assert destination.incomplete_dir == root / ".incomplete" / "job-42"
+    assert destination.partial_path == root / ".incomplete" / "job-42" / "selected.webm"
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("collection", "../outside"),
+        ("partial_filename", "nested/partial.webm"),
+        ("selected_final_filename", "nested/final.webm"),
+        ("selected_final_filename", "renamed.webm"),
+    ),
+)
+def test_rehydrate_destination_rejects_unmanaged_components_and_final_names(
+    field: str, value: str
+) -> None:
+    paths = _paths()
+    values = {
+        "category": "Videos",
+        "collection": None,
+        "partial_filename": "selected.webm",
+        "selected_final_filename": "selected.webm",
+        "job_id": "job-42",
+    }
+    values[field] = value
+
+    with pytest.raises(paths.PathValidationError):
+        paths.rehydrate_destination(**values)

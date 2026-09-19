@@ -862,3 +862,125 @@ def test_retry_budget_rejects_nonrepresentable_hydrated_audit_history(
             exhausted=exhausted,
             audit=audit,
         )
+
+
+def test_retry_authority_restore_preserves_the_valid_budget_history_exactly() -> None:
+    retry = _retry()
+    policy = retry.RetryPolicy()
+    source = _authority(retry, policy=policy)
+    recorded = source.decide(
+        _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+        generation=source.budget.generation,
+        jitter_seconds=0,
+    ).budget
+
+    restored = retry.RetryAuthority.restore(policy=policy, budget=recorded)
+
+    assert restored.budget is recorded
+    assert restored.budget.audit is recorded.audit
+    assert restored.budget.audit == recorded.audit
+    assert restored.budget.ordinary_attempts == 1
+
+
+def test_cold_start_fence_closes_budget_and_invalidates_prior_callbacks() -> None:
+    retry = _retry()
+    policy = retry.RetryPolicy()
+    authority = _authority(retry, policy=policy)
+    before = authority.decide(
+        _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+        generation=authority.budget.generation,
+        jitter_seconds=0,
+    ).budget
+
+    fenced = authority.fence_cold_start(new_generation=19)
+
+    assert fenced.generation == 19
+    assert fenced.budget_number == before.budget_number
+    assert fenced.ordinary_attempts == before.ordinary_attempts
+    assert fenced.paused is True
+    assert fenced.exhausted is False
+    assert fenced.audit[:-1] == before.audit
+    assert fenced.audit[-1] == retry.RetryAuditEvent(
+        retry.RetryAuditKind.FENCED,
+        generation=19,
+        budget_number=before.budget_number,
+        ordinary_attempts=before.ordinary_attempts,
+    )
+    with pytest.raises(retry.StaleGenerationError):
+        authority.decide(
+            _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+            generation=before.generation,
+            jitter_seconds=0,
+        )
+    assert authority.budget is fenced
+
+
+@pytest.mark.parametrize("new_generation", (7, 6))
+def test_cold_start_fence_rejects_nonadvancing_generation_without_mutation(
+    new_generation: int,
+) -> None:
+    retry = _retry()
+    authority = _authority(retry, generation=7)
+    before = authority.budget
+
+    with pytest.raises(ValueError, match="generation"):
+        authority.fence_cold_start(new_generation=new_generation)
+
+    assert authority.budget is before
+
+
+def test_cold_start_fence_rejects_exhausted_and_audit_capacity_budgets_without_mutation() -> None:
+    retry = _retry()
+    policy = retry.RetryPolicy()
+    exhausted_authority = _authority(retry, policy=policy)
+    for _ in range(policy.max_ordinary_attempts):
+        exhausted_authority.decide(
+            _failure(retry, retry.FailureKind.TRANSIENT_HOST),
+            generation=exhausted_authority.budget.generation,
+            jitter_seconds=0,
+        )
+    exhausted = exhausted_authority.budget
+
+    with pytest.raises(ValueError, match="exhausted"):
+        exhausted_authority.fence_cold_start(new_generation=exhausted.generation + 1)
+    assert exhausted_authority.budget is exhausted
+
+    audit, generation, budget_number, ordinary_attempts, exhausted = _valid_retry_audit(
+        retry, event_count=_RETRY_AUDIT_CAPACITY
+    )
+    assert exhausted is False
+    at_capacity = retry.RetryBudget(
+        job_id="retry-job",
+        generation=generation,
+        budget_number=budget_number,
+        ordinary_attempts=ordinary_attempts,
+        paused=False,
+        exhausted=False,
+        audit=audit,
+    )
+    capacity_authority = retry.RetryAuthority.restore(policy=policy, budget=at_capacity)
+
+    with pytest.raises(OverflowError, match="audit.*capacity"):
+        capacity_authority.fence_cold_start(new_generation=generation + 1)
+    assert capacity_authority.budget is at_capacity
+
+
+def test_retry_authority_restore_and_fence_reject_malformed_snapshot_without_replacing_it() -> None:
+    retry = _retry()
+    malformed = object.__new__(retry.RetryBudget)
+    object.__setattr__(malformed, "job_id", "retry-job")
+    object.__setattr__(malformed, "generation", 7)
+    object.__setattr__(malformed, "budget_number", 1)
+    object.__setattr__(malformed, "ordinary_attempts", 0)
+    object.__setattr__(malformed, "paused", False)
+    object.__setattr__(malformed, "exhausted", False)
+    object.__setattr__(malformed, "audit", ())
+
+    with pytest.raises(ValueError, match="audit"):
+        retry.RetryAuthority.restore(policy=retry.RetryPolicy(), budget=malformed)
+
+    authority = _authority(retry)
+    object.__setattr__(authority, "_budget", malformed)
+    with pytest.raises(ValueError, match="audit"):
+        authority.fence_cold_start(new_generation=8)
+    assert authority.budget is malformed
