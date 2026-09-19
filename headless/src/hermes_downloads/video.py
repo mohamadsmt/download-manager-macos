@@ -10,7 +10,9 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import sys
+import threading
 from typing import Final, Protocol
 import unicodedata
 from urllib.parse import urlsplit
@@ -24,6 +26,11 @@ from hermes_downloads.network import (
     SourceURL,
     validate_source_url,
 )
+from hermes_downloads.paths import (
+    DestinationIntent,
+    PathValidationError,
+    _validate_destination_intent,
+)
 from hermes_downloads.processes import EngineResult, run_contained
 
 __all__ = [
@@ -34,6 +41,10 @@ __all__ = [
     "MetadataFailure",
     "MetadataRunner",
     "PlaylistSelection",
+    "VideoPayloadPhase",
+    "VideoPayloadResult",
+    "YtDlpPayloadClient",
+    "merge_verified_local_media",
     "SubtitleChoice",
     "SubtitleTrack",
     "VideoOptions",
@@ -54,6 +65,7 @@ _MAX_TITLE_CHARACTERS: Final = 180
 MAX_METADATA_BYTES: Final = 64 * 1024
 _MAX_PLAYLIST_ITEMS: Final = 25
 _MAX_EXCEPTION_GRAPH_NODES: Final = 16
+_CERTIFIED_PAYLOAD_PROTOCOLS: Final = frozenset({"http", "https"})
 _METADATA_FLAGS: Final = (
     "--dump-single-json",
     "--skip-download",
@@ -205,6 +217,8 @@ class FormatSelection:
     container: str
     extension: str
     subtitles: tuple[SubtitleTrack, ...]
+    video_protocol: str | None = None
+    audio_protocol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +252,226 @@ class MetadataFailure:
             raise ValueError("metadata failures require an unavailable status")
 
 
+class VideoPayloadPhase(str, Enum):
+    """Observed bounded payload outcomes; no speed or ETA is inferred."""
+
+    WAITING_FOR_BUDGET = "waiting_for_budget"
+    UNSUPPORTED = "unsupported"
+    DOWNLOADING = "downloading"
+    LOCAL_VERIFIED = "local_verified"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class VideoPayloadResult:
+    """One payload observation with physical usage only when available."""
+
+    phase: VideoPayloadPhase
+    logical_bytes: int | None
+    allocated_bytes: int | None
+    speed_bps: None = None
+    eta_seconds: None = None
+
+
+class YtDlpPayloadClient:
+    """Start only certified HTTP(S) video payloads through yt-dlp/aria2."""
+
+    __slots__ = (
+        "_aria2_executable",
+        "_ffmpeg_executable",
+        "_ffprobe_executable",
+        "_python_executable",
+    )
+
+    def __init__(
+        self,
+        *,
+        aria2_executable: str,
+        ffmpeg_executable: str,
+        ffprobe_executable: str,
+        python_executable: str = sys.executable,
+    ) -> None:
+        for name, value in (
+            ("aria2_executable", aria2_executable),
+            ("ffmpeg_executable", ffmpeg_executable),
+            ("ffprobe_executable", ffprobe_executable),
+            ("python_executable", python_executable),
+        ):
+            if type(value) is not str or not os.path.isabs(value):
+                raise ValueError(f"{name} must be an absolute path")
+        self._aria2_executable = aria2_executable
+        self._ffmpeg_executable = ffmpeg_executable
+        self._ffprobe_executable = ffprobe_executable
+        self._python_executable = python_executable
+
+    def download(
+        self,
+        resolution: VideoResolution,
+        *,
+        destination: DestinationIntent,
+        allocation_bps: int,
+        cancel_event: threading.Event | None = None,
+    ) -> VideoPayloadResult:
+        """Dispatch one certified payload; separate formats remain serialized."""
+
+        if type(resolution) is not VideoResolution:
+            raise TypeError("resolution must be a VideoResolution")
+        if type(destination) is not DestinationIntent:
+            raise TypeError("destination must be a DestinationIntent")
+        if type(allocation_bps) is not int or allocation_bps < 0:
+            raise ValueError("allocation_bps must be a nonnegative integer")
+        if allocation_bps == 0:
+            return VideoPayloadResult(VideoPayloadPhase.WAITING_FOR_BUDGET, None, None)
+        selection = resolution.selection
+        if (
+            resolution.status is not VideoStatus.READY
+            or selection is None
+            or not _certified_payload_selection(selection)
+        ):
+            return VideoPayloadResult(VideoPayloadPhase.UNSUPPORTED, None, None)
+        if selection.video_format_id is not None and selection.audio_format_id is not None:
+            video_input = destination.partial_path.with_name(
+                f"{destination.partial_path.name}.video"
+            )
+            audio_input = destination.partial_path.with_name(
+                f"{destination.partial_path.name}.audio"
+            )
+            _require_safe_payload_output(destination, video_input)
+            _require_safe_payload_output(destination, audio_input)
+            _run_ytdlp_payload(
+                resolution,
+                destination,
+                format_id=selection.video_format_id,
+                output=video_input,
+                allocation_bps=allocation_bps,
+                python_executable=self._python_executable,
+                aria2_executable=self._aria2_executable,
+                ffmpeg_executable=self._ffmpeg_executable,
+                cancel_event=cancel_event,
+            )
+            _run_ytdlp_payload(
+                resolution,
+                destination,
+                format_id=selection.audio_format_id,
+                output=audio_input,
+                allocation_bps=allocation_bps,
+                python_executable=self._python_executable,
+                aria2_executable=self._aria2_executable,
+                ffmpeg_executable=self._ffmpeg_executable,
+                cancel_event=cancel_event,
+            )
+            return merge_verified_local_media(
+                resolution,
+                destination=destination,
+                video_input=video_input,
+                audio_input=audio_input,
+                ffmpeg_executable=self._ffmpeg_executable,
+                ffprobe_executable=self._ffprobe_executable,
+                cancel_event=cancel_event,
+            )
+        format_id = selection.video_format_id or selection.audio_format_id
+        assert format_id is not None
+        _require_safe_payload_output(destination, destination.partial_path)
+        _run_ytdlp_payload(
+            resolution,
+            destination,
+            format_id=format_id,
+            output=destination.partial_path,
+            allocation_bps=allocation_bps,
+            python_executable=self._python_executable,
+            aria2_executable=self._aria2_executable,
+            ffmpeg_executable=self._ffmpeg_executable,
+            cancel_event=cancel_event,
+        )
+        return VideoPayloadResult(
+            VideoPayloadPhase.DOWNLOADING,
+            *_observed_file_bytes(destination.partial_path),
+        )
+
+
+def merge_verified_local_media(
+    resolution: VideoResolution,
+    *,
+    destination: DestinationIntent,
+    video_input: Path,
+    audio_input: Path,
+    ffmpeg_executable: str,
+    ffprobe_executable: str,
+    cancel_event: threading.Event | None = None,
+) -> VideoPayloadResult:
+    """Copy one verified local video/audio pair, then require both streams."""
+
+    if type(resolution) is not VideoResolution:
+        raise TypeError("resolution must be a VideoResolution")
+    if type(destination) is not DestinationIntent:
+        raise TypeError("destination must be a DestinationIntent")
+    _require_absolute_media_executable(ffmpeg_executable, "ffmpeg_executable")
+    _require_absolute_media_executable(ffprobe_executable, "ffprobe_executable")
+    selection = resolution.selection
+    if (
+        resolution.status is not VideoStatus.READY
+        or selection is None
+        or selection.video_format_id is None
+        or selection.audio_format_id is None
+        or not _certified_payload_selection(selection)
+    ):
+        return VideoPayloadResult(VideoPayloadPhase.UNSUPPORTED, None, None)
+
+    _require_local_merge_destination(destination)
+    _require_verified_local_input(destination, video_input)
+    _require_verified_local_input(destination, audio_input)
+    _require_absent_local_merge_output(destination)
+    run_contained(
+        (
+            ffmpeg_executable,
+            "-nostdin",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-n",
+            "-i",
+            str(video_input),
+            "-i",
+            str(audio_input),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c",
+            "copy",
+            str(destination.partial_path),
+        ),
+        cwd=destination.incomplete_dir,
+        timeout=30.0,
+        output_limit=MAX_METADATA_BYTES,
+        cancel_event=cancel_event,
+    )
+    _require_verified_local_input(destination, destination.partial_path)
+    probe = run_contained(
+        (
+            ffprobe_executable,
+            "-protocol_whitelist",
+            "file,pipe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
+            str(destination.partial_path),
+        ),
+        cwd=destination.incomplete_dir,
+        timeout=30.0,
+        output_limit=MAX_METADATA_BYTES,
+        cancel_event=cancel_event,
+    )
+    if not _has_selected_local_streams(probe):
+        raise ValueError("local merge output verification failed")
+    return VideoPayloadResult(
+        VideoPayloadPhase.LOCAL_VERIFIED,
+        *_observed_file_bytes(destination.partial_path),
+    )
+
+
 class MetadataRunner(Protocol):
     """A testable metadata-only command boundary."""
 
@@ -251,6 +485,7 @@ class _Format:
     video_codec: str
     audio_codec: str
     extension: str
+    protocol: str | None
     bitrate: float
 
     @property
@@ -663,6 +898,144 @@ def _run_ytdlp_metadata(
 
 
 
+def _require_absolute_media_executable(value: object, name: str) -> None:
+    if type(value) is not str or not os.path.isabs(value):
+        raise ValueError(f"{name} must be an absolute path")
+
+
+def _require_local_merge_destination(destination: DestinationIntent) -> None:
+    try:
+        _validate_destination_intent(destination)
+    except (PathValidationError, TypeError):
+        raise ValueError("local merge destination is unsafe") from None
+    current = Path(destination.root.anchor)
+    for component in (*destination.root.parts[1:], ".incomplete", destination.job_id):
+        current /= component
+        try:
+            details = os.lstat(current)
+        except OSError:
+            raise ValueError("local merge destination is unsafe") from None
+        if not stat.S_ISDIR(details.st_mode):
+            raise ValueError("local merge destination is unsafe")
+
+
+def _require_verified_local_input(destination: DestinationIntent, path: Path) -> None:
+    if not isinstance(path, Path) or path.parent != destination.incomplete_dir:
+        raise ValueError("local input is unsafe")
+    try:
+        details = os.lstat(path)
+    except OSError:
+        raise ValueError("local input is unsafe") from None
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError("local input is unsafe")
+
+
+def _require_absent_local_merge_output(destination: DestinationIntent) -> None:
+    try:
+        os.lstat(destination.partial_path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass
+    raise ValueError("local merge output is unsafe")
+
+
+def _require_safe_payload_output(destination: DestinationIntent, output: Path) -> None:
+    _require_local_merge_destination(destination)
+    if output.parent != destination.incomplete_dir:
+        raise ValueError("payload output is unsafe")
+    try:
+        details = os.lstat(output)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ValueError("payload output is unsafe") from None
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise ValueError("payload output is unsafe")
+
+
+def _has_selected_local_streams(response: object) -> bool:
+    parsed = _parse_metadata_response(response)
+    if type(parsed) is not dict:
+        return False
+    streams = parsed.get("streams")
+    if type(streams) is not list:
+        return False
+    return tuple(
+        stream.get("codec_type") if type(stream) is dict else None
+        for stream in streams
+    ) == ("video", "audio")
+
+
+def _certified_payload_selection(selection: FormatSelection) -> bool:
+    if selection.video_format_id is None:
+        return selection.audio_format_id is not None and (
+            selection.audio_protocol in _CERTIFIED_PAYLOAD_PROTOCOLS
+        )
+    if selection.video_protocol not in _CERTIFIED_PAYLOAD_PROTOCOLS:
+        return False
+    return selection.audio_format_id is None or (
+        selection.audio_protocol in _CERTIFIED_PAYLOAD_PROTOCOLS
+    )
+
+
+def _run_ytdlp_payload(
+    resolution: VideoResolution,
+    destination: DestinationIntent,
+    *,
+    format_id: str,
+    output: Path,
+    allocation_bps: int,
+    python_executable: str,
+    aria2_executable: str,
+    ffmpeg_executable: str,
+    cancel_event: threading.Event | None,
+) -> None:
+    command = (
+        python_executable,
+        "-m",
+        "yt_dlp",
+        "--ignore-config",
+        "--no-plugin-dirs",
+        "--no-update",
+        "--no-remote-components",
+        "--no-cookies",
+        "--no-playlist",
+        "--no-part",
+        "--abort-on-unavailable-fragment",
+        "--downloader",
+        aria2_executable,
+        "--downloader-args",
+        "-x4 -s4 -j1 --file-allocation=none "
+        f"--max-overall-download-limit={allocation_bps}",
+        "--ffmpeg-location",
+        ffmpeg_executable,
+        "--format",
+        format_id,
+        "--output",
+        str(output),
+        resolution.original_page.raw_url.decode("utf-8"),
+    )
+    run_contained(
+        command,
+        cwd=destination.incomplete_dir,
+        timeout=30.0,
+        output_limit=MAX_METADATA_BYTES,
+        cancel_event=cancel_event,
+    )
+
+
+def _observed_file_bytes(path: Path) -> tuple[int | None, int | None]:
+    try:
+        details = path.stat()
+    except OSError:
+        return None, None
+    if not path.is_file():
+        return None, None
+    blocks = getattr(details, "st_blocks", None)
+    return details.st_size, blocks * 512 if type(blocks) is int else None
+
+
 def _metadata_options(request: VideoRequest) -> dict[str, object]:
     options: dict[str, object] = {
         "cachedir": False,
@@ -917,12 +1290,16 @@ def _format_from_metadata(value: dict[object, object]) -> _Format | None:
     bitrate = _bitrate(value.get("abr"))
     if bitrate == 0.0:
         bitrate = _bitrate(value.get("tbr"))
+    protocol = value.get("protocol")
+    if type(protocol) is not str:
+        protocol = None
     return _Format(
         format_id=format_id,
         height=height,
         video_codec=video_codec,
         audio_codec=audio_codec,
         extension=extension.casefold(),
+        protocol=protocol,
         bitrate=bitrate,
     )
 
@@ -957,6 +1334,8 @@ def _select_formats(
             container=audio.extension,
             extension=audio.extension,
             subtitles=selected_subtitles,
+            video_protocol=None,
+            audio_protocol=audio.protocol,
         )
 
     videos = tuple(
@@ -976,6 +1355,8 @@ def _select_formats(
             container=video.extension,
             extension=video.extension,
             subtitles=selected_subtitles,
+            video_protocol=video.protocol,
+            audio_protocol=None,
         )
 
     video = _best(format for format in videos if not format.has_audio)
@@ -988,6 +1369,8 @@ def _select_formats(
             container=container,
             extension=container,
             subtitles=selected_subtitles,
+            video_protocol=video.protocol,
+            audio_protocol=audio.protocol,
         )
 
     progressive = _best(format for format in videos if format.has_audio)
@@ -999,6 +1382,8 @@ def _select_formats(
         container=progressive.extension,
         extension=progressive.extension,
         subtitles=selected_subtitles,
+        video_protocol=progressive.protocol,
+        audio_protocol=None,
     )
 
 

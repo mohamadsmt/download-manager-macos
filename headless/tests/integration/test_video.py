@@ -10,11 +10,53 @@ import shlex
 import subprocess
 import sys
 import textwrap
+import threading
+from types import ModuleType
 
 import pytest
 from yt_dlp.utils import DownloadError, UnsupportedError
 
 from hermes_downloads import network, processes
+
+
+def _payload_resolution(video: object, source: network.SourceURL, *, protocol: str) -> object:
+    return video.VideoResolution(
+        status=video.VideoStatus.READY,
+        original_page=source,
+        provisional_filename="job-payload--metadata-pending",
+        content_id="payload-content",
+        final_filename="payload.mp4",
+        selection=video.FormatSelection(
+            video_format_id="0",
+            audio_format_id=None,
+            container="mp4",
+            extension="mp4",
+            subtitles=(),
+            video_protocol=protocol,
+            audio_protocol=None,
+        ),
+        available_qualities=(360,),
+    )
+
+
+def _synthetic_origin_type() -> type[object]:
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "http_origin.py"
+    spec = importlib.util.spec_from_file_location("_video_http_origin", fixture_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    assert isinstance(module, ModuleType)
+    previous = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(spec.name, None)
+        else:
+            sys.modules[spec.name] = previous
+    origin_type = getattr(module, "SyntheticHttpOrigin", None)
+    assert isinstance(origin_type, type)
+    return origin_type
 
 
 def _video():
@@ -592,3 +634,459 @@ def test_metadata_adapter_bounds_response_before_decoding_and_honors_network_dis
 
     assert disabled.status is video.VideoStatus.TRANSIENT
     assert attempted is False
+
+
+def test_video_payload_waits_at_zero_budget_and_rejects_uncertified_protocol_before_engine_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = _video()
+    paths = importlib.import_module("hermes_downloads.paths")
+    source = _source("https://video.example.test/watch?v=payload")
+    destination_root = Path.home() / "Downloads" / "Hermes"
+    destination_root.mkdir(parents=True)
+    destination = paths.resolve_destination(
+        destination_root,
+        category="Videos",
+        filename="payload.mp4",
+        job_id="job-payload",
+    )
+    started: list[tuple[str, ...]] = []
+
+    def unexpected_engine(*args: object, **kwargs: object) -> object:
+        started.append(tuple(args[0]))
+        raise AssertionError("payload engine must not start")
+
+    monkeypatch.setattr(video, "run_contained", unexpected_engine)
+    client = video.YtDlpPayloadClient(
+        aria2_executable="/opt/homebrew/bin/aria2c",
+        ffmpeg_executable="/opt/homebrew/bin/ffmpeg",
+        ffprobe_executable="/opt/homebrew/bin/ffprobe",
+    )
+
+    waiting = client.download(
+        _payload_resolution(video, source, protocol="https"),
+        destination=destination,
+        allocation_bps=0,
+        cancel_event=threading.Event(),
+    )
+
+    assert waiting.phase is video.VideoPayloadPhase.WAITING_FOR_BUDGET
+    assert waiting.logical_bytes is None
+    assert waiting.allocated_bytes is None
+    assert waiting.speed_bps is None
+    assert waiting.eta_seconds is None
+    assert started == []
+
+    unsupported = client.download(
+        _payload_resolution(video, source, protocol="m3u8_native"),
+        destination=destination,
+        allocation_bps=1,
+        cancel_event=threading.Event(),
+    )
+
+    assert unsupported.phase is video.VideoPayloadPhase.UNSUPPORTED
+    assert unsupported.logical_bytes is None
+    assert unsupported.allocated_bytes is None
+    assert started == []
+
+
+def test_video_payload_uses_external_aria2_for_a_certified_loopback_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = _video()
+    paths = importlib.import_module("hermes_downloads.paths")
+    captured: tuple[str, ...] | None = None
+    original_run_contained = video.run_contained
+
+    def capture(command: tuple[str, ...], **kwargs: object) -> object:
+        nonlocal captured
+        captured = command
+        return original_run_contained(command, **kwargs)
+
+    monkeypatch.setattr(video, "run_contained", capture)
+    with _synthetic_origin_type()() as origin:
+        source = network.validate_source_url(
+            origin.url("/range"),
+            local_origin_grant=network.LocalOriginGrant.for_url(origin.url()),
+        )
+        root = Path.home() / "Downloads" / "Hermes"
+        root.mkdir(parents=True)
+        destination = paths.resolve_destination(
+            root,
+            category="Videos",
+            filename="payload.bin",
+            job_id="job-certified-payload",
+        )
+        result = video.YtDlpPayloadClient(
+            aria2_executable="/opt/homebrew/bin/aria2c",
+            ffmpeg_executable="/opt/homebrew/bin/ffmpeg",
+            ffprobe_executable="/opt/homebrew/bin/ffprobe",
+        ).download(
+            _payload_resolution(video, source, protocol="http"),
+            destination=destination,
+            allocation_bps=1024,
+        )
+
+        assert result.phase is video.VideoPayloadPhase.DOWNLOADING
+        assert result.logical_bytes == len(origin.payload)
+        assert result.allocated_bytes is not None
+        assert result.allocated_bytes >= result.logical_bytes
+        assert destination.partial_path.read_bytes() == origin.payload
+        # The generic extractor probes a direct URL before aria2 receives the
+        # selected format.  The final payload must still be exactly the
+        # fixture bytes; the ledger proves a body transfer occurred.
+        assert origin.ledger.response_body_bytes >= len(origin.payload)
+
+    assert captured is not None
+    assert captured[:3] == (sys.executable, "-m", "yt_dlp")
+    assert captured[captured.index("--downloader") + 1] == "/opt/homebrew/bin/aria2c"
+    assert "--no-part" in captured
+    assert "--abort-on-unavailable-fragment" in captured
+    assert captured[captured.index("--format") + 1] == "0"
+    assert "--max-overall-download-limit=1024" in captured[
+        captured.index("--downloader-args") + 1
+    ]
+
+
+def test_video_payload_serializes_separate_formats_before_local_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = _video()
+    paths = importlib.import_module("hermes_downloads.paths")
+    root = Path.home() / "Downloads" / "Hermes"
+    root.mkdir(parents=True)
+    destination = paths.resolve_destination(
+        root,
+        category="Videos",
+        filename="separate.mp4",
+        job_id="job-separate-payload",
+    )
+    source = _source("https://video.example.test/watch?v=separate")
+    resolution = video.VideoResolution(
+        status=video.VideoStatus.READY,
+        original_page=source,
+        provisional_filename="job-separate-payload--metadata-pending",
+        content_id="separate-content",
+        final_filename="separate.mp4",
+        selection=video.FormatSelection(
+            video_format_id="137",
+            audio_format_id="140",
+            container="mp4",
+            extension="mp4",
+            subtitles=(),
+            video_protocol="https",
+            audio_protocol="https",
+        ),
+        available_qualities=(1080,),
+    )
+    payload_commands: list[tuple[str, ...]] = []
+    merge_calls: list[tuple[Path, Path]] = []
+
+    def contained(command: tuple[str, ...], **_kwargs: object) -> object:
+        payload_commands.append(command)
+        output = Path(command[command.index("--output") + 1])
+        output.write_bytes(b"stage")
+        return _engine_result("")
+
+    def merge(
+        _resolution: object,
+        *,
+        destination: object,
+        video_input: Path,
+        audio_input: Path,
+        **_kwargs: object,
+    ) -> object:
+        assert destination is not None
+        merge_calls.append((video_input, audio_input))
+        return video.VideoPayloadResult(
+            video.VideoPayloadPhase.LOCAL_VERIFIED, 5, 4096
+        )
+
+    monkeypatch.setattr(video, "run_contained", contained)
+    monkeypatch.setattr(video, "merge_verified_local_media", merge)
+
+    result = video.YtDlpPayloadClient(
+        aria2_executable="/opt/homebrew/bin/aria2c",
+        ffmpeg_executable="/opt/homebrew/bin/ffmpeg",
+        ffprobe_executable="/opt/homebrew/bin/ffprobe",
+    ).download(resolution, destination=destination, allocation_bps=512)
+
+    assert result.phase is video.VideoPayloadPhase.LOCAL_VERIFIED
+    assert [command[command.index("--format") + 1] for command in payload_commands] == [
+        "137",
+        "140",
+    ]
+    assert all(
+        "--max-overall-download-limit=512"
+        in command[command.index("--downloader-args") + 1]
+        for command in payload_commands
+    )
+    assert merge_calls == [
+        (
+            destination.incomplete_dir / "separate.mp4.video",
+            destination.incomplete_dir / "separate.mp4.audio",
+        )
+    ]
+
+
+def test_audio_payload_rejects_unsafe_partial_before_containment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = _video()
+    paths = importlib.import_module("hermes_downloads.paths")
+    root = Path.home() / "Downloads" / "Hermes"
+    root.mkdir(parents=True)
+    destination = paths.resolve_destination(
+        root,
+        category="Audio",
+        filename="audio.m4a",
+        job_id="job-audio-symlink",
+    )
+    destination.partial_path.symlink_to(destination.final_path)
+    resolution = video.VideoResolution(
+        status=video.VideoStatus.READY,
+        original_page=_source("https://video.example.test/watch?v=audio"),
+        provisional_filename="job-audio-symlink--metadata-pending",
+        content_id="audio-content",
+        final_filename="audio.m4a",
+        selection=video.FormatSelection(
+            video_format_id=None,
+            audio_format_id="140",
+            container="m4a",
+            extension="m4a",
+            subtitles=(),
+            video_protocol=None,
+            audio_protocol="https",
+        ),
+        available_qualities=(),
+    )
+    started: list[tuple[str, ...]] = []
+
+    def unexpected_engine(command: tuple[str, ...], **_kwargs: object) -> object:
+        started.append(command)
+        raise AssertionError("unsafe payload path reached containment")
+
+    monkeypatch.setattr(video, "run_contained", unexpected_engine)
+    client = video.YtDlpPayloadClient(
+        aria2_executable="/opt/homebrew/bin/aria2c",
+        ffmpeg_executable="/opt/homebrew/bin/ffmpeg",
+        ffprobe_executable="/opt/homebrew/bin/ffprobe",
+    )
+
+    with pytest.raises(ValueError, match=r"^payload output is unsafe$"):
+        client.download(resolution, destination=destination, allocation_bps=1)
+
+    assert started == []
+
+
+def test_video_payload_locally_merges_verified_inputs_and_ffprobe_validates_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = _video()
+    paths = importlib.import_module("hermes_downloads.paths")
+    source = _source("https://video.example.test/watch?v=merge&signature=source-private")
+    root = Path.home() / "Downloads" / "Hermes"
+    root.mkdir(parents=True)
+    destination = paths.resolve_destination(
+        root,
+        category="Videos",
+        filename="merged.mp4",
+        job_id="job-local-merge",
+    )
+    selection = video.FormatSelection(
+        video_format_id="137",
+        audio_format_id="140",
+        container="mp4",
+        extension="mp4",
+        subtitles=(),
+        video_protocol="https",
+        audio_protocol="https",
+    )
+    resolution = video.VideoResolution(
+        status=video.VideoStatus.READY,
+        original_page=source,
+        provisional_filename="job-local-merge--metadata-pending",
+        content_id="local-merge-content",
+        final_filename="merged.mp4",
+        selection=selection,
+        available_qualities=(360,),
+    )
+    video_input = destination.incomplete_dir / "video.mp4"
+    audio_input = destination.incomplete_dir / "audio.m4a"
+    for command in (
+        (
+            "/opt/homebrew/bin/ffmpeg",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=16x16:r=1:d=1",
+            "-an",
+            "-c:v",
+            "mpeg4",
+            "-y",
+            str(video_input),
+        ),
+        (
+            "/opt/homebrew/bin/ffmpeg",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=mono",
+            "-t",
+            "1",
+            "-vn",
+            "-c:a",
+            "aac",
+            "-y",
+            str(audio_input),
+        ),
+    ):
+        subprocess.run(
+            command,
+            check=True,
+            cwd=destination.incomplete_dir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    original_run_contained = video.run_contained
+
+    def capture(command: tuple[str, ...], **kwargs: object) -> object:
+        calls.append((command, kwargs))
+        return original_run_contained(command, **kwargs)
+
+    monkeypatch.setattr(video, "run_contained", capture)
+
+    for rejected in (
+        video.VideoResolution(
+            status=video.VideoStatus.UNAVAILABLE,
+            original_page=source,
+            provisional_filename=resolution.provisional_filename,
+            content_id=resolution.content_id,
+            final_filename=None,
+            selection=selection,
+            available_qualities=resolution.available_qualities,
+        ),
+        video.VideoResolution(
+            status=video.VideoStatus.READY,
+            original_page=source,
+            provisional_filename=resolution.provisional_filename,
+            content_id=resolution.content_id,
+            final_filename=None,
+            selection=None,
+            available_qualities=resolution.available_qualities,
+        ),
+        video.VideoResolution(
+            status=video.VideoStatus.READY,
+            original_page=source,
+            provisional_filename=resolution.provisional_filename,
+            content_id=resolution.content_id,
+            final_filename=resolution.final_filename,
+            selection=video.FormatSelection(
+                video_format_id=selection.video_format_id,
+                audio_format_id=selection.audio_format_id,
+                container=selection.container,
+                extension=selection.extension,
+                subtitles=selection.subtitles,
+                video_protocol=selection.video_protocol,
+                audio_protocol="m3u8_native",
+            ),
+            available_qualities=resolution.available_qualities,
+        ),
+    ):
+        unsupported = video.merge_verified_local_media(
+            rejected,
+            destination=destination,
+            video_input=video_input,
+            audio_input=audio_input,
+            ffmpeg_executable="/opt/homebrew/bin/ffmpeg",
+            ffprobe_executable="/opt/homebrew/bin/ffprobe",
+        )
+        assert unsupported.phase is video.VideoPayloadPhase.UNSUPPORTED
+        assert unsupported.logical_bytes is None
+        assert unsupported.allocated_bytes is None
+    assert calls == []
+
+    missing_video = destination.incomplete_dir / "missing.mp4"
+    video_link = destination.incomplete_dir / "video-link.mp4"
+    video_link.symlink_to(video_input.name)
+    for unsafe_video in (missing_video, video_link):
+        with pytest.raises(ValueError, match=r"^local input is unsafe$"):
+            video.merge_verified_local_media(
+                resolution,
+                destination=destination,
+                video_input=unsafe_video,
+                audio_input=audio_input,
+                ffmpeg_executable="/opt/homebrew/bin/ffmpeg",
+                ffprobe_executable="/opt/homebrew/bin/ffprobe",
+            )
+        assert calls == []
+
+    result = video.merge_verified_local_media(
+        resolution,
+        destination=destination,
+        video_input=video_input,
+        audio_input=audio_input,
+        ffmpeg_executable="/opt/homebrew/bin/ffmpeg",
+        ffprobe_executable="/opt/homebrew/bin/ffprobe",
+    )
+
+    assert result.phase is video.VideoPayloadPhase.LOCAL_VERIFIED
+    assert result.logical_bytes == destination.partial_path.stat().st_size
+    assert result.allocated_bytes == destination.partial_path.stat().st_blocks * 512
+    assert result.speed_bps is None
+    assert result.eta_seconds is None
+    assert destination.partial_path.parent == destination.incomplete_dir
+    assert not destination.final_path.exists()
+    assert list(destination.final_path.parent.iterdir()) == []
+
+    assert [command for command, _ in calls] == [
+        (
+            "/opt/homebrew/bin/ffmpeg",
+            "-nostdin",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-n",
+            "-i",
+            str(video_input),
+            "-i",
+            str(audio_input),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c",
+            "copy",
+            str(destination.partial_path),
+        ),
+        (
+            "/opt/homebrew/bin/ffprobe",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
+            str(destination.partial_path),
+        ),
+    ]
+    assert [
+        (kwargs["cwd"], kwargs["timeout"], kwargs["output_limit"])
+        for _, kwargs in calls
+    ] == [
+        (destination.incomplete_dir, 30.0, video.MAX_METADATA_BYTES),
+        (destination.incomplete_dir, 30.0, video.MAX_METADATA_BYTES),
+    ]
+    assert all(
+        source.raw_url.decode("utf-8") not in command for command, _ in calls
+    )
+    assert not any(
+        "://" in argument for command, _ in calls for argument in command
+    )
