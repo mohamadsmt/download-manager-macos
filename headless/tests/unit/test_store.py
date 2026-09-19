@@ -869,6 +869,49 @@ def test_v3_migration_failure_leaves_v2_database_unchanged(
     }
 
 
+def test_v3_rejects_incomplete_retry_schema_without_bootstrap_writes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v2_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE job_retry (job_id TEXT PRIMARY KEY)")
+        connection.execute(store_module._JOB_RETRY_AUDIT_SCHEMA)
+        connection.execute("PRAGMA user_version = 3")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA table_info(job_retry)").fetchall() == [
+            (0, "job_id", "TEXT", 0, None, 1)
+        ]
+
+
+def test_v3_rejects_retry_schema_missing_required_constraints(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v2_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE job_retry (
+                job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+                generation INTEGER NOT NULL,
+                budget_number INTEGER NOT NULL,
+                ordinary_attempts INTEGER NOT NULL,
+                paused INTEGER NOT NULL,
+                exhausted INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(store_module._JOB_RETRY_AUDIT_SCHEMA)
+        connection.execute("PRAGMA user_version = 3")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+
 def test_v2_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:

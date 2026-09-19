@@ -108,19 +108,40 @@ CREATE TABLE job_retry_audit (
 );
 """
 
+
+def _normalize_table_schema(schema: str) -> str:
+    """Canonicalize static SQLite DDL for exact current-version validation."""
+
+    return " ".join(
+        schema.replace("CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ").split()
+    ).upper()
+
+
+def _expected_table_schemas(*schemas: str) -> dict[str, str]:
+    """Index the known static table definitions by their normalized names."""
+
+    expected: dict[str, str] = {}
+    for schema in schemas:
+        for statement in schema.split(";"):
+            normalized = _normalize_table_schema(statement)
+            if not normalized:
+                continue
+            prefix, _, _definition = normalized.partition("(")
+            table_name = prefix.removeprefix("CREATE TABLE ").strip().lower()
+            if not table_name:
+                raise RuntimeError("static table schema is invalid")
+            expected[table_name] = normalized
+    return expected
+
+
 _SUPPORTED_SCHEMA_VERSION: Final = 3
 _RETRY_AUDIT_CAPACITY: Final = 256
-_V3_TABLES: Final[frozenset[str]] = frozenset(
-    {
-        "settings",
-        "jobs",
-        "commands",
-        "events",
-        "materialized_jobs",
-        "collection_holds",
-        "job_retry",
-        "job_retry_audit",
-    }
+_V3_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
 )
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
@@ -258,19 +279,26 @@ class SQLiteStore:
         if row[0] == _SUPPORTED_SCHEMA_VERSION and not SQLiteStore._has_v3_tables(
             connection
         ):
-            raise RuntimeError("database schema version is newer than supported")
+            raise RuntimeError("database schema version is newer than supported or incomplete")
 
     @staticmethod
     def _has_v3_tables(connection: sqlite3.Connection) -> bool:
         """Recognize only the complete current schema before legacy bootstrap."""
 
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-        return _V3_TABLES <= tables
+        for table_name, expected_schema in _V3_TABLE_SCHEMAS.items():
+            row = connection.execute(
+                """
+                SELECT sql
+                FROM sqlite_master
+                WHERE type = 'table' AND name = ?
+                """,
+                (table_name,),
+            ).fetchone()
+            if row is None or type(row["sql"]) is not str:
+                return False
+            if _normalize_table_schema(row["sql"]) != expected_schema:
+                return False
+        return True
 
     @staticmethod
     def _migrate_schema_v3(connection: sqlite3.Connection) -> None:
