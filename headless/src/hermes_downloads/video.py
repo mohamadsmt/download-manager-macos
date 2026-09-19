@@ -944,8 +944,13 @@ def _require_safe_payload_output(destination: DestinationIntent, output: Path) -
     _require_local_merge_destination(destination)
     if output.parent != destination.incomplete_dir:
         raise ValueError("payload output is unsafe")
+    for path in (output, output.with_name(f"{output.name}.aria2")):
+        _require_safe_payload_artifact(path)
+
+
+def _require_safe_payload_artifact(path: Path) -> None:
     try:
-        details = os.lstat(output)
+        details = os.lstat(path)
     except FileNotFoundError:
         return
     except OSError:
@@ -1006,7 +1011,7 @@ def _run_ytdlp_payload(
         "--downloader",
         aria2_executable,
         "--downloader-args",
-        "-x4 -s4 -j1 --file-allocation=none "
+        "-x4 -s4 -j1 --file-allocation=none --no-netrc=true "
         f"--max-overall-download-limit={allocation_bps}",
         "--ffmpeg-location",
         ffmpeg_executable,

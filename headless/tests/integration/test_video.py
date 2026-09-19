@@ -746,6 +746,7 @@ def test_video_payload_uses_external_aria2_for_a_certified_loopback_resource(
     assert "--max-overall-download-limit=1024" in captured[
         captured.index("--downloader-args") + 1
     ]
+    assert "--no-netrc=true" in captured[captured.index("--downloader-args") + 1]
 
 
 def test_video_payload_serializes_separate_formats_before_local_merge(
@@ -865,6 +866,58 @@ def test_audio_payload_rejects_unsafe_partial_before_containment(
     def unexpected_engine(command: tuple[str, ...], **_kwargs: object) -> object:
         started.append(command)
         raise AssertionError("unsafe payload path reached containment")
+
+    monkeypatch.setattr(video, "run_contained", unexpected_engine)
+    client = video.YtDlpPayloadClient(
+        aria2_executable="/opt/homebrew/bin/aria2c",
+        ffmpeg_executable="/opt/homebrew/bin/ffmpeg",
+        ffprobe_executable="/opt/homebrew/bin/ffprobe",
+    )
+
+    with pytest.raises(ValueError, match=r"^payload output is unsafe$"):
+        client.download(resolution, destination=destination, allocation_bps=1)
+
+    assert started == []
+
+
+def test_audio_payload_rejects_unsafe_aria2_sidecar_before_containment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = _video()
+    paths = importlib.import_module("hermes_downloads.paths")
+    root = Path.home() / "Downloads" / "Hermes"
+    root.mkdir(parents=True)
+    destination = paths.resolve_destination(
+        root,
+        category="Audio",
+        filename="sidecar.m4a",
+        job_id="job-audio-sidecar",
+    )
+    destination.partial_path.with_name(
+        f"{destination.partial_path.name}.aria2"
+    ).symlink_to(destination.final_path)
+    resolution = video.VideoResolution(
+        status=video.VideoStatus.READY,
+        original_page=_source("https://video.example.test/watch?v=audio-sidecar"),
+        provisional_filename="job-audio-sidecar--metadata-pending",
+        content_id="audio-sidecar-content",
+        final_filename="sidecar.m4a",
+        selection=video.FormatSelection(
+            video_format_id=None,
+            audio_format_id="140",
+            container="m4a",
+            extension="m4a",
+            subtitles=(),
+            video_protocol=None,
+            audio_protocol="https",
+        ),
+        available_qualities=(),
+    )
+    started: list[tuple[str, ...]] = []
+
+    def unexpected_engine(command: tuple[str, ...], **_kwargs: object) -> object:
+        started.append(command)
+        raise AssertionError("unsafe aria2 sidecar reached containment")
 
     monkeypatch.setattr(video, "run_contained", unexpected_engine)
     client = video.YtDlpPayloadClient(
