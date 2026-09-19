@@ -182,7 +182,7 @@ def observe_job_space(
 ) -> JobSpace:
     """Observe only the explicit job artifacts without creating or changing them."""
 
-    _validate_destination_intent(destination)
+    root, _ = _validate_destination_intent(destination)
     expected_output_logical_bytes = _require_expected_output_logical_bytes(
         expected_output_logical_bytes
     )
@@ -191,30 +191,44 @@ def observe_job_space(
         owned_paths=owned_paths,
         output_path=output_path,
     )
-    _require_real_directory(destination.incomplete_dir)
 
-    owned_details = tuple(_require_job_file(path) for path in owned_paths)
-    output_details = _observe_output_file(output_path)
-    included_details = owned_details + (() if output_details is None else (output_details,))
+    root_fd = _open_root(root)
+    try:
+        incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)
+        try:
+            job_fd = _open_existing_directory(incomplete_fd, destination.job_id)
+            try:
+                owned_details = tuple(_require_job_file(path) for path in owned_paths)
+                output_details = _observe_output_file(output_path)
+                included_details = owned_details + (
+                    () if output_details is None else (output_details,)
+                )
+                _require_unique_job_file_identities(included_details)
 
-    owned_logical_bytes = sum(details.st_size for details in owned_details)
-    output_logical_bytes = 0 if output_details is None else output_details.st_size
-    current = StorageUsage(
-        logical_bytes=owned_logical_bytes + output_logical_bytes,
-        allocated_bytes=_allocated_bytes(included_details),
-    )
-    expected_peak_logical_bytes = (
-        None
-        if expected_output_logical_bytes is None
-        else owned_logical_bytes
-        + max(output_logical_bytes, expected_output_logical_bytes)
-    )
-    return JobSpace(
-        current=current,
-        available_bytes=_available_bytes(destination.incomplete_dir),
-        expected_output_logical_bytes=expected_output_logical_bytes,
-        expected_peak_logical_bytes=expected_peak_logical_bytes,
-    )
+                owned_logical_bytes = sum(details.st_size for details in owned_details)
+                output_logical_bytes = 0 if output_details is None else output_details.st_size
+                current = StorageUsage(
+                    logical_bytes=owned_logical_bytes + output_logical_bytes,
+                    allocated_bytes=_allocated_bytes(included_details),
+                )
+                expected_peak_logical_bytes = (
+                    None
+                    if expected_output_logical_bytes is None
+                    else owned_logical_bytes
+                    + max(output_logical_bytes, expected_output_logical_bytes)
+                )
+                return JobSpace(
+                    current=current,
+                    available_bytes=_available_bytes(destination.incomplete_dir),
+                    expected_output_logical_bytes=expected_output_logical_bytes,
+                    expected_peak_logical_bytes=expected_peak_logical_bytes,
+                )
+            finally:
+                os.close(job_fd)
+        finally:
+            os.close(incomplete_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _validate_destination_intent(destination: DestinationIntent) -> tuple[Path, str]:
@@ -320,6 +334,22 @@ def _require_regular_single_link_file(details: os.stat_result) -> os.stat_result
     if type(logical_bytes) is not int or logical_bytes < 0:
         raise PathValidationError("job artifact size is invalid")
     return details
+
+
+def _require_unique_job_file_identities(details: tuple[os.stat_result, ...]) -> None:
+    identities: set[tuple[int, int]] = set()
+    for item in details:
+        try:
+            device = item.st_dev
+            inode = item.st_ino
+        except (AttributeError, TypeError, ValueError) as error:
+            raise PathValidationError("job artifact identity is invalid") from error
+        if type(device) is not int or device < 0 or type(inode) is not int or inode < 0:
+            raise PathValidationError("job artifact identity is invalid")
+        identity = (device, inode)
+        if identity in identities:
+            raise PathValidationError("job artifacts must identify unique files")
+        identities.add(identity)
 
 
 def _allocated_bytes(details: tuple[os.stat_result, ...]) -> int | None:

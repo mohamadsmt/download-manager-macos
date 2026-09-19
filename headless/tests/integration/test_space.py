@@ -231,3 +231,72 @@ def test_rejects_a_non_tuple_owned_ledger_without_changing_content() -> None:
         )
 
     assert sidecar.read_bytes() == b"unchanged"
+
+
+def test_rejects_replaced_incomplete_component_without_touching_external_or_original_files(
+    tmp_path: Path,
+) -> None:
+    paths = _paths()
+    destination = _destination(paths, job_id="job-space-replaced-incomplete")
+    original_owned = destination.incomplete_dir / "owned.part"
+    original_owned.write_bytes(b"original owned")
+    destination.partial_path.write_bytes(b"original output")
+    destination.final_path.write_bytes(b"final output")
+
+    original_incomplete = destination.incomplete_dir.parent
+    relocated_incomplete = tmp_path / "original-incomplete"
+    external_incomplete = tmp_path / "external-incomplete"
+    external_owned = external_incomplete / destination.job_id / "owned.part"
+    external_owned.parent.mkdir(parents=True)
+    external_owned.write_bytes(b"external owned")
+    original_incomplete.rename(relocated_incomplete)
+    original_incomplete.symlink_to(external_incomplete, target_is_directory=True)
+
+    with pytest.raises(paths.PathValidationError):
+        paths.observe_job_space(
+            destination,
+            owned_paths=(original_owned,),
+            output_path=destination.partial_path,
+            expected_output_logical_bytes=23,
+        )
+
+    assert external_owned.read_bytes() == b"external owned"
+    assert (relocated_incomplete / destination.job_id / "owned.part").read_bytes() == (
+        b"original owned"
+    )
+    assert (relocated_incomplete / destination.job_id / destination.filename).read_bytes() == (
+        b"original output"
+    )
+    assert destination.final_path.read_bytes() == b"final output"
+    assert original_incomplete.is_symlink()
+
+
+def test_rejects_same_inode_lexical_owned_aliases_before_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination = _destination(paths, job_id="job-space-inode-alias")
+    first_alias = destination.incomplete_dir / "artifact.part"
+    second_alias = destination.incomplete_dir / "ARTIFACT.PART"
+    first_alias.write_bytes(b"one physical artifact")
+    assert first_alias != second_alias
+
+    original_observe_file = paths._require_job_file
+    observed_paths: list[Path] = []
+
+    def observe_normalized_alias(path: Path) -> os.stat_result:
+        observed_paths.append(path)
+        assert path in (first_alias, second_alias)
+        return original_observe_file(first_alias)
+
+    monkeypatch.setattr(paths, "_require_job_file", observe_normalized_alias)
+
+    with pytest.raises(paths.PathValidationError):
+        paths.observe_job_space(
+            destination,
+            owned_paths=(first_alias, second_alias),
+            output_path=destination.partial_path,
+            expected_output_logical_bytes=0,
+        )
+
+    assert observed_paths == [first_alias, second_alias]
