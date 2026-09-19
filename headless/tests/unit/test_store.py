@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import hermes_downloads.retry as retry_module
 import hermes_downloads.store as store_module
 from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
 from hermes_downloads.store import RequestConflictError, SQLiteStore
@@ -89,6 +90,51 @@ def _materialized_job(**overrides: Any) -> MaterializedJob:
     }
     values.update(overrides)
     return MaterializedJob(**values)
+
+
+def _retry_budget(**overrides: Any) -> retry_module.RetryBudget:
+    values: dict[str, Any] = {
+        "job_id": "job-1",
+        "generation": 4,
+        "budget_number": 1,
+        "ordinary_attempts": 1,
+        "paused": False,
+        "exhausted": False,
+    }
+    values.update(overrides)
+    if "audit" not in overrides:
+        values["audit"] = (
+            retry_module.RetryAuditEvent(
+                retry_module.RetryAuditKind.OPENED,
+                generation=values["generation"],
+                budget_number=1,
+                ordinary_attempts=0,
+            ),
+            retry_module.RetryAuditEvent(
+                retry_module.RetryAuditKind.RETRY_SCHEDULED,
+                generation=values["generation"],
+                budget_number=1,
+                ordinary_attempts=1,
+            ),
+        )
+    return retry_module.RetryBudget(**values)
+
+
+def _retry_budget_at_audit_capacity() -> retry_module.RetryBudget:
+    authority = retry_module.RetryAuthority.open(
+        policy=retry_module.RetryPolicy(), job_id="job-1", generation=4
+    )
+    while len(authority.budget.audit) < 256:
+        budget = authority.budget
+        if budget.exhausted:
+            authority.resume_after_exhaustion(new_generation=budget.generation + 1)
+        else:
+            authority.decide(
+                retry_module.RetryFailure(retry_module.FailureKind.TRANSIENT_HOST),
+                generation=budget.generation,
+            )
+    assert authority.budget.exhausted is False
+    return authority.budget
 
 
 def _create_v1_database(database_path: Path) -> tuple[object, ...]:
@@ -714,7 +760,7 @@ def test_v2_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -725,8 +771,8 @@ def test_v2_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
     v1_tables = {"settings", "jobs", "commands", "events"}
     v2_tables = _table_names(database_path)
     assert v1_tables <= v2_tables
-    assert "collection_holds" in v2_tables
-    assert len(v2_tables - v1_tables) >= 2
+    assert {"collection_holds", "job_retry", "job_retry_audit"} <= v2_tables
+    assert len(v2_tables - v1_tables) >= 4
 
 
 def test_v2_migration_failure_leaves_v1_database_unchanged(
@@ -902,5 +948,83 @@ def test_materialized_domain_cold_recovery_preserves_projection_fields(
                 revision=before_job.revision + 1,
             ),
         )
+    finally:
+        store.close()
+
+
+def test_v3_retry_budget_reopens_exactly_with_its_bounded_audit(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    budget = _retry_budget()
+    store = SQLiteStore(database_path)
+    try:
+        store.apply_add(_intent())
+        store.set_retry_budget(budget)
+        assert store.get_retry_budget(budget.job_id) == budget
+    finally:
+        store.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.get_retry_budget(budget.job_id) == budget
+    finally:
+        reopened.close()
+
+
+def test_v3_retry_budget_write_requires_current_job_generation(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(_intent())
+        with pytest.raises(ValueError, match="generation"):
+            store.set_retry_budget(_retry_budget(generation=5))
+        assert store.get_retry_budget("job-1") is None
+    finally:
+        store.close()
+
+
+def test_v3_cold_recovery_fences_persisted_retry_budget_atomically(tmp_path: Path) -> None:
+    budget = _retry_budget()
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(_intent())
+        store._connection.execute("UPDATE jobs SET state = 'retry_wait' WHERE job_id = 'job-1'")
+        store.set_retry_budget(budget)
+
+        assert store.recover_cold_start() == 1
+
+        job = store.get_job("job-1")
+        retry = store.get_retry_budget("job-1")
+        assert job is not None
+        assert retry is not None
+        assert (job.state, job.generation, job.revision) == ("paused", 5, 8)
+        assert retry.generation == job.generation
+        assert retry.paused is True
+        assert retry.audit[:-1] == budget.audit
+        assert retry.audit[-1] == retry_module.RetryAuditEvent(
+            retry_module.RetryAuditKind.FENCED,
+            generation=job.generation,
+            budget_number=budget.budget_number,
+            ordinary_attempts=budget.ordinary_attempts,
+        )
+    finally:
+        store.close()
+
+
+def test_v3_cold_recovery_rolls_back_when_retry_audit_cannot_be_fenced(
+    tmp_path: Path,
+) -> None:
+    budget = _retry_budget_at_audit_capacity()
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(_intent(generation=budget.generation))
+        store._connection.execute("UPDATE jobs SET state = 'retry_wait' WHERE job_id = 'job-1'")
+        store.set_retry_budget(budget)
+        before_job = store.get_job("job-1")
+
+        with pytest.raises(OverflowError, match="audit.*capacity"):
+            store.recover_cold_start()
+
+        assert store.worker_epoch() is None
+        assert store.get_job("job-1") == before_job
+        assert store.get_retry_budget("job-1") == budget
     finally:
         store.close()

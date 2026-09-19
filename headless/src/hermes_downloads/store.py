@@ -10,6 +10,13 @@ import sqlite3
 from typing import Final
 
 from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
+from hermes_downloads.retry import (
+    RetryAuditEvent,
+    RetryAuditKind,
+    RetryAuthority,
+    RetryBudget,
+    RetryPolicy,
+)
 
 __all__ = [
     "CommandRecord",
@@ -78,6 +85,43 @@ CREATE TABLE collection_holds (
 );
 """
 
+_JOB_RETRY_SCHEMA: Final = """
+CREATE TABLE job_retry (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    budget_number INTEGER NOT NULL,
+    ordinary_attempts INTEGER NOT NULL,
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    exhausted INTEGER NOT NULL CHECK (exhausted IN (0, 1))
+);
+"""
+
+_JOB_RETRY_AUDIT_SCHEMA: Final = """
+CREATE TABLE job_retry_audit (
+    job_id TEXT NOT NULL REFERENCES job_retry(job_id) ON DELETE CASCADE,
+    audit_index INTEGER NOT NULL CHECK (audit_index >= 0 AND audit_index < 256),
+    kind TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    budget_number INTEGER NOT NULL,
+    ordinary_attempts INTEGER NOT NULL,
+    PRIMARY KEY (job_id, audit_index)
+);
+"""
+
+_SUPPORTED_SCHEMA_VERSION: Final = 3
+_RETRY_AUDIT_CAPACITY: Final = 256
+_V3_TABLES: Final[frozenset[str]] = frozenset(
+    {
+        "settings",
+        "jobs",
+        "commands",
+        "events",
+        "materialized_jobs",
+        "collection_holds",
+        "job_retry",
+        "job_retry_audit",
+    }
+)
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _PAGE_SIZE: Final = 100
@@ -189,7 +233,7 @@ class SQLiteStore:
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
-            self._migrate_schema_v2(connection)
+            self._migrate_schema_v3(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -209,12 +253,28 @@ class SQLiteStore:
         row = connection.execute("PRAGMA user_version").fetchone()
         if row is None or type(row[0]) is not int:
             raise RuntimeError("database schema version is invalid")
-        if row[0] > 2:
+        if row[0] > _SUPPORTED_SCHEMA_VERSION:
+            raise RuntimeError("database schema version is newer than supported")
+        if row[0] == _SUPPORTED_SCHEMA_VERSION and not SQLiteStore._has_v3_tables(
+            connection
+        ):
             raise RuntimeError("database schema version is newer than supported")
 
     @staticmethod
-    def _migrate_schema_v2(connection: sqlite3.Connection) -> None:
-        """Apply the additive v2 schema migration in one transaction."""
+    def _has_v3_tables(connection: sqlite3.Connection) -> bool:
+        """Recognize only the complete current schema before legacy bootstrap."""
+
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        return _V3_TABLES <= tables
+
+    @staticmethod
+    def _migrate_schema_v3(connection: sqlite3.Connection) -> None:
+        """Apply additive v2 and v3 schema migrations in one transaction."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -226,7 +286,12 @@ class SQLiteStore:
                 connection.execute(_MATERIALIZED_JOBS_SCHEMA)
                 connection.execute(_COLLECTION_HOLDS_SCHEMA)
                 connection.execute("PRAGMA user_version = 2")
-            elif version > 2:
+                version = 2
+            if version <= 2:
+                connection.execute(_JOB_RETRY_SCHEMA)
+                connection.execute(_JOB_RETRY_AUDIT_SCHEMA)
+                connection.execute(f"PRAGMA user_version = {_SUPPORTED_SCHEMA_VERSION}")
+            elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
             connection.commit()
         except BaseException:
@@ -526,22 +591,34 @@ class SQLiteStore:
                 _RECOVERABLE_COLD_START_STATES,
             ).fetchall()
             for job in jobs:
-                generation = job["generation"] + 1
-                revision = job["revision"] + 1
+                job_id = _require_sqlite_text(job["job_id"], "job_id")
+                generation = _require_sqlite_integer(job["generation"], "generation") + 1
+                revision = _require_sqlite_integer(job["revision"], "revision") + 1
+                retry_budget = self._read_retry_budget(connection, job_id)
+                fenced_retry = None
+                if retry_budget is not None:
+                    authority = RetryAuthority.restore(
+                        policy=RetryPolicy(), budget=retry_budget
+                    )
+                    fenced_retry = authority.fence_cold_start(
+                        new_generation=generation
+                    )
                 connection.execute(
                     """
                     UPDATE jobs
                     SET generation = ?, revision = ?, state = 'paused'
                     WHERE job_id = ?
                     """,
-                    (generation, revision, job["job_id"]),
+                    (generation, revision, job_id),
                 )
+                if fenced_retry is not None:
+                    self._replace_retry_budget(connection, fenced_retry)
                 connection.execute(
                     """
                     INSERT INTO events (kind, job_id, generation, revision)
                     VALUES ('job_paused', ?, ?, ?)
                     """,
-                    (job["job_id"], generation, revision),
+                    (job_id, generation, revision),
                 )
             connection.commit()
         except BaseException:
@@ -592,6 +669,228 @@ class SQLiteStore:
         except BaseException:
             connection.rollback()
             raise
+
+    def set_retry_budget(self, budget: RetryBudget) -> None:
+        """Atomically replace one validated retry snapshot and its audit history."""
+
+        budget = RetryAuthority.restore(policy=RetryPolicy(), budget=budget).budget
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            job_rows = connection.execute(
+                """
+                SELECT generation
+                FROM jobs
+                WHERE job_id = ?
+                LIMIT 2
+                """,
+                (budget.job_id,),
+            ).fetchall()
+            if not job_rows:
+                raise ValueError("retry budget job does not exist")
+            if len(job_rows) != 1:
+                raise ValueError("retry budget job record is not unique")
+            generation = _require_sqlite_integer(
+                job_rows[0]["generation"], "job generation"
+            )
+            if generation != budget.generation:
+                raise ValueError(
+                    "retry budget generation does not match the current job generation"
+                )
+            self._replace_retry_budget(connection, budget)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def get_retry_budget(self, job_id: str) -> RetryBudget | None:
+        """Read one fully validated retry snapshot, if the job owns one."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        return self._read_retry_budget(self._connection, job_id)
+
+    @staticmethod
+    def _read_retry_budget(
+        connection: sqlite3.Connection, job_id: str
+    ) -> RetryBudget | None:
+        """Rebuild retry state from normalized rows without defaulting corruption."""
+
+        snapshot_rows = connection.execute(
+            """
+            SELECT
+                job_id,
+                generation,
+                budget_number,
+                ordinary_attempts,
+                paused,
+                exhausted
+            FROM job_retry
+            WHERE job_id = ?
+            LIMIT 2
+            """,
+            (job_id,),
+        ).fetchall()
+        if not snapshot_rows:
+            orphan = connection.execute(
+                """
+                SELECT 1
+                FROM job_retry_audit
+                WHERE job_id = ?
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            if orphan is not None:
+                raise ValueError("retry audit exists without a retry snapshot")
+            return None
+        if len(snapshot_rows) != 1:
+            raise ValueError("job has multiple retry snapshots")
+
+        snapshot = snapshot_rows[0]
+        persisted_job_id = _require_sqlite_text(snapshot["job_id"], "retry job_id")
+        if persisted_job_id != job_id:
+            raise ValueError("retry snapshot job_id does not match its lookup")
+        job_rows = connection.execute(
+            """
+            SELECT generation
+            FROM jobs
+            WHERE job_id = ?
+            LIMIT 2
+            """,
+            (job_id,),
+        ).fetchall()
+        if len(job_rows) != 1:
+            raise ValueError("retry snapshot must belong to exactly one job")
+
+        audit_rows = connection.execute(
+            """
+            SELECT audit_index, kind, generation, budget_number, ordinary_attempts
+            FROM job_retry_audit
+            WHERE job_id = ?
+            ORDER BY audit_index
+            LIMIT ?
+            """,
+            (job_id, _RETRY_AUDIT_CAPACITY + 1),
+        ).fetchall()
+        if len(audit_rows) > _RETRY_AUDIT_CAPACITY:
+            raise ValueError("persisted retry audit exceeds capacity")
+        audit = tuple(
+            SQLiteStore._retry_audit_event_from_row(row, index)
+            for index, row in enumerate(audit_rows)
+        )
+        budget = RetryBudget(
+            job_id=persisted_job_id,
+            generation=_require_sqlite_integer(
+                snapshot["generation"], "retry generation"
+            ),
+            budget_number=_require_sqlite_integer(
+                snapshot["budget_number"], "retry budget_number"
+            ),
+            ordinary_attempts=_require_sqlite_integer(
+                snapshot["ordinary_attempts"], "retry ordinary_attempts"
+            ),
+            paused=_require_sqlite_boolean(snapshot["paused"], "retry paused"),
+            exhausted=_require_sqlite_boolean(
+                snapshot["exhausted"], "retry exhausted"
+            ),
+            audit=audit,
+        )
+        job_generation = _require_sqlite_integer(
+            job_rows[0]["generation"], "job generation"
+        )
+        if budget.generation != job_generation:
+            raise ValueError("retry budget generation does not match its job")
+        return RetryAuthority.restore(policy=RetryPolicy(), budget=budget).budget
+
+    @staticmethod
+    def _retry_audit_event_from_row(
+        row: sqlite3.Row, expected_index: int
+    ) -> RetryAuditEvent:
+        """Decode one ordered audit row without coercing malformed SQLite values."""
+
+        audit_index = _require_sqlite_integer(row["audit_index"], "retry audit index")
+        if audit_index != expected_index:
+            raise ValueError("persisted retry audit is not contiguous")
+        try:
+            kind = RetryAuditKind(
+                _require_sqlite_text(row["kind"], "retry audit kind")
+            )
+        except ValueError as error:
+            raise ValueError("persisted retry audit kind is invalid") from error
+        return RetryAuditEvent(
+            kind=kind,
+            generation=_require_sqlite_integer(
+                row["generation"], "retry audit generation"
+            ),
+            budget_number=_require_sqlite_integer(
+                row["budget_number"], "retry audit budget_number"
+            ),
+            ordinary_attempts=_require_sqlite_integer(
+                row["ordinary_attempts"], "retry audit ordinary_attempts"
+            ),
+        )
+
+    @staticmethod
+    def _replace_retry_budget(
+        connection: sqlite3.Connection, budget: RetryBudget
+    ) -> None:
+        """Replace one authoritative snapshot and its bounded normalized history."""
+
+        budget = RetryAuthority.restore(policy=RetryPolicy(), budget=budget).budget
+        connection.execute(
+            """
+            INSERT INTO job_retry (
+                job_id,
+                generation,
+                budget_number,
+                ordinary_attempts,
+                paused,
+                exhausted
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                generation = excluded.generation,
+                budget_number = excluded.budget_number,
+                ordinary_attempts = excluded.ordinary_attempts,
+                paused = excluded.paused,
+                exhausted = excluded.exhausted
+            """,
+            (
+                budget.job_id,
+                budget.generation,
+                budget.budget_number,
+                budget.ordinary_attempts,
+                1 if budget.paused else 0,
+                1 if budget.exhausted else 0,
+            ),
+        )
+        connection.execute(
+            "DELETE FROM job_retry_audit WHERE job_id = ?", (budget.job_id,)
+        )
+        connection.executemany(
+            """
+            INSERT INTO job_retry_audit (
+                job_id,
+                audit_index,
+                kind,
+                generation,
+                budget_number,
+                ordinary_attempts
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            tuple(
+                (
+                    budget.job_id,
+                    index,
+                    event.kind.value,
+                    event.generation,
+                    event.budget_number,
+                    event.ordinary_attempts,
+                )
+                for index, event in enumerate(budget.audit)
+            ),
+        )
 
     def worker_epoch(self) -> int | None:
         """Return the durable cold-worker epoch, if recovery has run."""
