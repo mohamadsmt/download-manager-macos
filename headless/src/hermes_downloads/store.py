@@ -52,6 +52,15 @@ CREATE TABLE IF NOT EXISTS events (
 """
 
 _PAGE_SIZE: Final = 100
+_RECOVERABLE_COLD_START_STATES: Final = (
+    "queued",
+    "resolving",
+    "downloading",
+    "pausing",
+    "paused",
+    "retry_wait",
+    "finalizing",
+)
 
 
 class RequestConflictError(ValueError):
@@ -230,6 +239,87 @@ class SQLiteStore:
             raise
         return "paused"
 
+    def recover_cold_start(self) -> int:
+        """Atomically fence a cold worker epoch and pause incomplete jobs."""
+
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            epoch_setting = connection.execute(
+                "SELECT value, revision FROM settings WHERE key = 'worker_epoch'"
+            ).fetchone()
+            if epoch_setting is None:
+                epoch = 1
+                connection.execute(
+                    """
+                    INSERT INTO settings (key, value, revision)
+                    VALUES ('worker_epoch', '1', 1)
+                    """
+                )
+            else:
+                epoch = int(epoch_setting["value"]) + 1
+                connection.execute(
+                    """
+                    UPDATE settings
+                    SET value = ?, revision = ?
+                    WHERE key = 'worker_epoch'
+                    """,
+                    (str(epoch), epoch_setting["revision"] + 1),
+                )
+
+            gate_setting = connection.execute(
+                "SELECT revision FROM settings WHERE key = 'queue_gate'"
+            ).fetchone()
+            if gate_setting is None:
+                connection.execute(
+                    """
+                    INSERT INTO settings (key, value, revision)
+                    VALUES ('queue_gate', 'paused', 1)
+                    """
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE settings
+                    SET value = 'paused', revision = ?
+                    WHERE key = 'queue_gate'
+                    """,
+                    (gate_setting["revision"] + 1,),
+                )
+
+            jobs = connection.execute(
+                """
+                SELECT job_id, generation, revision
+                FROM jobs
+                WHERE state IN (?, ?, ?, ?, ?, ?, ?)
+                ORDER BY job_id
+                """,
+                _RECOVERABLE_COLD_START_STATES,
+            ).fetchall()
+            for job in jobs:
+                generation = job["generation"] + 1
+                revision = job["revision"] + 1
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET generation = ?, revision = ?, state = 'paused'
+                    WHERE job_id = ?
+                    """,
+                    (generation, revision, job["job_id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO events (kind, job_id, generation, revision)
+                    VALUES ('job_paused', ?, ?, ?)
+                    """,
+                    (job["job_id"], generation, revision),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return epoch
+
     def queue_gate(self) -> str | None:
         """Return the persisted global admission gate, if initialized."""
 
@@ -237,6 +327,14 @@ class SQLiteStore:
             "SELECT value FROM settings WHERE key = 'queue_gate'"
         ).fetchone()
         return None if row is None else row["value"]
+
+    def worker_epoch(self) -> int | None:
+        """Return the durable cold-worker epoch, if recovery has run."""
+
+        row = self._connection.execute(
+            "SELECT value FROM settings WHERE key = 'worker_epoch'"
+        ).fetchone()
+        return None if row is None else int(row["value"])
 
     def get_job(self, job_id: str) -> JobRecord | None:
         """Read one persisted job."""

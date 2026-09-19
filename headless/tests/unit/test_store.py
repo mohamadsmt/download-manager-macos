@@ -310,3 +310,248 @@ def test_cold_start_persists_global_queue_gate_paused_without_worker(tmp_path: P
         assert reopened.queue_gate() == "paused"
     finally:
         reopened.close()
+
+
+def test_cold_recovery_fences_incomplete_jobs_and_allocates_epochs(tmp_path: Path) -> None:
+    recoverable_states = (
+        "queued",
+        "resolving",
+        "downloading",
+        "pausing",
+        "paused",
+        "retry_wait",
+        "finalizing",
+    )
+    untouched_states = (
+        "completed",
+        "cancelled",
+        "removed",
+        "failed",
+        "needs_link",
+        "needs_auth",
+        "blocked",
+    )
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        recovered: list[tuple[str, int, int]] = []
+        untouched: list[tuple[str, str, int, int]] = []
+        for index, state in enumerate(recoverable_states):
+            job_id = f"recover-{index}"
+            generation = 10 + index
+            revision = 20 + index
+            store.apply_add(
+                _intent(
+                    job_id=job_id,
+                    request_id=f"recover-request-{index}",
+                    generation=generation,
+                    revision=revision,
+                )
+            )
+            store._connection.execute(
+                "UPDATE jobs SET state = ? WHERE job_id = ?", (state, job_id)
+            )
+            recovered.append((job_id, generation, revision))
+        for index, state in enumerate(untouched_states):
+            job_id = f"untouched-{index}"
+            generation = 30 + index
+            revision = 40 + index
+            store.apply_add(
+                _intent(
+                    job_id=job_id,
+                    request_id=f"untouched-request-{index}",
+                    generation=generation,
+                    revision=revision,
+                )
+            )
+            store._connection.execute(
+                "UPDATE jobs SET state = ? WHERE job_id = ?", (state, job_id)
+            )
+            untouched.append((job_id, state, generation, revision))
+        commands_before = tuple(
+            store.get_command(f"recover-request-{index}")
+            for index in range(len(recoverable_states))
+        ) + tuple(
+            store.get_command(f"untouched-request-{index}")
+            for index in range(len(untouched_states))
+        )
+        event_count_before_recovery = len(store.list_events())
+
+        assert store.recover_cold_start() == 1
+        assert store.worker_epoch() == 1
+        assert store.queue_gate() == "paused"
+        for job_id, generation, revision in recovered:
+            assert store.get_job(job_id) is not None
+            assert store.get_job(job_id) == store_module.JobRecord(
+                job=job_id,
+                source_url=b"https://example.test/files/one.bin?signature=unchanged",
+                generation=generation + 1,
+                revision=revision + 1,
+                state="paused",
+            )
+        for job_id, state, generation, revision in untouched:
+            assert store.get_job(job_id) is not None
+            assert store.get_job(job_id) == store_module.JobRecord(
+                job=job_id,
+                source_url=b"https://example.test/files/one.bin?signature=unchanged",
+                generation=generation,
+                revision=revision,
+                state=state,
+            )
+        expected_first_events = [
+            ("job_paused", job_id, generation + 1, revision + 1)
+            for job_id, generation, revision in recovered
+        ]
+        assert sorted(
+            (event.kind, event.job, event.generation, event.revision)
+            for event in store.list_events()[event_count_before_recovery:]
+        ) == sorted(expected_first_events)
+        assert tuple(
+            store.get_command(f"recover-request-{index}")
+            for index in range(len(recoverable_states))
+        ) + tuple(
+            store.get_command(f"untouched-request-{index}")
+            for index in range(len(untouched_states))
+        ) == commands_before
+
+        assert store.recover_cold_start() == 2
+        assert store.worker_epoch() == 2
+        for job_id, generation, revision in recovered:
+            assert store.get_job(job_id) == store_module.JobRecord(
+                job=job_id,
+                source_url=b"https://example.test/files/one.bin?signature=unchanged",
+                generation=generation + 2,
+                revision=revision + 2,
+                state="paused",
+            )
+        recovery_events = [
+            (event.kind, event.job, event.generation, event.revision)
+            for event in store.list_events()[event_count_before_recovery:]
+        ]
+        assert sorted(recovery_events) == sorted(
+            expected_first_events
+            + [
+                ("job_paused", job_id, generation + 2, revision + 2)
+                for job_id, generation, revision in recovered
+            ]
+        )
+    finally:
+        store.close()
+
+
+def test_cold_recovery_advances_epoch_without_events_when_no_job_needs_conversion(
+    tmp_path: Path,
+) -> None:
+    untouched_states = (
+        "completed",
+        "cancelled",
+        "removed",
+        "failed",
+        "needs_link",
+        "needs_auth",
+        "blocked",
+    )
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        for index, state in enumerate(untouched_states):
+            job_id = f"untouched-{index}"
+            store.apply_add(
+                _intent(
+                    job_id=job_id,
+                    request_id=f"untouched-request-{index}",
+                    generation=50 + index,
+                    revision=60 + index,
+                )
+            )
+            store._connection.execute(
+                "UPDATE jobs SET state = ? WHERE job_id = ?", (state, job_id)
+            )
+        jobs_before = store.list_jobs()
+        commands_before = tuple(
+            store.get_command(f"untouched-request-{index}")
+            for index in range(len(untouched_states))
+        )
+        events_before = store.list_events()
+
+        assert store.recover_cold_start() == 1
+        assert store.worker_epoch() == 1
+        assert store.queue_gate() == "paused"
+        assert store.list_jobs() == jobs_before
+        assert (
+            tuple(
+                store.get_command(f"untouched-request-{index}")
+                for index in range(len(untouched_states))
+            )
+            == commands_before
+        )
+        assert store.list_events() == events_before
+
+        assert store.recover_cold_start() == 2
+        assert store.worker_epoch() == 2
+        assert store.list_jobs() == jobs_before
+        assert store.list_events() == events_before
+    finally:
+        store.close()
+
+
+def test_cold_recovery_event_failure_rolls_back_epoch_gate_jobs_and_events(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    initialized = SQLiteStore(database_path)
+    try:
+        initialized.apply_add(_intent())
+        initialized._connection.execute(
+            "UPDATE jobs SET state = 'downloading' WHERE job_id = 'job-1'"
+        )
+        initialized._connection.execute(
+            """
+            INSERT INTO settings (key, value, revision)
+            VALUES ('queue_gate', 'running', 9)
+            """
+        )
+        job_before = initialized.get_job("job-1")
+        command_before = initialized.get_command("request-1")
+        events_before = initialized.list_events()
+    finally:
+        initialized.close()
+    _install_failing_insert_trigger(
+        database_path,
+        table="events",
+        trigger_name="fail_recovery_event_insert",
+        message="injected recovery event write failure",
+    )
+
+    store = SQLiteStore(database_path)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="injected recovery event write failure"):
+            store.recover_cold_start()
+
+        assert store.worker_epoch() is None
+        assert store.queue_gate() == "running"
+        assert store.get_job("job-1") == job_before
+        assert store.get_command("request-1") == command_before
+        assert store.list_events() == events_before
+    finally:
+        store.close()
+
+
+def test_cold_recovery_epoch_survives_reopen(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    first = SQLiteStore(database_path)
+    try:
+        assert first.recover_cold_start() == 1
+    finally:
+        first.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.worker_epoch() == 1
+        assert reopened.recover_cold_start() == 2
+    finally:
+        reopened.close()
+
+    final = SQLiteStore(database_path)
+    try:
+        assert final.worker_epoch() == 2
+    finally:
+        final.close()
