@@ -191,7 +191,10 @@ def test_retry_authority_exposes_no_callable_bare_failure_or_budget_decider() ->
     }
 
     assert direct_decider is None
-    assert decision_methods == {"decide": ("failure", "generation", "jitter_seconds")}
+    assert decision_methods == {
+        "decide": ("failure", "generation", "jitter_seconds"),
+        "restore": ("policy", "budget"),
+    }
 
 
 def test_retry_authority_rejects_a_legacy_fork_before_stale_callbacks_can_bypass_it() -> None:

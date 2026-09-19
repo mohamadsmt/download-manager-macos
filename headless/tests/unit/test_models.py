@@ -455,6 +455,13 @@ def test_materialized_job_binds_intent_and_normalizes_its_projections() -> None:
     assert ordinary.selected_final_filename == ordinary.partial_filename
 
 
+def test_materialized_job_preserves_absent_queue_and_schedule_projections() -> None:
+    materialized = _materialized_job(queue_collection_id=None, scheduled_for=None)
+
+    assert materialized.queue_collection_id is None
+    assert materialized.scheduled_for is None
+
+
 @pytest.mark.parametrize(
     "overrides",
     (

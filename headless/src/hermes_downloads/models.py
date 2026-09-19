@@ -164,10 +164,10 @@ class MaterializedJob:
     job_id: str
     intent: DownloadIntent
     source_kind: SourceKind
-    queue_collection_id: str
+    queue_collection_id: str | None
     priority: int
     order_key: int
-    scheduled_for: datetime
+    scheduled_for: datetime | None
     authorized: bool
     manual_hold: bool
     start_now_requested: bool
@@ -184,17 +184,22 @@ class MaterializedJob:
             raise ValueError("job_id must match intent.job_id")
         if type(self.source_kind) is not SourceKind:
             raise TypeError("source_kind must be a SourceKind")
-        _require_identifier(self.queue_collection_id, "queue_collection_id")
+        if self.queue_collection_id is not None:
+            _require_identifier(self.queue_collection_id, "queue_collection_id")
         if type(self.priority) is not int:
             raise TypeError("priority must be an integer")
         if not _MIN_PRIORITY <= self.priority <= _MAX_PRIORITY:
             raise ValueError("priority must fit a signed 32-bit integer")
         _require_counter(self.order_key, "order_key")
-        if type(self.scheduled_for) is not datetime:
-            raise TypeError("scheduled_for must be a datetime")
-        if self.scheduled_for.tzinfo is None or self.scheduled_for.utcoffset() is None:
-            raise ValueError("scheduled_for must be timezone-aware")
-        object.__setattr__(self, "scheduled_for", self.scheduled_for.astimezone(UTC))
+        if self.scheduled_for is not None:
+            if type(self.scheduled_for) is not datetime:
+                raise TypeError("scheduled_for must be a datetime")
+            if (
+                self.scheduled_for.tzinfo is None
+                or self.scheduled_for.utcoffset() is None
+            ):
+                raise ValueError("scheduled_for must be timezone-aware")
+            object.__setattr__(self, "scheduled_for", self.scheduled_for.astimezone(UTC))
         for name in ("authorized", "manual_hold", "start_now_requested"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a boolean")
