@@ -766,6 +766,20 @@ def test_v2_migration_failure_leaves_v1_database_unchanged(
         } == {"settings", "jobs", "commands", "events"}
 
 
+def test_v2_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
+        connection.execute("PRAGMA user_version = 3")
+
+    with pytest.raises(RuntimeError, match="newer than supported"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert _table_names(database_path) == {"future_jobs"}
+
+
 def test_materialized_domain_apply_add_reopens_exact_projection(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     materialized = _materialized_job()

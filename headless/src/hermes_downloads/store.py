@@ -187,6 +187,7 @@ class SQLiteStore:
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
+            self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
             self._migrate_schema_v2(connection)
         except BaseException:
@@ -200,6 +201,16 @@ class SQLiteStore:
                 pass
             raise
         self._connection = connection
+
+    @staticmethod
+    def _reject_newer_schema_version(connection: sqlite3.Connection) -> None:
+        """Fail before legacy bootstrap can mutate a future database."""
+
+        row = connection.execute("PRAGMA user_version").fetchone()
+        if row is None or type(row[0]) is not int:
+            raise RuntimeError("database schema version is invalid")
+        if row[0] > 2:
+            raise RuntimeError("database schema version is newer than supported")
 
     @staticmethod
     def _migrate_schema_v2(connection: sqlite3.Connection) -> None:
