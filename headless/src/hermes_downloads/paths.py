@@ -199,8 +199,10 @@ def observe_job_space(
         try:
             job_fd = _open_existing_directory(incomplete_fd, destination.job_id)
             try:
-                owned_details = tuple(_require_job_file(path) for path in owned_paths)
-                output_details = _observe_output_file(output_path)
+                owned_details = tuple(
+                    _require_job_file(job_fd, path.name) for path in owned_paths
+                )
+                output_details = _observe_output_file(job_fd, output_path.name)
                 included_details = owned_details + (
                     () if output_details is None else (output_details,)
                 )
@@ -220,7 +222,7 @@ def observe_job_space(
                 )
                 return JobSpace(
                     current=current,
-                    available_bytes=_available_bytes(destination.incomplete_dir),
+                    available_bytes=_available_bytes(job_fd),
                     expected_output_logical_bytes=expected_output_logical_bytes,
                     expected_peak_logical_bytes=expected_peak_logical_bytes,
                 )
@@ -297,9 +299,9 @@ def _require_direct_incomplete_child(value: object, incomplete_dir: Path) -> Pat
     return value
 
 
-def _require_job_file(path: Path) -> os.stat_result:
+def _require_job_file(parent_fd: int, name: str) -> os.stat_result:
     try:
-        details = os.lstat(path)
+        details = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError as error:
         raise PathValidationError("owned job artifact is missing") from error
     except OSError as error:
@@ -307,9 +309,9 @@ def _require_job_file(path: Path) -> os.stat_result:
     return _require_regular_single_link_file(details)
 
 
-def _observe_output_file(path: Path) -> os.stat_result | None:
+def _observe_output_file(parent_fd: int, name: str) -> os.stat_result | None:
     try:
-        details = os.lstat(path)
+        details = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     except OSError as error:
@@ -366,9 +368,9 @@ def _allocated_bytes(details: tuple[os.stat_result, ...]) -> int | None:
     return allocated_bytes
 
 
-def _available_bytes(incomplete_dir: Path) -> int:
+def _available_bytes(directory_fd: int) -> int:
     try:
-        filesystem = os.statvfs(incomplete_dir)
+        filesystem = os.fstatvfs(directory_fd)
     except (OSError, TypeError, ValueError) as error:
         raise PathValidationError("incomplete filesystem is inaccessible") from error
     try:

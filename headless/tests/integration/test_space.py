@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -271,6 +272,106 @@ def test_rejects_replaced_incomplete_component_without_touching_external_or_orig
     assert original_incomplete.is_symlink()
 
 
+def test_binds_job_accounting_to_open_job_descriptor_across_incomplete_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths()
+    destination = _destination(paths, job_id="job-space-open-descriptor")
+    original_owned = destination.incomplete_dir / "owned.part"
+    original_output = destination.partial_path
+    original_owned_bytes = b"original owned artifact"
+    original_output_bytes = b"original output artifact"
+    original_owned.write_bytes(original_owned_bytes)
+    original_output.write_bytes(original_output_bytes)
+    original_current = paths.StorageUsage(
+        logical_bytes=len(original_owned_bytes) + len(original_output_bytes),
+        allocated_bytes=_observed_allocated_bytes((original_owned, original_output)),
+    )
+    original_available = 41
+
+    original_incomplete = destination.incomplete_dir.parent
+    relocated_incomplete = tmp_path / "relocated-incomplete"
+    external_incomplete = tmp_path / "external-incomplete"
+    external_job = external_incomplete / destination.job_id
+    external_owned = external_job / original_owned.name
+    external_output = external_job / original_output.name
+    external_owned_bytes = b"external owned artifact with a different size"
+    external_output_bytes = b"external output artifact with a different size"
+    external_job.mkdir(parents=True)
+    external_owned.write_bytes(external_owned_bytes)
+    external_output.write_bytes(external_output_bytes)
+    external_available = original_available + 1
+
+    original_require_job_file = paths._require_job_file
+    original_statvfs = os.statvfs
+    swap_job_fd: int | None = None
+    swap_calls = 0
+    swapped = False
+    fstatvfs_descriptors: list[int] = []
+    statvfs_paths: list[Path] = []
+
+    def replace_incomplete_after_job_open(job_fd: int, name: str) -> os.stat_result:
+        nonlocal swap_calls, swap_job_fd, swapped
+        swap_calls += 1
+        assert swap_calls == 1
+        assert name == original_owned.name
+        swap_job_fd = job_fd
+        original_incomplete.rename(relocated_incomplete)
+        original_incomplete.symlink_to(external_incomplete, target_is_directory=True)
+        swapped = True
+        return original_require_job_file(job_fd, name)
+
+    def observe_original_fstatvfs(directory_fd: int) -> Any:
+        assert directory_fd == swap_job_fd
+        fstatvfs_descriptors.append(directory_fd)
+        return SimpleNamespace(f_bavail=original_available, f_frsize=1)
+
+    def observe_external_statvfs(path: Any) -> Any:
+        if swapped and Path(path) == destination.incomplete_dir:
+            statvfs_paths.append(Path(path))
+            return SimpleNamespace(f_bavail=external_available, f_frsize=1)
+        return original_statvfs(path)
+
+    monkeypatch.setattr(paths, "_require_job_file", replace_incomplete_after_job_open)
+    monkeypatch.setattr(paths.os, "fstatvfs", observe_original_fstatvfs)
+    monkeypatch.setattr(paths.os, "statvfs", observe_external_statvfs)
+
+    expected_output_bytes = len(original_output_bytes) + 9
+    observed = paths.observe_job_space(
+        destination,
+        owned_paths=(original_owned,),
+        output_path=original_output,
+        expected_output_logical_bytes=expected_output_bytes,
+    )
+
+    assert swap_calls == 1
+    assert swap_job_fd is not None
+    assert (relocated_incomplete / destination.job_id / original_owned.name).read_bytes() == (
+        original_owned_bytes
+    )
+    assert (relocated_incomplete / destination.job_id / original_output.name).read_bytes() == (
+        original_output_bytes
+    )
+    assert external_owned.read_bytes() == external_owned_bytes
+    assert external_output.read_bytes() == external_output_bytes
+    assert original_incomplete.is_symlink()
+    assert (
+        observed.current,
+        observed.available_bytes,
+        statvfs_paths,
+        fstatvfs_descriptors,
+    ) == (
+        original_current,
+        original_available,
+        [],
+        [swap_job_fd],
+    )
+    assert observed.expected_output_logical_bytes == expected_output_bytes
+    assert observed.expected_peak_logical_bytes == (
+        len(original_owned_bytes) + expected_output_bytes
+    )
+
+
 def test_rejects_same_inode_lexical_owned_aliases_before_accounting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -282,12 +383,12 @@ def test_rejects_same_inode_lexical_owned_aliases_before_accounting(
     assert first_alias != second_alias
 
     original_observe_file = paths._require_job_file
-    observed_paths: list[Path] = []
+    observed_names: list[str] = []
 
-    def observe_normalized_alias(path: Path) -> os.stat_result:
-        observed_paths.append(path)
-        assert path in (first_alias, second_alias)
-        return original_observe_file(first_alias)
+    def observe_normalized_alias(job_fd: int, name: str) -> os.stat_result:
+        observed_names.append(name)
+        assert name in (first_alias.name, second_alias.name)
+        return original_observe_file(job_fd, first_alias.name)
 
     monkeypatch.setattr(paths, "_require_job_file", observe_normalized_alias)
 
@@ -299,7 +400,7 @@ def test_rejects_same_inode_lexical_owned_aliases_before_accounting(
             expected_output_logical_bytes=0,
         )
 
-    assert observed_paths == [first_alias, second_alias]
+    assert observed_names == [first_alias.name, second_alias.name]
 
 
 def test_rejects_replaced_downloads_root_chain_without_observing_external_artifacts(
