@@ -335,6 +335,35 @@ class DirectAria2Controller:
             raise DirectTransferError("aria2 did not acknowledge resume")
         return self._readback(transfer)
 
+    def set_allocation(
+        self, *, job_id: str, generation: int, allocation_bps: int | None
+    ) -> DirectTransfer:
+        """Apply one transfer allocation; zero pauses rather than becoming unlimited."""
+
+        if allocation_bps is not None and (
+            type(allocation_bps) is not int or allocation_bps < 0
+        ):
+            raise ValueError("allocation_bps must be a nonnegative integer or None")
+        transfer = self._current_transfer(job_id, generation)
+        if allocation_bps == 0:
+            result = self._rpc("aria2.pause", [transfer.gid])
+            if result != transfer.gid:
+                raise DirectTransferError("aria2 did not acknowledge pause")
+            state = self._readback(transfer)
+            if state.status != "paused":
+                raise DirectTransferError("aria2 did not confirm pause")
+            return state
+        result = self._rpc(
+            "aria2.changeOption",
+            [
+                transfer.gid,
+                {"max-download-limit": "0" if allocation_bps is None else str(allocation_bps)},
+            ],
+        )
+        if result != "OK":
+            raise DirectTransferError("aria2 did not acknowledge allocation")
+        return self._readback(transfer)
+
     def readback(self, *, job_id: str, generation: int, gid: str) -> DirectTransfer:
         """Read one exact mapped engine state after validating callback identity."""
 

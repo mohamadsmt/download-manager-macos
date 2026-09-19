@@ -175,6 +175,25 @@ def _running_direct_controller(direct: Any, tmp_path: Path):
                 _force_stop_group(identity.process_group_id)
 
 
+def _allocation_controller(direct: Any, tmp_path: Path) -> tuple[Any, Any]:
+    job_id = "direct-allocation"
+    transfer = direct._TrackedTransfer(
+        job_id=job_id,
+        generation=6,
+        gid="0123456789abcdef",
+        source=object(),
+        destination=_destination(job_id, "allocation.bin"),
+        expected_sha256=None,
+    )
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+    )
+    controller._by_job_id[job_id] = transfer
+    controller._by_gid[transfer.gid] = transfer
+    return controller, transfer
+
+
 def _request(
     origin: Any,
     path: str,
@@ -898,6 +917,225 @@ def test_direct_rejects_same_length_payload_when_expected_hash_does_not_match(
 
         with pytest.raises(direct.DirectTransferError):
             controller.wait_for_terminal(job_id=job_id, generation=1, timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("allocation_bps", "expected_limit"),
+    (
+        pytest.param(1024, "1024", id="positive"),
+        pytest.param(None, "0", id="unlimited"),
+    ),
+)
+def test_direct_sets_per_transfer_allocation_and_reads_back(
+    tmp_path: Path, monkeypatch, allocation_bps: int | None, expected_limit: str
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    rpc_calls: list[tuple[str, list[Any]]] = []
+
+    def fake_rpc(method: str, params: list[Any]) -> Any:
+        rpc_calls.append((method, params))
+        if method == "aria2.changeOption":
+            return "OK"
+        assert method == "aria2.tellStatus"
+        return {"status": "active", "totalLength": "1024", "completedLength": "256"}
+
+    monkeypatch.setattr(controller, "_rpc", fake_rpc)
+
+    observed = controller.set_allocation(
+        job_id=transfer.job_id,
+        generation=transfer.generation,
+        allocation_bps=allocation_bps,
+    )
+
+    assert (observed.job_id, observed.generation, observed.gid, observed.status) == (
+        transfer.job_id,
+        transfer.generation,
+        transfer.gid,
+        "active",
+    )
+    assert rpc_calls == [
+        (
+            "aria2.changeOption",
+            [transfer.gid, {"max-download-limit": expected_limit}],
+        ),
+        (
+            "aria2.tellStatus",
+            [transfer.gid, ["status", "totalLength", "completedLength"]],
+        ),
+    ]
+
+
+def test_direct_zero_allocation_pauses_without_sending_an_unlimited_limit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    rpc_calls: list[tuple[str, list[Any]]] = []
+
+    def fake_rpc(method: str, params: list[Any]) -> Any:
+        rpc_calls.append((method, params))
+        if method == "aria2.pause":
+            return transfer.gid
+        assert method == "aria2.tellStatus"
+        return {"status": "paused", "totalLength": "1024", "completedLength": "256"}
+
+    monkeypatch.setattr(controller, "_rpc", fake_rpc)
+
+    observed = controller.set_allocation(
+        job_id=transfer.job_id,
+        generation=transfer.generation,
+        allocation_bps=0,
+    )
+
+    assert observed.status == "paused"
+    assert not any(method == "aria2.changeOption" for method, _ in rpc_calls)
+    assert rpc_calls == [
+        ("aria2.pause", [transfer.gid]),
+        (
+            "aria2.tellStatus",
+            [transfer.gid, ["status", "totalLength", "completedLength"]],
+        ),
+    ]
+
+
+def test_direct_zero_allocation_rejects_nonpaused_readback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    rpc_calls: list[tuple[str, list[Any]]] = []
+
+    def fake_rpc(method: str, params: list[Any]) -> Any:
+        rpc_calls.append((method, params))
+        if method == "aria2.pause":
+            return transfer.gid
+        assert method == "aria2.tellStatus"
+        return {"status": "active", "totalLength": "1024", "completedLength": "256"}
+
+    monkeypatch.setattr(controller, "_rpc", fake_rpc)
+
+    with pytest.raises(direct.DirectTransferError):
+        controller.set_allocation(
+            job_id=transfer.job_id,
+            generation=transfer.generation,
+            allocation_bps=0,
+        )
+
+    assert rpc_calls == [
+        ("aria2.pause", [transfer.gid]),
+        (
+            "aria2.tellStatus",
+            [transfer.gid, ["status", "totalLength", "completedLength"]],
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("allocation_bps", "expected_limit"),
+    (
+        pytest.param(1024, "1024", id="positive"),
+        pytest.param(None, "0", id="unlimited"),
+    ),
+)
+def test_direct_allocation_rejects_non_ok_limit_acknowledgement_before_readback(
+    tmp_path: Path, monkeypatch, allocation_bps: int | None, expected_limit: str
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    rpc_calls: list[tuple[str, list[Any]]] = []
+
+    def fake_rpc(method: str, params: list[Any]) -> Any:
+        rpc_calls.append((method, params))
+        assert method == "aria2.changeOption"
+        return "not-OK"
+
+    monkeypatch.setattr(controller, "_rpc", fake_rpc)
+
+    with pytest.raises(direct.DirectTransferError):
+        controller.set_allocation(
+            job_id=transfer.job_id,
+            generation=transfer.generation,
+            allocation_bps=allocation_bps,
+        )
+
+    assert rpc_calls == [
+        (
+            "aria2.changeOption",
+            [transfer.gid, {"max-download-limit": expected_limit}],
+        )
+    ]
+
+
+def test_direct_zero_allocation_rejects_wrong_pause_acknowledgement_before_readback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    rpc_calls: list[tuple[str, list[Any]]] = []
+
+    def fake_rpc(method: str, params: list[Any]) -> Any:
+        rpc_calls.append((method, params))
+        assert method == "aria2.pause"
+        return "0123456789abcdee"
+
+    monkeypatch.setattr(controller, "_rpc", fake_rpc)
+
+    with pytest.raises(direct.DirectTransferError):
+        controller.set_allocation(
+            job_id=transfer.job_id,
+            generation=transfer.generation,
+            allocation_bps=0,
+        )
+
+    assert rpc_calls == [("aria2.pause", [transfer.gid])]
+
+
+@pytest.mark.parametrize("allocation_bps", (True, -1, "1024"))
+def test_direct_rejects_invalid_allocation_before_rpc(
+    tmp_path: Path, monkeypatch, allocation_bps: object
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    rpc_calls: list[tuple[str, list[Any]]] = []
+
+    def unexpected_rpc(method: str, params: list[Any]) -> Any:
+        rpc_calls.append((method, params))
+        raise AssertionError("invalid allocation reached aria2 RPC")
+
+    monkeypatch.setattr(controller, "_rpc", unexpected_rpc)
+
+    with pytest.raises(ValueError):
+        controller.set_allocation(
+            job_id=transfer.job_id,
+            generation=transfer.generation,
+            allocation_bps=allocation_bps,
+        )
+
+    assert rpc_calls == []
+
+
+def test_direct_allocation_rejects_stale_generation_before_rpc(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    rpc_calls: list[tuple[str, list[Any]]] = []
+
+    def unexpected_rpc(method: str, params: list[Any]) -> Any:
+        rpc_calls.append((method, params))
+        raise AssertionError("stale allocation reached aria2 RPC")
+
+    monkeypatch.setattr(controller, "_rpc", unexpected_rpc)
+
+    with pytest.raises(direct.StaleGenerationError):
+        controller.set_allocation(
+            job_id=transfer.job_id,
+            generation=transfer.generation - 1,
+            allocation_bps=1024,
+        )
+
+    assert rpc_calls == []
 
 
 def test_direct_rejects_stale_generation_callback_before_readback(tmp_path: Path) -> None:

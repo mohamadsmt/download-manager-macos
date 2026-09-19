@@ -20,6 +20,7 @@ HEADLESS_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_PACKAGE = HEADLESS_ROOT / "src" / "hermes_downloads"
 EXPECTED_WHEEL_MODULES = {
     "hermes_downloads/__init__.py",
+    "hermes_downloads/bandwidth.py",
     "hermes_downloads/cli.py",
     "hermes_downloads/direct.py",
     "hermes_downloads/mcp_server.py",
