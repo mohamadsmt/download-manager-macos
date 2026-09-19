@@ -90,7 +90,15 @@ def _run(
 def _assert_runtime_roots_are_isolated(private_roots: dict[str, Path]) -> None:
     for name in ("home", "hermes_home", "output"):
         assert list(private_roots[name].iterdir()) == []
-    assert [path.name for path in private_roots["state"].iterdir()] == ["state.db"]
+    state_root = private_roots["state"]
+    assert sorted(path.name for path in state_root.iterdir()) == [
+        ".worker.lock",
+        "state.db",
+    ]
+    lease = state_root / ".worker.lock"
+    lease_stat = lease.lstat()
+    assert stat.S_ISREG(lease_stat.st_mode)
+    assert stat.S_IMODE(lease_stat.st_mode) == 0o600
 
 
 def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
