@@ -24,6 +24,7 @@ EXPECTED_WHEEL_MODULES = {
     "hermes_downloads/bandwidth.py",
     "hermes_downloads/cli.py",
     "hermes_downloads/direct.py",
+    "hermes_downloads/ipc.py",
     "hermes_downloads/mcp_server.py",
     "hermes_downloads/models.py",
     "hermes_downloads/network.py",

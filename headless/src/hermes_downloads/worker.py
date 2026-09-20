@@ -9,16 +9,24 @@ import stat
 import threading
 from typing import Final, Protocol
 
+from hermes_downloads.ipc import (
+    HealthServer,
+    IPCStateError,
+    WorkerHealth,
+    validate_available_socket_path,
+)
 from hermes_downloads.store import SQLiteStore
 
 __all__ = ["WorkerStateError", "main", "run_worker", "worker_busy"]
 
 _STATE_DATABASE_NAME: Final = "state.db"
 _LEASE_FILE_NAME: Final = ".worker.lock"
+_IPC_SOCKET_FILE_NAME: Final = "worker.sock"
 _WORKER_STATE_INVALID: Final = "worker_state_invalid"
 worker_busy: Final = "worker_busy"
 _LEASE_FLAGS: Final = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
 _LEASE_MODE: Final = 0o600
+_IPC_POLL_SECONDS: Final = 0.05
 
 
 class _LifecycleEvent(Protocol):
@@ -115,9 +123,28 @@ def _release_worker_lease(descriptor: int) -> None:
         _close_descriptor(descriptor)
 
 
+def _validate_ipc_socket_path(state_root: Path, socket_path: str | Path) -> Path:
+    try:
+        path = Path(socket_path)
+    except (TypeError, ValueError):
+        raise WorkerStateError from None
+    if path != state_root / _IPC_SOCKET_FILE_NAME:
+        raise WorkerStateError
+    return path
+
+
+def _health_from_store(store: SQLiteStore) -> WorkerHealth:
+    epoch = store.worker_epoch()
+    queue_gate = store.queue_gate()
+    if epoch is None or queue_gate is None:
+        raise IPCStateError("ipc_health_invalid")
+    return WorkerHealth(worker_epoch=epoch, queue_gate=queue_gate)
+
+
 def run_worker(
     state_root: str | Path,
     *,
+    socket_path: str | Path | None = None,
     ready_event: _LifecycleEvent,
     shutdown_event: _LifecycleEvent,
     stopped_event: _LifecycleEvent,
@@ -126,21 +153,46 @@ def run_worker(
 
     lease_descriptor: int | None = None
     store: SQLiteStore | None = None
+    health_server: HealthServer | None = None
     try:
         root = _validate_state_root(state_root)
+        requested_socket_path: Path | None = None
+        if socket_path is not None:
+            try:
+                requested_socket_path = validate_available_socket_path(
+                    _validate_ipc_socket_path(root, socket_path)
+                )
+            except IPCStateError:
+                raise WorkerStateError from None
         lease_descriptor = _acquire_worker_lease(root)
         if lease_descriptor is None:
             return worker_busy
 
         store = SQLiteStore(root / _STATE_DATABASE_NAME)
         store.recover_cold_start()
+        if requested_socket_path is not None:
+            try:
+                health_server = HealthServer(
+                    requested_socket_path,
+                    health=lambda: _health_from_store(store),
+                )
+            except IPCStateError:
+                raise WorkerStateError from None
         ready_event.set()
-        shutdown_event.wait()
+        if health_server is None:
+            shutdown_event.wait()
+        else:
+            while not shutdown_event.wait(_IPC_POLL_SECONDS):
+                health_server.serve_once()
         return None
     finally:
         try:
-            if store is not None:
-                store.close()
+            try:
+                if health_server is not None:
+                    health_server.close()
+            finally:
+                if store is not None:
+                    store.close()
         finally:
             try:
                 if lease_descriptor is not None:

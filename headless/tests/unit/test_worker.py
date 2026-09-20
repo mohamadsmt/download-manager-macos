@@ -160,6 +160,31 @@ def test_run_worker_rejects_unsafe_lease_file_shapes(
     assert list(state_root.iterdir()) == [lease_path]
 
 
+def test_run_worker_rejects_existing_ipc_socket_path_before_bootstrap(
+    private_roots: dict[str, Path],
+) -> None:
+    state_root = private_roots["state"]
+    socket_path = state_root / "worker.sock"
+    socket_path.write_text("unsafe pre-existing object", encoding="utf-8")
+    ready = threading.Event()
+    shutdown = threading.Event()
+    stopped = threading.Event()
+
+    with pytest.raises(worker.WorkerStateError) as failure:
+        worker.run_worker(
+            state_root,
+            socket_path=socket_path,
+            ready_event=ready,
+            shutdown_event=shutdown,
+            stopped_event=stopped,
+        )
+
+    assert str(failure.value) == "worker_state_invalid"
+    assert not ready.is_set()
+    assert stopped.is_set()
+    assert list(state_root.iterdir()) == [socket_path]
+
+
 def test_main_does_not_bypass_an_active_worker_lease(
     private_roots: dict[str, Path]
 ) -> None:
