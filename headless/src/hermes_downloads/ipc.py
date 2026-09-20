@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 from typing import Callable, Final, Mapping
@@ -15,8 +17,11 @@ __all__ = [
     "IPCError",
     "IPCStateError",
     "MAX_MESSAGE_BYTES",
+    "QueueGateCommand",
+    "QueueGateResult",
     "WorkerHealth",
     "request_health",
+    "set_queue_gate",
     "validate_available_socket_path",
 ]
 
@@ -28,6 +33,10 @@ _CONNECTION_TIMEOUT_SECONDS: Final = 0.2
 _CLIENT_TIMEOUT_SECONDS: Final = 5.0
 _MAX_DARWIN_UNIX_SOCKET_PATH_BYTES: Final = 103
 _INVALID_REQUEST: Final = {"error": "invalid_request"}
+_COMMAND_CONFLICT: Final = {"error": "command_conflict"}
+_IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_MAX_COUNTER: Final = (1 << 63) - 1
+_QUEUE_GATES: Final = frozenset({"paused", "running"})
 
 
 class IPCError(RuntimeError):
@@ -36,6 +45,37 @@ class IPCError(RuntimeError):
 
 class IPCStateError(ValueError):
     """Raised when an IPC endpoint cannot be safely owned."""
+
+
+def _require_identifier(value: object, name: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    if _IDENTIFIER.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a nonblank identifier")
+    return value
+
+
+def _require_queue_gate(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("gate must be a string")
+    if value not in _QUEUE_GATES:
+        raise ValueError("gate must be 'paused' or 'running'")
+    return value
+
+
+def _require_counter(value: object, name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer")
+    if not 0 <= value <= _MAX_COUNTER:
+        raise ValueError(f"{name} must be a nonnegative persisted counter")
+    return value
+
+
+def _canonical_payload_digest(record: Mapping[str, object]) -> str:
+    payload = json.dumps(
+        record, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +113,103 @@ class WorkerHealth:
             raise IPCError("ipc_response_invalid")
         try:
             return cls(worker_epoch=worker_epoch, queue_gate=queue_gate)
+        except (TypeError, ValueError):
+            raise IPCError("ipc_response_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class QueueGateCommand:
+    """One typed queue-gate command with a locally derived payload digest."""
+
+    gate: str
+    request_id: str
+    expected_revision: int
+    payload_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        gate = _require_queue_gate(self.gate)
+        request_id = _require_identifier(self.request_id, "request_id")
+        expected_revision = _require_counter(
+            self.expected_revision, "expected_revision"
+        )
+        object.__setattr__(self, "gate", gate)
+        object.__setattr__(self, "request_id", request_id)
+        object.__setattr__(self, "expected_revision", expected_revision)
+        object.__setattr__(
+            self,
+            "payload_digest",
+            _canonical_payload_digest(
+                {
+                    "expected_revision": expected_revision,
+                    "gate": gate,
+                    "request_id": request_id,
+                }
+            ),
+        )
+
+    def to_record(self) -> dict[str, int | str]:
+        """Return the exact queue-gate wire record without an injectable digest."""
+
+        return {
+            "op": "queue_gate",
+            "gate": self.gate,
+            "request_id": self.request_id,
+            "expected_revision": self.expected_revision,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "QueueGateCommand":
+        if type(record) is not dict or set(record) != {
+            "op",
+            "gate",
+            "request_id",
+            "expected_revision",
+        }:
+            raise ValueError("queue-gate request is invalid")
+        if record["op"] != "queue_gate":
+            raise ValueError("queue-gate request is invalid")
+        return cls(
+            gate=record["gate"],
+            request_id=record["request_id"],
+            expected_revision=record["expected_revision"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QueueGateResult:
+    """The fixed public response for a durable queue-gate command."""
+
+    applied: bool
+    queue_gate: str
+    revision: int
+
+    def __post_init__(self) -> None:
+        if type(self.applied) is not bool:
+            raise TypeError("applied must be a boolean")
+        _require_queue_gate(self.queue_gate)
+        _require_counter(self.revision, "revision")
+
+    def to_record(self) -> dict[str, bool | int | str]:
+        return {
+            "applied": self.applied,
+            "queue_gate": self.queue_gate,
+            "revision": self.revision,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "QueueGateResult":
+        if type(record) is not dict or set(record) != {
+            "applied",
+            "queue_gate",
+            "revision",
+        }:
+            raise IPCError("ipc_response_invalid")
+        try:
+            return cls(
+                applied=record["applied"],
+                queue_gate=record["queue_gate"],
+                revision=record["revision"],
+            )
         except (TypeError, ValueError):
             raise IPCError("ipc_response_invalid") from None
 
@@ -130,23 +267,54 @@ def _read_line(connection: socket.socket) -> bytes | None:
             return None
 
 
-def _decode_health_request(payload: bytes | None) -> bool:
+def _decode_request(payload: bytes | None) -> object | None:
     if payload is None:
-        return False
+        return None
     try:
-        request = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
+        return json.loads(
+            payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_object_keys
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
+        return None
+
+
+def _is_health_request(request: object) -> bool:
     return type(request) is dict and request == {"op": "health"}
+
+
+def _reject_duplicate_object_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    record: dict[str, object] = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError("JSON object contains duplicate keys")
+        record[key] = value
+    return record
+
+
+def _decode_queue_gate_request(request: object) -> QueueGateCommand | None:
+    try:
+        return QueueGateCommand.from_record(request)
+    except (TypeError, ValueError, RecursionError):
+        return None
 
 
 class HealthServer:
     """A one-request AF_UNIX listener owned and serviced by the worker thread."""
 
-    def __init__(self, socket_path: Path, *, health: Callable[[], WorkerHealth]) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        *,
+        health: Callable[[], WorkerHealth],
+        queue_gate: Callable[[QueueGateCommand], QueueGateResult] | None = None,
+    ) -> None:
         self.socket_path = validate_available_socket_path(socket_path)
         if not callable(health):
             raise TypeError("health must be callable")
+        if queue_gate is not None and not callable(queue_gate):
+            raise TypeError("queue_gate must be callable")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         socket_identity: tuple[int, int] | None = None
         try:
@@ -167,6 +335,7 @@ class HealthServer:
             _unlink_owned_socket(self.socket_path, socket_identity)
             raise
         self._health = health
+        self._queue_gate = queue_gate
         self._listener = listener
         self._identity = socket_identity
 
@@ -181,11 +350,22 @@ class HealthServer:
             raise IPCStateError("ipc_socket_invalid") from error
         with connection:
             connection.settimeout(_CONNECTION_TIMEOUT_SECONDS)
+            payload = _read_line(connection)
+            request = _decode_request(payload)
             try:
-                if _decode_health_request(_read_line(connection)):
+                if _is_health_request(request):
                     response = _encoded_record(self._health().to_record())
                 else:
-                    response = _encoded_record(_INVALID_REQUEST)
+                    command = _decode_queue_gate_request(request)
+                    if command is None or self._queue_gate is None:
+                        response = _encoded_record(_INVALID_REQUEST)
+                    else:
+                        try:
+                            response = _encoded_record(
+                                self._queue_gate(command).to_record()
+                            )
+                        except Exception:
+                            response = _encoded_record(_COMMAND_CONFLICT)
             except (IPCStateError, ValueError):
                 response = _encoded_record(_INVALID_REQUEST)
             try:
@@ -242,3 +422,39 @@ def request_health(socket_path: Path) -> WorkerHealth:
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise IPCError("ipc_response_invalid") from None
     return WorkerHealth.from_record(record)
+
+
+def set_queue_gate(
+    socket_path: Path,
+    *,
+    gate: str,
+    request_id: str,
+    expected_revision: int,
+) -> QueueGateResult:
+    """Apply one typed queue-gate command through the worker-owned connection."""
+
+    path = _require_socket_path(socket_path)
+    command = QueueGateCommand(
+        gate=gate,
+        request_id=request_id,
+        expected_revision=expected_revision,
+    )
+    request = _encoded_record(command.to_record())
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(_CLIENT_TIMEOUT_SECONDS)
+        try:
+            client.connect(str(path))
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            response = _read_line(client)
+        except (OSError, TimeoutError):
+            raise IPCError("ipc_unavailable") from None
+    if response is None:
+        raise IPCError("ipc_response_invalid")
+    try:
+        record = json.loads(response.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise IPCError("ipc_response_invalid") from None
+    if record == _COMMAND_CONFLICT:
+        raise IPCError("command_conflict")
+    return QueueGateResult.from_record(record)

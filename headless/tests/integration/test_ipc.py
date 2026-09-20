@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import cast
 import pytest
 
 from hermes_downloads import ipc, worker
-from hermes_downloads.ipc import MAX_MESSAGE_BYTES, request_health
+from hermes_downloads.ipc import MAX_MESSAGE_BYTES, request_health, set_queue_gate
 from hermes_downloads.store import SQLiteStore
 
 
@@ -146,6 +147,39 @@ def test_worker_health_ipc_is_bounded_read_only_and_removed_on_shutdown() -> Non
                 "worker_epoch": 1,
                 "queue_gate": "paused",
             }
+            opened = set_queue_gate(
+                socket_path,
+                gate="running",
+                request_id="queue-open-request",
+                expected_revision=1,
+            )
+            assert opened.to_record() == {
+                "applied": True,
+                "queue_gate": "running",
+                "revision": 2,
+            }
+            assert set_queue_gate(
+                socket_path,
+                gate="running",
+                request_id="queue-open-request",
+                expected_revision=1,
+            ).to_record()["applied"] is False
+            assert _raw_request(
+                socket_path, b'{"op":"queue_gate","op":"health"}\n'
+            ) == {"error": "invalid_request"}
+            assert request_health(socket_path).to_record() == {
+                "protocol_version": 1,
+                "worker_epoch": 1,
+                "queue_gate": "running",
+            }
+            assert _raw_request(
+                socket_path,
+                b'{"op":"queue_gate","gate":"paused","request_id":"queue-close","expected_revision":1}\n',
+            ) == {"error": "command_conflict"}
+            assert _raw_request(
+                socket_path,
+                b'{"op":"queue_gate","gate":"paused","request_id":"queue-close","expected_revision":true}\n',
+            ) == {"error": "invalid_request"}
             assert _raw_request(socket_path, b'{"op":"unknown"}\n') == {
                 "error": "invalid_request"
             }
@@ -164,11 +198,40 @@ def test_worker_health_ipc_is_bounded_read_only_and_removed_on_shutdown() -> Non
             assert _raw_request(socket_path, b"x" * (MAX_MESSAGE_BYTES + 1)) == {
                 "error": "invalid_request"
             }
+            assert request_health(socket_path).to_record() == {
+                "protocol_version": 1,
+                "worker_epoch": 1,
+                "queue_gate": "running",
+            }
 
             store = SQLiteStore(state_root / "state.db")
             try:
                 assert store.worker_epoch() == 1
-                assert store.queue_gate() == "paused"
+                assert store.queue_gate() == "running"
+                receipts = store._connection.execute(
+                    """
+                    SELECT request_id, payload_digest, gate, revision
+                    FROM queue_commands
+                    ORDER BY request_id
+                    """
+                ).fetchall()
+                assert len(receipts) == 1
+                assert tuple(receipts[0]) == (
+                    "queue-open-request",
+                    hashlib.sha256(
+                        json.dumps(
+                            {
+                                "expected_revision": 1,
+                                "gate": "running",
+                                "request_id": "queue-open-request",
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "running",
+                    2,
+                )
                 assert store.list_jobs() == ()
             finally:
                 store.close()
