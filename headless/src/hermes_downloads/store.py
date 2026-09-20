@@ -23,7 +23,9 @@ __all__ = [
     "CommandResult",
     "EventRecord",
     "JobRecord",
+    "QueueGateResult",
     "RequestConflictError",
+    "RevisionConflictError",
     "SQLiteStore",
 ]
 
@@ -108,6 +110,15 @@ CREATE TABLE job_retry_audit (
 );
 """
 
+_QUEUE_COMMANDS_SCHEMA: Final = """
+CREATE TABLE queue_commands (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL,
+    gate TEXT NOT NULL CHECK (gate IN ('paused', 'running')),
+    revision INTEGER NOT NULL
+);
+"""
+
 
 def _normalize_table_schema(schema: str) -> str:
     """Canonicalize static SQLite DDL for exact current-version validation."""
@@ -134,8 +145,9 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 3
+_SUPPORTED_SCHEMA_VERSION: Final = 4
 _RETRY_AUDIT_CAPACITY: Final = 256
+_MAX_COUNTER: Final = (1 << 63) - 1
 _V3_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _SCHEMA,
     _MATERIALIZED_JOBS_SCHEMA,
@@ -143,7 +155,17 @@ _V3_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _JOB_RETRY_SCHEMA,
     _JOB_RETRY_AUDIT_SCHEMA,
 )
+_V4_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+)
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
+_QUEUE_GATES: Final = frozenset({"paused", "running"})
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _PAGE_SIZE: Final = 100
 _RECOVERABLE_COLD_START_STATES: Final = (
@@ -158,7 +180,11 @@ _RECOVERABLE_COLD_START_STATES: Final = (
 
 
 class RequestConflictError(ValueError):
-    """Raised when a request ID is reused with a different payload digest."""
+    """Raised when a request ID is reused for a different command."""
+
+
+class RevisionConflictError(ValueError):
+    """Raised when a command is fenced by a stale queue-gate revision."""
 
 
 def _require_identifier(value: object, name: str) -> str:
@@ -166,6 +192,30 @@ def _require_identifier(value: object, name: str) -> str:
         raise TypeError(f"{name} must be a string")
     if _IDENTIFIER.fullmatch(value) is None:
         raise ValueError(f"{name} must be a nonblank identifier")
+    return value
+
+
+def _require_payload_digest(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("payload_digest must be a string")
+    if _SHA256_DIGEST.fullmatch(value) is None:
+        raise ValueError("payload_digest must be a lowercase SHA-256 digest")
+    return value
+
+
+def _require_queue_gate(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("gate must be a string")
+    if value not in _QUEUE_GATES:
+        raise ValueError("gate must be 'paused' or 'running'")
+    return value
+
+
+def _require_counter(value: object, name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer")
+    if not 0 <= value <= _MAX_COUNTER:
+        raise ValueError(f"{name} must be a nonnegative persisted counter")
     return value
 
 
@@ -207,6 +257,15 @@ class CommandResult:
     applied: bool
     job: str
     generation: int
+    revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class QueueGateResult:
+    """The durable outcome of one global queue-gate command delivery."""
+
+    applied: bool
+    gate: str
     revision: int
 
 
@@ -254,7 +313,7 @@ class SQLiteStore:
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
-            self._migrate_schema_v3(connection)
+            self._migrate_schema_v4(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -269,23 +328,30 @@ class SQLiteStore:
 
     @staticmethod
     def _reject_newer_schema_version(connection: sqlite3.Connection) -> None:
-        """Fail before legacy bootstrap can mutate a future database."""
+        """Fail before bootstrap can mutate an unsupported current schema."""
 
         row = connection.execute("PRAGMA user_version").fetchone()
         if row is None or type(row[0]) is not int:
             raise RuntimeError("database schema version is invalid")
         if row[0] > _SUPPORTED_SCHEMA_VERSION:
             raise RuntimeError("database schema version is newer than supported")
-        if row[0] == _SUPPORTED_SCHEMA_VERSION and not SQLiteStore._has_v3_tables(
-            connection
+        expected_schemas = (
+            _V4_TABLE_SCHEMAS
+            if row[0] == _SUPPORTED_SCHEMA_VERSION
+            else _V3_TABLE_SCHEMAS if row[0] == 3 else None
+        )
+        if expected_schemas is not None and not SQLiteStore._has_table_schemas(
+            connection, expected_schemas
         ):
-            raise RuntimeError("database schema version is newer than supported or incomplete")
+            raise RuntimeError("database schema version is incomplete")
 
     @staticmethod
-    def _has_v3_tables(connection: sqlite3.Connection) -> bool:
-        """Recognize only the complete current schema before legacy bootstrap."""
+    def _has_table_schemas(
+        connection: sqlite3.Connection, expected_schemas: dict[str, str]
+    ) -> bool:
+        """Recognize an exact supported schema before a bootstrap write."""
 
-        for table_name, expected_schema in _V3_TABLE_SCHEMAS.items():
+        for table_name, expected_schema in expected_schemas.items():
             row = connection.execute(
                 """
                 SELECT sql
@@ -301,8 +367,8 @@ class SQLiteStore:
         return True
 
     @staticmethod
-    def _migrate_schema_v3(connection: sqlite3.Connection) -> None:
-        """Apply additive v2 and v3 schema migrations in one transaction."""
+    def _migrate_schema_v4(connection: sqlite3.Connection) -> None:
+        """Apply additive v2 through v4 schema migrations in one transaction."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -318,7 +384,16 @@ class SQLiteStore:
             if version <= 2:
                 connection.execute(_JOB_RETRY_SCHEMA)
                 connection.execute(_JOB_RETRY_AUDIT_SCHEMA)
+                connection.execute("PRAGMA user_version = 3")
+                version = 3
+            if version == 3:
+                if not SQLiteStore._has_table_schemas(connection, _V3_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_QUEUE_COMMANDS_SCHEMA)
                 connection.execute(f"PRAGMA user_version = {_SUPPORTED_SCHEMA_VERSION}")
+            elif version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V4_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
             connection.commit()
@@ -560,6 +635,100 @@ class SQLiteStore:
             connection.rollback()
             raise
         return "paused"
+
+    def apply_queue_gate(
+        self,
+        *,
+        gate: str,
+        request_id: str,
+        payload_digest: str,
+        expected_revision: int,
+    ) -> QueueGateResult:
+        """Atomically apply or replay one revision-fenced global gate command."""
+
+        gate = _require_queue_gate(gate)
+        request_id = _require_identifier(request_id, "request_id")
+        payload_digest = _require_payload_digest(payload_digest)
+        expected_revision = _require_counter(expected_revision, "expected_revision")
+
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            receipt = connection.execute(
+                """
+                SELECT payload_digest, gate, revision
+                FROM queue_commands
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if receipt is not None:
+                receipt_digest = _require_sqlite_text(
+                    receipt["payload_digest"], "queue command payload_digest"
+                )
+                receipt_gate = _require_queue_gate(
+                    _require_sqlite_text(receipt["gate"], "queue command gate")
+                )
+                receipt_revision = _require_counter(
+                    _require_sqlite_integer(
+                        receipt["revision"], "queue command revision"
+                    ),
+                    "queue command revision",
+                )
+                if receipt_digest != payload_digest or receipt_gate != gate:
+                    raise RequestConflictError(
+                        "request_id is already bound to a different queue-gate command"
+                    )
+                result = QueueGateResult(
+                    applied=False, gate=receipt_gate, revision=receipt_revision
+                )
+            else:
+                setting = connection.execute(
+                    """
+                    SELECT value, revision
+                    FROM settings
+                    WHERE key = 'queue_gate'
+                    """
+                ).fetchone()
+                if setting is None:
+                    raise RuntimeError("queue gate is not initialized")
+                _require_queue_gate(
+                    _require_sqlite_text(setting["value"], "queue gate value")
+                )
+                current_revision = _require_counter(
+                    _require_sqlite_integer(
+                        setting["revision"], "queue gate revision"
+                    ),
+                    "queue gate revision",
+                )
+                if current_revision != expected_revision:
+                    raise RevisionConflictError("queue gate revision is stale")
+                if current_revision == _MAX_COUNTER:
+                    raise OverflowError("queue gate revision exceeds persisted counter range")
+                next_revision = current_revision + 1
+                connection.execute(
+                    """
+                    UPDATE settings
+                    SET value = ?, revision = ?
+                    WHERE key = 'queue_gate'
+                    """,
+                    (gate, next_revision),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO queue_commands (request_id, payload_digest, gate, revision)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (request_id, payload_digest, gate, next_revision),
+                )
+                result = QueueGateResult(
+                    applied=True, gate=gate, revision=next_revision
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return result
 
     def recover_cold_start(self) -> int:
         """Atomically fence a cold worker epoch and pause incomplete jobs."""

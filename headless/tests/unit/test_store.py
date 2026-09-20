@@ -182,6 +182,15 @@ def _create_v2_database(database_path: Path) -> tuple[object, ...]:
     return legacy_job
 
 
+def _create_v3_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v2_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._JOB_RETRY_SCHEMA)
+        connection.execute(store_module._JOB_RETRY_AUDIT_SCHEMA)
+        connection.execute("PRAGMA user_version = 3")
+    return legacy_job
+
+
 def _table_names(database_path: Path) -> frozenset[str]:
     with sqlite3.connect(database_path) as connection:
         return frozenset(
@@ -190,6 +199,19 @@ def _table_names(database_path: Path) -> frozenset[str]:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         )
+
+
+def _queue_command_rows(store: SQLiteStore) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        tuple(row)
+        for row in store._connection.execute(
+            """
+            SELECT request_id, payload_digest, gate, revision
+            FROM queue_commands
+            ORDER BY request_id
+            """
+        ).fetchall()
+    )
 
 
 def _add_page_of_jobs(store: SQLiteStore) -> None:
@@ -328,6 +350,261 @@ def test_duplicate_exact_request_is_idempotent_without_extra_queue_mutation(
         assert [job.job for job in store.list_jobs()] == ["job-1"]
         assert store.get_command("request-1") is not None
         assert [event.kind for event in store.list_events()] == ["job_added"]
+    finally:
+        store.close()
+
+
+def test_queue_gate_control_is_idempotent_and_revision_fenced(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.initialize_cold_start() == "paused"
+
+        opened = store.apply_queue_gate(
+            gate="running",
+            request_id="queue-open-request",
+            payload_digest="c" * 64,
+            expected_revision=1,
+        )
+        assert (opened.applied, opened.gate, opened.revision) == (True, "running", 2)
+        assert store.queue_gate() == "running"
+
+        repeated = store.apply_queue_gate(
+            gate="running",
+            request_id="queue-open-request",
+            payload_digest="c" * 64,
+            expected_revision=1,
+        )
+        assert (repeated.applied, repeated.gate, repeated.revision) == (
+            False,
+            "running",
+            2,
+        )
+
+        before = (store.queue_gate(), store.list_events())
+        with pytest.raises(store_module.RevisionConflictError):
+            store.apply_queue_gate(
+                gate="paused",
+                request_id="queue-close-stale",
+                payload_digest="d" * 64,
+                expected_revision=1,
+            )
+        assert (store.queue_gate(), store.list_events()) == before
+    finally:
+        store.close()
+
+
+def test_queue_gate_control_rolls_back_gate_revision_and_receipt_when_receipt_insert_fails(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    try:
+        assert store.initialize_cold_start() == "paused"
+        _install_failing_insert_trigger(
+            database_path,
+            table="queue_commands",
+            trigger_name="fail_queue_command_insert",
+            message="injected queue command receipt failure",
+        )
+
+        with pytest.raises(
+            sqlite3.DatabaseError, match="injected queue command receipt failure"
+        ):
+            store.apply_queue_gate(
+                gate="running",
+                request_id="queue-open-request",
+                payload_digest="c" * 64,
+                expected_revision=1,
+            )
+
+        setting = store._connection.execute(
+            "SELECT value, revision FROM settings WHERE key = 'queue_gate'"
+        ).fetchone()
+        assert setting is not None
+        assert tuple(setting) == ("paused", 1)
+        assert _queue_command_rows(store) == ()
+
+        store._connection.execute("DROP TRIGGER fail_queue_command_insert")
+        assert store.apply_queue_gate(
+            gate="running",
+            request_id="queue-open-request",
+            payload_digest="c" * 64,
+            expected_revision=1,
+        ) == store_module.QueueGateResult(
+            applied=True,
+            gate="running",
+            revision=2,
+        )
+    finally:
+        store.close()
+
+
+def test_queue_gate_control_replays_its_durable_receipt_after_reopen(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    try:
+        assert store.initialize_cold_start() == "paused"
+        assert store.apply_queue_gate(
+            gate="running",
+            request_id="queue-open-request",
+            payload_digest="c" * 64,
+            expected_revision=1,
+        ) == store_module.QueueGateResult(
+            applied=True,
+            gate="running",
+            revision=2,
+        )
+    finally:
+        store.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.apply_queue_gate(
+            gate="running",
+            request_id="queue-open-request",
+            payload_digest="c" * 64,
+            expected_revision=1,
+        ) == store_module.QueueGateResult(
+            applied=False,
+            gate="running",
+            revision=2,
+        )
+        assert reopened.queue_gate() == "running"
+        assert reopened.list_jobs() == ()
+        assert reopened.list_events() == ()
+    finally:
+        reopened.close()
+
+
+def test_queue_gate_control_reused_request_conflicts_on_digest_or_gate(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.initialize_cold_start() == "paused"
+        store.apply_queue_gate(
+            gate="running",
+            request_id="queue-open-request",
+            payload_digest="c" * 64,
+            expected_revision=1,
+        )
+        before = (
+            store.queue_gate(),
+            _queue_command_rows(store),
+            store.list_jobs(),
+            store.list_events(),
+        )
+
+        with pytest.raises(RequestConflictError):
+            store.apply_queue_gate(
+                gate="running",
+                request_id="queue-open-request",
+                payload_digest="d" * 64,
+                expected_revision=2,
+            )
+        with pytest.raises(RequestConflictError):
+            store.apply_queue_gate(
+                gate="paused",
+                request_id="queue-open-request",
+                payload_digest="c" * 64,
+                expected_revision=2,
+            )
+
+        assert (
+            store.queue_gate(),
+            _queue_command_rows(store),
+            store.list_jobs(),
+            store.list_events(),
+        ) == before
+    finally:
+        store.close()
+
+
+def test_queue_gate_control_stale_revision_rolls_back_every_queue_mutation(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(_intent())
+        assert store.initialize_cold_start() == "paused"
+        before = (
+            store.queue_gate(),
+            _queue_command_rows(store),
+            store.list_jobs(),
+            store.list_events(),
+        )
+
+        with pytest.raises(store_module.RevisionConflictError):
+            store.apply_queue_gate(
+                gate="running",
+                request_id="queue-open-stale-request",
+                payload_digest="e" * 64,
+                expected_revision=0,
+            )
+
+        assert (
+            store.queue_gate(),
+            _queue_command_rows(store),
+            store.list_jobs(),
+            store.list_events(),
+        ) == before
+    finally:
+        store.close()
+
+
+def test_queue_gate_control_fails_closed_before_cold_start_without_a_receipt(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        with pytest.raises(RuntimeError, match="not initialized"):
+            store.apply_queue_gate(
+                gate="running",
+                request_id="queue-open-request",
+                payload_digest="c" * 64,
+                expected_revision=0,
+            )
+
+        assert store.queue_gate() is None
+        assert _queue_command_rows(store) == ()
+        assert store.list_jobs() == ()
+        assert store.list_events() == ()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("gate", "request_id", "payload_digest", "expected_revision"),
+    (
+        ("pausing", "queue-open-request", "c" * 64, 1),
+        ("running", "queue/open-request", "c" * 64, 1),
+        ("running", "queue-open-request", "C" * 64, 1),
+        ("running", "queue-open-request", "c" * 64, -1),
+    ),
+)
+def test_queue_gate_control_rejects_invalid_command_arguments_without_mutation(
+    tmp_path: Path,
+    gate: object,
+    request_id: object,
+    payload_digest: object,
+    expected_revision: object,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.initialize_cold_start() == "paused"
+        before = (store.queue_gate(), _queue_command_rows(store))
+
+        with pytest.raises((TypeError, ValueError)):
+            store.apply_queue_gate(
+                gate=gate,
+                request_id=request_id,
+                payload_digest=payload_digest,
+                expected_revision=expected_revision,
+            )
+
+        assert (store.queue_gate(), _queue_command_rows(store)) == before
     finally:
         store.close()
 
@@ -754,7 +1031,7 @@ def test_cold_recovery_epoch_survives_reopen(tmp_path: Path) -> None:
         final.close()
 
 
-def test_v2_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+def test_v4_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     expected_legacy_job = _create_v1_database(database_path)
     legacy_source_url = expected_legacy_job[1]
@@ -774,7 +1051,7 @@ def test_v2_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -783,10 +1060,15 @@ def test_v2_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
             """
         ).fetchone() == expected_legacy_job
     v1_tables = {"settings", "jobs", "commands", "events"}
-    v2_tables = _table_names(database_path)
-    assert v1_tables <= v2_tables
-    assert {"collection_holds", "job_retry", "job_retry_audit"} <= v2_tables
-    assert len(v2_tables - v1_tables) >= 4
+    v4_tables = _table_names(database_path)
+    assert v1_tables <= v4_tables
+    assert {
+        "collection_holds",
+        "job_retry",
+        "job_retry_audit",
+        "queue_commands",
+    } <= v4_tables
+    assert len(v4_tables - v1_tables) >= 5
 
 
 def test_v2_migration_failure_leaves_v1_database_unchanged(
@@ -869,6 +1151,112 @@ def test_v3_migration_failure_leaves_v2_database_unchanged(
     }
 
 
+def test_v4_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v3_database(database_path)
+    legacy_source_url = expected_legacy_job[1]
+    assert isinstance(legacy_source_url, bytes)
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_job("legacy-job") == store_module.JobRecord(
+            job="legacy-job",
+            source_url=legacy_source_url,
+            generation=23,
+            revision=41,
+            state="downloading",
+        )
+        assert store.queue_gate() is None
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        schema = connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'queue_commands'
+            """
+        ).fetchone()
+        assert schema is not None
+        assert store_module._normalize_table_schema(schema[0]) == (
+            store_module._V4_TABLE_SCHEMAS["queue_commands"]
+        )
+    assert "queue_commands" in _table_names(database_path)
+
+
+def test_v4_migration_failure_leaves_v3_database_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v3_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_migration_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="CREATE TABLE queue_commands",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_migration_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute(
+            """
+            SELECT job_id, source_url, generation, revision, state
+            FROM jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone() == expected_legacy_job
+    monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
+    assert "queue_commands" not in _table_names(database_path)
+
+
+def test_v4_migration_rolls_back_queue_command_ddl_when_version_bump_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v3_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_version_bump_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="PRAGMA user_version = 4",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_version_bump_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V3_TABLE_SCHEMAS
+    assert "queue_commands" not in table_schemas
+
+
 def test_v3_rejects_incomplete_retry_schema_without_bootstrap_writes(
     tmp_path: Path,
 ) -> None:
@@ -887,6 +1275,7 @@ def test_v3_rejects_incomplete_retry_schema_without_bootstrap_writes(
         assert connection.execute("PRAGMA table_info(job_retry)").fetchall() == [
             (0, "job_id", "TEXT", 0, None, 1)
         ]
+    assert "queue_commands" not in _table_names(database_path)
 
 
 def test_v3_rejects_retry_schema_missing_required_constraints(tmp_path: Path) -> None:
@@ -912,18 +1301,39 @@ def test_v3_rejects_retry_schema_missing_required_constraints(tmp_path: Path) ->
         SQLiteStore(database_path)
 
 
-def test_v2_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v4_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 3")
+        connection.execute("PRAGMA user_version = 5")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert _table_names(database_path) == {"future_jobs"}
+
+
+def test_v4_rejects_malformed_queue_command_schema_without_bootstrap_writes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v3_database(database_path)
+    v3_tables = _table_names(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE queue_commands (request_id TEXT PRIMARY KEY)")
+        connection.execute("PRAGMA user_version = 4")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA table_info(queue_commands)").fetchall() == [
+            (0, "request_id", "TEXT", 0, None, 1)
+        ]
+    assert _table_names(database_path) == v3_tables | {"queue_commands"}
 
 
 def test_materialized_domain_apply_add_reopens_exact_projection(tmp_path: Path) -> None:
