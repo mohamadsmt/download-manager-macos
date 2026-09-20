@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import hashlib
 import importlib
 import importlib.util
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -867,3 +870,61 @@ def test_surrogate_argv_fails_closed_before_fixture_launch(tmp_path: Path) -> No
         assert not pid_file.exists()
     finally:
         _kill_fixture_group(pid_file)
+
+
+def test_process_birth_identity_binds_a_live_fresh_session_and_rejects_stale_records(
+    tmp_path: Path,
+) -> None:
+    processes = _processes()
+    argv = (sys.executable, "-c", "import time; time.sleep(60)")
+    process = subprocess.Popen(
+        argv,
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    identity = processes.EngineIdentity(
+        leader_pid=process.pid,
+        process_group_id=process.pid,
+        started_monotonic_ns=time.monotonic_ns(),
+        argv_sha256=hashlib.sha256(
+            b"\0".join(os.fsencode(argument) for argument in argv)
+        ).hexdigest(),
+    )
+
+    try:
+        birth = processes.capture_process_birth(identity)
+
+        assert birth is not None
+        assert birth.leader_pid == process.pid
+        assert birth.process_group_id == process.pid
+        assert birth.session_id == process.pid
+        assert birth.owner_uid == os.geteuid()
+        assert birth.argv_sha256 == identity.argv_sha256
+        assert processes.ProcessBirthIdentity.from_record(birth.to_record()) == birth
+        assert processes.is_current_process_birth(birth)
+        assert not processes.is_current_process_birth(
+            replace(birth, started_unix_us=birth.started_unix_us + 1)
+        )
+        assert processes.capture_process_birth(
+            replace(identity, process_group_id=process.pid + 1)
+        ) is None
+    finally:
+        _kill_fixture_process_group(process.pid)
+
+    assert not processes.is_current_process_birth(birth)
+
+
+def test_process_birth_capture_fails_closed_off_darwin(monkeypatch) -> None:
+    processes = _processes()
+    identity = processes.EngineIdentity(
+        leader_pid=os.getpid(),
+        process_group_id=os.getpgrp(),
+        started_monotonic_ns=time.monotonic_ns(),
+        argv_sha256="0" * 64,
+    )
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    assert processes.capture_process_birth(identity) is None

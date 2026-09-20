@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 import hashlib
 import os
@@ -10,6 +11,7 @@ import select
 import selectors
 import signal
 import subprocess
+import sys
 import threading
 import time
 from typing import Mapping, NoReturn, Sequence, cast
@@ -20,6 +22,44 @@ _CHUNK_SIZE = 8192
 _TERM_GRACE_SECONDS = 0.2
 _KILL_GRACE_SECONDS = 0.5
 _POLL_INTERVAL_SECONDS = 0.01
+_PROC_PIDTBSDINFO = 3
+
+
+class _ProcBsdInfo(ctypes.Structure):
+    """Darwin's SDK-declared ``struct proc_bsdinfo`` ABI."""
+
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _DarwinProcessSnapshot:
+    leader_pid: int
+    process_group_id: int
+    owner_uid: int
+    started_unix_us: int
 
 
 class EngineProcessError(RuntimeError):
@@ -55,6 +95,164 @@ class EngineIdentity:
             started_monotonic_ns=cast(int, record["started_monotonic_ns"]),
             argv_sha256=cast(str, record["argv_sha256"]),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessBirthIdentity:
+    """A Darwin-bound identity that distinguishes a reused PID from its prior process."""
+
+    leader_pid: int
+    process_group_id: int
+    session_id: int
+    owner_uid: int
+    started_unix_us: int
+    argv_sha256: str
+
+    def to_record(self) -> dict[str, int | str]:
+        return {
+            "leader_pid": self.leader_pid,
+            "process_group_id": self.process_group_id,
+            "session_id": self.session_id,
+            "owner_uid": self.owner_uid,
+            "started_unix_us": self.started_unix_us,
+            "argv_sha256": self.argv_sha256,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, int | str]) -> "ProcessBirthIdentity":
+        required = {
+            "leader_pid",
+            "process_group_id",
+            "session_id",
+            "owner_uid",
+            "started_unix_us",
+            "argv_sha256",
+        }
+        if set(record) != required:
+            raise ValueError("invalid process-birth record")
+        integer_names = required - {"argv_sha256"}
+        values: dict[str, int] = {}
+        for name in integer_names:
+            value = record[name]
+            if type(value) is not int or value < 0:
+                raise ValueError("invalid process-birth record")
+            values[name] = value
+        if any(values[name] == 0 for name in integer_names - {"owner_uid"}):
+            raise ValueError("invalid process-birth record")
+        argv_sha256 = record["argv_sha256"]
+        if (
+            type(argv_sha256) is not str
+            or len(argv_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in argv_sha256)
+        ):
+            raise ValueError("invalid process-birth record")
+        return cls(argv_sha256=argv_sha256, **values)
+
+
+def _read_darwin_process_snapshot(leader_pid: int) -> _DarwinProcessSnapshot | None:
+    if (
+        sys.platform != "darwin"
+        or leader_pid <= 0
+        or ctypes.sizeof(_ProcBsdInfo) != 136
+    ):
+        return None
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidinfo = library.proc_pidinfo
+        proc_pidinfo.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        )
+        proc_pidinfo.restype = ctypes.c_int
+        info = _ProcBsdInfo()
+        bytes_read = proc_pidinfo(
+            leader_pid,
+            _PROC_PIDTBSDINFO,
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+    except (AttributeError, OSError):
+        return None
+    if (
+        bytes_read != ctypes.sizeof(info)
+        or info.pbi_pid != leader_pid
+        or info.pbi_pgid <= 0
+        or info.pbi_start_tvusec >= 1_000_000
+    ):
+        return None
+    return _DarwinProcessSnapshot(
+        leader_pid=info.pbi_pid,
+        process_group_id=info.pbi_pgid,
+        owner_uid=info.pbi_uid,
+        started_unix_us=(info.pbi_start_tvsec * 1_000_000) + info.pbi_start_tvusec,
+    )
+
+
+def _read_stable_darwin_process_identity(
+    leader_pid: int,
+) -> tuple[_DarwinProcessSnapshot, int] | None:
+    first = _read_darwin_process_snapshot(leader_pid)
+    if first is None:
+        return None
+    try:
+        process_group_id = os.getpgid(leader_pid)
+        session_id = os.getsid(leader_pid)
+    except OSError:
+        return None
+    second = _read_darwin_process_snapshot(leader_pid)
+    if (
+        second != first
+        or process_group_id != first.process_group_id
+        or session_id <= 0
+    ):
+        return None
+    return first, session_id
+
+
+def capture_process_birth(identity: EngineIdentity) -> ProcessBirthIdentity | None:
+    """Capture a fresh Darwin session identity without signaling or reaping it."""
+
+    stable_identity = _read_stable_darwin_process_identity(identity.leader_pid)
+    if stable_identity is None:
+        return None
+    snapshot, session_id = stable_identity
+    if (
+        identity.process_group_id != identity.leader_pid
+        or session_id != identity.leader_pid
+        or snapshot.process_group_id != identity.process_group_id
+        or snapshot.owner_uid != os.geteuid()
+    ):
+        return None
+    return ProcessBirthIdentity(
+        leader_pid=identity.leader_pid,
+        process_group_id=identity.process_group_id,
+        session_id=session_id,
+        owner_uid=snapshot.owner_uid,
+        started_unix_us=snapshot.started_unix_us,
+        argv_sha256=identity.argv_sha256,
+    )
+
+
+def is_current_process_birth(identity: ProcessBirthIdentity) -> bool:
+    """Return whether the exact live Darwin process still matches this identity."""
+
+    if not isinstance(identity, ProcessBirthIdentity) or identity.owner_uid != os.geteuid():
+        return False
+    stable_identity = _read_stable_darwin_process_identity(identity.leader_pid)
+    if stable_identity is None:
+        return False
+    snapshot, session_id = stable_identity
+    return (
+        snapshot.leader_pid == identity.leader_pid
+        and snapshot.process_group_id == identity.process_group_id
+        and session_id == identity.session_id
+        and snapshot.owner_uid == identity.owner_uid
+        and snapshot.started_unix_us == identity.started_unix_us
+    )
 
 
 @dataclass(frozen=True, slots=True)
