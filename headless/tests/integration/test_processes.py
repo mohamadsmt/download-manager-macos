@@ -928,3 +928,20 @@ def test_process_birth_capture_fails_closed_off_darwin(monkeypatch) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
 
     assert processes.capture_process_birth(identity) is None
+
+
+def test_process_birth_record_rejects_a_nonfresh_session_shape() -> None:
+    processes = _processes()
+    record = {
+        "leader_pid": 42,
+        "process_group_id": 42,
+        "session_id": 42,
+        "owner_uid": 0,
+        "started_unix_us": 1,
+        "argv_sha256": "0" * 64,
+    }
+
+    record["process_group_id"] = 43
+
+    with pytest.raises(ValueError, match="invalid process-birth record"):
+        processes.ProcessBirthIdentity.from_record(record)

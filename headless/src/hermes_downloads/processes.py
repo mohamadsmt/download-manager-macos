@@ -137,7 +137,11 @@ class ProcessBirthIdentity:
             if type(value) is not int or value < 0:
                 raise ValueError("invalid process-birth record")
             values[name] = value
-        if any(values[name] == 0 for name in integer_names - {"owner_uid"}):
+        if (
+            any(values[name] == 0 for name in integer_names - {"owner_uid"})
+            or values["process_group_id"] != values["leader_pid"]
+            or values["session_id"] != values["leader_pid"]
+        ):
             raise ValueError("invalid process-birth record")
         argv_sha256 = record["argv_sha256"]
         if (
