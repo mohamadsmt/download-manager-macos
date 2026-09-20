@@ -22,6 +22,7 @@ __all__ = [
     "CommandRecord",
     "CommandResult",
     "EventRecord",
+    "JobPageRecord",
     "JobRecord",
     "QueueGateResult",
     "RequestConflictError",
@@ -275,6 +276,16 @@ class JobRecord:
 
     job: str
     source_url: bytes
+    generation: int
+    revision: int
+    state: str
+
+
+@dataclass(frozen=True, slots=True)
+class JobPageRecord:
+    """Lifecycle fields needed to render one bounded job page."""
+
+    job: str
     generation: int
     revision: int
     state: str
@@ -1248,6 +1259,40 @@ class SQLiteStore:
                 (cursor, _PAGE_SIZE),
             ).fetchall()
         return tuple(self._job_record(row) for row in rows)
+
+    def list_job_page(self, *, cursor: str | None = None) -> tuple[JobPageRecord, ...]:
+        """Read one bounded lifecycle-only page after a stable job-ID cursor."""
+
+        if cursor is None:
+            rows = self._connection.execute(
+                """
+                SELECT job_id, generation, revision, state
+                FROM jobs
+                ORDER BY job_id
+                LIMIT ?
+                """,
+                (_PAGE_SIZE,),
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                """
+                SELECT job_id, generation, revision, state
+                FROM jobs
+                WHERE job_id > ?
+                ORDER BY job_id
+                LIMIT ?
+                """,
+                (cursor, _PAGE_SIZE),
+            ).fetchall()
+        return tuple(
+            JobPageRecord(
+                job=row["job_id"],
+                generation=row["generation"],
+                revision=row["revision"],
+                state=row["state"],
+            )
+            for row in rows
+        )
 
     def get_command(self, request_id: str) -> CommandRecord | None:
         """Read one idempotency ledger entry."""

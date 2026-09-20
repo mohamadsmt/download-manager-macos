@@ -12,20 +12,27 @@ import socket
 import stat
 from typing import Callable, Final, Mapping
 
+from hermes_downloads.models import JobState
+
 __all__ = [
     "HealthServer",
     "IPCError",
     "IPCStateError",
+    "JobsPage",
     "MAX_MESSAGE_BYTES",
+    "PublicJobRecord",
     "QueueGateCommand",
     "QueueGateResult",
     "WorkerHealth",
     "request_health",
+    "request_jobs_page",
     "set_queue_gate",
     "validate_available_socket_path",
 ]
 
 MAX_MESSAGE_BYTES: Final = 4096
+_MAX_RESPONSE_BYTES: Final = 36_864
+_MAX_JOBS_PAGE_RECORDS: Final = 100
 _PROTOCOL_VERSION: Final = 1
 _SOCKET_MODE: Final = 0o600
 _SOCKET_BACKLOG: Final = 8
@@ -61,6 +68,15 @@ def _require_queue_gate(value: object) -> str:
     if value not in _QUEUE_GATES:
         raise ValueError("gate must be 'paused' or 'running'")
     return value
+
+
+def _require_public_job_state(value: object) -> str:
+    state = _require_identifier(value, "state")
+    try:
+        JobState(state)
+    except ValueError:
+        raise ValueError("state is not a public job state") from None
+    return state
 
 
 def _require_counter(value: object, name: str) -> int:
@@ -214,6 +230,91 @@ class QueueGateResult:
             raise IPCError("ipc_response_invalid") from None
 
 
+@dataclass(frozen=True, slots=True)
+class PublicJobRecord:
+    """The redacted, immutable job projection exposed by jobs-page IPC."""
+
+    job: str
+    generation: int
+    revision: int
+    state: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.job, "job")
+        _require_counter(self.generation, "generation")
+        _require_counter(self.revision, "revision")
+        _require_public_job_state(self.state)
+
+    def to_record(self) -> dict[str, int | str]:
+        return {
+            "job": self.job,
+            "generation": self.generation,
+            "revision": self.revision,
+            "state": self.state,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "PublicJobRecord":
+        if type(record) is not dict or set(record) != {
+            "job",
+            "generation",
+            "revision",
+            "state",
+        }:
+            raise IPCError("ipc_response_invalid")
+        try:
+            return cls(
+                job=record["job"],
+                generation=record["generation"],
+                revision=record["revision"],
+                state=record["state"],
+            )
+        except (TypeError, ValueError):
+            raise IPCError("ipc_response_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class JobsPage:
+    """One fixed-size-or-smaller public jobs page with a stable cursor."""
+
+    jobs: tuple[PublicJobRecord, ...]
+    next_cursor: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.jobs) is not tuple or len(self.jobs) > _MAX_JOBS_PAGE_RECORDS:
+            raise ValueError("jobs page is invalid")
+        if any(type(job) is not PublicJobRecord for job in self.jobs):
+            raise TypeError("jobs page contains an invalid job")
+        if self.next_cursor is not None:
+            _require_identifier(self.next_cursor, "next_cursor")
+            if (
+                len(self.jobs) != _MAX_JOBS_PAGE_RECORDS
+                or self.jobs[-1].job != self.next_cursor
+            ):
+                raise ValueError("jobs page cursor is invalid")
+
+    def to_record(self) -> dict[str, list[dict[str, int | str]] | str | None]:
+        return {
+            "jobs": [job.to_record() for job in self.jobs],
+            "next_cursor": self.next_cursor,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "JobsPage":
+        if type(record) is not dict or set(record) != {"jobs", "next_cursor"}:
+            raise IPCError("ipc_response_invalid")
+        jobs = record["jobs"]
+        if type(jobs) is not list:
+            raise IPCError("ipc_response_invalid")
+        try:
+            return cls(
+                jobs=tuple(PublicJobRecord.from_record(job) for job in jobs),
+                next_cursor=record["next_cursor"],
+            )
+        except (IPCError, RecursionError, TypeError, ValueError):
+            raise IPCError("ipc_response_invalid") from None
+
+
 def _require_socket_path(value: object) -> Path:
     if not isinstance(value, Path) or not value.is_absolute():
         raise IPCStateError("ipc_socket_invalid")
@@ -244,18 +345,22 @@ def validate_available_socket_path(socket_path: Path) -> Path:
     return path
 
 
-def _encoded_record(record: Mapping[str, object]) -> bytes:
+def _encoded_record(
+    record: Mapping[str, object], *, maximum_bytes: int = MAX_MESSAGE_BYTES
+) -> bytes:
     payload = json.dumps(record, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
-    if len(payload) > MAX_MESSAGE_BYTES:
+    if len(payload) > maximum_bytes:
         raise IPCStateError("ipc_response_invalid")
     return payload
 
 
-def _read_line(connection: socket.socket) -> bytes | None:
+def _read_line(
+    connection: socket.socket, *, maximum_bytes: int = MAX_MESSAGE_BYTES
+) -> bytes | None:
     received = bytearray()
     while True:
         try:
-            chunk = connection.recv(MAX_MESSAGE_BYTES + 1 - len(received))
+            chunk = connection.recv(maximum_bytes + 1 - len(received))
         except (OSError, TimeoutError):
             return None
         if not chunk:
@@ -263,7 +368,7 @@ def _read_line(connection: socket.socket) -> bytes | None:
                 return None
             return bytes(received[:-1])
         received.extend(chunk)
-        if len(received) > MAX_MESSAGE_BYTES:
+        if len(received) > maximum_bytes:
             return None
 
 
@@ -293,6 +398,20 @@ def _reject_duplicate_object_keys(
     return record
 
 
+def _decode_jobs_page_request(request: object) -> tuple[bool, str | None]:
+    if type(request) is not dict or request.get("op") != "jobs_page":
+        return False, None
+    if set(request) not in ({"op"}, {"op", "cursor"}):
+        return False, None
+    cursor = request.get("cursor")
+    if cursor is None:
+        return True, None
+    try:
+        return True, _require_identifier(cursor, "cursor")
+    except (TypeError, ValueError):
+        return False, None
+
+
 def _decode_queue_gate_request(request: object) -> QueueGateCommand | None:
     try:
         return QueueGateCommand.from_record(request)
@@ -308,11 +427,14 @@ class HealthServer:
         socket_path: Path,
         *,
         health: Callable[[], WorkerHealth],
+        jobs_page: Callable[[str | None], JobsPage] | None = None,
         queue_gate: Callable[[QueueGateCommand], QueueGateResult] | None = None,
     ) -> None:
         self.socket_path = validate_available_socket_path(socket_path)
         if not callable(health):
             raise TypeError("health must be callable")
+        if jobs_page is not None and not callable(jobs_page):
+            raise TypeError("jobs_page must be callable")
         if queue_gate is not None and not callable(queue_gate):
             raise TypeError("queue_gate must be callable")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -335,6 +457,7 @@ class HealthServer:
             _unlink_owned_socket(self.socket_path, socket_identity)
             raise
         self._health = health
+        self._jobs_page = jobs_page
         self._queue_gate = queue_gate
         self._listener = listener
         self._identity = socket_identity
@@ -356,17 +479,26 @@ class HealthServer:
                 if _is_health_request(request):
                     response = _encoded_record(self._health().to_record())
                 else:
-                    command = _decode_queue_gate_request(request)
-                    if command is None or self._queue_gate is None:
-                        response = _encoded_record(_INVALID_REQUEST)
+                    jobs_page_request, cursor = _decode_jobs_page_request(request)
+                    if jobs_page_request and self._jobs_page is not None:
+                        page = self._jobs_page(cursor)
+                        if type(page) is not JobsPage:
+                            raise ValueError("jobs_page result is invalid")
+                        response = _encoded_record(
+                            page.to_record(), maximum_bytes=_MAX_RESPONSE_BYTES
+                        )
                     else:
-                        try:
-                            response = _encoded_record(
-                                self._queue_gate(command).to_record()
-                            )
-                        except Exception:
-                            response = _encoded_record(_COMMAND_CONFLICT)
-            except (IPCStateError, ValueError):
+                        command = _decode_queue_gate_request(request)
+                        if command is None or self._queue_gate is None:
+                            response = _encoded_record(_INVALID_REQUEST)
+                        else:
+                            try:
+                                response = _encoded_record(
+                                    self._queue_gate(command).to_record()
+                                )
+                            except Exception:
+                                response = _encoded_record(_COMMAND_CONFLICT)
+            except (IPCStateError, TypeError, ValueError):
                 response = _encoded_record(_INVALID_REQUEST)
             try:
                 connection.sendall(response)
@@ -422,6 +554,33 @@ def request_health(socket_path: Path) -> WorkerHealth:
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise IPCError("ipc_response_invalid") from None
     return WorkerHealth.from_record(record)
+
+
+def request_jobs_page(socket_path: Path, *, cursor: str | None = None) -> JobsPage:
+    """Read one redacted, bounded job page through the worker-owned socket."""
+
+    path = _require_socket_path(socket_path)
+    if cursor is not None:
+        cursor = _require_identifier(cursor, "cursor")
+    request = _encoded_record({"op": "jobs_page", "cursor": cursor})
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(_CLIENT_TIMEOUT_SECONDS)
+        try:
+            client.connect(str(path))
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            response = _read_line(client, maximum_bytes=_MAX_RESPONSE_BYTES)
+        except (OSError, TimeoutError):
+            raise IPCError("ipc_unavailable") from None
+    if response is None:
+        raise IPCError("ipc_response_invalid")
+    try:
+        record = json.loads(
+            response.decode("utf-8"), object_pairs_hook=_reject_duplicate_object_keys
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
+        raise IPCError("ipc_response_invalid") from None
+    return JobsPage.from_record(record)
 
 
 def set_queue_gate(

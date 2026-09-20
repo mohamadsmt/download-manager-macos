@@ -644,6 +644,47 @@ def test_list_jobs_resumes_after_the_previous_page_cursor(tmp_path: Path) -> Non
         store.close()
 
 
+def test_list_job_page_avoids_source_url_reads_and_resumes_after_cursor(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _add_page_of_jobs(store)
+
+        def deny_source_url_reads(
+            action: int,
+            first_argument: str | None,
+            second_argument: str | None,
+            _database_name: str | None,
+            _trigger_name: str | None,
+        ) -> int:
+            if (
+                action == sqlite3.SQLITE_READ
+                and first_argument == "jobs"
+                and second_argument == "source_url"
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store._connection.set_authorizer(deny_source_url_reads)
+        try:
+            first_page = store.list_job_page()
+            next_page = store.list_job_page(cursor=first_page[-1].job)
+        finally:
+            store._connection.set_authorizer(None)
+
+        assert [
+            (job.job, job.generation, job.revision, job.state) for job in first_page
+        ] == [
+            (f"job-{index:03d}", 4, 7, "queued") for index in range(100)
+        ]
+        assert [
+            (job.job, job.generation, job.revision, job.state) for job in next_page
+        ] == [("job-100", 4, 7, "queued")]
+    finally:
+        store.close()
+
+
 def test_list_events_resumes_after_the_previous_page_cursor(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "queue.sqlite3")
     try:

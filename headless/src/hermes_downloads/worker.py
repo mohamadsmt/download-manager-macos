@@ -12,6 +12,8 @@ from typing import Final, Protocol
 from hermes_downloads.ipc import (
     HealthServer,
     IPCStateError,
+    JobsPage,
+    PublicJobRecord,
     QueueGateCommand,
     QueueGateResult,
     WorkerHealth,
@@ -143,6 +145,22 @@ def _health_from_store(store: SQLiteStore) -> WorkerHealth:
     return WorkerHealth(worker_epoch=epoch, queue_gate=queue_gate)
 
 
+def _jobs_page_from_store(store: SQLiteStore, cursor: str | None) -> JobsPage:
+    jobs = tuple(
+        PublicJobRecord(
+            job=job.job,
+            generation=job.generation,
+            revision=job.revision,
+            state=job.state,
+        )
+        for job in store.list_job_page(cursor=cursor)
+    )
+    return JobsPage(
+        jobs=jobs,
+        next_cursor=jobs[-1].job if len(jobs) == 100 else None,
+    )
+
+
 def _queue_gate_from_store(
     store: SQLiteStore, command: QueueGateCommand
 ) -> QueueGateResult:
@@ -193,6 +211,7 @@ def run_worker(
                 health_server = HealthServer(
                     requested_socket_path,
                     health=lambda: _health_from_store(store),
+                    jobs_page=lambda cursor: _jobs_page_from_store(store, cursor),
                     queue_gate=lambda command: _queue_gate_from_store(store, command),
                 )
             except IPCStateError:
