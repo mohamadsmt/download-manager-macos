@@ -1196,6 +1196,88 @@ def test_direct_stop_and_restart_do_not_resurrect_paused_transfer(tmp_path: Path
         assert origin.ledger.response_body_bytes == 0
 
 
+def test_direct_binds_process_birth_before_rpc_ready(tmp_path: Path, monkeypatch) -> None:
+    direct = _direct_module()
+    processes = __import__("hermes_downloads.processes", fromlist=["is_current_process_birth"])
+    bound: list[Any] = []
+    order: list[str] = []
+
+    def on_engine_bound(identity: Any) -> None:
+        order.append("bound")
+        bound.append(identity)
+        assert type(identity) is direct.ProcessBirthIdentity
+        assert processes.is_current_process_birth(identity)
+        assert set(identity.to_record()) == {
+            "leader_pid",
+            "process_group_id",
+            "session_id",
+            "owner_uid",
+            "started_unix_us",
+            "argv_sha256",
+        }
+
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+        on_engine_bound=on_engine_bound,
+    )
+
+    def assert_bound_before_ready() -> None:
+        order.append("ready")
+        assert len(bound) == 1
+
+    monkeypatch.setattr(controller, "_wait_for_rpc_ready", assert_bound_before_ready)
+    identity = controller.start()
+    try:
+        assert order == ["bound", "ready"]
+        assert identity.leader_pid == bound[0].leader_pid
+        assert controller.engine_identity is identity
+    finally:
+        controller.close()
+        _assert_group_gone(identity.process_group_id)
+
+
+def test_direct_contain_and_cleanup_on_process_birth_callback_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    bound: list[Any] = []
+    runtime_paths: list[Path] = []
+    callback_failure = RuntimeError("fixture parent registration failure")
+
+    def reject_engine_bound(identity: Any) -> None:
+        bound.append(identity)
+        raise callback_failure
+
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+        on_engine_bound=reject_engine_bound,
+    )
+    original_create_private_config = controller._create_private_config
+
+    def capture_private_runtime() -> tuple[Path, Path, str]:
+        result = original_create_private_config()
+        runtime_paths.append(result[0])
+        return result
+
+    monkeypatch.setattr(controller, "_create_private_config", capture_private_runtime)
+    monkeypatch.setattr(
+        controller,
+        "_wait_for_rpc_ready",
+        lambda: pytest.fail("RPC readiness must not run after parent rejection"),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        controller.start()
+
+    assert raised.value is callback_failure
+    assert len(bound) == len(runtime_paths) == 1
+    assert controller.engine_identity is None
+    assert not runtime_paths[0].exists()
+    _assert_group_gone(bound[0].process_group_id)
+
+
 def test_direct_binding_interrupt_reaps_spawned_daemon_and_removes_private_runtime(
     tmp_path: Path, monkeypatch
 ) -> None:

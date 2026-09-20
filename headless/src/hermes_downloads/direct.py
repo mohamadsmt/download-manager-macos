@@ -6,6 +6,7 @@ never implements HTTP transfer itself and never decides queue admission.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 import hashlib
 import http.client
@@ -26,7 +27,11 @@ from typing import Any, Final, cast
 from hermes_downloads.models import Admission
 from hermes_downloads.network import SourceURL
 from hermes_downloads.paths import DestinationIntent
-from hermes_downloads.processes import EngineIdentity
+from hermes_downloads.processes import (
+    EngineIdentity,
+    ProcessBirthIdentity,
+    capture_process_birth,
+)
 from hermes_downloads.retry import CompletionVerification
 
 __all__ = [
@@ -113,6 +118,7 @@ class DirectAria2Controller:
         max_concurrent_downloads: int = 1,
         split: int = 4,
         max_connection_per_server: int = 4,
+        on_engine_bound: Callable[[ProcessBirthIdentity], None] | None = None,
     ) -> None:
         self._executable = _require_executable(executable)
         self._runtime_root = _require_absolute_path(runtime_root, "runtime_root")
@@ -123,6 +129,9 @@ class DirectAria2Controller:
         self._max_connection_per_server = _require_connection_limit(
             max_connection_per_server
         )
+        if on_engine_bound is not None and not callable(on_engine_bound):
+            raise TypeError("on_engine_bound must be callable or None")
+        self._on_engine_bound = on_engine_bound
         self._process: subprocess.Popen[bytes] | None = None
         self._identity: EngineIdentity | None = None
         self._port: int | None = None
@@ -216,6 +225,11 @@ class DirectAria2Controller:
                 started_monotonic_ns=time.monotonic_ns(),
                 argv_sha256=_argv_sha256(argv),
             )
+            if self._on_engine_bound is not None:
+                birth_identity = capture_process_birth(identity)
+                if birth_identity is None:
+                    raise DirectEngineError("aria2 containment failed")
+                self._on_engine_bound(birth_identity)
             self._identity = identity
             self._wait_for_rpc_ready()
             return identity
