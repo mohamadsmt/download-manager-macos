@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Mapping, NoReturn, Sequence, cast
+from typing import Final, Literal, Mapping, NoReturn, Sequence, cast
 
 
 _SAFE_ENVIRONMENT_NAMES = frozenset({"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR"})
@@ -23,6 +23,8 @@ _TERM_GRACE_SECONDS = 0.2
 _KILL_GRACE_SECONDS = 0.5
 _POLL_INTERVAL_SECONDS = 0.01
 _PROC_PIDTBSDINFO = 3
+_MAX_RECONCILIATION_GROUP_MEMBERS: Final = 4096
+ProcessBirthReconciliation = Literal["absent", "current", "indeterminate"]
 
 
 class _ProcBsdInfo(ctypes.Structure):
@@ -217,6 +219,36 @@ def _read_stable_darwin_process_identity(
     return first, session_id
 
 
+def _read_darwin_process_group_members(
+    process_group_id: int,
+) -> tuple[int, ...] | None:
+    """Read a bounded Darwin process-group snapshot without sending a signal."""
+
+    if sys.platform != "darwin" or type(process_group_id) is not int or process_group_id <= 0:
+        return None
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        list_group_pids = library.proc_listpgrppids
+        list_group_pids.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
+        list_group_pids.restype = ctypes.c_int
+        members = (ctypes.c_int * _MAX_RECONCILIATION_GROUP_MEMBERS)()
+        member_count = list_group_pids(
+            process_group_id,
+            ctypes.byref(members),
+            ctypes.sizeof(members),
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    if member_count < 0 or member_count > _MAX_RECONCILIATION_GROUP_MEMBERS:
+        return None
+    result = tuple(members[:member_count])
+    if any(type(member) is not int or member <= 0 for member in result):
+        return None
+    if len(set(result)) != len(result):
+        return None
+    return result
+
+
 def capture_process_birth(identity: EngineIdentity) -> ProcessBirthIdentity | None:
     """Capture a fresh Darwin session identity without signaling or reaping it."""
 
@@ -257,6 +289,44 @@ def is_current_process_birth(identity: ProcessBirthIdentity) -> bool:
         and snapshot.owner_uid == identity.owner_uid
         and snapshot.started_unix_us == identity.started_unix_us
     )
+
+
+def reconcile_process_birth(identity: object) -> ProcessBirthReconciliation:
+    """Classify a recorded Darwin birth without signaling, killing, or reaping."""
+
+    if type(identity) is not ProcessBirthIdentity:
+        return "indeterminate"
+    try:
+        identity = ProcessBirthIdentity.from_record(identity.to_record())
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return "indeterminate"
+    if sys.platform != "darwin":
+        return "indeterminate"
+    try:
+        if identity.owner_uid != os.geteuid():
+            return "indeterminate"
+    except OSError:
+        return "indeterminate"
+    members = _read_darwin_process_group_members(identity.process_group_id)
+    if members is None:
+        return "indeterminate"
+    if not members:
+        return "absent"
+    if identity.leader_pid not in members:
+        return "indeterminate"
+    stable_identity = _read_stable_darwin_process_identity(identity.leader_pid)
+    if stable_identity is None:
+        return "indeterminate"
+    snapshot, session_id = stable_identity
+    if (
+        snapshot.leader_pid == identity.leader_pid
+        and snapshot.process_group_id == identity.process_group_id
+        and session_id == identity.session_id
+        and snapshot.owner_uid == identity.owner_uid
+        and snapshot.started_unix_us == identity.started_unix_us
+    ):
+        return "current"
+    return "indeterminate"
 
 
 @dataclass(frozen=True, slots=True)

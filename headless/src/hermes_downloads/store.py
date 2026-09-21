@@ -10,6 +10,7 @@ import sqlite3
 from typing import Final
 
 from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
+from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.retry import (
     RetryAuditEvent,
     RetryAuditKind,
@@ -21,6 +22,7 @@ from hermes_downloads.retry import (
 __all__ = [
     "CommandRecord",
     "CommandResult",
+    "DirectEngineRecord",
     "EventRecord",
     "JobPageRecord",
     "JobRecord",
@@ -120,6 +122,21 @@ CREATE TABLE queue_commands (
 );
 """
 
+_ENGINE_INSTANCES_SCHEMA: Final = """
+CREATE TABLE engine_instances (
+    engine_kind TEXT PRIMARY KEY CHECK (engine_kind = 'direct'),
+    worker_epoch INTEGER NOT NULL CHECK (worker_epoch > 0),
+    leader_pid INTEGER NOT NULL CHECK (leader_pid > 0),
+    process_group_id INTEGER NOT NULL CHECK (process_group_id = leader_pid),
+    session_id INTEGER NOT NULL CHECK (session_id = leader_pid),
+    owner_uid INTEGER NOT NULL CHECK (owner_uid >= 0),
+    started_unix_us INTEGER NOT NULL CHECK (started_unix_us > 0),
+    argv_sha256 TEXT NOT NULL CHECK (
+        length(argv_sha256) = 64 AND argv_sha256 NOT GLOB '*[^0-9a-f]*'
+    )
+);
+"""
+
 
 def _normalize_table_schema(schema: str) -> str:
     """Canonicalize static SQLite DDL for exact current-version validation."""
@@ -146,9 +163,15 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 4
+_SUPPORTED_SCHEMA_VERSION: Final = 5
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
+_V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
+_V2_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+)
 _V3_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _SCHEMA,
     _MATERIALIZED_JOBS_SCHEMA,
@@ -163,6 +186,15 @@ _V4_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _JOB_RETRY_SCHEMA,
     _JOB_RETRY_AUDIT_SCHEMA,
     _QUEUE_COMMANDS_SCHEMA,
+)
+_V5_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
 )
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
@@ -218,6 +250,22 @@ def _require_counter(value: object, name: str) -> int:
     if not 0 <= value <= _MAX_COUNTER:
         raise ValueError(f"{name} must be a nonnegative persisted counter")
     return value
+
+
+def _require_worker_epoch(value: object, name: str) -> int:
+    epoch = _require_counter(value, name)
+    if epoch == 0:
+        raise ValueError(f"{name} must be a positive worker epoch")
+    return epoch
+
+
+def _require_process_birth_identity(value: object) -> ProcessBirthIdentity:
+    if type(value) is not ProcessBirthIdentity:
+        raise TypeError("identity must be a ProcessBirthIdentity")
+    try:
+        return ProcessBirthIdentity.from_record(value.to_record())
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError("identity must be a valid process-birth identity") from error
 
 
 def _require_sqlite_text(value: object, name: str) -> str:
@@ -313,6 +361,22 @@ class EventRecord:
     revision: int
 
 
+@dataclass(frozen=True, slots=True)
+class DirectEngineRecord:
+    """One direct-engine process identity bound to its owning worker epoch."""
+
+    worker_epoch: int
+    identity: ProcessBirthIdentity
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "worker_epoch", _require_worker_epoch(self.worker_epoch, "worker_epoch")
+        )
+        object.__setattr__(
+            self, "identity", _require_process_birth_identity(self.identity)
+        )
+
+
 class SQLiteStore:
     """A small single-writer SQLite store with command idempotency."""
 
@@ -324,7 +388,7 @@ class SQLiteStore:
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
-            self._migrate_schema_v4(connection)
+            self._migrate_schema_v5(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -339,21 +403,22 @@ class SQLiteStore:
 
     @staticmethod
     def _reject_newer_schema_version(connection: sqlite3.Connection) -> None:
-        """Fail before bootstrap can mutate an unsupported current schema."""
+        """Fail before bootstrap can mutate any nonempty unsupported schema."""
 
         row = connection.execute("PRAGMA user_version").fetchone()
-        if row is None or type(row[0]) is not int:
+        if row is None or type(row[0]) is not int or row[0] < 0:
             raise RuntimeError("database schema version is invalid")
         if row[0] > _SUPPORTED_SCHEMA_VERSION:
             raise RuntimeError("database schema version is newer than supported")
-        expected_schemas = (
-            _V4_TABLE_SCHEMAS
-            if row[0] == _SUPPORTED_SCHEMA_VERSION
-            else _V3_TABLE_SCHEMAS if row[0] == 3 else None
-        )
-        if expected_schemas is not None and not SQLiteStore._has_table_schemas(
-            connection, expected_schemas
-        ):
+        expected_schemas = {
+            0: {},
+            1: _V1_TABLE_SCHEMAS,
+            2: _V2_TABLE_SCHEMAS,
+            3: _V3_TABLE_SCHEMAS,
+            4: _V4_TABLE_SCHEMAS,
+            5: _V5_TABLE_SCHEMAS,
+        }[row[0]]
+        if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
 
     @staticmethod
@@ -362,29 +427,33 @@ class SQLiteStore:
     ) -> bool:
         """Recognize an exact supported schema before a bootstrap write."""
 
-        for table_name, expected_schema in expected_schemas.items():
-            row = connection.execute(
-                """
-                SELECT sql
-                FROM sqlite_master
-                WHERE type = 'table' AND name = ?
-                """,
-                (table_name,),
-            ).fetchone()
-            if row is None or type(row["sql"]) is not str:
+        actual_schemas: dict[str, str] = {}
+        rows = connection.execute(
+            """
+            SELECT type, name, sql
+            FROM sqlite_master
+            WHERE substr(name, 1, 7) != 'sqlite_'
+            """
+        ).fetchall()
+        for row in rows:
+            if (
+                type(row["type"]) is not str
+                or row["type"] != "table"
+                or type(row["name"]) is not str
+                or type(row["sql"]) is not str
+            ):
                 return False
-            if _normalize_table_schema(row["sql"]) != expected_schema:
-                return False
-        return True
+            actual_schemas[row["name"]] = _normalize_table_schema(row["sql"])
+        return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v4(connection: sqlite3.Connection) -> None:
-        """Apply additive v2 through v4 schema migrations in one transaction."""
+    def _migrate_schema_v5(connection: sqlite3.Connection) -> None:
+        """Apply additive v2 through v5 schema migrations in one transaction."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("PRAGMA user_version").fetchone()
-            if row is None or type(row[0]) is not int:
+            if row is None or type(row[0]) is not int or row[0] < 0:
                 raise RuntimeError("database schema version is invalid")
             version = row[0]
             if version <= 1:
@@ -392,7 +461,9 @@ class SQLiteStore:
                 connection.execute(_COLLECTION_HOLDS_SCHEMA)
                 connection.execute("PRAGMA user_version = 2")
                 version = 2
-            if version <= 2:
+            if version == 2:
+                if not SQLiteStore._has_table_schemas(connection, _V2_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
                 connection.execute(_JOB_RETRY_SCHEMA)
                 connection.execute(_JOB_RETRY_AUDIT_SCHEMA)
                 connection.execute("PRAGMA user_version = 3")
@@ -401,9 +472,16 @@ class SQLiteStore:
                 if not SQLiteStore._has_table_schemas(connection, _V3_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
                 connection.execute(_QUEUE_COMMANDS_SCHEMA)
-                connection.execute(f"PRAGMA user_version = {_SUPPORTED_SCHEMA_VERSION}")
-            elif version == _SUPPORTED_SCHEMA_VERSION:
+                connection.execute("PRAGMA user_version = 4")
+                version = 4
+            if version == 4:
                 if not SQLiteStore._has_table_schemas(connection, _V4_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_ENGINE_INSTANCES_SCHEMA)
+                connection.execute(f"PRAGMA user_version = {_SUPPORTED_SCHEMA_VERSION}")
+                version = _SUPPORTED_SCHEMA_VERSION
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V5_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1107,6 +1185,180 @@ class SQLiteStore:
             "SELECT value FROM settings WHERE key = 'worker_epoch'"
         ).fetchone()
         return None if row is None else int(row["value"])
+
+    @staticmethod
+    def _current_worker_epoch(connection: sqlite3.Connection) -> int:
+        rows = connection.execute(
+            """
+            SELECT value
+            FROM settings
+            WHERE key = 'worker_epoch'
+            LIMIT 2
+            """
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("current worker epoch is not initialized")
+        value = _require_sqlite_text(rows[0]["value"], "worker epoch")
+        try:
+            epoch = int(value)
+        except ValueError as error:
+            raise ValueError("persisted worker epoch is invalid") from error
+        if str(epoch) != value:
+            raise ValueError("persisted worker epoch is invalid")
+        return _require_worker_epoch(epoch, "worker epoch")
+
+    def set_direct_engine_record(self, record: DirectEngineRecord) -> None:
+        """Create or replace the direct engine record for the current worker epoch."""
+
+        if type(record) is not DirectEngineRecord:
+            raise TypeError("record must be a DirectEngineRecord")
+        record = DirectEngineRecord(
+            worker_epoch=record.worker_epoch,
+            identity=record.identity,
+        )
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._current_worker_epoch(connection) != record.worker_epoch:
+                raise ValueError("direct engine worker epoch is not current")
+            identity = record.identity
+            connection.execute(
+                """
+                INSERT INTO engine_instances (
+                    engine_kind,
+                    worker_epoch,
+                    leader_pid,
+                    process_group_id,
+                    session_id,
+                    owner_uid,
+                    started_unix_us,
+                    argv_sha256
+                )
+                VALUES ('direct', ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(engine_kind) DO UPDATE SET
+                    worker_epoch = excluded.worker_epoch,
+                    leader_pid = excluded.leader_pid,
+                    process_group_id = excluded.process_group_id,
+                    session_id = excluded.session_id,
+                    owner_uid = excluded.owner_uid,
+                    started_unix_us = excluded.started_unix_us,
+                    argv_sha256 = excluded.argv_sha256
+                """,
+                (
+                    record.worker_epoch,
+                    identity.leader_pid,
+                    identity.process_group_id,
+                    identity.session_id,
+                    identity.owner_uid,
+                    identity.started_unix_us,
+                    identity.argv_sha256,
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def get_direct_engine_record(self) -> DirectEngineRecord | None:
+        """Read the one exact durable direct-engine record, if present."""
+
+        rows = self._connection.execute(
+            """
+            SELECT
+                engine_kind,
+                worker_epoch,
+                leader_pid,
+                process_group_id,
+                session_id,
+                owner_uid,
+                started_unix_us,
+                argv_sha256
+            FROM engine_instances
+            LIMIT 2
+            """
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("direct engine record is not unique")
+        row = rows[0]
+        if _require_sqlite_text(row["engine_kind"], "engine kind") != "direct":
+            raise ValueError("persisted engine kind is invalid")
+        try:
+            return DirectEngineRecord(
+                worker_epoch=_require_worker_epoch(
+                    _require_sqlite_integer(row["worker_epoch"], "worker epoch"),
+                    "worker epoch",
+                ),
+                identity=ProcessBirthIdentity.from_record(
+                    {
+                        "leader_pid": _require_sqlite_integer(
+                            row["leader_pid"], "leader_pid"
+                        ),
+                        "process_group_id": _require_sqlite_integer(
+                            row["process_group_id"], "process_group_id"
+                        ),
+                        "session_id": _require_sqlite_integer(
+                            row["session_id"], "session_id"
+                        ),
+                        "owner_uid": _require_sqlite_integer(
+                            row["owner_uid"], "owner_uid"
+                        ),
+                        "started_unix_us": _require_sqlite_integer(
+                            row["started_unix_us"], "started_unix_us"
+                        ),
+                        "argv_sha256": _require_sqlite_text(
+                            row["argv_sha256"], "argv_sha256"
+                        ),
+                    }
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("persisted direct engine record is invalid") from error
+
+    def clear_direct_engine_record(self, record: DirectEngineRecord) -> bool:
+        """Delete only the exact direct-engine record supplied by the caller."""
+
+        if type(record) is not DirectEngineRecord:
+            raise TypeError("record must be a DirectEngineRecord")
+        record = DirectEngineRecord(
+            worker_epoch=record.worker_epoch,
+            identity=record.identity,
+        )
+        identity = record.identity
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                DELETE FROM engine_instances
+                WHERE engine_kind = 'direct'
+                  AND worker_epoch = ?
+                  AND leader_pid = ?
+                  AND process_group_id = ?
+                  AND session_id = ?
+                  AND owner_uid = ?
+                  AND started_unix_us = ?
+                  AND argv_sha256 = ?
+                """,
+                (
+                    record.worker_epoch,
+                    identity.leader_pid,
+                    identity.process_group_id,
+                    identity.session_id,
+                    identity.owner_uid,
+                    identity.started_unix_us,
+                    identity.argv_sha256,
+                ),
+            )
+            changed = connection.execute("SELECT changes()").fetchone()
+            if changed is None or type(changed[0]) is not int or changed[0] not in {0, 1}:
+                raise RuntimeError("direct engine record delete is invalid")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return bool(changed[0])
 
     def get_job(self, job_id: str) -> JobRecord | None:
         """Read one persisted job."""

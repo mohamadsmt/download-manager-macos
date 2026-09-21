@@ -13,6 +13,7 @@ import pytest
 import hermes_downloads.retry as retry_module
 import hermes_downloads.store as store_module
 from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
+from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.store import RequestConflictError, SQLiteStore
 
 
@@ -189,6 +190,27 @@ def _create_v3_database(database_path: Path) -> tuple[object, ...]:
         connection.execute(store_module._JOB_RETRY_AUDIT_SCHEMA)
         connection.execute("PRAGMA user_version = 3")
     return legacy_job
+
+
+def _create_v4_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v3_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._QUEUE_COMMANDS_SCHEMA)
+        connection.execute("PRAGMA user_version = 4")
+    return legacy_job
+
+
+def _process_birth_identity(**overrides: Any) -> ProcessBirthIdentity:
+    values: dict[str, int | str] = {
+        "leader_pid": 4242,
+        "process_group_id": 4242,
+        "session_id": 4242,
+        "owner_uid": 501,
+        "started_unix_us": 1_700_000_000_000_001,
+        "argv_sha256": "a" * 64,
+    }
+    values.update(overrides)
+    return ProcessBirthIdentity.from_record(values)
 
 
 def _table_names(database_path: Path) -> frozenset[str]:
@@ -751,17 +773,15 @@ def test_injected_command_write_failure_rolls_back_the_entire_transaction(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "queue.sqlite3"
-    initialized = SQLiteStore(database_path)
-    initialized.close()
-    _install_failing_insert_trigger(
-        database_path,
-        table="commands",
-        trigger_name="fail_command_insert",
-        message="injected command write failure",
-    )
-
     store = SQLiteStore(database_path)
     try:
+        _install_failing_insert_trigger(
+            database_path,
+            table="commands",
+            trigger_name="fail_command_insert",
+            message="injected command write failure",
+        )
+
         with pytest.raises(sqlite3.DatabaseError, match="injected command write failure"):
             store.apply_add(_intent())
 
@@ -1012,32 +1032,28 @@ def test_cold_recovery_event_failure_rolls_back_epoch_gate_jobs_and_events(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "queue.sqlite3"
-    initialized = SQLiteStore(database_path)
+    store = SQLiteStore(database_path)
     try:
-        initialized.apply_add(_intent())
-        initialized._connection.execute(
+        store.apply_add(_intent())
+        store._connection.execute(
             "UPDATE jobs SET state = 'downloading' WHERE job_id = 'job-1'"
         )
-        initialized._connection.execute(
+        store._connection.execute(
             """
             INSERT INTO settings (key, value, revision)
             VALUES ('queue_gate', 'running', 9)
             """
         )
-        job_before = initialized.get_job("job-1")
-        command_before = initialized.get_command("request-1")
-        events_before = initialized.list_events()
-    finally:
-        initialized.close()
-    _install_failing_insert_trigger(
-        database_path,
-        table="events",
-        trigger_name="fail_recovery_event_insert",
-        message="injected recovery event write failure",
-    )
+        job_before = store.get_job("job-1")
+        command_before = store.get_command("request-1")
+        events_before = store.list_events()
+        _install_failing_insert_trigger(
+            database_path,
+            table="events",
+            trigger_name="fail_recovery_event_insert",
+            message="injected recovery event write failure",
+        )
 
-    store = SQLiteStore(database_path)
-    try:
         with pytest.raises(sqlite3.DatabaseError, match="injected recovery event write failure"):
             store.recover_cold_start()
 
@@ -1072,7 +1088,7 @@ def test_cold_recovery_epoch_survives_reopen(tmp_path: Path) -> None:
         final.close()
 
 
-def test_v4_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+def test_v5_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     expected_legacy_job = _create_v1_database(database_path)
     legacy_source_url = expected_legacy_job[1]
@@ -1092,7 +1108,7 @@ def test_v4_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1101,15 +1117,16 @@ def test_v4_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
             """
         ).fetchone() == expected_legacy_job
     v1_tables = {"settings", "jobs", "commands", "events"}
-    v4_tables = _table_names(database_path)
-    assert v1_tables <= v4_tables
+    v5_tables = _table_names(database_path)
+    assert v1_tables <= v5_tables
     assert {
         "collection_holds",
         "job_retry",
         "job_retry_audit",
         "queue_commands",
-    } <= v4_tables
-    assert len(v4_tables - v1_tables) >= 5
+        "engine_instances",
+    } <= v5_tables
+    assert len(v5_tables - v1_tables) >= 6
 
 
 def test_v2_migration_failure_leaves_v1_database_unchanged(
@@ -1192,7 +1209,7 @@ def test_v3_migration_failure_leaves_v2_database_unchanged(
     }
 
 
-def test_v4_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+def test_v5_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     expected_legacy_job = _create_v3_database(database_path)
     legacy_source_url = expected_legacy_job[1]
@@ -1212,7 +1229,7 @@ def test_v4_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         schema = connection.execute(
             """
             SELECT sql
@@ -1224,7 +1241,19 @@ def test_v4_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         assert store_module._normalize_table_schema(schema[0]) == (
             store_module._V4_TABLE_SCHEMAS["queue_commands"]
         )
+        engine_schema = connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'engine_instances'
+            """
+        ).fetchone()
+        assert engine_schema is not None
+        assert store_module._normalize_table_schema(engine_schema[0]) == (
+            store_module._V5_TABLE_SCHEMAS["engine_instances"]
+        )
     assert "queue_commands" in _table_names(database_path)
+    assert "engine_instances" in _table_names(database_path)
 
 
 def test_v4_migration_failure_leaves_v3_database_unchanged(
@@ -1298,6 +1327,41 @@ def test_v4_migration_rolls_back_queue_command_ddl_when_version_bump_fails(
     assert "queue_commands" not in table_schemas
 
 
+def test_v5_migration_rolls_back_engine_instance_ddl_when_version_bump_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v4_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_version_bump_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="PRAGMA user_version = 5",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_version_bump_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V4_TABLE_SCHEMAS
+    assert "engine_instances" not in table_schemas
+
+
 def test_v3_rejects_incomplete_retry_schema_without_bootstrap_writes(
     tmp_path: Path,
 ) -> None:
@@ -1342,17 +1406,46 @@ def test_v3_rejects_retry_schema_missing_required_constraints(tmp_path: Path) ->
         SQLiteStore(database_path)
 
 
-def test_v4_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v0_rejects_nonempty_unknown_schema_before_bootstrap_writes(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE unknown_bootstrap_table (value TEXT NOT NULL)")
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert _table_names(database_path) == {"unknown_bootstrap_table"}
+
+
+def test_v0_rejects_sqlite_prefix_lookalike_before_bootstrap_writes(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    lookalike = "sqliteX_evil"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(f"CREATE TABLE {lookalike} (value TEXT NOT NULL)")
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert _table_names(database_path) == {lookalike}
+
+
+def test_v5_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 5")
+        connection.execute("PRAGMA user_version = 6")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1375,6 +1468,195 @@ def test_v4_rejects_malformed_queue_command_schema_without_bootstrap_writes(
             (0, "request_id", "TEXT", 0, None, 1)
         ]
     assert _table_names(database_path) == v3_tables | {"queue_commands"}
+
+
+def test_v4_rejects_unknown_trigger_before_v5_bootstrap_writes(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v4_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER unexpected_v4_trigger
+            BEFORE INSERT ON settings
+            BEGIN
+                SELECT RAISE(FAIL, 'unexpected trigger');
+            END
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall() == [("unexpected_v4_trigger",)]
+    assert "engine_instances" not in _table_names(database_path)
+
+
+def test_v5_rejects_malformed_engine_instance_schema_without_bootstrap_writes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v4_database(database_path)
+    v4_tables = _table_names(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE engine_instances (engine_kind TEXT PRIMARY KEY)")
+        connection.execute("PRAGMA user_version = 5")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA table_info(engine_instances)").fetchall() == [
+            (0, "engine_kind", "TEXT", 0, None, 1)
+        ]
+    assert _table_names(database_path) == v4_tables | {"engine_instances"}
+
+
+def test_v5_rejects_unknown_current_table_without_bootstrap_writes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v4_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._ENGINE_INSTANCES_SCHEMA)
+        connection.execute("CREATE TABLE unexpected_current_table (value TEXT NOT NULL)")
+        connection.execute("PRAGMA user_version = 5")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert _table_names(database_path) == {
+        *store_module._V5_TABLE_SCHEMAS,
+        "unexpected_current_table",
+    }
+
+
+def test_v5_rejects_unknown_current_trigger_without_bootstrap_writes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v4_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._ENGINE_INSTANCES_SCHEMA)
+        connection.execute(
+            """
+            CREATE TRIGGER unexpected_current_trigger
+            BEFORE INSERT ON engine_instances
+            BEGIN
+                SELECT RAISE(FAIL, 'unexpected trigger');
+            END
+            """
+        )
+        connection.execute("PRAGMA user_version = 5")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall() == [("unexpected_current_trigger",)]
+
+
+def test_direct_engine_record_rejects_malformed_birth_identity() -> None:
+    malformed_identity = object.__new__(ProcessBirthIdentity)
+
+    with pytest.raises(ValueError, match="valid process-birth identity"):
+        store_module.DirectEngineRecord(worker_epoch=1, identity=malformed_identity)
+
+
+def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    initial_identity = _process_birth_identity()
+    initial = store_module.DirectEngineRecord(worker_epoch=1, identity=initial_identity)
+    updated = replace(
+        initial,
+        identity=_process_birth_identity(
+            started_unix_us=initial_identity.started_unix_us + 1,
+            argv_sha256="b" * 64,
+        ),
+    )
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.recover_cold_start() == 1
+        assert store.get_direct_engine_record() is None
+
+        store.set_direct_engine_record(initial)
+        assert store.get_direct_engine_record() == initial
+
+        store.set_direct_engine_record(updated)
+        assert store.get_direct_engine_record() == updated
+        assert store.clear_direct_engine_record(initial) is False
+        assert store.get_direct_engine_record() == updated
+        assert store.clear_direct_engine_record(updated) is True
+        assert store.get_direct_engine_record() is None
+
+        store.set_direct_engine_record(updated)
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert [
+            row[1]
+            for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
+        ] == [
+            "engine_kind",
+            "worker_epoch",
+            "leader_pid",
+            "process_group_id",
+            "session_id",
+            "owner_uid",
+            "started_unix_us",
+            "argv_sha256",
+        ]
+        assert connection.execute(
+            """
+            SELECT
+                engine_kind,
+                worker_epoch,
+                leader_pid,
+                process_group_id,
+                session_id,
+                owner_uid,
+                started_unix_us,
+                argv_sha256
+            FROM engine_instances
+            """
+        ).fetchall() == [
+            (
+                "direct",
+                updated.worker_epoch,
+                updated.identity.leader_pid,
+                updated.identity.process_group_id,
+                updated.identity.session_id,
+                updated.identity.owner_uid,
+                updated.identity.started_unix_us,
+                updated.identity.argv_sha256,
+            )
+        ]
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.get_direct_engine_record() == updated
+        with pytest.raises(ValueError, match="worker epoch"):
+            reopened.set_direct_engine_record(
+                store_module.DirectEngineRecord(
+                    worker_epoch=updated.worker_epoch + 1,
+                    identity=updated.identity,
+                )
+            )
+        assert reopened.get_direct_engine_record() == updated
+    finally:
+        reopened.close()
 
 
 def test_materialized_domain_apply_add_reopens_exact_projection(tmp_path: Path) -> None:

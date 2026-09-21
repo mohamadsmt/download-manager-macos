@@ -873,7 +873,7 @@ def test_surrogate_argv_fails_closed_before_fixture_launch(tmp_path: Path) -> No
 
 
 def test_process_birth_identity_binds_a_live_fresh_session_and_rejects_stale_records(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     processes = _processes()
     argv = (sys.executable, "-c", "import time; time.sleep(60)")
@@ -905,16 +905,24 @@ def test_process_birth_identity_binds_a_live_fresh_session_and_rejects_stale_rec
         assert birth.argv_sha256 == identity.argv_sha256
         assert processes.ProcessBirthIdentity.from_record(birth.to_record()) == birth
         assert processes.is_current_process_birth(birth)
-        assert not processes.is_current_process_birth(
-            replace(birth, started_unix_us=birth.started_unix_us + 1)
-        )
+        members = processes._read_darwin_process_group_members(process.pid)
+        assert members is not None
+        assert process.pid in members
+        assert processes.reconcile_process_birth(birth) == "current"
+        stale_birth = replace(birth, started_unix_us=birth.started_unix_us + 1)
+        assert not processes.is_current_process_birth(stale_birth)
+        assert processes.reconcile_process_birth(stale_birth) == "indeterminate"
         assert processes.capture_process_birth(
             replace(identity, process_group_id=process.pid + 1)
         ) is None
     finally:
         _kill_fixture_process_group(process.pid)
 
+    monkeypatch.setattr(
+        processes, "_read_darwin_process_group_members", lambda _process_group_id: ()
+    )
     assert not processes.is_current_process_birth(birth)
+    assert processes.reconcile_process_birth(birth) == "absent"
 
 
 def test_process_birth_capture_fails_closed_off_darwin(monkeypatch) -> None:
@@ -928,6 +936,65 @@ def test_process_birth_capture_fails_closed_off_darwin(monkeypatch) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
 
     assert processes.capture_process_birth(identity) is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin libproc only")
+def test_darwin_group_member_reader_finds_current_process_without_assuming_count() -> None:
+    processes = _processes()
+
+    members = processes._read_darwin_process_group_members(os.getpgrp())
+
+    assert members is not None
+    assert os.getpid() in members
+
+
+def test_darwin_group_member_reader_treats_libproc_result_as_pid_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _processes()
+    process_group_id = 4242
+    member_pids = (4343, 4444)
+    pid_bytes = processes.ctypes.sizeof(processes.ctypes.c_int)
+    buffer_bytes = pid_bytes * processes._MAX_RECONCILIATION_GROUP_MEMBERS
+
+    class FakeListGroupPids:
+        def __call__(self, group_id, members, byte_count) -> int:
+            assert group_id == process_group_id
+            assert byte_count == buffer_bytes
+            result = processes.ctypes.cast(
+                members, processes.ctypes.POINTER(processes.ctypes.c_int)
+            )
+            result[0], result[1] = member_pids
+            return 2
+
+    class FakeLibproc:
+        proc_listpgrppids = FakeListGroupPids()
+
+    monkeypatch.setattr(processes.sys, "platform", "darwin")
+    monkeypatch.setattr(processes.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibproc())
+
+    assert processes._read_darwin_process_group_members(process_group_id) == member_pids
+
+
+def test_darwin_group_member_reader_rejects_malformed_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _processes()
+    process_group_id = 4242
+    reported_counts = iter((-1, processes._MAX_RECONCILIATION_GROUP_MEMBERS + 1))
+
+    class FakeListGroupPids:
+        def __call__(self, _group_id, _members, _byte_count) -> int:
+            return next(reported_counts)
+
+    class FakeLibproc:
+        proc_listpgrppids = FakeListGroupPids()
+
+    monkeypatch.setattr(processes.sys, "platform", "darwin")
+    monkeypatch.setattr(processes.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibproc())
+
+    assert processes._read_darwin_process_group_members(process_group_id) is None
+    assert processes._read_darwin_process_group_members(process_group_id) is None
 
 
 def test_process_birth_identity_rejects_an_unreaped_zombie(tmp_path: Path) -> None:
@@ -980,3 +1047,158 @@ def test_process_birth_record_rejects_a_nonfresh_session_shape() -> None:
 
     with pytest.raises(ValueError, match="invalid process-birth record"):
         processes.ProcessBirthIdentity.from_record(record)
+
+
+def test_reconcile_process_birth_reports_absence_without_signaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _processes()
+    identity = processes.ProcessBirthIdentity.from_record(
+        {
+            "leader_pid": 4242,
+            "process_group_id": 4242,
+            "session_id": 4242,
+            "owner_uid": 501,
+            "started_unix_us": 1_700_000_000_000_001,
+            "argv_sha256": "a" * 64,
+        }
+    )
+    forbidden_calls: list[str] = []
+
+    def forbid_signal(name: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            forbidden_calls.append(name)
+            raise AssertionError(f"reconciliation called {name}")
+
+        return forbidden
+
+    monkeypatch.setattr(processes.os, "killpg", forbid_signal("killpg"))
+    monkeypatch.setattr(processes.os, "kill", forbid_signal("kill"))
+    monkeypatch.setattr(processes.os, "waitpid", forbid_signal("waitpid"))
+    monkeypatch.setattr(processes.os, "geteuid", lambda: identity.owner_uid)
+    seen_groups: list[int] = []
+
+    def no_group(process_group_id: int) -> tuple[int, ...]:
+        seen_groups.append(process_group_id)
+        return ()
+
+    monkeypatch.setattr(
+        processes, "_read_darwin_process_group_members", no_group, raising=False
+    )
+
+    assert processes.reconcile_process_birth(identity) == "absent"
+    assert seen_groups == [identity.process_group_id]
+    assert forbidden_calls == []
+
+
+def test_reconcile_process_birth_is_indeterminate_off_darwin_without_geteuid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _processes()
+    identity = processes.ProcessBirthIdentity.from_record(
+        {
+            "leader_pid": 4242,
+            "process_group_id": 4242,
+            "session_id": 4242,
+            "owner_uid": 501,
+            "started_unix_us": 1_700_000_000_000_001,
+            "argv_sha256": "a" * 64,
+        }
+    )
+    monkeypatch.setattr(processes.sys, "platform", "linux")
+    monkeypatch.delattr(processes.os, "geteuid")
+
+    assert processes.reconcile_process_birth(identity) == "indeterminate"
+
+
+def test_reconcile_process_birth_reports_current_only_for_a_stable_live_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _processes()
+    identity = processes.ProcessBirthIdentity.from_record(
+        {
+            "leader_pid": 4242,
+            "process_group_id": 4242,
+            "session_id": 4242,
+            "owner_uid": 501,
+            "started_unix_us": 1_700_000_000_000_001,
+            "argv_sha256": "a" * 64,
+        }
+    )
+    forbidden_calls: list[str] = []
+
+    def forbid_signal(name: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            forbidden_calls.append(name)
+            raise AssertionError(f"reconciliation called {name}")
+
+        return forbidden
+
+    snapshot = processes._DarwinProcessSnapshot(
+        leader_pid=identity.leader_pid,
+        process_group_id=identity.process_group_id,
+        owner_uid=identity.owner_uid,
+        started_unix_us=identity.started_unix_us,
+    )
+    monkeypatch.setattr(processes.os, "killpg", forbid_signal("killpg"))
+    monkeypatch.setattr(processes.os, "kill", forbid_signal("kill"))
+    monkeypatch.setattr(processes.os, "waitpid", forbid_signal("waitpid"))
+    monkeypatch.setattr(processes.os, "geteuid", lambda: identity.owner_uid)
+    monkeypatch.setattr(
+        processes,
+        "_read_darwin_process_group_members",
+        lambda _process_group_id: (identity.leader_pid,),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        processes,
+        "_read_stable_darwin_process_identity",
+        lambda _leader_pid: (snapshot, identity.session_id),
+    )
+
+    assert processes.reconcile_process_birth(identity) == "current"
+    assert forbidden_calls == []
+
+
+def test_reconcile_process_birth_fails_closed_as_indeterminate_without_signaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _processes()
+    identity = processes.ProcessBirthIdentity.from_record(
+        {
+            "leader_pid": 4242,
+            "process_group_id": 4242,
+            "session_id": 4242,
+            "owner_uid": 501,
+            "started_unix_us": 1_700_000_000_000_001,
+            "argv_sha256": "a" * 64,
+        }
+    )
+    forbidden_calls: list[str] = []
+
+    def forbid_signal(name: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            forbidden_calls.append(name)
+            raise AssertionError(f"reconciliation called {name}")
+
+        return forbidden
+
+    monkeypatch.setattr(processes.os, "killpg", forbid_signal("killpg"))
+    monkeypatch.setattr(processes.os, "kill", forbid_signal("kill"))
+    monkeypatch.setattr(processes.os, "waitpid", forbid_signal("waitpid"))
+    monkeypatch.setattr(processes.os, "geteuid", lambda: identity.owner_uid)
+    monkeypatch.setattr(
+        processes,
+        "_read_darwin_process_group_members",
+        lambda _process_group_id: (identity.leader_pid,),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        processes, "_read_stable_darwin_process_identity", lambda _leader_pid: None
+    )
+
+    assert processes.reconcile_process_birth(identity) == "indeterminate"
+    assert processes.reconcile_process_birth(object()) == "indeterminate"
+    malformed = object.__new__(processes.ProcessBirthIdentity)
+    assert processes.reconcile_process_birth(malformed) == "indeterminate"
+    assert forbidden_calls == []
