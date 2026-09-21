@@ -10,15 +10,19 @@ from queue import Empty
 import socket
 import sqlite3
 import tempfile
-from typing import Protocol, cast
+import threading
+from typing import Callable, Iterator, Protocol, cast
 
 import pytest
 
 from hermes_downloads import ipc, worker
 from hermes_downloads.ipc import (
+    DirectEngineActivateCommand,
+    DirectEngineActivateResult,
     MAX_MESSAGE_BYTES,
     JobsPage,
     PublicJobRecord,
+    activate_direct_engine,
     request_health,
     request_jobs_page,
     set_queue_gate,
@@ -28,6 +32,12 @@ from hermes_downloads.store import SQLiteStore
 
 
 _WATCHDOG_SECONDS = 5.0
+
+
+@pytest.fixture
+def short_socket_root() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        yield Path(temporary_root)
 
 
 class _JoinedProcess(Protocol):
@@ -96,6 +106,256 @@ def _raw_request(
             response.extend(chunk)
             assert len(response) <= MAX_MESSAGE_BYTES
     return json.loads(response)
+
+
+def _serve_one(
+    server: ipc.HealthServer, request: Callable[[], object]
+) -> object:
+    """Issue one client request while the test owns one server dispatch."""
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(request())
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        server.serve_once()
+    finally:
+        thread.join(_WATCHDOG_SECONDS)
+    assert not thread.is_alive()
+    if errors:
+        raise errors[0]
+    assert len(results) == 1
+    return results[0]
+
+
+def _start_response_server(
+    socket_path: Path, response: bytes, requests: list[bytes | None]
+) -> tuple[threading.Thread, list[BaseException]]:
+    """Serve exactly one raw response so client decoding is exercised end-to-end."""
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            connection, _address = listener.accept()
+            with connection:
+                connection.settimeout(_WATCHDOG_SECONDS)
+                requests.append(ipc._read_line(connection))
+                connection.sendall(response)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, errors
+
+
+def test_direct_engine_activate_client_uses_exact_typed_envelope(
+    short_socket_root: Path,
+) -> None:
+    socket_path = short_socket_root / "worker.sock"
+    commands: list[DirectEngineActivateCommand] = []
+
+    def direct_engine_activate(
+        command: DirectEngineActivateCommand,
+    ) -> DirectEngineActivateResult:
+        commands.append(command)
+        return DirectEngineActivateResult(worker_epoch=7, status="active")
+
+    server = ipc.HealthServer(
+        socket_path,
+        health=lambda: ipc.WorkerHealth(worker_epoch=7, queue_gate="paused"),
+        direct_engine_activate=direct_engine_activate,
+    )
+    try:
+        assert _serve_one(
+            server,
+            lambda: activate_direct_engine(socket_path, expected_worker_epoch=7),
+        ) == DirectEngineActivateResult(worker_epoch=7, status="active")
+    finally:
+        server.close()
+
+    assert [command.to_record() for command in commands] == [
+        {"op": "direct_engine_activate", "expected_worker_epoch": 7}
+    ]
+
+
+@pytest.mark.parametrize("status", ("active", "blocked", "stale_epoch"))
+def test_direct_engine_activate_response_is_closed_and_status_limited(
+    status: str,
+) -> None:
+    response = DirectEngineActivateResult(worker_epoch=7, status=status)
+    assert response.to_record() == {"worker_epoch": 7, "status": status}
+    assert DirectEngineActivateResult.from_record(response.to_record()) == response
+
+    for record in (
+        {"worker_epoch": 7},
+        {"worker_epoch": 7, "status": "unexpected"},
+        {"worker_epoch": 7, "status": status, "pid": 123},
+        {"worker_epoch": 0, "status": status},
+        {"worker_epoch": True, "status": status},
+    ):
+        with pytest.raises(ipc.IPCError, match="^ipc_response_invalid$"):
+            DirectEngineActivateResult.from_record(record)
+
+
+def test_direct_engine_activate_server_rejects_invalid_requests_without_invoking_handlers(
+    short_socket_root: Path,
+) -> None:
+    socket_path = short_socket_root / "worker.sock"
+    commands: list[DirectEngineActivateCommand] = []
+
+    def direct_engine_activate(
+        command: DirectEngineActivateCommand,
+    ) -> DirectEngineActivateResult:
+        commands.append(command)
+        return DirectEngineActivateResult(worker_epoch=7, status="active")
+
+    server = ipc.HealthServer(
+        socket_path,
+        health=lambda: ipc.WorkerHealth(worker_epoch=7, queue_gate="paused"),
+        direct_engine_activate=direct_engine_activate,
+    )
+    try:
+        for payload in (
+            b'{"op":"direct_engine_activate"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":0}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":true}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1.0}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"path":"/private"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"executable":"aria2c"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"runtime":"private"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"secret":"secret"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"url":"https://example.test"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"gid":"1234"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"request_id":"request"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"payload_digest":"a"}\n',
+            b'{"op":"direct_engine_activate","expected_worker_epoch":1,"expected_worker_epoch":2}\n',
+        ):
+            assert _serve_one(
+                server, lambda payload=payload: _raw_request(socket_path, payload)
+            ) == {"error": "invalid_request"}
+    finally:
+        server.close()
+    assert commands == []
+
+    other_handler_calls: list[object] = []
+
+    def queue_gate(command: ipc.QueueGateCommand) -> ipc.QueueGateResult:
+        other_handler_calls.append(command)
+        return ipc.QueueGateResult(applied=True, queue_gate="running", revision=1)
+
+    socket_path = short_socket_root / "without-handler.sock"
+    server = ipc.HealthServer(
+        socket_path,
+        health=lambda: ipc.WorkerHealth(worker_epoch=7, queue_gate="paused"),
+        queue_gate=queue_gate,
+    )
+    try:
+        assert _serve_one(
+            server,
+            lambda: _raw_request(
+                socket_path,
+                b'{"op":"direct_engine_activate","expected_worker_epoch":7}\n',
+            ),
+        ) == {"error": "invalid_request"}
+    finally:
+        server.close()
+    assert other_handler_calls == []
+
+
+def test_direct_engine_activate_server_maps_bad_handler_results_to_bounded_conflict(
+    short_socket_root: Path,
+) -> None:
+    handlers: tuple[Callable[[DirectEngineActivateCommand], object], ...] = (
+        lambda _command: {"worker_epoch": 7, "status": "active"},
+        lambda _command: (_ for _ in ()).throw(RuntimeError("private failure")),
+    )
+    for index, direct_engine_activate in enumerate(handlers):
+        socket_path = short_socket_root / f"worker-{index}.sock"
+        server = ipc.HealthServer(
+            socket_path,
+            health=lambda: ipc.WorkerHealth(worker_epoch=7, queue_gate="paused"),
+            direct_engine_activate=cast(
+                Callable[[DirectEngineActivateCommand], DirectEngineActivateResult],
+                direct_engine_activate,
+            ),
+        )
+        try:
+            assert _serve_one(
+                server,
+                lambda: _raw_request(
+                    socket_path,
+                    b'{"op":"direct_engine_activate","expected_worker_epoch":7}\n',
+                ),
+            ) == {"error": "command_conflict"}
+        finally:
+            server.close()
+
+
+def test_health_server_requires_a_callable_direct_engine_activate_handler(
+    short_socket_root: Path,
+) -> None:
+    with pytest.raises(TypeError, match="^direct_engine_activate must be callable$"):
+        ipc.HealthServer(
+            short_socket_root / "worker.sock",
+            health=lambda: ipc.WorkerHealth(worker_epoch=7, queue_gate="paused"),
+            direct_engine_activate=cast(
+                Callable[[DirectEngineActivateCommand], DirectEngineActivateResult],
+                object(),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    (
+        pytest.param(b'{"error":"command_conflict"}\n', "command_conflict", id="conflict"),
+        pytest.param(b'{"error":"invalid_request"}\n', "invalid_request", id="invalid-request"),
+        pytest.param(
+            b'{"worker_epoch":7,"status":"active","pid":123}\n',
+            "ipc_response_invalid",
+            id="extra-field",
+        ),
+        pytest.param(
+            b'{"worker_epoch":7,"status":"active","status":"blocked"}\n',
+            "ipc_response_invalid",
+            id="duplicate-field",
+        ),
+        pytest.param(
+            b'{"worker_epoch":7,"status":"unexpected"}\n',
+            "ipc_response_invalid",
+            id="unknown-status",
+        ),
+    ),
+)
+def test_direct_engine_activate_client_rejects_error_or_nonclosed_response(
+    short_socket_root: Path, response: bytes, error: str
+) -> None:
+    socket_path = short_socket_root / "worker.sock"
+    requests: list[bytes | None] = []
+    thread, errors = _start_response_server(socket_path, response, requests)
+    try:
+        with pytest.raises(ipc.IPCError, match=rf"^{error}$"):
+            activate_direct_engine(socket_path, expected_worker_epoch=7)
+    finally:
+        thread.join(_WATCHDOG_SECONDS)
+        socket_path.unlink(missing_ok=True)
+    assert not thread.is_alive()
+    assert errors == []
+    assert requests == [b'{"expected_worker_epoch":7,"op":"direct_engine_activate"}']
 
 
 def test_worker_jobs_page_ipc_is_empty_and_read_only() -> None:

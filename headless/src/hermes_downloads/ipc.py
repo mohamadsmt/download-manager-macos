@@ -15,6 +15,8 @@ from typing import Callable, Final, Mapping
 from hermes_downloads.models import JobState
 
 __all__ = [
+    "DirectEngineActivateCommand",
+    "DirectEngineActivateResult",
     "HealthServer",
     "IPCError",
     "IPCStateError",
@@ -24,6 +26,7 @@ __all__ = [
     "QueueGateCommand",
     "QueueGateResult",
     "WorkerHealth",
+    "activate_direct_engine",
     "request_health",
     "request_jobs_page",
     "set_queue_gate",
@@ -44,6 +47,9 @@ _COMMAND_CONFLICT: Final = {"error": "command_conflict"}
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_COUNTER: Final = (1 << 63) - 1
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
+_DIRECT_ENGINE_ACTIVATE_STATUSES: Final = frozenset(
+    {"active", "blocked", "stale_epoch"}
+)
 
 
 class IPCError(RuntimeError):
@@ -84,6 +90,21 @@ def _require_counter(value: object, name: str) -> int:
         raise TypeError(f"{name} must be an integer")
     if not 0 <= value <= _MAX_COUNTER:
         raise ValueError(f"{name} must be a nonnegative persisted counter")
+    return value
+
+
+def _require_positive_counter(value: object, name: str) -> int:
+    value = _require_counter(value, name)
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive persisted counter")
+    return value
+
+
+def _require_direct_engine_activate_status(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("status must be a string")
+    if value not in _DIRECT_ENGINE_ACTIVATE_STATUSES:
+        raise ValueError("status is not a direct-engine activation status")
     return value
 
 
@@ -129,6 +150,71 @@ class WorkerHealth:
             raise IPCError("ipc_response_invalid")
         try:
             return cls(worker_epoch=worker_epoch, queue_gate=queue_gate)
+        except (TypeError, ValueError):
+            raise IPCError("ipc_response_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class DirectEngineActivateCommand:
+    """One fixed direct-engine activation request, fenced by worker epoch."""
+
+    expected_worker_epoch: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "expected_worker_epoch",
+            _require_positive_counter(
+                self.expected_worker_epoch, "expected_worker_epoch"
+            ),
+        )
+
+    def to_record(self) -> dict[str, int | str]:
+        return {
+            "op": "direct_engine_activate",
+            "expected_worker_epoch": self.expected_worker_epoch,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "DirectEngineActivateCommand":
+        if type(record) is not dict or set(record) != {
+            "op",
+            "expected_worker_epoch",
+        }:
+            raise ValueError("direct-engine activation request is invalid")
+        if record["op"] != "direct_engine_activate":
+            raise ValueError("direct-engine activation request is invalid")
+        return cls(expected_worker_epoch=record["expected_worker_epoch"])
+
+
+@dataclass(frozen=True, slots=True)
+class DirectEngineActivateResult:
+    """The bounded direct-engine activation readback."""
+
+    worker_epoch: int
+    status: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "worker_epoch",
+            _require_positive_counter(self.worker_epoch, "worker_epoch"),
+        )
+        object.__setattr__(
+            self,
+            "status",
+            _require_direct_engine_activate_status(self.status),
+        )
+
+    def to_record(self) -> dict[str, int | str]:
+        return {"worker_epoch": self.worker_epoch, "status": self.status}
+
+    @classmethod
+    def from_record(cls, record: object) -> "DirectEngineActivateResult":
+        if type(record) is not dict or set(record) != {"worker_epoch", "status"}:
+            raise IPCError("ipc_response_invalid")
+        try:
+            return cls(worker_epoch=record["worker_epoch"], status=record["status"])
         except (TypeError, ValueError):
             raise IPCError("ipc_response_invalid") from None
 
@@ -419,6 +505,15 @@ def _decode_queue_gate_request(request: object) -> QueueGateCommand | None:
         return None
 
 
+def _decode_direct_engine_activate_request(
+    request: object,
+) -> DirectEngineActivateCommand | None:
+    try:
+        return DirectEngineActivateCommand.from_record(request)
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 class HealthServer:
     """A one-request AF_UNIX listener owned and serviced by the worker thread."""
 
@@ -429,6 +524,10 @@ class HealthServer:
         health: Callable[[], WorkerHealth],
         jobs_page: Callable[[str | None], JobsPage] | None = None,
         queue_gate: Callable[[QueueGateCommand], QueueGateResult] | None = None,
+        direct_engine_activate: Callable[
+            [DirectEngineActivateCommand], DirectEngineActivateResult
+        ]
+        | None = None,
     ) -> None:
         self.socket_path = validate_available_socket_path(socket_path)
         if not callable(health):
@@ -437,6 +536,8 @@ class HealthServer:
             raise TypeError("jobs_page must be callable")
         if queue_gate is not None and not callable(queue_gate):
             raise TypeError("queue_gate must be callable")
+        if direct_engine_activate is not None and not callable(direct_engine_activate):
+            raise TypeError("direct_engine_activate must be callable")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         socket_identity: tuple[int, int] | None = None
         try:
@@ -459,6 +560,7 @@ class HealthServer:
         self._health = health
         self._jobs_page = jobs_page
         self._queue_gate = queue_gate
+        self._direct_engine_activate = direct_engine_activate
         self._listener = listener
         self._identity = socket_identity
 
@@ -488,16 +590,35 @@ class HealthServer:
                             page.to_record(), maximum_bytes=_MAX_RESPONSE_BYTES
                         )
                     else:
-                        command = _decode_queue_gate_request(request)
-                        if command is None or self._queue_gate is None:
-                            response = _encoded_record(_INVALID_REQUEST)
+                        direct_engine_command = _decode_direct_engine_activate_request(
+                            request
+                        )
+                        if direct_engine_command is not None:
+                            if self._direct_engine_activate is None:
+                                response = _encoded_record(_INVALID_REQUEST)
+                            else:
+                                try:
+                                    result = self._direct_engine_activate(
+                                        direct_engine_command
+                                    )
+                                    if type(result) is not DirectEngineActivateResult:
+                                        raise TypeError(
+                                            "direct_engine_activate result is invalid"
+                                        )
+                                    response = _encoded_record(result.to_record())
+                                except Exception:
+                                    response = _encoded_record(_COMMAND_CONFLICT)
                         else:
-                            try:
-                                response = _encoded_record(
-                                    self._queue_gate(command).to_record()
-                                )
-                            except Exception:
-                                response = _encoded_record(_COMMAND_CONFLICT)
+                            command = _decode_queue_gate_request(request)
+                            if command is None or self._queue_gate is None:
+                                response = _encoded_record(_INVALID_REQUEST)
+                            else:
+                                try:
+                                    response = _encoded_record(
+                                        self._queue_gate(command).to_record()
+                                    )
+                                except Exception:
+                                    response = _encoded_record(_COMMAND_CONFLICT)
             except (IPCStateError, TypeError, ValueError):
                 response = _encoded_record(_INVALID_REQUEST)
             try:
@@ -617,3 +738,35 @@ def set_queue_gate(
     if record == _COMMAND_CONFLICT:
         raise IPCError("command_conflict")
     return QueueGateResult.from_record(record)
+
+
+def activate_direct_engine(
+    socket_path: Path, *, expected_worker_epoch: int
+) -> DirectEngineActivateResult:
+    """Request one worker-epoch-fenced direct-engine activation."""
+
+    path = _require_socket_path(socket_path)
+    command = DirectEngineActivateCommand(expected_worker_epoch=expected_worker_epoch)
+    request = _encoded_record(command.to_record())
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(_CLIENT_TIMEOUT_SECONDS)
+        try:
+            client.connect(str(path))
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            response = _read_line(client)
+        except (OSError, TimeoutError):
+            raise IPCError("ipc_unavailable") from None
+    if response is None:
+        raise IPCError("ipc_response_invalid")
+    try:
+        record = json.loads(
+            response.decode("utf-8"), object_pairs_hook=_reject_duplicate_object_keys
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
+        raise IPCError("ipc_response_invalid") from None
+    if record == _COMMAND_CONFLICT:
+        raise IPCError("command_conflict")
+    if record == _INVALID_REQUEST:
+        raise IPCError("invalid_request")
+    return DirectEngineActivateResult.from_record(record)
