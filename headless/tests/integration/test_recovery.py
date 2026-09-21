@@ -3,16 +3,88 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 from pathlib import Path
 from queue import Empty
+import subprocess
+import sys
+import textwrap
+from typing import Protocol
 
 import pytest
 
 from hermes_downloads import worker
-from hermes_downloads.store import SQLiteStore
+from hermes_downloads.processes import ProcessBirthIdentity
+from hermes_downloads.store import DirectEngineRecord, SQLiteStore
 
 
 _WATCHDOG_SECONDS = 5.0
+
+_COLD_WORKER_PROGRAM = textwrap.dedent(
+    """
+    import builtins
+    import os
+    from pathlib import Path
+    import stat
+    import subprocess
+    import sys
+    import threading
+
+    state_root = Path(sys.argv[1])
+    root_stat = state_root.lstat()
+    assert state_root.is_absolute()
+    assert stat.S_ISDIR(root_stat.st_mode)
+    assert root_stat.st_uid == os.geteuid()
+    assert stat.S_IMODE(root_stat.st_mode) == 0o700
+    assert not {
+        "hermes_downloads.worker",
+        "hermes_downloads.direct",
+        "hermes_downloads.video",
+    } & sys.modules.keys()
+
+    blocked_imports = []
+    launches = []
+    original_import = builtins.__import__
+    original_popen = subprocess.Popen
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name in {"hermes_downloads.direct", "hermes_downloads.video"}:
+            blocked_imports.append(name)
+            raise AssertionError("cold recovery imported an engine module")
+        return original_import(name, globals, locals, fromlist, level)
+
+    def forbidden_popen(*args, **kwargs):
+        launches.append((args, kwargs))
+        raise AssertionError("cold recovery launched an engine process")
+
+    builtins.__import__ = guarded_import
+    subprocess.Popen = forbidden_popen
+    try:
+        from hermes_downloads import worker
+
+        assert Path(worker.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+        shutdown = threading.Event()
+        shutdown.set()
+        ready = threading.Event()
+        stopped = threading.Event()
+        assert worker.run_worker(
+            state_root,
+            ready_event=ready,
+            shutdown_event=shutdown,
+            stopped_event=stopped,
+        ) is None
+        assert ready.is_set()
+        assert stopped.is_set()
+    finally:
+        subprocess.Popen = original_popen
+        builtins.__import__ = original_import
+
+    assert not {"hermes_downloads.direct", "hermes_downloads.video"} & sys.modules.keys()
+    assert blocked_imports == []
+    assert launches == []
+    assert sorted(path.name for path in state_root.iterdir()) == [".worker.lock", "state.db"]
+    """
+)
 
 
 def _run_worker_process(
@@ -42,13 +114,61 @@ def _result(results: object) -> tuple[object, ...]:
         pytest.fail("worker process did not report an outcome")
 
 
-def _join(process: multiprocessing.Process) -> None:
+class _JoinedProcess(Protocol):
+    @property
+    def exitcode(self) -> int | None: ...
+
+    def is_alive(self) -> bool: ...
+
+    def join(self, timeout: float | None = None) -> None: ...
+
+    def terminate(self) -> None: ...
+
+
+def _join(process: _JoinedProcess) -> None:
     process.join(_WATCHDOG_SECONDS)
     if process.is_alive():
         process.terminate()
         process.join(_WATCHDOG_SECONDS)
         pytest.fail("worker process did not stop after its shutdown handshake")
     assert process.exitcode == 0
+
+
+def test_cold_worker_import_is_guarded_before_lazy_engine_activation(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "cold-worker-state"
+    scratch = tmp_path / "cold-worker-scratch"
+    for path in (state_root, scratch):
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    environment["HERMES_DOWNLOADS_DISABLE_NETWORK"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONNOUSERSITE"] = "1"
+    assert "PYTHONPATH" not in environment
+    assert "PYTHONHOME" not in environment
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _COLD_WORKER_PROGRAM, str(state_root)],
+            cwd=scratch,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=_WATCHDOG_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("cold guarded worker subprocess did not stop")
+    assert completed.returncode == 0, (
+        "cold guarded worker subprocess failed:\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
 
 
 def test_worker_lifecycle_recovers_before_ready_and_stops_on_shutdown_event(
@@ -314,6 +434,57 @@ def test_restarted_worker_does_not_import_or_start_engines(
         assert store.worker_epoch() == 2
     finally:
         store.close()
+
+
+def test_restarted_worker_preserves_a_prior_direct_record_without_importing_engines(
+    private_roots: dict[str, Path],
+) -> None:
+    state_root = private_roots["state"]
+    prior = DirectEngineRecord(
+        worker_epoch=1,
+        identity=ProcessBirthIdentity(
+            leader_pid=999_991,
+            process_group_id=999_991,
+            session_id=999_991,
+            owner_uid=os.geteuid(),
+            started_unix_us=1,
+            argv_sha256="a" * 64,
+        ),
+    )
+    seeded = SQLiteStore(state_root / "state.db")
+    try:
+        assert seeded.recover_cold_start() == 1
+        seeded.set_direct_engine_record(prior)
+    finally:
+        seeded.close()
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    restarted = context.Process(
+        target=_run_worker_process_with_engine_imports_forbidden,
+        args=(str(state_root), ready, shutdown, stopped, results),
+    )
+    restarted.start()
+    try:
+        assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+        shutdown.set()
+        assert stopped.wait(_WATCHDOG_SECONDS)
+        _join(restarted)
+        assert _result(results) == ("result", None)
+    finally:
+        shutdown.set()
+        if restarted.is_alive():
+            _join(restarted)
+
+    recovered = SQLiteStore(state_root / "state.db")
+    try:
+        assert recovered.worker_epoch() == 2
+        assert recovered.get_direct_engine_record() == prior
+    finally:
+        recovered.close()
 
 
 def _exit_unrelated_client() -> None:
