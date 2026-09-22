@@ -200,6 +200,14 @@ def _create_v4_database(database_path: Path) -> tuple[object, ...]:
     return legacy_job
 
 
+def _create_v5_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v4_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._ENGINE_INSTANCES_SCHEMA)
+        connection.execute("PRAGMA user_version = 5")
+    return legacy_job
+
+
 def _process_birth_identity(**overrides: Any) -> ProcessBirthIdentity:
     values: dict[str, int | str] = {
         "leader_pid": 4242,
@@ -1088,7 +1096,7 @@ def test_cold_recovery_epoch_survives_reopen(tmp_path: Path) -> None:
         final.close()
 
 
-def test_v5_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+def test_v6_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     expected_legacy_job = _create_v1_database(database_path)
     legacy_source_url = expected_legacy_job[1]
@@ -1108,7 +1116,7 @@ def test_v5_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1117,16 +1125,17 @@ def test_v5_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
             """
         ).fetchone() == expected_legacy_job
     v1_tables = {"settings", "jobs", "commands", "events"}
-    v5_tables = _table_names(database_path)
-    assert v1_tables <= v5_tables
+    v6_tables = _table_names(database_path)
+    assert v1_tables <= v6_tables
     assert {
         "collection_holds",
         "job_retry",
         "job_retry_audit",
         "queue_commands",
         "engine_instances",
-    } <= v5_tables
-    assert len(v5_tables - v1_tables) >= 6
+        "direct_engine_activation_fences",
+    } <= v6_tables
+    assert len(v6_tables - v1_tables) >= 7
 
 
 def test_v2_migration_failure_leaves_v1_database_unchanged(
@@ -1209,7 +1218,7 @@ def test_v3_migration_failure_leaves_v2_database_unchanged(
     }
 
 
-def test_v5_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+def test_v6_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     expected_legacy_job = _create_v3_database(database_path)
     legacy_source_url = expected_legacy_job[1]
@@ -1229,7 +1238,7 @@ def test_v5_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         schema = connection.execute(
             """
             SELECT sql
@@ -1254,6 +1263,7 @@ def test_v5_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         )
     assert "queue_commands" in _table_names(database_path)
     assert "engine_instances" in _table_names(database_path)
+    assert "direct_engine_activation_fences" in _table_names(database_path)
 
 
 def test_v4_migration_failure_leaves_v3_database_unchanged(
@@ -1435,17 +1445,17 @@ def test_v0_rejects_sqlite_prefix_lookalike_before_bootstrap_writes(tmp_path: Pa
     assert _table_names(database_path) == {lookalike}
 
 
-def test_v5_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v6_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 6")
+        connection.execute("PRAGMA user_version = 7")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1604,7 +1614,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1657,6 +1667,591 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         assert reopened.get_direct_engine_record() == updated
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize(
+    "legacy_builder",
+    (
+        _create_v1_database,
+        _create_v2_database,
+        _create_v3_database,
+        _create_v4_database,
+        _create_v5_database,
+    ),
+    ids=("v1", "v2", "v3", "v4", "v5"),
+)
+def test_v6_migrates_every_supported_legacy_schema_to_the_exact_catalog(
+    tmp_path: Path, legacy_builder: Any
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = legacy_builder(database_path)
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_job("legacy-job") == store_module.JobRecord(
+            job="legacy-job",
+            source_url=expected_legacy_job[1],
+            generation=23,
+            revision=41,
+            state="downloading",
+        )
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V6_TABLE_SCHEMAS
+
+
+def test_v6_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v5_database(database_path)
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    with sqlite3.connect(database_path) as connection:
+        identity = record.identity
+        connection.execute(
+            """
+            INSERT INTO engine_instances (
+                engine_kind,
+                worker_epoch,
+                leader_pid,
+                process_group_id,
+                session_id,
+                owner_uid,
+                started_unix_us,
+                argv_sha256
+            )
+            VALUES ('direct', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.worker_epoch,
+                identity.leader_pid,
+                identity.process_group_id,
+                identity.session_id,
+                identity.owner_uid,
+                identity.started_unix_us,
+                identity.argv_sha256,
+            ),
+        )
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_direct_engine_record() == record
+        assert store.get_direct_engine_activation_fence() is None
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(direct_engine_activation_fences)"
+            ).fetchall()
+        ] == ["engine_kind", "worker_epoch", "reservation_token"]
+
+
+def test_v6_migration_ddl_failure_rolls_back_to_the_v5_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v5_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_migration_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="CREATE TABLE direct_engine_activation_fences",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_migration_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V5_TABLE_SCHEMAS
+
+
+def test_v6_migration_version_bump_failure_rolls_back_activation_fence_ddl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v5_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_version_bump_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="PRAGMA user_version = 6",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_version_bump_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V5_TABLE_SCHEMAS
+
+
+def test_v6_rejects_activation_fence_schema_missing_reservation_token_before_bootstrap_writes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v5_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE direct_engine_activation_fences (
+                engine_kind TEXT PRIMARY KEY NOT NULL CHECK (engine_kind = 'direct'),
+                worker_epoch INTEGER NOT NULL CHECK (worker_epoch > 0)
+            )
+            """
+        )
+        connection.execute("PRAGMA user_version = 6")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(direct_engine_activation_fences)"
+            ).fetchall()
+        ] == ["engine_kind", "worker_epoch"]
+    assert _table_names(database_path) == {
+        *store_module._V5_TABLE_SCHEMAS,
+        "direct_engine_activation_fences",
+    }
+
+
+def test_v6_rejects_unknown_current_table_before_bootstrap_writes(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v5_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE direct_engine_activation_fences (
+                engine_kind TEXT PRIMARY KEY NOT NULL CHECK (engine_kind = 'direct'),
+                worker_epoch INTEGER NOT NULL CHECK (worker_epoch > 0),
+                reservation_token TEXT NOT NULL CHECK (
+                    length(reservation_token) = 64
+                    AND reservation_token NOT GLOB '*[^0-9a-f]*'
+                )
+            )
+            """
+        )
+        connection.execute("CREATE TABLE unexpected_v6_table (value TEXT NOT NULL)")
+        connection.execute("PRAGMA user_version = 6")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert _table_names(database_path) == {
+        *store_module._V5_TABLE_SCHEMAS,
+        "direct_engine_activation_fences",
+        "unexpected_v6_table",
+    }
+
+
+def test_v6_rejects_unknown_current_trigger_before_bootstrap_writes(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v5_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE direct_engine_activation_fences (
+                engine_kind TEXT PRIMARY KEY NOT NULL CHECK (engine_kind = 'direct'),
+                worker_epoch INTEGER NOT NULL CHECK (worker_epoch > 0),
+                reservation_token TEXT NOT NULL CHECK (
+                    length(reservation_token) = 64
+                    AND reservation_token NOT GLOB '*[^0-9a-f]*'
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER unexpected_v6_trigger
+            BEFORE INSERT ON direct_engine_activation_fences
+            BEGIN
+                SELECT RAISE(FAIL, 'unexpected trigger');
+            END
+            """
+        )
+        connection.execute("PRAGMA user_version = 6")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall() == [("unexpected_v6_trigger",)]
+
+
+def test_direct_engine_activation_fence_requires_a_positive_worker_epoch() -> None:
+    with pytest.raises((TypeError, ValueError)):
+        store_module.DirectEngineActivationFence(
+            worker_epoch=0, reservation_token="a" * 64
+        )
+
+
+def test_direct_engine_activation_fence_carries_a_fixed_lowercase_hex_token() -> None:
+    fence = store_module.DirectEngineActivationFence(
+        worker_epoch=1, reservation_token="a" * 64
+    )
+
+    assert fence.reservation_token == "a" * 64
+
+
+@pytest.mark.parametrize("reservation_token", ("a" * 63, "A" * 64, b"a" * 64))
+def test_direct_engine_activation_fence_rejects_an_invalid_reservation_token(
+    reservation_token: Any,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        store_module.DirectEngineActivationFence(
+            worker_epoch=1, reservation_token=reservation_token
+        )
+
+
+def test_direct_engine_activation_reservation_is_durable_and_conflicts_nonthrowingly(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    try:
+        assert store.recover_cold_start() == 1
+        reserved = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert reserved is not None
+        assert reserved.worker_epoch == 1
+        assert type(reserved.reservation_token) is str
+        assert len(reserved.reservation_token) == 64
+        assert set(reserved.reservation_token) <= set("0123456789abcdef")
+        assert store.get_direct_engine_activation_fence() == reserved
+        assert store.reserve_direct_engine_activation(worker_epoch=1) is None
+        assert store.get_direct_engine_record() is None
+    finally:
+        store.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.get_direct_engine_activation_fence() == reserved
+        assert reopened.get_direct_engine_record() is None
+    finally:
+        reopened.close()
+
+
+def test_direct_engine_activation_reservation_requires_current_epoch_and_no_record(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.recover_cold_start() == 1
+        with pytest.raises(ValueError, match="current"):
+            store.reserve_direct_engine_activation(worker_epoch=2)
+        assert store.get_direct_engine_activation_fence() is None
+
+        record = store_module.DirectEngineRecord(
+            worker_epoch=1, identity=_process_birth_identity()
+        )
+        store.set_direct_engine_record(record)
+        assert store.reserve_direct_engine_activation(worker_epoch=1) is None
+        assert store.get_direct_engine_activation_fence() is None
+        assert store.get_direct_engine_record() == record
+    finally:
+        store.close()
+
+
+def test_direct_engine_activation_fence_compare_and_clear_preserves_a_stale_fence(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.recover_cold_start() == 1
+        fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert fence is not None
+        assert store.clear_direct_engine_activation_fence(
+            store_module.DirectEngineActivationFence(
+                worker_epoch=2, reservation_token="a" * 64
+            )
+        ) is False
+        assert store.get_direct_engine_activation_fence() == fence
+
+        assert store.recover_cold_start() == 2
+        assert store.reserve_direct_engine_activation(worker_epoch=2) is None
+        assert store.clear_direct_engine_activation_fence(fence) is True
+        assert store.get_direct_engine_activation_fence() is None
+        replacement = store.reserve_direct_engine_activation(worker_epoch=2)
+        assert replacement is not None
+        assert replacement.worker_epoch == 2
+    finally:
+        store.close()
+
+
+def test_direct_engine_activation_bind_converts_the_exact_current_fence_atomically(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    try:
+        assert store.recover_cold_start() == 1
+        fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert fence is not None
+
+        store.bind_direct_engine_activation_fence(fence, record)
+
+        assert store.get_direct_engine_activation_fence() is None
+        assert store.get_direct_engine_record() == record
+    finally:
+        store.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.get_direct_engine_activation_fence() is None
+        assert reopened.get_direct_engine_record() == record
+    finally:
+        reopened.close()
+
+
+def test_direct_engine_activation_fence_rejects_a_stale_same_epoch_clear_after_rereservation(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.recover_cold_start() == 1
+        delayed_fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert delayed_fence is not None
+        assert store.clear_direct_engine_activation_fence(delayed_fence) is True
+        current_fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert current_fence is not None
+
+        assert store.clear_direct_engine_activation_fence(delayed_fence) is False
+        assert store.get_direct_engine_activation_fence() == current_fence
+        assert store.get_direct_engine_record() is None
+    finally:
+        store.close()
+
+
+def test_direct_engine_activation_fence_rejects_a_stale_same_epoch_bind_after_rereservation(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    try:
+        assert store.recover_cold_start() == 1
+        delayed_fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert delayed_fence is not None
+        assert store.clear_direct_engine_activation_fence(delayed_fence) is True
+        current_fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert current_fence is not None
+
+        with pytest.raises(ValueError, match="fence"):
+            store.bind_direct_engine_activation_fence(delayed_fence, record)
+        assert store.get_direct_engine_activation_fence() == current_fence
+        assert store.get_direct_engine_record() is None
+    finally:
+        store.close()
+
+
+def test_direct_engine_record_write_rejects_a_live_activation_fence_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    try:
+        assert store.recover_cold_start() == 1
+        fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert fence is not None
+
+        with pytest.raises(ValueError, match="fence"):
+            store.set_direct_engine_record(record)
+        assert store.get_direct_engine_activation_fence() == fence
+        assert store.get_direct_engine_record() is None
+    finally:
+        store.close()
+
+
+def test_direct_engine_activation_bind_rejects_a_current_record_without_mutating_either(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    initial_identity = _process_birth_identity()
+    initial = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=initial_identity
+    )
+    replacement = replace(
+        initial,
+        identity=_process_birth_identity(
+            started_unix_us=initial_identity.started_unix_us + 1,
+            argv_sha256="b" * 64,
+        ),
+    )
+    fence = store_module.DirectEngineActivationFence(
+        worker_epoch=1, reservation_token="c" * 64
+    )
+    try:
+        assert store.recover_cold_start() == 1
+        store.set_direct_engine_record(initial)
+        store._connection.execute(
+            """
+            INSERT INTO direct_engine_activation_fences (
+                engine_kind, worker_epoch, reservation_token
+            )
+            VALUES ('direct', ?, ?)
+            """,
+            (fence.worker_epoch, fence.reservation_token),
+        )
+
+        with pytest.raises(ValueError, match="record"):
+            store.bind_direct_engine_activation_fence(fence, replacement)
+        assert store.get_direct_engine_activation_fence() == fence
+        assert store.get_direct_engine_record() == initial
+    finally:
+        store.close()
+
+
+def test_direct_engine_activation_bind_requires_the_exact_current_fence_and_epoch(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.recover_cold_start() == 1
+        fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert fence is not None
+        record = store_module.DirectEngineRecord(
+            worker_epoch=1, identity=_process_birth_identity()
+        )
+
+        with pytest.raises(ValueError, match="fence"):
+            store.bind_direct_engine_activation_fence(
+                store_module.DirectEngineActivationFence(
+                    worker_epoch=2, reservation_token="b" * 64
+                ),
+                record,
+            )
+        assert store.get_direct_engine_activation_fence() == fence
+        assert store.get_direct_engine_record() is None
+
+        assert store.recover_cold_start() == 2
+        with pytest.raises(ValueError, match="current"):
+            store.bind_direct_engine_activation_fence(fence, record)
+        assert store.get_direct_engine_activation_fence() == fence
+        assert store.get_direct_engine_record() is None
+    finally:
+        store.close()
+
+
+def test_direct_engine_activation_reservation_rolls_back_when_fence_insert_fails(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    try:
+        assert store.recover_cold_start() == 1
+        _install_failing_insert_trigger(
+            database_path,
+            table="direct_engine_activation_fences",
+            trigger_name="fail_direct_activation_fence_insert",
+            message="injected direct activation fence insert failure",
+        )
+
+        with pytest.raises(
+            sqlite3.DatabaseError, match="injected direct activation fence insert failure"
+        ):
+            store.reserve_direct_engine_activation(worker_epoch=1)
+
+        assert store.get_direct_engine_activation_fence() is None
+        assert store.get_direct_engine_record() is None
+        store._connection.execute("DROP TRIGGER fail_direct_activation_fence_insert")
+        reserved = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert reserved is not None
+        assert reserved.worker_epoch == 1
+    finally:
+        store.close()
+
+
+def test_direct_engine_activation_bind_rolls_back_record_insert_when_fence_delete_fails(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    try:
+        assert store.recover_cold_start() == 1
+        fence = store.reserve_direct_engine_activation(worker_epoch=1)
+        assert fence is not None
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER fail_direct_activation_fence_delete
+                BEFORE DELETE ON direct_engine_activation_fences
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected direct activation fence delete failure');
+                END
+                """
+            )
+
+        with pytest.raises(
+            sqlite3.DatabaseError, match="injected direct activation fence delete failure"
+        ):
+            store.bind_direct_engine_activation_fence(fence, record)
+
+        assert store.get_direct_engine_activation_fence() == fence
+        assert store.get_direct_engine_record() is None
+        store._connection.execute("DROP TRIGGER fail_direct_activation_fence_delete")
+        store.bind_direct_engine_activation_fence(fence, record)
+        assert store.get_direct_engine_activation_fence() is None
+        assert store.get_direct_engine_record() == record
+    finally:
+        store.close()
 
 
 def test_materialized_domain_apply_add_reopens_exact_projection(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 from typing import Final
 
@@ -22,6 +23,7 @@ from hermes_downloads.retry import (
 __all__ = [
     "CommandRecord",
     "CommandResult",
+    "DirectEngineActivationFence",
     "DirectEngineRecord",
     "EventRecord",
     "JobPageRecord",
@@ -137,6 +139,17 @@ CREATE TABLE engine_instances (
 );
 """
 
+_DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA: Final = """
+CREATE TABLE direct_engine_activation_fences (
+    engine_kind TEXT PRIMARY KEY NOT NULL CHECK (engine_kind = 'direct'),
+    worker_epoch INTEGER NOT NULL CHECK (worker_epoch > 0),
+    reservation_token TEXT NOT NULL CHECK (
+        length(reservation_token) = 64
+        AND reservation_token NOT GLOB '*[^0-9a-f]*'
+    )
+);
+"""
+
 
 def _normalize_table_schema(schema: str) -> str:
     """Canonicalize static SQLite DDL for exact current-version validation."""
@@ -163,7 +176,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 5
+_SUPPORTED_SCHEMA_VERSION: Final = 6
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -195,6 +208,16 @@ _V5_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _JOB_RETRY_AUDIT_SCHEMA,
     _QUEUE_COMMANDS_SCHEMA,
     _ENGINE_INSTANCES_SCHEMA,
+)
+_V6_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
 )
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
@@ -257,6 +280,14 @@ def _require_worker_epoch(value: object, name: str) -> int:
     if epoch == 0:
         raise ValueError(f"{name} must be a positive worker epoch")
     return epoch
+
+
+def _require_reservation_token(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("reservation_token must be a string")
+    if _SHA256_DIGEST.fullmatch(value) is None:
+        raise ValueError("reservation_token must be 64 lowercase hexadecimal characters")
+    return value
 
 
 def _require_process_birth_identity(value: object) -> ProcessBirthIdentity:
@@ -362,6 +393,22 @@ class EventRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectEngineActivationFence:
+    """A durable direct-engine launch claim for one worker epoch."""
+
+    worker_epoch: int
+    reservation_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "worker_epoch", _require_worker_epoch(self.worker_epoch, "worker_epoch")
+        )
+        object.__setattr__(
+            self, "reservation_token", _require_reservation_token(self.reservation_token)
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class DirectEngineRecord:
     """One direct-engine process identity bound to its owning worker epoch."""
 
@@ -388,7 +435,7 @@ class SQLiteStore:
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
-            self._migrate_schema_v5(connection)
+            self._migrate_schema_v6(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -417,6 +464,7 @@ class SQLiteStore:
             3: _V3_TABLE_SCHEMAS,
             4: _V4_TABLE_SCHEMAS,
             5: _V5_TABLE_SCHEMAS,
+            6: _V6_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -447,8 +495,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v5(connection: sqlite3.Connection) -> None:
-        """Apply additive v2 through v5 schema migrations in one transaction."""
+    def _migrate_schema_v6(connection: sqlite3.Connection) -> None:
+        """Apply additive v2 through v6 schema migrations in one transaction."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -478,10 +526,16 @@ class SQLiteStore:
                 if not SQLiteStore._has_table_schemas(connection, _V4_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
                 connection.execute(_ENGINE_INSTANCES_SCHEMA)
-                connection.execute(f"PRAGMA user_version = {_SUPPORTED_SCHEMA_VERSION}")
-                version = _SUPPORTED_SCHEMA_VERSION
-            if version == _SUPPORTED_SCHEMA_VERSION:
+                connection.execute("PRAGMA user_version = 5")
+                version = 5
+            if version == 5:
                 if not SQLiteStore._has_table_schemas(connection, _V5_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA)
+                connection.execute("PRAGMA user_version = 6")
+                version = 6
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V6_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1207,6 +1261,223 @@ class SQLiteStore:
             raise ValueError("persisted worker epoch is invalid")
         return _require_worker_epoch(epoch, "worker epoch")
 
+    def reserve_direct_engine_activation(
+        self, *, worker_epoch: int
+    ) -> DirectEngineActivationFence | None:
+        """Durably claim one current epoch before any direct-engine launch.
+
+        ``None`` is a non-throwing conflict: another direct record or launch fence
+        already exists, so callers must treat direct activation as blocked.
+        """
+
+        worker_epoch = _require_worker_epoch(worker_epoch, "worker_epoch")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._current_worker_epoch(connection) != worker_epoch:
+                raise ValueError("direct engine activation worker epoch is not current")
+            direct_record = connection.execute(
+                "SELECT 1 FROM engine_instances WHERE engine_kind = 'direct' LIMIT 1"
+            ).fetchone()
+            existing_fence = connection.execute(
+                """
+                SELECT 1
+                FROM direct_engine_activation_fences
+                WHERE engine_kind = 'direct'
+                LIMIT 1
+                """
+            ).fetchone()
+            if direct_record is not None or existing_fence is not None:
+                result = None
+            else:
+                result = DirectEngineActivationFence(
+                    worker_epoch=worker_epoch,
+                    reservation_token=secrets.token_hex(32),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO direct_engine_activation_fences (
+                        engine_kind, worker_epoch, reservation_token
+                    )
+                    VALUES ('direct', ?, ?)
+                    """,
+                    (worker_epoch, result.reservation_token),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return result
+
+    def get_direct_engine_activation_fence(self) -> DirectEngineActivationFence | None:
+        """Read the exact durable direct-engine launch fence, if one exists."""
+
+        rows = self._connection.execute(
+            """
+            SELECT engine_kind, worker_epoch, reservation_token
+            FROM direct_engine_activation_fences
+            LIMIT 2
+            """
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("direct engine activation fence is not unique")
+        row = rows[0]
+        if _require_sqlite_text(row["engine_kind"], "engine kind") != "direct":
+            raise ValueError("persisted direct engine activation fence kind is invalid")
+        try:
+            return DirectEngineActivationFence(
+                worker_epoch=_require_worker_epoch(
+                    _require_sqlite_integer(row["worker_epoch"], "worker epoch"),
+                    "worker epoch",
+                ),
+                reservation_token=_require_reservation_token(
+                    _require_sqlite_text(row["reservation_token"], "reservation token")
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("persisted direct engine activation fence is invalid") from error
+
+    def clear_direct_engine_activation_fence(
+        self, fence: DirectEngineActivationFence
+    ) -> bool:
+        """Compare and clear only the exact direct-engine activation fence."""
+
+        if type(fence) is not DirectEngineActivationFence:
+            raise TypeError("fence must be a DirectEngineActivationFence")
+        fence = DirectEngineActivationFence(
+            worker_epoch=fence.worker_epoch,
+            reservation_token=fence.reservation_token,
+        )
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                DELETE FROM direct_engine_activation_fences
+                WHERE engine_kind = 'direct'
+                  AND worker_epoch = ?
+                  AND reservation_token = ?
+                """,
+                (fence.worker_epoch, fence.reservation_token),
+            )
+            changed = connection.execute("SELECT changes()").fetchone()
+            if changed is None or type(changed[0]) is not int or changed[0] not in {0, 1}:
+                raise RuntimeError("direct engine activation fence delete is invalid")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return bool(changed[0])
+
+    def bind_direct_engine_activation_fence(
+        self, fence: DirectEngineActivationFence, record: DirectEngineRecord
+    ) -> None:
+        """Atomically replace one reserved fence with its direct-engine identity."""
+
+        if type(fence) is not DirectEngineActivationFence:
+            raise TypeError("fence must be a DirectEngineActivationFence")
+        if type(record) is not DirectEngineRecord:
+            raise TypeError("record must be a DirectEngineRecord")
+        fence = DirectEngineActivationFence(
+            worker_epoch=fence.worker_epoch,
+            reservation_token=fence.reservation_token,
+        )
+        record = DirectEngineRecord(
+            worker_epoch=record.worker_epoch,
+            identity=record.identity,
+        )
+        if record.worker_epoch != fence.worker_epoch:
+            raise ValueError(
+                "direct engine record worker epoch does not match activation fence"
+            )
+
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._current_worker_epoch(connection) != fence.worker_epoch:
+                raise ValueError("direct engine activation fence worker epoch is not current")
+            fence_rows = connection.execute(
+                """
+                SELECT engine_kind, worker_epoch, reservation_token
+                FROM direct_engine_activation_fences
+                LIMIT 2
+                """
+            ).fetchall()
+            if len(fence_rows) != 1:
+                raise ValueError("direct engine activation fence is not present")
+            persisted_fence = fence_rows[0]
+            try:
+                current_fence = DirectEngineActivationFence(
+                    worker_epoch=_require_worker_epoch(
+                        _require_sqlite_integer(
+                            persisted_fence["worker_epoch"], "worker epoch"
+                        ),
+                        "worker epoch",
+                    ),
+                    reservation_token=_require_reservation_token(
+                        _require_sqlite_text(
+                            persisted_fence["reservation_token"], "reservation token"
+                        )
+                    ),
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError("persisted direct engine activation fence is invalid") from error
+            if (
+                _require_sqlite_text(persisted_fence["engine_kind"], "engine kind")
+                != "direct"
+                or current_fence != fence
+            ):
+                raise ValueError("direct engine activation fence does not match")
+            direct_record = connection.execute(
+                "SELECT 1 FROM engine_instances WHERE engine_kind = 'direct' LIMIT 1"
+            ).fetchone()
+            if direct_record is not None:
+                raise ValueError("direct engine record is already present")
+
+            identity = record.identity
+            connection.execute(
+                """
+                INSERT INTO engine_instances (
+                    engine_kind,
+                    worker_epoch,
+                    leader_pid,
+                    process_group_id,
+                    session_id,
+                    owner_uid,
+                    started_unix_us,
+                    argv_sha256
+                )
+                VALUES ('direct', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.worker_epoch,
+                    identity.leader_pid,
+                    identity.process_group_id,
+                    identity.session_id,
+                    identity.owner_uid,
+                    identity.started_unix_us,
+                    identity.argv_sha256,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM direct_engine_activation_fences
+                WHERE engine_kind = 'direct'
+                  AND worker_epoch = ?
+                  AND reservation_token = ?
+                """,
+                (fence.worker_epoch, fence.reservation_token),
+            )
+            changed = connection.execute("SELECT changes()").fetchone()
+            if changed is None or type(changed[0]) is not int or changed[0] != 1:
+                raise RuntimeError("direct engine activation fence bind delete is invalid")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
     def set_direct_engine_record(self, record: DirectEngineRecord) -> None:
         """Create or replace the direct engine record for the current worker epoch."""
 
@@ -1221,6 +1492,16 @@ class SQLiteStore:
         try:
             if self._current_worker_epoch(connection) != record.worker_epoch:
                 raise ValueError("direct engine worker epoch is not current")
+            activation_fence = connection.execute(
+                """
+                SELECT 1
+                FROM direct_engine_activation_fences
+                WHERE engine_kind = 'direct'
+                LIMIT 1
+                """
+            ).fetchone()
+            if activation_fence is not None:
+                raise ValueError("direct engine record conflicts with an activation fence")
             identity = record.identity
             connection.execute(
                 """
