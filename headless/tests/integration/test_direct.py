@@ -1278,6 +1278,135 @@ def test_direct_contain_and_cleanup_on_process_birth_callback_failure(
     _assert_group_gone(bound[0].process_group_id)
 
 
+def test_direct_callback_failure_retains_bound_group_identity_for_cleanup_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    callback_failure = RuntimeError("fixture parent registration failure")
+    process_group_id = 45_101
+    cleanup_groups: list[int | None] = []
+    events: list[object] = []
+    private_paths: list[tuple[Path, Path]] = []
+    group_descendants_absent = False
+    bound_identity: Any | None = None
+
+    class FakeProcess:
+        pid = 45_100
+
+    process = FakeProcess()
+
+    def reject_engine_bound(_identity: Any) -> None:
+        raise callback_failure
+
+    controller = direct.DirectAria2Controller(
+        executable=_ARIA2C,
+        runtime_root=tmp_path / "aria2-private-runtime",
+        on_engine_bound=reject_engine_bound,
+    )
+    original_create_private_config = controller._create_private_config
+    original_clear_stopped_process_state = controller._clear_stopped_process_state
+
+    def capture_private_runtime() -> tuple[Path, Path, str]:
+        runtime_path, config_path, secret = original_create_private_config()
+        private_paths.append((runtime_path, config_path))
+        return runtime_path, config_path, secret
+
+    def retrying_group_cleanup(
+        stopped_process: Any, saved_process_group_id: int | None
+    ) -> tuple[bool, None]:
+        nonlocal group_descendants_absent
+        assert stopped_process is process
+        cleanup_groups.append(saved_process_group_id)
+        events.append(("cleanup", saved_process_group_id))
+        if len(cleanup_groups) < 3:
+            return False, None
+        assert saved_process_group_id == process_group_id
+        assert controller.engine_identity is bound_identity
+        group_descendants_absent = True
+        events.append("group-descendants-absent")
+        return True, None
+
+    def clear_only_after_group_absence() -> None:
+        assert group_descendants_absent
+        events.append("clear-stopped-state")
+        original_clear_stopped_process_state()
+
+    def unavailable_rpc(*_args: Any, **_kwargs: Any) -> Any:
+        raise direct.DirectEngineError("fixture RPC unavailable")
+
+    def capture_bound_identity(identity: Any) -> object:
+        assert controller.engine_identity is identity
+        return object()
+
+    monkeypatch.setattr(controller, "_create_private_config", capture_private_runtime)
+    monkeypatch.setattr(controller, "_rpc", unavailable_rpc)
+    monkeypatch.setattr(direct.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(direct, "_bind_process_group", lambda _process: process_group_id)
+    monkeypatch.setattr(direct, "capture_process_birth", capture_bound_identity)
+    monkeypatch.setattr(direct, "_stop_process", retrying_group_cleanup)
+    monkeypatch.setattr(
+        controller, "_clear_stopped_process_state", clear_only_after_group_absence
+    )
+
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            controller.start()
+
+        assert raised.value is callback_failure
+        assert len(private_paths) == 1
+        runtime_path, config_path = private_paths[0]
+        bound_identity = controller.engine_identity
+        assert bound_identity is not None
+        assert bound_identity.leader_pid == process.pid
+        assert bound_identity.process_group_id == process_group_id
+        assert controller._process is process
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+        assert config_path.exists()
+        assert cleanup_groups == [process_group_id]
+
+        with pytest.raises(direct.DirectEngineError, match="^aria2 containment failed$"):
+            controller.close()
+
+        assert cleanup_groups == [process_group_id, process_group_id]
+        assert controller._process is process
+        assert controller.engine_identity is bound_identity
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+        assert config_path.exists()
+        assert events == [
+            ("cleanup", process_group_id),
+            ("cleanup", process_group_id),
+        ]
+
+        controller.close()
+
+        assert cleanup_groups == [
+            process_group_id,
+            process_group_id,
+            process_group_id,
+        ]
+        assert events == [
+            ("cleanup", process_group_id),
+            ("cleanup", process_group_id),
+            ("cleanup", process_group_id),
+            "group-descendants-absent",
+            "clear-stopped-state",
+        ]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        assert not runtime_path.exists()
+        assert not config_path.exists()
+    finally:
+        original_clear_stopped_process_state()
+        controller._clear_private_runtime_state()
+        for runtime_path, _config_path in private_paths:
+            if runtime_path.exists():
+                direct._remove_private_runtime(runtime_path)
+
+
 def test_direct_binding_interrupt_reaps_spawned_daemon_and_removes_private_runtime(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1528,6 +1657,231 @@ def test_direct_close_keeps_daemon_owned_when_group_cleanup_fails(
 
         assert controller._process is process
         assert controller.engine_identity is identity
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+    finally:
+        controller._clear_runtime_state()
+        if runtime_path.exists():
+            direct._remove_private_runtime(runtime_path)
+
+
+def test_direct_discard_absent_reaps_exact_leader_without_rpc_or_signals(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    runtime_path, config_path, secret = controller._create_private_config()
+    events: list[object] = []
+
+    class FakeProcess:
+        pid = 4_747
+
+        def wait(self, *_args: object, **_kwargs: object) -> int:
+            pytest.fail("absent discard must reap through the exact child PID")
+
+        def poll(self) -> int:
+            events.append("poll")
+            return -signal.SIGKILL
+
+        def terminate(self) -> None:
+            pytest.fail("absent discard must not terminate the stale leader")
+
+        def kill(self) -> None:
+            pytest.fail("absent discard must not kill the stale leader")
+
+    process = FakeProcess()
+    identity = direct.EngineIdentity(
+        leader_pid=process.pid,
+        process_group_id=process.pid,
+        started_monotonic_ns=1,
+        argv_sha256="0" * 64,
+    )
+    controller._process = process
+    controller._identity = identity
+    controller._port = 4321
+    controller._secret = secret
+
+    def unexpected_rpc(*_args: Any, **_kwargs: Any) -> Any:
+        events.append("rpc")
+        pytest.fail("absent discard must not issue aria2 RPC")
+
+    def unexpected_group_signal(*_args: Any, **_kwargs: Any) -> bool:
+        events.append("group-signal")
+        pytest.fail("absent discard must not signal a process group")
+
+    def unexpected_kill(*_args: Any, **_kwargs: Any) -> None:
+        events.append("kill")
+        pytest.fail("absent discard must not signal a process")
+
+    monkeypatch.setattr(controller, "_rpc", unexpected_rpc)
+    monkeypatch.setattr(direct, "_signal_group", unexpected_group_signal)
+    monkeypatch.setattr(direct.os, "killpg", unexpected_group_signal)
+    monkeypatch.setattr(direct.os, "kill", unexpected_kill)
+
+    try:
+        controller.discard_absent()
+
+        assert events == ["poll"]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        assert controller.active_job_ids == ()
+        assert controller._by_gid == {}
+        assert controller.launch_argv == ()
+        assert not runtime_path.exists()
+        assert not config_path.exists()
+        with pytest.raises(direct.DirectEngineError):
+            _ = controller.private_runtime_path
+        with pytest.raises(direct.DirectEngineError):
+            _ = controller.private_config_path
+    finally:
+        if runtime_path.exists():
+            direct._remove_private_runtime(runtime_path)
+
+
+def test_direct_discard_absent_retries_private_cleanup_with_exact_owner_retained(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    runtime_path, config_path, secret = controller._create_private_config()
+    events: list[object] = []
+    removal_paths: list[Path] = []
+    original_remove = direct._remove_private_runtime
+
+    class FakeProcess:
+        pid = 4_798
+
+        def poll(self) -> int:
+            events.append("poll")
+            return -signal.SIGKILL
+
+        def wait(self, *_args: object, **_kwargs: object) -> int:
+            pytest.fail("absent discard must not wait on the stale leader")
+
+        def terminate(self) -> None:
+            pytest.fail("absent discard must not terminate the stale leader")
+
+        def kill(self) -> None:
+            pytest.fail("absent discard must not kill the stale leader")
+
+    process = FakeProcess()
+    identity = direct.EngineIdentity(
+        leader_pid=process.pid,
+        process_group_id=process.pid,
+        started_monotonic_ns=1,
+        argv_sha256="0" * 64,
+    )
+    controller._process = process
+    controller._identity = identity
+    controller._port = 4321
+    controller._secret = secret
+
+    def unexpected_rpc(*_args: Any, **_kwargs: Any) -> Any:
+        events.append("rpc")
+        pytest.fail("absent discard must not issue aria2 RPC")
+
+    def unexpected_signal(*_args: Any, **_kwargs: Any) -> Any:
+        events.append("signal")
+        pytest.fail("absent discard must not signal a process or group")
+
+    def fail_private_cleanup_once(path: Path) -> None:
+        removal_paths.append(path)
+        if len(removal_paths) == 1:
+            raise direct.DirectEngineError("fixture transient private cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(controller, "_rpc", unexpected_rpc)
+    monkeypatch.setattr(direct, "_signal_group", unexpected_signal)
+    monkeypatch.setattr(direct.os, "killpg", unexpected_signal)
+    monkeypatch.setattr(direct.os, "kill", unexpected_signal)
+    monkeypatch.setattr(direct, "_remove_private_runtime", fail_private_cleanup_once)
+
+    try:
+        assert b"rpc-secret=" in config_path.read_bytes()
+        with pytest.raises(
+            direct.DirectEngineError,
+            match="^fixture transient private cleanup failure$",
+        ):
+            controller.discard_absent()
+
+        assert events == ["poll"]
+        assert removal_paths == [runtime_path]
+        assert controller._process is process
+        assert controller.engine_identity is identity
+        assert controller._secret == secret
+        assert controller._by_job_id == {}
+        assert controller._by_gid == {}
+        assert controller.private_runtime_path == runtime_path
+        assert controller.private_config_path == config_path
+        assert runtime_path.exists()
+        assert config_path.exists()
+
+        controller.discard_absent()
+
+        assert events == ["poll", "poll"]
+        assert removal_paths == [runtime_path, runtime_path]
+        assert controller._process is None
+        assert controller.engine_identity is None
+        assert controller._secret is None
+        assert not runtime_path.exists()
+        assert not config_path.exists()
+    finally:
+        controller._clear_runtime_state()
+        if runtime_path.exists():
+            original_remove(runtime_path)
+
+
+def test_direct_discard_absent_fails_closed_when_exact_leader_cannot_be_reaped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    runtime_path, config_path, secret = controller._create_private_config()
+
+    class FakeProcess:
+        pid = 4_848
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, *_args: object, **_kwargs: object) -> int:
+            pytest.fail("absent discard must not delegate reaping to Popen.wait")
+
+        def terminate(self) -> None:
+            pytest.fail("absent discard must not terminate the stale leader")
+
+        def kill(self) -> None:
+            pytest.fail("absent discard must not kill the stale leader")
+
+    process = FakeProcess()
+    identity = direct.EngineIdentity(
+        leader_pid=process.pid,
+        process_group_id=process.pid,
+        started_monotonic_ns=1,
+        argv_sha256="0" * 64,
+    )
+    controller._process = process
+    controller._identity = identity
+    controller._port = 4321
+    controller._secret = secret
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("absent discard must not issue RPC or signals before failing closed")
+
+    monkeypatch.setattr(controller, "_rpc", forbidden)
+    monkeypatch.setattr(direct, "_signal_group", forbidden)
+    monkeypatch.setattr(direct.os, "killpg", forbidden)
+    monkeypatch.setattr(direct.os, "kill", forbidden)
+
+    try:
+        with pytest.raises(direct.DirectEngineError, match="^aria2 absent owner discard failed$"):
+            controller.discard_absent()
+
+        assert controller._process is process
+        assert controller.engine_identity is identity
+        assert controller._by_job_id == {transfer.job_id: transfer}
+        assert controller._by_gid == {transfer.gid: transfer}
         assert controller.private_runtime_path == runtime_path
         assert controller.private_config_path == config_path
         assert runtime_path.exists()

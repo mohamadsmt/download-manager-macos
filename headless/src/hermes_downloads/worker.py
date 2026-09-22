@@ -22,7 +22,11 @@ from hermes_downloads.ipc import (
     validate_available_socket_path,
 )
 from hermes_downloads.processes import ProcessBirthIdentity
-from hermes_downloads.store import DirectEngineRecord, SQLiteStore
+from hermes_downloads.store import (
+    DirectEngineActivationFence,
+    DirectEngineRecord,
+    SQLiteStore,
+)
 
 __all__ = ["WorkerStateError", "main", "run_worker", "worker_busy"]
 
@@ -47,6 +51,8 @@ class _DirectController(Protocol):
     def start(self) -> object: ...
 
     def close(self) -> None: ...
+
+    def discard_absent(self) -> None: ...
 
 
 class WorkerStateError(ValueError):
@@ -201,9 +207,11 @@ def run_worker(
     store: SQLiteStore | None = None
     health_server: HealthServer | None = None
     direct_controller: _DirectController | None = None
+    direct_fence: DirectEngineActivationFence | None = None
     direct_record: DirectEngineRecord | None = None
     direct_record_persisted = False
     direct_controller_ready = False
+    direct_controller_absent_discard_failed = False
     try:
         root = _validate_state_root(state_root)
         requested_socket_path: Path | None = None
@@ -221,29 +229,67 @@ def run_worker(
         store = SQLiteStore(root / _STATE_DATABASE_NAME)
         store.recover_cold_start()
 
-        def close_owned_direct_controller() -> None:
-            nonlocal direct_controller, direct_record
-            nonlocal direct_record_persisted, direct_controller_ready
+        def clear_owned_direct_claim() -> None:
+            nonlocal direct_fence, direct_record, direct_record_persisted
 
-            controller = direct_controller
-            if controller is None:
-                return
-            controller.close()
             if direct_record_persisted:
                 if direct_record is None or not store.clear_direct_engine_record(
                     direct_record
                 ):
                     raise IPCStateError("ipc_health_invalid")
+                direct_record = None
+                direct_record_persisted = False
+            elif direct_fence is not None:
+                if not store.clear_direct_engine_activation_fence(direct_fence):
+                    raise IPCStateError("ipc_health_invalid")
+                direct_fence = None
+
+        def close_owned_direct_controller() -> None:
+            nonlocal direct_controller, direct_fence, direct_record
+            nonlocal direct_record_persisted, direct_controller_ready
+            nonlocal direct_controller_absent_discard_failed
+
+            controller = direct_controller
+            if controller is None:
+                return
+            controller.close()
+            clear_owned_direct_claim()
             direct_controller = None
+            direct_fence = None
             direct_record = None
             direct_record_persisted = False
             direct_controller_ready = False
+            direct_controller_absent_discard_failed = False
+
+        def discard_absent_owned_direct_controller() -> None:
+            nonlocal direct_controller, direct_fence, direct_record
+            nonlocal direct_record_persisted, direct_controller_ready
+            nonlocal direct_controller_absent_discard_failed
+
+            controller = direct_controller
+            if controller is None:
+                raise IPCStateError("ipc_health_invalid")
+            controller.discard_absent()
+            clear_owned_direct_claim()
+            direct_controller = None
+            direct_fence = None
+            direct_record = None
+            direct_record_persisted = False
+            direct_controller_ready = False
+            direct_controller_absent_discard_failed = False
+
+        def cleanup_owned_direct_candidate() -> None:
+            if direct_controller is None:
+                clear_owned_direct_claim()
+            else:
+                close_owned_direct_controller()
 
         def direct_engine_activate(
             command: DirectEngineActivateCommand,
         ) -> DirectEngineActivateResult:
-            nonlocal direct_controller, direct_record
+            nonlocal direct_controller, direct_fence, direct_record
             nonlocal direct_record_persisted, direct_controller_ready
+            nonlocal direct_controller_absent_discard_failed
 
             current_epoch = store.worker_epoch()
             if current_epoch is None:
@@ -253,33 +299,47 @@ def run_worker(
                     worker_epoch=current_epoch, status="stale_epoch"
                 )
             if direct_controller is not None:
+                if direct_controller_absent_discard_failed:
+                    return DirectEngineActivateResult(
+                        worker_epoch=current_epoch, status="blocked"
+                    )
                 owned_record = direct_record
-                if owned_record is not None and owned_record.worker_epoch != current_epoch:
-                    return DirectEngineActivateResult(
-                        worker_epoch=current_epoch, status="blocked"
-                    )
                 if (
-                    direct_controller_ready
-                    and direct_record_persisted
-                    and owned_record is not None
+                    not direct_controller_ready
+                    or direct_fence is not None
+                    or not direct_record_persisted
+                    or owned_record is None
                 ):
-                    from hermes_downloads.processes import reconcile_process_birth
-
-                    reconciliation = reconcile_process_birth(owned_record.identity)
-                    if reconciliation == "current":
-                        return DirectEngineActivateResult(
-                            worker_epoch=current_epoch, status="active"
-                        )
-                    if reconciliation != "absent":
-                        return DirectEngineActivateResult(
-                            worker_epoch=current_epoch, status="blocked"
-                        )
-                try:
-                    close_owned_direct_controller()
-                except BaseException:
                     return DirectEngineActivateResult(
                         worker_epoch=current_epoch, status="blocked"
                     )
+                if owned_record.worker_epoch != current_epoch:
+                    return DirectEngineActivateResult(
+                        worker_epoch=current_epoch, status="blocked"
+                    )
+                from hermes_downloads.processes import reconcile_process_birth
+
+                reconciliation = reconcile_process_birth(owned_record.identity)
+                if reconciliation == "current":
+                    return DirectEngineActivateResult(
+                        worker_epoch=current_epoch, status="active"
+                    )
+                if reconciliation != "absent":
+                    return DirectEngineActivateResult(
+                        worker_epoch=current_epoch, status="blocked"
+                    )
+                try:
+                    discard_absent_owned_direct_controller()
+                except BaseException:
+                    direct_controller_absent_discard_failed = True
+                    return DirectEngineActivateResult(
+                        worker_epoch=current_epoch, status="blocked"
+                    )
+
+            if direct_fence is not None:
+                return DirectEngineActivateResult(
+                    worker_epoch=current_epoch, status="blocked"
+                )
 
             existing_record = store.get_direct_engine_record()
             if existing_record is not None:
@@ -294,39 +354,59 @@ def run_worker(
                         worker_epoch=current_epoch, status="blocked"
                     )
 
-            def on_engine_bound(identity: ProcessBirthIdentity) -> None:
-                nonlocal direct_record, direct_record_persisted
+            existing_fence = store.get_direct_engine_activation_fence()
+            if existing_fence is not None:
+                return DirectEngineActivateResult(
+                    worker_epoch=current_epoch, status="blocked"
+                )
+            fence = store.reserve_direct_engine_activation(worker_epoch=current_epoch)
+            if fence is None:
+                return DirectEngineActivateResult(
+                    worker_epoch=current_epoch, status="blocked"
+                )
+            direct_fence = fence
 
+            def on_engine_bound(identity: ProcessBirthIdentity) -> None:
+                nonlocal direct_fence, direct_record, direct_record_persisted
+
+                fence = direct_fence
+                if fence is None:
+                    raise IPCStateError("ipc_health_invalid")
                 record = DirectEngineRecord(
                     worker_epoch=current_epoch,
                     identity=identity,
                 )
+                store.bind_direct_engine_activation_fence(fence, record)
                 direct_record = record
-                direct_record_persisted = False
-                store.set_direct_engine_record(record)
                 direct_record_persisted = True
+                direct_fence = None
 
-            from hermes_downloads.direct import DirectAria2Controller
-
-            candidate = DirectAria2Controller(
-                runtime_root=root / _DIRECT_RUNTIME_DIRECTORY_NAME,
-                on_engine_bound=on_engine_bound,
-            )
-            direct_controller = candidate
-            direct_record = None
-            direct_record_persisted = False
-            direct_controller_ready = False
             try:
+                from hermes_downloads.direct import DirectAria2Controller
+
+                candidate = DirectAria2Controller(
+                    runtime_root=root / _DIRECT_RUNTIME_DIRECTORY_NAME,
+                    on_engine_bound=on_engine_bound,
+                )
+                direct_controller = candidate
+                direct_record = None
+                direct_record_persisted = False
+                direct_controller_ready = False
+                direct_controller_absent_discard_failed = False
                 candidate.start()
             except BaseException:
                 try:
-                    close_owned_direct_controller()
+                    cleanup_owned_direct_candidate()
                 except BaseException:
                     pass
                 raise
-            if direct_record is None or not direct_record_persisted:
+            if (
+                direct_fence is not None
+                or direct_record is None
+                or not direct_record_persisted
+            ):
                 try:
-                    close_owned_direct_controller()
+                    cleanup_owned_direct_candidate()
                 except BaseException:
                     pass
                 raise IPCStateError("ipc_health_invalid")
@@ -355,7 +435,10 @@ def run_worker(
         try:
             try:
                 if direct_controller is not None:
-                    close_owned_direct_controller()
+                    if direct_controller_absent_discard_failed:
+                        discard_absent_owned_direct_controller()
+                    else:
+                        close_owned_direct_controller()
             finally:
                 try:
                     if health_server is not None:

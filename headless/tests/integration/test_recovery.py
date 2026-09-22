@@ -487,6 +487,50 @@ def test_restarted_worker_preserves_a_prior_direct_record_without_importing_engi
         recovered.close()
 
 
+def test_restarted_worker_preserves_an_unbound_direct_activation_fence_without_importing_engines(
+    private_roots: dict[str, Path],
+) -> None:
+    state_root = private_roots["state"]
+    seeded = SQLiteStore(state_root / "state.db")
+    try:
+        assert seeded.recover_cold_start() == 1
+        fence = seeded.reserve_direct_engine_activation(worker_epoch=1)
+        assert fence is not None
+        assert seeded.get_direct_engine_record() is None
+        assert seeded.get_direct_engine_activation_fence() == fence
+    finally:
+        seeded.close()
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    restarted = context.Process(
+        target=_run_worker_process_with_engine_imports_forbidden,
+        args=(str(state_root), ready, shutdown, stopped, results),
+    )
+    restarted.start()
+    try:
+        assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+        shutdown.set()
+        assert stopped.wait(_WATCHDOG_SECONDS)
+        _join(restarted)
+        assert _result(results) == ("result", None)
+    finally:
+        shutdown.set()
+        if restarted.is_alive():
+            _join(restarted)
+
+    recovered = SQLiteStore(state_root / "state.db")
+    try:
+        assert recovered.worker_epoch() == 2
+        assert recovered.get_direct_engine_record() is None
+        assert recovered.get_direct_engine_activation_fence() == fence
+    finally:
+        recovered.close()
+
+
 def _exit_unrelated_client() -> None:
     return None
 

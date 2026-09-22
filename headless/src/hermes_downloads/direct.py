@@ -225,12 +225,12 @@ class DirectAria2Controller:
                 started_monotonic_ns=time.monotonic_ns(),
                 argv_sha256=_argv_sha256(argv),
             )
+            self._identity = identity
             if self._on_engine_bound is not None:
                 birth_identity = capture_process_birth(identity)
                 if birth_identity is None:
                     raise DirectEngineError("aria2 containment failed")
                 self._on_engine_bound(birth_identity)
-            self._identity = identity
             self._wait_for_rpc_ready()
             return identity
         except (OSError, ValueError):
@@ -264,6 +264,26 @@ class DirectAria2Controller:
             raise interruption
         if not stopped:
             raise DirectEngineError("aria2 containment failed")
+
+    def discard_absent(self) -> None:
+        """Discard a worker-reconciled absent owner without signaling its old PGID."""
+
+        process, identity = self._process, self._identity
+        if (
+            process is None
+            or identity is None
+            or process.pid != identity.leader_pid
+        ):
+            raise DirectEngineError("aria2 absent owner discard failed")
+        try:
+            returncode = process.poll()
+        except (AttributeError, OSError):
+            raise DirectEngineError("aria2 absent owner discard failed") from None
+        if type(returncode) is not int:
+            raise DirectEngineError("aria2 absent owner discard failed")
+        self._clear_mappings()
+        self._cleanup_owned_private_runtime(preserve_primary=False)
+        self._clear_stopped_process_state()
 
     def restart(self) -> EngineIdentity:
         """Stop and discard all engine state before starting a blank daemon."""

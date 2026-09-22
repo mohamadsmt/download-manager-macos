@@ -36,7 +36,11 @@ from hermes_downloads.ipc import (
 )
 from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
 from hermes_downloads.processes import ProcessBirthIdentity, reconcile_process_birth
-from hermes_downloads.store import DirectEngineRecord, SQLiteStore
+from hermes_downloads.store import (
+    DirectEngineActivationFence,
+    DirectEngineRecord,
+    SQLiteStore,
+)
 
 
 _WATCHDOG_SECONDS = 5.0
@@ -121,6 +125,10 @@ def _run_worker_process_with_engine_imports_gated(
     bound_before_ready: _LifecycleEvent | None = None,
     release_rpc_ready: _LifecycleEvent | None = None,
     reap_child_exits: bool = False,
+    fence_before_direct_import: _LifecycleEvent | None = None,
+    release_direct_import: _LifecycleEvent | None = None,
+    forbid_direct_group_signal: _ImportGateEvent | None = None,
+    direct_group_signal_attempted: _LifecycleEvent | None = None,
 ) -> None:
     """Reject cold engine imports and optionally hold direct RPC readiness."""
 
@@ -128,6 +136,7 @@ def _run_worker_process_with_engine_imports_gated(
 
     original_import = builtins.__import__
     direct_patched = False
+    direct_signal_patched = False
     bound_event = bound_before_ready
     release_event = release_rpc_ready
     original_sigchld: Any | None = None
@@ -152,13 +161,50 @@ def _run_worker_process_with_engine_imports_gated(
         fromlist: object = (),
         level: int = 0,
     ) -> object:
-        nonlocal direct_patched
+        nonlocal direct_patched, direct_signal_patched
         if name in {"hermes_downloads.direct", "hermes_downloads.video"}:
             if name == "hermes_downloads.video" or not direct_import_allowed.is_set():
                 raise AssertionError("worker imported an engine outside direct activation")
+            if name == "hermes_downloads.direct" and fence_before_direct_import is not None:
+                assert release_direct_import is not None
+                observer = SQLiteStore(Path(state_root) / "state.db")
+                try:
+                    fence = observer.get_direct_engine_activation_fence()
+                    assert fence is not None
+                    assert fence.worker_epoch == observer.worker_epoch()
+                    assert observer.get_direct_engine_record() is None
+                finally:
+                    observer.close()
+                fence_before_direct_import.set()
+                if not release_direct_import.wait(_WATCHDOG_SECONDS):
+                    raise RuntimeError("test did not release direct engine import")
             imported = cast(Any, original_import)(
                 name, globals, locals, fromlist, level
             )
+            if (
+                name == "hermes_downloads.direct"
+                and forbid_direct_group_signal is not None
+                and not direct_signal_patched
+            ):
+                group_signal_guard = cast(
+                    _ImportGateEvent, forbid_direct_group_signal
+                )
+                direct_module = sys.modules["hermes_downloads.direct"]
+                original_killpg = direct_module.os.killpg
+
+                def guarded_killpg(
+                    process_group_id: int, signal_number: signal.Signals
+                ) -> None:
+                    if group_signal_guard.is_set():
+                        if direct_group_signal_attempted is not None:
+                            direct_group_signal_attempted.set()
+                        raise AssertionError(
+                            "stale absent direct controller called os.killpg"
+                        )
+                    original_killpg(process_group_id, signal_number)
+
+                direct_module.os.killpg = guarded_killpg
+                direct_signal_patched = True
             if (
                 name == "hermes_downloads.direct"
                 and bound_event is not None
@@ -198,6 +244,99 @@ def _run_worker_process_with_engine_imports_gated(
             signal.signal(signal.SIGCHLD, original_sigchld)
 
 
+def _run_worker_process_with_retrying_absent_private_cleanup(
+    state_root: str,
+    socket_path: str,
+    ready_event: object,
+    shutdown_event: object,
+    stopped_event: object,
+    results: object,
+    cleanup_attempts: Any,
+    cleanup_failed: _LifecycleEvent,
+    cleanup_succeeded: _LifecycleEvent,
+    no_signal_or_rpc_guard: _ImportGateEvent,
+    normal_close_attempted: _LifecycleEvent,
+    rpc_attempted: _LifecycleEvent,
+    group_signal_attempted: _LifecycleEvent,
+    process_signal_attempted: _LifecycleEvent,
+) -> None:
+    """Fail one local discard cleanup while guarding stale-owner side effects."""
+
+    direct_module = _direct_module()
+    controller_type = direct_module.DirectAria2Controller
+    original_remove_private_runtime = direct_module._remove_private_runtime
+    original_rpc = controller_type._rpc
+    original_close = controller_type.close
+    original_killpg = direct_module.os.killpg
+    original_kill = direct_module.os.kill
+
+    def fail_private_cleanup_once(path: Path) -> None:
+        cleanup_attempts.value += 1
+        if cleanup_attempts.value == 1:
+            cleanup_failed.set()
+            raise direct_module.DirectEngineError(
+                "fixture transient absent private cleanup failure"
+            )
+        original_remove_private_runtime(path)
+        cleanup_succeeded.set()
+
+    def guarded_rpc(controller: object, *args: Any, **kwargs: Any) -> Any:
+        if no_signal_or_rpc_guard.is_set():
+            rpc_attempted.set()
+            raise AssertionError("absent owner discard issued aria2 RPC")
+        return original_rpc(controller, *args, **kwargs)
+
+    def guarded_close(controller: object) -> None:
+        if no_signal_or_rpc_guard.is_set():
+            normal_close_attempted.set()
+            raise AssertionError("absent owner discard used normal close")
+        original_close(controller)
+
+    def guarded_killpg(process_group_id: int, signal_number: signal.Signals) -> None:
+        if no_signal_or_rpc_guard.is_set():
+            group_signal_attempted.set()
+            raise AssertionError("absent owner discard signaled a process group")
+        original_killpg(process_group_id, signal_number)
+
+    def guarded_kill(process_id: int, signal_number: int) -> None:
+        if no_signal_or_rpc_guard.is_set():
+            process_signal_attempted.set()
+            raise AssertionError("absent owner discard signaled a process")
+        original_kill(process_id, signal_number)
+
+    def reap_child_exits(_signal_number: int, _frame: object) -> None:
+        while True:
+            try:
+                child_pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if child_pid == 0:
+                return
+
+    original_sigchld = signal.signal(signal.SIGCHLD, reap_child_exits)
+    direct_module._remove_private_runtime = fail_private_cleanup_once
+    controller_type._rpc = guarded_rpc
+    controller_type.close = guarded_close
+    direct_module.os.killpg = guarded_killpg
+    direct_module.os.kill = guarded_kill
+    try:
+        _run_worker_process(
+            state_root,
+            socket_path,
+            ready_event,
+            shutdown_event,
+            stopped_event,
+            results,
+        )
+    finally:
+        direct_module._remove_private_runtime = original_remove_private_runtime
+        controller_type._rpc = original_rpc
+        controller_type.close = original_close
+        direct_module.os.killpg = original_killpg
+        direct_module.os.kill = original_kill
+        signal.signal(signal.SIGCHLD, original_sigchld)
+
+
 def _run_worker_process_with_fake_direct(
     state_root: str,
     socket_path: str,
@@ -216,6 +355,8 @@ def _run_worker_process_with_fake_direct(
     persistence_attempted: _LifecycleEvent | None = None,
     release_after_callback: _LifecycleEvent | None = None,
     controller_construction_count: Any | None = None,
+    fence_before_construction: _LifecycleEvent | None = None,
+    release_before_start: _LifecycleEvent | None = None,
 ) -> None:
     """Install a deterministic direct controller before the worker imports it lazily."""
 
@@ -224,18 +365,28 @@ def _run_worker_process_with_fake_direct(
     if close_mode not in {"succeeds", "fails"}:
         raise AssertionError("invalid fake direct close mode")
 
-    original_set_direct_engine_record = worker.SQLiteStore.set_direct_engine_record
+    original_bind_direct_engine_activation_fence = (
+        worker.SQLiteStore.bind_direct_engine_activation_fence
+    )
     if persistence_attempted is not None:
 
         def fail_direct_record_persistence(
-            self: SQLiteStore, record: DirectEngineRecord
+            self: SQLiteStore,
+            fence: DirectEngineActivationFence,
+            record: DirectEngineRecord,
         ) -> None:
-            if type(self) is not SQLiteStore or type(record) is not DirectEngineRecord:
-                raise AssertionError("worker passed an invalid direct record to the store")
+            if (
+                type(self) is not SQLiteStore
+                or type(fence) is not DirectEngineActivationFence
+                or type(record) is not DirectEngineRecord
+            ):
+                raise AssertionError("worker passed an invalid direct activation binding")
             persistence_attempted.set()
             raise RuntimeError("fake direct-record persistence failure")
 
-        worker.SQLiteStore.set_direct_engine_record = fail_direct_record_persistence
+        worker.SQLiteStore.bind_direct_engine_activation_fence = (
+            fail_direct_record_persistence
+        )
 
     class FakeDirectAria2Controller:
         def __init__(
@@ -246,10 +397,24 @@ def _run_worker_process_with_fake_direct(
         ) -> None:
             if not isinstance(runtime_root, Path) or not callable(on_engine_bound):
                 raise AssertionError("worker did not construct the direct controller safely")
+            if fence_before_construction is not None:
+                observer = SQLiteStore(Path(state_root) / "state.db")
+                try:
+                    fence = observer.get_direct_engine_activation_fence()
+                    assert fence is not None
+                    assert fence.worker_epoch == observer.worker_epoch()
+                    assert observer.get_direct_engine_record() is None
+                finally:
+                    observer.close()
+                fence_before_construction.set()
             self._on_engine_bound = on_engine_bound
             if controller_construction_count is not None:
                 controller_construction_count.value += 1
             controller_constructed.set()
+            if release_before_start is not None and not release_before_start.wait(
+                _WATCHDOG_SECONDS
+            ):
+                raise RuntimeError("test did not release fake direct start")
 
         def start(self) -> object:
             start_called.set()
@@ -284,7 +449,98 @@ def _run_worker_process_with_fake_direct(
             results,
         )
     finally:
-        worker.SQLiteStore.set_direct_engine_record = original_set_direct_engine_record
+        worker.SQLiteStore.bind_direct_engine_activation_fence = (
+            original_bind_direct_engine_activation_fence
+        )
+
+
+def _run_worker_process_with_absent_fake_direct(
+    state_root: str,
+    socket_path: str,
+    ready_event: object,
+    shutdown_event: object,
+    stopped_event: object,
+    results: object,
+    fake_identity: ProcessBirthIdentity,
+    discard_fails: bool,
+    controller_construction_count: Any,
+    reconciliation_called: _LifecycleEvent,
+    discard_called: _LifecycleEvent,
+    stale_close_guard: _ImportGateEvent,
+    stale_close_attempted: _LifecycleEvent,
+    replacement_claim_cleared: _LifecycleEvent,
+) -> None:
+    """Install an absent-owner controller whose normal close path is forbidden."""
+
+    processes: Any = importlib.import_module("hermes_downloads.processes")
+    original_reconcile_process_birth = processes.reconcile_process_birth
+    controller_index = 0
+
+    class FakeDirectAria2Controller:
+        def __init__(
+            self,
+            *,
+            runtime_root: Path,
+            on_engine_bound: Callable[[ProcessBirthIdentity], None],
+        ) -> None:
+            nonlocal controller_index
+
+            if not isinstance(runtime_root, Path) or not callable(on_engine_bound):
+                raise AssertionError("worker did not construct the direct controller safely")
+            self._index = controller_index
+            controller_index += 1
+            controller_construction_count.value += 1
+            self._on_engine_bound = on_engine_bound
+            if self._index == 1:
+                observer = SQLiteStore(Path(state_root) / "state.db")
+                try:
+                    assert observer.get_direct_engine_record() is None
+                    fence = observer.get_direct_engine_activation_fence()
+                    assert fence is not None
+                    assert fence.worker_epoch == observer.worker_epoch()
+                finally:
+                    observer.close()
+                replacement_claim_cleared.set()
+
+        def start(self) -> object:
+            self._on_engine_bound(fake_identity)
+            return object()
+
+        def discard_absent(self) -> None:
+            if self._index != 0:
+                raise AssertionError("worker discarded a fresh direct controller")
+            discard_called.set()
+            if discard_fails:
+                raise RuntimeError("fake direct absent discard failure")
+
+        def close(self) -> None:
+            if self._index == 0 and stale_close_guard.is_set():
+                stale_close_attempted.set()
+                raise AssertionError("stale absent direct controller used normal close")
+
+    def reconcile_absent(identity: object) -> str:
+        if identity == fake_identity:
+            reconciliation_called.set()
+            return "absent"
+        return original_reconcile_process_birth(identity)
+
+    fake_module = types.ModuleType("hermes_downloads.direct")
+    setattr(fake_module, "DirectAria2Controller", FakeDirectAria2Controller)
+    sys.modules["hermes_downloads.direct"] = fake_module
+    package = importlib.import_module("hermes_downloads")
+    setattr(package, "direct", fake_module)
+    processes.reconcile_process_birth = reconcile_absent
+    try:
+        _run_worker_process(
+            state_root,
+            socket_path,
+            ready_event,
+            shutdown_event,
+            stopped_event,
+            results,
+        )
+    finally:
+        processes.reconcile_process_birth = original_reconcile_process_birth
 
 
 def _synthetic_birth(*, owner_uid: int) -> ProcessBirthIdentity:
@@ -328,7 +584,7 @@ def _seed_epoch_one_direct_record(
 def _direct_engine_state_snapshot(
     state_root: Path,
 ) -> tuple[int | None, str | None, tuple[tuple[object, ...], ...]]:
-    """Read every durable direct-engine field without relying on worker-local state."""
+    """Read direct-engine record fields without relying on worker-local state."""
 
     store = SQLiteStore(state_root / "state.db")
     try:
@@ -351,6 +607,21 @@ def _direct_engine_state_snapshot(
             store.worker_epoch(),
             store.queue_gate(),
             tuple(tuple(row) for row in rows),
+        )
+    finally:
+        store.close()
+
+
+def _direct_engine_claims(
+    state_root: Path,
+) -> tuple[DirectEngineRecord | None, DirectEngineActivationFence | None]:
+    """Read the mutually exclusive durable direct-engine lifecycle claim."""
+
+    store = SQLiteStore(state_root / "state.db")
+    try:
+        return (
+            store.get_direct_engine_record(),
+            store.get_direct_engine_activation_fence(),
         )
     finally:
         store.close()
@@ -702,9 +973,9 @@ def test_direct_engine_activate_client_rejects_error_or_nonclosed_response(
     assert requests == [b'{"expected_worker_epoch":7,"op":"direct_engine_activate"}']
 
 
-def test_worker_direct_activation_binds_a_blank_durable_daemon_before_rpc_ready(
+def test_worker_direct_activation_reserves_before_import_and_binds_before_rpc_ready(
 ) -> None:
-    """A real lazy activation owns no transfer and persists before readiness."""
+    """A real lazy activation fences before import and atomically binds before ready."""
 
     with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
         state_root = Path(temporary_root) / "state"
@@ -716,6 +987,8 @@ def test_worker_direct_activation_binds_a_blank_durable_daemon_before_rpc_ready(
         stopped = context.Event()
         results = context.Queue()
         direct_import_allowed = context.Event()
+        fence_before_direct_import = context.Event()
+        release_direct_import = context.Event()
         bound_before_ready = context.Event()
         release_rpc_ready = context.Event()
         process = context.Process(
@@ -730,6 +1003,9 @@ def test_worker_direct_activation_binds_a_blank_durable_daemon_before_rpc_ready(
                 direct_import_allowed,
                 bound_before_ready,
                 release_rpc_ready,
+                False,
+                fence_before_direct_import,
+                release_direct_import,
             ),
         )
         activation_thread: threading.Thread | None = None
@@ -795,6 +1071,19 @@ def test_worker_direct_activation_binds_a_blank_durable_daemon_before_rpc_ready(
                 direct_import_allowed.set()
                 activation_thread = threading.Thread(target=activate)
                 activation_thread.start()
+                assert fence_before_direct_import.wait(_WATCHDOG_SECONDS)
+
+                observer = SQLiteStore(state_root / "state.db")
+                try:
+                    fence = observer.get_direct_engine_activation_fence()
+                    assert fence is not None
+                    assert fence.worker_epoch == 1
+                    assert observer.get_direct_engine_record() is None
+                finally:
+                    observer.close()
+                assert activation_thread.is_alive()
+
+                release_direct_import.set()
                 assert bound_before_ready.wait(_WATCHDOG_SECONDS)
 
                 observer = SQLiteStore(state_root / "state.db")
@@ -803,6 +1092,7 @@ def test_worker_direct_activation_binds_a_blank_durable_daemon_before_rpc_ready(
                     assert record is not None
                     assert record.worker_epoch == 1
                     assert reconcile_process_birth(record.identity) == "current"
+                    assert observer.get_direct_engine_activation_fence() is None
                 finally:
                     observer.close()
                 assert activation_thread.is_alive()
@@ -823,6 +1113,7 @@ def test_worker_direct_activation_binds_a_blank_durable_daemon_before_rpc_ready(
                 observer = SQLiteStore(state_root / "state.db")
                 try:
                     assert observer.get_direct_engine_record() == record
+                    assert observer.get_direct_engine_activation_fence() is None
                 finally:
                     observer.close()
                 assert origin.ledger.response_body_bytes == 0
@@ -836,9 +1127,11 @@ def test_worker_direct_activation_binds_a_blank_durable_daemon_before_rpc_ready(
                 reopened = SQLiteStore(state_root / "state.db")
                 try:
                     assert reopened.get_direct_engine_record() is None
+                    assert reopened.get_direct_engine_activation_fence() is None
                 finally:
                     reopened.close()
             finally:
+                release_direct_import.set()
                 release_rpc_ready.set()
                 shutdown.set()
                 if activation_thread is not None:
@@ -860,6 +1153,8 @@ def test_worker_direct_activation_replaces_an_absent_owned_controller() -> None:
         stopped = context.Event()
         results = context.Queue()
         direct_import_allowed = context.Event()
+        stale_group_signal_guard = context.Event()
+        stale_group_signal_attempted = context.Event()
         process = context.Process(
             target=_run_worker_process_with_engine_imports_gated,
             args=(
@@ -873,6 +1168,10 @@ def test_worker_direct_activation_replaces_an_absent_owned_controller() -> None:
                 None,
                 None,
                 True,
+                None,
+                None,
+                stale_group_signal_guard,
+                stale_group_signal_attempted,
             ),
         )
         initial: DirectEngineRecord | None = None
@@ -897,9 +1196,11 @@ def test_worker_direct_activation_replaces_an_absent_owned_controller() -> None:
             assert reconcile_process_birth(initial.identity) == "absent"
             assert process.is_alive()
 
+            stale_group_signal_guard.set()
             assert activate_direct_engine(
                 socket_path, expected_worker_epoch=1
             ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+            assert not stale_group_signal_attempted.is_set()
             observer = SQLiteStore(state_root / "state.db")
             try:
                 replacement = observer.get_direct_engine_record()
@@ -909,17 +1210,225 @@ def test_worker_direct_activation_replaces_an_absent_owned_controller() -> None:
             finally:
                 observer.close()
 
+            stale_group_signal_guard.clear()
             shutdown.set()
             assert stopped.wait(_WATCHDOG_SECONDS)
             _join(process)
             assert _result(results) == ("result", None)
             _assert_group_gone(replacement.identity.process_group_id)
         finally:
+            stale_group_signal_guard.clear()
             shutdown.set()
             if process.is_alive():
                 _join(process)
             if replacement is not None:
                 _force_stop_group(replacement.identity.process_group_id)
+
+
+@pytest.mark.parametrize(
+    "discard_fails",
+    (False, True),
+    ids=("clears-the-exact-claim-before-replacement", "blocks-with-claim-intact"),
+)
+def test_worker_direct_activation_uses_absent_discard_without_normal_close(
+    discard_fails: bool,
+) -> None:
+    """Only a no-signal discard may retire a reconciled-absent in-memory owner."""
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        socket_path = state_root / "worker.sock"
+        identity = _fake_unowned_birth()
+        expected_record = DirectEngineRecord(worker_epoch=1, identity=identity)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        shutdown = context.Event()
+        stopped = context.Event()
+        results = context.Queue()
+        controller_construction_count = context.Value("i", 0)
+        reconciliation_called = context.Event()
+        discard_called = context.Event()
+        stale_close_guard = context.Event()
+        stale_close_attempted = context.Event()
+        replacement_claim_cleared = context.Event()
+        process = context.Process(
+            target=_run_worker_process_with_absent_fake_direct,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                identity,
+                discard_fails,
+                controller_construction_count,
+                reconciliation_called,
+                discard_called,
+                stale_close_guard,
+                stale_close_attempted,
+                replacement_claim_cleared,
+            ),
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+            assert controller_construction_count.value == 1
+            assert _direct_engine_claims(state_root) == (expected_record, None)
+
+            stale_close_guard.set()
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(
+                worker_epoch=1,
+                status="blocked" if discard_fails else "active",
+            )
+            assert reconciliation_called.wait(_WATCHDOG_SECONDS)
+            assert discard_called.wait(_WATCHDOG_SECONDS)
+            assert not stale_close_attempted.is_set()
+
+            if discard_fails:
+                assert controller_construction_count.value == 1
+                assert not replacement_claim_cleared.is_set()
+                assert _direct_engine_claims(state_root) == (expected_record, None)
+
+                # Keep the close guard armed through teardown: a failed absent
+                # discard must not later fall back to normal group signaling.
+                shutdown.set()
+                assert stopped.wait(_WATCHDOG_SECONDS)
+                _join(process)
+                assert _result(results) == (
+                    "error",
+                    "RuntimeError",
+                    "fake direct absent discard failure",
+                )
+                assert not stale_close_attempted.is_set()
+                assert _direct_engine_claims(state_root) == (expected_record, None)
+            else:
+                assert controller_construction_count.value == 2
+                assert replacement_claim_cleared.wait(_WATCHDOG_SECONDS)
+                assert _direct_engine_claims(state_root) == (expected_record, None)
+
+                stale_close_guard.clear()
+                shutdown.set()
+                assert stopped.wait(_WATCHDOG_SECONDS)
+                _join(process)
+                assert _result(results) == ("result", None)
+                assert _direct_engine_claims(state_root) == (None, None)
+        finally:
+            stale_close_guard.clear()
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+def test_worker_shutdown_retries_absent_discard_private_cleanup_without_signals() -> None:
+    """Shutdown retries only local cleanup for an already-absent exact owner."""
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        socket_path = state_root / "worker.sock"
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        shutdown = context.Event()
+        stopped = context.Event()
+        results = context.Queue()
+        cleanup_attempts = context.Value("i", 0)
+        cleanup_failed = context.Event()
+        cleanup_succeeded = context.Event()
+        no_signal_or_rpc_guard = context.Event()
+        normal_close_attempted = context.Event()
+        rpc_attempted = context.Event()
+        group_signal_attempted = context.Event()
+        process_signal_attempted = context.Event()
+        process = context.Process(
+            target=_run_worker_process_with_retrying_absent_private_cleanup,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                cleanup_attempts,
+                cleanup_failed,
+                cleanup_succeeded,
+                no_signal_or_rpc_guard,
+                normal_close_attempted,
+                rpc_attempted,
+                group_signal_attempted,
+                process_signal_attempted,
+            ),
+        )
+        record: DirectEngineRecord | None = None
+        runtime_path: Path | None = None
+        config_path: Path | None = None
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+
+            record, fence = _direct_engine_claims(state_root)
+            assert record is not None
+            assert fence is None
+            runtime_paths = tuple((state_root / "direct-runtime").iterdir())
+            assert len(runtime_paths) == 1
+            runtime_path = runtime_paths[0]
+            config_path = runtime_path / "aria2.conf"
+            assert config_path.is_file()
+            assert b"rpc-secret=" in config_path.read_bytes()
+
+            _force_stop_group(record.identity.process_group_id)
+            assert reconcile_process_birth(record.identity) == "absent"
+            no_signal_or_rpc_guard.set()
+
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="blocked")
+            assert cleanup_failed.wait(_WATCHDOG_SECONDS)
+            assert cleanup_attempts.value == 1
+            assert _direct_engine_claims(state_root) == (record, None)
+            assert runtime_path.exists()
+            assert config_path.exists()
+            assert not normal_close_attempted.is_set()
+            assert not rpc_attempted.is_set()
+            assert not group_signal_attempted.is_set()
+            assert not process_signal_attempted.is_set()
+
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="blocked")
+            assert cleanup_attempts.value == 1
+            assert _direct_engine_claims(state_root) == (record, None)
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+            assert cleanup_succeeded.wait(_WATCHDOG_SECONDS)
+            assert cleanup_attempts.value == 2
+            assert _direct_engine_claims(state_root) == (None, None)
+            assert not normal_close_attempted.is_set()
+            assert not rpc_attempted.is_set()
+            assert not group_signal_attempted.is_set()
+            assert not process_signal_attempted.is_set()
+            assert not runtime_path.exists()
+            assert not config_path.exists()
+            assert tuple((state_root / "direct-runtime").glob("*/aria2.conf")) == ()
+        finally:
+            no_signal_or_rpc_guard.clear()
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+            if record is not None:
+                _force_stop_group(record.identity.process_group_id)
 
 
 def test_worker_direct_activation_fences_stale_epoch_before_engine_or_record_touch() -> None:
@@ -1169,6 +1678,8 @@ def test_worker_direct_activation_post_bind_start_failure_cleans_persisted_recor
         callback_entered = context.Event()
         callback_completed = context.Event()
         close_called = context.Event()
+        fence_before_construction = context.Event()
+        release_before_start = context.Event()
         release_after_callback = context.Event()
         process = context.Process(
             target=_run_worker_process_with_fake_direct,
@@ -1189,6 +1700,9 @@ def test_worker_direct_activation_post_bind_start_failure_cleans_persisted_recor
                 close_called,
                 None,
                 release_after_callback,
+                None,
+                fence_before_construction,
+                release_before_start,
             ),
         )
         activation_thread: threading.Thread | None = None
@@ -1211,7 +1725,13 @@ def test_worker_direct_activation_post_bind_start_failure_cleans_persisted_recor
 
             activation_thread = threading.Thread(target=activate)
             activation_thread.start()
+            assert fence_before_construction.wait(_WATCHDOG_SECONDS)
             assert controller_constructed.wait(_WATCHDOG_SECONDS)
+            unbound_record, unbound_fence = _direct_engine_claims(state_root)
+            assert unbound_record is None
+            assert unbound_fence is not None
+            assert unbound_fence.worker_epoch == 1
+            release_before_start.set()
             assert start_called.wait(_WATCHDOG_SECONDS)
             assert callback_entered.wait(_WATCHDOG_SECONDS)
             assert callback_completed.wait(_WATCHDOG_SECONDS)
@@ -1220,6 +1740,7 @@ def test_worker_direct_activation_post_bind_start_failure_cleans_persisted_recor
             observer = SQLiteStore(state_root / "state.db")
             try:
                 assert observer.get_direct_engine_record() == expected_record
+                assert observer.get_direct_engine_activation_fence() is None
             finally:
                 observer.close()
 
@@ -1232,6 +1753,7 @@ def test_worker_direct_activation_post_bind_start_failure_cleans_persisted_recor
             assert str(errors[0]) == "command_conflict"
             assert close_called.wait(_WATCHDOG_SECONDS)
             assert _direct_engine_state_snapshot(state_root) == before
+            assert _direct_engine_claims(state_root) == (None, None)
             assert _group_is_gone(identity.process_group_id)
             assert not (state_root / "direct-runtime").exists()
             assert request_health(socket_path).to_record() == {
@@ -1246,6 +1768,7 @@ def test_worker_direct_activation_post_bind_start_failure_cleans_persisted_recor
             assert _result(results) == ("result", None)
             assert not socket_path.exists()
         finally:
+            release_before_start.set()
             release_after_callback.set()
             shutdown.set()
             if activation_thread is not None:
@@ -1310,6 +1833,7 @@ def test_worker_direct_activation_callback_persistence_failure_cleans_without_mu
             assert not callback_completed.wait(0.05)
             assert close_called.wait(_WATCHDOG_SECONDS)
             assert _direct_engine_state_snapshot(state_root) == before
+            assert _direct_engine_claims(state_root) == (None, None)
             assert _group_is_gone(identity.process_group_id)
             assert not (state_root / "direct-runtime").exists()
             assert request_health(socket_path).to_record() == {
@@ -1388,12 +1912,17 @@ def test_worker_direct_activation_blocks_retry_after_unpersisted_cleanup_failure
             assert close_called.wait(_WATCHDOG_SECONDS)
             assert controller_construction_count.value == 1
             assert _direct_engine_state_snapshot(state_root) == before
+            retained_record, retained_fence = _direct_engine_claims(state_root)
+            assert retained_record is None
+            assert retained_fence is not None
+            assert retained_fence.worker_epoch == 1
 
             assert activate_direct_engine(
                 socket_path, expected_worker_epoch=1
             ) == DirectEngineActivateResult(worker_epoch=1, status="blocked")
             assert controller_construction_count.value == 1
             assert _direct_engine_state_snapshot(state_root) == before
+            assert _direct_engine_claims(state_root) == (None, retained_fence)
 
             shutdown.set()
             assert stopped.wait(_WATCHDOG_SECONDS)
@@ -1403,6 +1932,43 @@ def test_worker_direct_activation_blocks_retry_after_unpersisted_cleanup_failure
                 "RuntimeError",
                 "fake direct close failure",
             )
+            assert _direct_engine_claims(state_root) == (None, retained_fence)
+
+            restarted_ready = context.Event()
+            restarted_shutdown = context.Event()
+            restarted_stopped = context.Event()
+            restarted_results = context.Queue()
+            restart_direct_import_allowed = context.Event()
+            restarted = context.Process(
+                target=_run_worker_process_with_engine_imports_gated,
+                args=(
+                    str(state_root),
+                    str(socket_path),
+                    restarted_ready,
+                    restarted_shutdown,
+                    restarted_stopped,
+                    restarted_results,
+                    restart_direct_import_allowed,
+                ),
+            )
+            restarted.start()
+            try:
+                assert restarted_ready.wait(_WATCHDOG_SECONDS), _result(restarted_results)
+                assert activate_direct_engine(
+                    socket_path, expected_worker_epoch=2
+                ) == DirectEngineActivateResult(worker_epoch=2, status="blocked")
+                assert controller_construction_count.value == 1
+                assert _direct_engine_claims(state_root) == (None, retained_fence)
+
+                restarted_shutdown.set()
+                assert restarted_stopped.wait(_WATCHDOG_SECONDS)
+                _join(restarted)
+                assert _result(restarted_results) == ("result", None)
+                assert _direct_engine_claims(state_root) == (None, retained_fence)
+            finally:
+                restarted_shutdown.set()
+                if restarted.is_alive():
+                    _join(restarted)
         finally:
             shutdown.set()
             if process.is_alive():
@@ -1462,6 +2028,7 @@ def test_worker_direct_activation_shutdown_close_failure_retains_exact_record() 
             observer = SQLiteStore(state_root / "state.db")
             try:
                 assert observer.get_direct_engine_record() == expected_record
+                assert observer.get_direct_engine_activation_fence() is None
             finally:
                 observer.close()
 
@@ -1481,6 +2048,7 @@ def test_worker_direct_activation_shutdown_close_failure_retains_exact_record() 
             reopened = SQLiteStore(state_root / "state.db")
             try:
                 assert reopened.get_direct_engine_record() == expected_record
+                assert reopened.get_direct_engine_activation_fence() is None
             finally:
                 reopened.close()
         finally:
