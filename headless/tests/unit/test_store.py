@@ -2365,6 +2365,85 @@ def test_materialized_domain_duplicate_is_idempotent_but_changed_domain_conflict
         store.close()
 
 
+@pytest.mark.parametrize("action", ("pause", "start_now"))
+def test_materialized_add_replay_ignores_lifecycle_changes_but_not_domain_changes(
+    tmp_path: Path, action: str
+) -> None:
+    materialized = replace(
+        _materialized_job(),
+        authorized=False,
+        manual_hold=False,
+        start_now_requested=False,
+    )
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.apply_add(materialized.intent, materialized=materialized).applied is True
+        if action == "start_now":
+            assert store.initialize_cold_start() == "paused"
+            assert store.apply_queue_gate(
+                gate="running",
+                request_id="open-queue-request",
+                payload_digest="b" * 64,
+                expected_revision=1,
+            ) == store_module.QueueGateResult(
+                applied=True, gate="running", revision=2
+            )
+
+        control = store.apply_job_control(
+            job_id=materialized.job_id,
+            action=action,
+            request_id=f"{action}-request",
+            payload_digest="c" * 64,
+            expected_revision=materialized.intent.revision,
+        )
+        assert control.status == "applied"
+        assert control.revision == materialized.intent.revision + 1
+        before_replay = (
+            store.list_jobs(),
+            store.get_command(materialized.intent.request_id),
+            _command_receipt_rows(store),
+            store.list_events(),
+            store.get_materialized_job(materialized.job_id),
+            _job_control_command_rows(store),
+        )
+
+        replay = store.apply_add(materialized.intent, materialized=materialized)
+
+        assert (replay.applied, replay.job, replay.generation, replay.revision) == (
+            False,
+            materialized.job_id,
+            materialized.intent.generation,
+            materialized.intent.revision,
+        )
+        assert (
+            store.list_jobs(),
+            store.get_command(materialized.intent.request_id),
+            _command_receipt_rows(store),
+            store.list_events(),
+            store.get_materialized_job(materialized.job_id),
+            _job_control_command_rows(store),
+        ) == before_replay
+
+        with pytest.raises(RequestConflictError):
+            store.apply_add(
+                materialized.intent,
+                materialized=replace(
+                    materialized, priority=materialized.priority + 1
+                ),
+            )
+
+        assert (
+            store.list_jobs(),
+            store.get_command(materialized.intent.request_id),
+            _command_receipt_rows(store),
+            store.list_events(),
+            store.get_materialized_job(materialized.job_id),
+            _job_control_command_rows(store),
+        ) == before_replay
+    finally:
+        store.close()
+
+
 def test_collection_hold_set_read_reopen_and_clear_are_idempotent(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     store = SQLiteStore(database_path)

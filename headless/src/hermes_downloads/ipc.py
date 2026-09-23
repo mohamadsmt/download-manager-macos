@@ -175,6 +175,82 @@ def _canonical_payload_digest(record: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _append_bounded_bytes(output: bytearray, value: bytes) -> None:
+    """Append fixed JSON bytes without exceeding the complete IPC record cap."""
+
+    if len(value) > MAX_MESSAGE_BYTES - len(output):
+        raise ValueError("job-add request exceeds the IPC message limit")
+    output.extend(value)
+
+
+def _append_bounded_json_string(output: bytearray, value: str) -> None:
+    """Append one ensure_ascii JSON string without materializing an unbounded value."""
+
+    _append_bounded_bytes(output, b'"')
+    for character in value:
+        code_point = ord(character)
+        if character == '"':
+            encoded = b'\\"'
+        elif character == "\\":
+            encoded = b"\\\\"
+        elif character == "\b":
+            encoded = b"\\b"
+        elif character == "\t":
+            encoded = b"\\t"
+        elif character == "\n":
+            encoded = b"\\n"
+        elif character == "\f":
+            encoded = b"\\f"
+        elif character == "\r":
+            encoded = b"\\r"
+        elif 0x20 <= code_point <= 0x7E:
+            encoded = bytes((code_point,))
+        elif code_point <= 0xFFFF:
+            encoded = f"\\u{code_point:04x}".encode("ascii")
+        else:
+            supplementary = code_point - 0x10000
+            encoded = (
+                f"\\u{0xD800 + (supplementary >> 10):04x}"
+                f"\\u{0xDC00 + (supplementary & 0x3FF):04x}"
+            ).encode("ascii")
+        _append_bounded_bytes(output, encoded)
+    _append_bounded_bytes(output, b'"')
+
+
+def _job_add_wire_request(
+    *,
+    job: str,
+    request_id: str,
+    source_url: str,
+    priority: int,
+    order_key: int,
+    category: str,
+    partial_filename: str,
+    selected_final_filename: str,
+) -> bytes:
+    """Build the one bounded canonical wire record before its digest exists."""
+
+    output = bytearray()
+    _append_bounded_bytes(output, b'{"category":')
+    _append_bounded_json_string(output, category)
+    _append_bounded_bytes(output, b',"job":')
+    _append_bounded_json_string(output, job)
+    _append_bounded_bytes(output, b',"op":"job_add","order_key":')
+    _append_bounded_bytes(output, str(order_key).encode("ascii"))
+    _append_bounded_bytes(output, b',"partial_filename":')
+    _append_bounded_json_string(output, partial_filename)
+    _append_bounded_bytes(output, b',"priority":')
+    _append_bounded_bytes(output, str(priority).encode("ascii"))
+    _append_bounded_bytes(output, b',"request_id":')
+    _append_bounded_json_string(output, request_id)
+    _append_bounded_bytes(output, b',"selected_final_filename":')
+    _append_bounded_json_string(output, selected_final_filename)
+    _append_bounded_bytes(output, b',"source_kind":"direct","source_url":')
+    _append_bounded_json_string(output, source_url)
+    _append_bounded_bytes(output, b',"start":false}\n')
+    return bytes(output)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerHealth:
     """The fixed non-mutating worker health projection."""
@@ -227,6 +303,7 @@ class JobAddCommand:
     partial_filename: str
     selected_final_filename: str
     payload_digest: str = field(init=False)
+    _wire_request: bytes = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         job = _require_identifier(self.job, "job")
@@ -254,23 +331,23 @@ class JobAddCommand:
         object.__setattr__(self, "category", category)
         object.__setattr__(self, "partial_filename", partial_filename)
         object.__setattr__(self, "selected_final_filename", selected_final_filename)
+        wire_request = _job_add_wire_request(
+            job=job,
+            request_id=request_id,
+            source_url=self.source_url,
+            priority=priority,
+            order_key=order_key,
+            category=category,
+            partial_filename=partial_filename,
+            selected_final_filename=selected_final_filename,
+        )
+        object.__setattr__(self, "_wire_request", wire_request)
         object.__setattr__(
             self,
             "payload_digest",
-            _canonical_payload_digest(
-                {
-                    "job": job,
-                    "request_id": request_id,
-                    "source_url": self.source_url,
-                    "source_kind": "direct",
-                    "priority": priority,
-                    "order_key": order_key,
-                    "category": category,
-                    "partial_filename": partial_filename,
-                    "selected_final_filename": selected_final_filename,
-                    "start": False,
-                }
-            ),
+            hashlib.sha256(
+                wire_request[:-1].replace(b',"op":"job_add"', b"", 1)
+            ).hexdigest(),
         )
 
     def to_record(self) -> dict[str, bool | int | str]:
@@ -1119,17 +1196,20 @@ def add_job(
     """Persist one typed, inactive direct job through the worker-owned connection."""
 
     path = _require_socket_path(socket_path)
-    command = JobAddCommand(
-        job=job,
-        request_id=request_id,
-        source_url=source_url,
-        priority=priority,
-        order_key=order_key,
-        category=category,
-        partial_filename=partial_filename,
-        selected_final_filename=selected_final_filename,
-    )
-    request = _encoded_record(command.to_record())
+    try:
+        command = JobAddCommand(
+            job=job,
+            request_id=request_id,
+            source_url=source_url,
+            priority=priority,
+            order_key=order_key,
+            category=category,
+            partial_filename=partial_filename,
+            selected_final_filename=selected_final_filename,
+        )
+    except (RecursionError, TypeError, ValueError):
+        raise IPCError("invalid_request") from None
+    request = command._wire_request
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(_CLIENT_TIMEOUT_SECONDS)
         try:

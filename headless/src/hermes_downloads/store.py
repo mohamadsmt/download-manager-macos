@@ -1047,9 +1047,6 @@ class SQLiteStore:
                 priority,
                 order_key,
                 scheduled_for_us,
-                authorized,
-                manual_hold,
-                start_now_requested,
                 category,
                 destination_collection,
                 partial_filename,
@@ -1064,11 +1061,15 @@ class SQLiteStore:
             return False
         if job_rows[0]["source_url"] != intent.source_url:
             return False
-        return tuple(domain_rows[0]) == SQLiteStore._projection_values(materialized)
+        return tuple(domain_rows[0]) == SQLiteStore._immutable_projection_values(
+            materialized
+        )
 
     @staticmethod
-    def _projection_values(materialized: MaterializedJob) -> tuple[object, ...]:
-        """Return SQLite-native values for the non-lifecycle domain projection."""
+    def _immutable_projection_values(
+        materialized: MaterializedJob,
+    ) -> tuple[object, ...]:
+        """Return the add-time domain fields that controls cannot mutate."""
 
         scheduled_for_us = (
             None
@@ -1081,14 +1082,24 @@ class SQLiteStore:
             materialized.priority,
             materialized.order_key,
             scheduled_for_us,
-            1 if materialized.authorized else 0,
-            1 if materialized.manual_hold else 0,
-            1 if materialized.start_now_requested else 0,
             materialized.category,
             materialized.destination_collection,
             materialized.partial_filename,
             materialized.selected_final_filename,
             materialized.intent.expected_revision,
+        )
+
+    @staticmethod
+    def _projection_values(materialized: MaterializedJob) -> tuple[object, ...]:
+        """Return SQLite-native values for the complete materialized projection."""
+
+        immutable = SQLiteStore._immutable_projection_values(materialized)
+        return (
+            *immutable[:5],
+            1 if materialized.authorized else 0,
+            1 if materialized.manual_hold else 0,
+            1 if materialized.start_now_requested else 0,
+            *immutable[5:],
         )
 
     @staticmethod

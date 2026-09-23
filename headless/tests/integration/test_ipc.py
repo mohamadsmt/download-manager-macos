@@ -3298,19 +3298,23 @@ def _job_add_payload(record: dict[str, object]) -> bytes:
 
 def _job_add_store_snapshot(
     state_root: Path,
-) -> tuple[
-    tuple[tuple[object, ...], ...],
-    tuple[tuple[object, ...], ...],
-    tuple[tuple[object, ...], ...],
-    tuple[tuple[object, ...], ...],
-    tuple[tuple[object, ...], ...],
-]:
+) -> tuple[object, ...]:
     """Capture add-visible durable state without exposing stored source URLs."""
 
     store = SQLiteStore(state_root / "state.db")
     try:
         connection = store._connection
         return (
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT key, value, revision
+                    FROM settings
+                    ORDER BY key
+                    """
+                ).fetchall()
+            ),
             tuple(
                 tuple(row)
                 for row in connection.execute(
@@ -3337,6 +3341,35 @@ def _job_add_store_snapshot(
                     """
                     SELECT request_id, scope, action
                     FROM command_receipts
+                    ORDER BY request_id
+                    """
+                ).fetchall()
+            ),
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT request_id, payload_digest, gate, revision
+                    FROM queue_commands
+                    ORDER BY request_id
+                    """
+                ).fetchall()
+            ),
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT
+                        request_id,
+                        payload_digest,
+                        job_id,
+                        action,
+                        status,
+                        generation,
+                        revision,
+                        state,
+                        authorized
+                    FROM job_control_commands
                     ORDER BY request_id
                     """
                 ).fetchall()
@@ -3531,6 +3564,146 @@ def test_job_add_client_rejects_error_or_nonclosed_response(
         assert requests == [expected_request]
 
 
+def test_job_add_client_rejects_unbounded_input_before_digest_or_socket(
+    short_socket_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import builtins
+
+    add_job = getattr(ipc, "add_job", None)
+    command_type = getattr(ipc, "JobAddCommand", None)
+    assert callable(add_job), "job_add client is missing"
+    assert isinstance(command_type, type), "job_add command is missing"
+
+    socket_path = short_socket_root / "worker.sock"
+    handler_commands: list[ipc.JobAddCommand] = []
+
+    def job_add_handler(command: ipc.JobAddCommand) -> ipc.JobAddResult:
+        handler_commands.append(command)
+        return ipc.JobAddResult(
+            applied=True, job=command.job, generation=0, revision=0
+        )
+
+    server = ipc.HealthServer(
+        socket_path,
+        health=lambda: ipc.WorkerHealth(worker_epoch=1, queue_gate="paused"),
+        job_add=job_add_handler,
+    )
+    socket_calls: list[object] = []
+    digest_calls: list[object] = []
+    engine_imports: list[str] = []
+    original_import = builtins.__import__
+
+    def reject_engine_import(
+        name: str,
+        globals: object = None,
+        locals: object = None,
+        fromlist: object = (),
+        level: int = 0,
+    ) -> object:
+        if name in {
+            "hermes_downloads.direct",
+            "hermes_downloads.paths",
+            "hermes_downloads.video",
+        }:
+            engine_imports.append(name)
+            raise AssertionError("invalid job add imported an engine")
+        return cast(Any, original_import)(name, globals, locals, fromlist, level)
+
+    def reject_socket(*args: object, **kwargs: object) -> object:
+        socket_calls.append((args, kwargs))
+        raise AssertionError("invalid job add opened a socket")
+
+    def reject_digest(record: object) -> str:
+        digest_calls.append(record)
+        raise AssertionError("unbounded job add reached canonical digest")
+
+    marker = "must-not-leak"
+    url_within_source_policy = (
+        "https://downloads.example.test/payload?signature=" + marker + "u" * 5_000
+    )
+    assert len(url_within_source_policy.encode("utf-8")) <= 8_192
+    cases: tuple[tuple[str, dict[str, object], type[Exception]], ...] = (
+        (
+            "oversized-url-within-url-policy",
+            {"source_url": url_within_source_policy},
+            ValueError,
+        ),
+        (
+            "oversized-filename",
+            {
+                "partial_filename": marker + "f" * 5_000 + ".bin",
+                "selected_final_filename": marker + "f" * 5_000 + ".bin",
+            },
+            ValueError,
+        ),
+        (
+            "escape-heavy-url",
+            {
+                "source_url": "https://downloads.example.test/payload?signature="
+                + marker
+                + '"' * 2_500,
+            },
+            ValueError,
+        ),
+        (
+            "escape-heavy-filename",
+            {
+                "partial_filename": marker + '"' * 2_500 + ".bin",
+                "selected_final_filename": marker + '"' * 2_500 + ".bin",
+            },
+            ValueError,
+        ),
+        ("invalid-primitive", {"source_url": True}, TypeError),
+    )
+    monkeypatch.setattr(builtins, "__import__", reject_engine_import)
+    monkeypatch.setattr(ipc.socket, "socket", reject_socket)
+    monkeypatch.setattr(ipc, "_canonical_payload_digest", reject_digest)
+    try:
+        for index, (_case, overrides, direct_error) in enumerate(cases):
+            values = {
+                "job": f"bounded-job-{index}",
+                "request_id": f"bounded-request-{index}",
+                "selected_final_filename": "payload.bin",
+                **overrides,
+            }
+            record = _job_add_record(**cast(dict[str, Any], values))
+            with pytest.raises(direct_error) as direct_failure:
+                command_type(
+                    job=record["job"],
+                    request_id=record["request_id"],
+                    source_url=record["source_url"],
+                    priority=record["priority"],
+                    order_key=record["order_key"],
+                    category=record["category"],
+                    partial_filename=record["partial_filename"],
+                    selected_final_filename=record["selected_final_filename"],
+                )
+            assert marker not in str(direct_failure.value)
+            assert marker not in repr(direct_failure.value)
+
+            with pytest.raises(ipc.IPCError, match="^invalid_request$") as public_failure:
+                add_job(
+                    socket_path,
+                    job=record["job"],
+                    request_id=record["request_id"],
+                    source_url=record["source_url"],
+                    priority=record["priority"],
+                    order_key=record["order_key"],
+                    category=record["category"],
+                    partial_filename=record["partial_filename"],
+                    selected_final_filename=record["selected_final_filename"],
+                )
+            assert marker not in str(public_failure.value)
+            assert marker not in repr(public_failure.value)
+    finally:
+        server.close()
+
+    assert socket_calls == []
+    assert handler_commands == []
+    assert digest_calls == []
+    assert engine_imports == []
+
+
 def test_worker_job_add_persists_a_cold_direct_job_without_engine_activation(
     short_socket_root: Path,
 ) -> None:
@@ -3572,8 +3745,11 @@ def test_worker_job_add_persists_a_cold_direct_job_without_engine_activation(
             }
             state_entries_before = tuple(sorted(path.name for path in state_root.iterdir()))
             source_url = (
-                f"http://job-add.example.test:{origin.port}/range?signature=source-private"
+                f"http://job-add.example.test:{origin.port}/range?"
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host&"
+                "X-Amz-Signature=fixture-exact-signed-query"
             )
+            assert len(_job_add_payload(_job_add_record(source_url=source_url))) <= MAX_MESSAGE_BYTES
             result = _add_job(
                 socket_path,
                 job="cold-direct-job",
@@ -3605,9 +3781,7 @@ def test_worker_job_add_persists_a_cold_direct_job_without_engine_activation(
                 assert job is not None
                 assert materialized is not None
                 assert (job.generation, job.revision, job.state) == (0, 0, "queued")
-                assert hashlib.sha256(job.source_url).hexdigest() == hashlib.sha256(
-                    source_url.encode("utf-8")
-                ).hexdigest()
+                assert job.source_url == source_url.encode("utf-8")
                 assert materialized.source_kind is SourceKind.DIRECT
                 assert materialized.queue_collection_id is None
                 assert materialized.scheduled_for is None
@@ -3814,6 +3988,128 @@ def test_worker_job_add_replays_conflicts_globally_and_has_no_partial_write(
                 selected_final_filename="control.bin",
             )
         assert _job_add_store_snapshot(state_root) == before_control_collision
+
+        shutdown.set()
+        assert stopped.wait(_WATCHDOG_SECONDS)
+        _join(process)
+        assert _result(results) == ("result", None)
+    finally:
+        shutdown.set()
+        if process.is_alive():
+            _join(process)
+
+
+def test_worker_job_add_replays_original_receipt_after_lifecycle_controls(
+    short_socket_root: Path,
+) -> None:
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_run_worker_process,
+        args=(str(state_root), str(socket_path), ready, shutdown, stopped, results),
+    )
+    process.start()
+    try:
+        assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+        paused_add = {
+            "job": "pause-replay-job",
+            "request_id": "pause-replay-add-request",
+            "source_url": "https://downloads.example.test/pause-replay.bin?sig=one",
+            "priority": -1,
+            "order_key": 1,
+            "category": "Other",
+            "partial_filename": "pause-replay.bin",
+            "selected_final_filename": "pause-replay.bin",
+        }
+        assert _add_job(socket_path, **paused_add).to_record() == {
+            "applied": True,
+            "job": "pause-replay-job",
+            "generation": 0,
+            "revision": 0,
+        }
+        assert ipc.control_job(
+            socket_path,
+            job="pause-replay-job",
+            action="pause",
+            request_id="pause-replay-control-request",
+            expected_revision=0,
+        ).to_record() == {
+            "status": "applied",
+            "job": "pause-replay-job",
+            "generation": 0,
+            "revision": 1,
+            "state": "paused",
+            "authorized": False,
+        }
+        after_pause = _job_add_store_snapshot(state_root)
+        assert _add_job(socket_path, **paused_add).to_record() == {
+            "applied": False,
+            "job": "pause-replay-job",
+            "generation": 0,
+            "revision": 0,
+        }
+        assert _job_add_store_snapshot(state_root) == after_pause
+        with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+            _add_job(socket_path, **{**paused_add, "priority": 1})
+        assert _job_add_store_snapshot(state_root) == after_pause
+
+        assert set_queue_gate(
+            socket_path,
+            gate="running",
+            request_id="open-queue-for-start-now",
+            expected_revision=1,
+        ).to_record() == {
+            "applied": True,
+            "queue_gate": "running",
+            "revision": 2,
+        }
+        started_add = {
+            "job": "start-replay-job",
+            "request_id": "start-replay-add-request",
+            "source_url": "https://downloads.example.test/start-replay.bin?sig=two",
+            "priority": -2,
+            "order_key": 2,
+            "category": "Other",
+            "partial_filename": "start-replay.bin",
+            "selected_final_filename": "start-replay.bin",
+        }
+        assert _add_job(socket_path, **started_add).to_record() == {
+            "applied": True,
+            "job": "start-replay-job",
+            "generation": 0,
+            "revision": 0,
+        }
+        assert ipc.control_job(
+            socket_path,
+            job="start-replay-job",
+            action="start_now",
+            request_id="start-replay-control-request",
+            expected_revision=0,
+        ).to_record() == {
+            "status": "applied",
+            "job": "start-replay-job",
+            "generation": 0,
+            "revision": 1,
+            "state": "queued",
+            "authorized": True,
+        }
+        after_start_now = _job_add_store_snapshot(state_root)
+        assert _add_job(socket_path, **started_add).to_record() == {
+            "applied": False,
+            "job": "start-replay-job",
+            "generation": 0,
+            "revision": 0,
+        }
+        assert _job_add_store_snapshot(state_root) == after_start_now
+        with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+            _add_job(socket_path, **{**started_add, "order_key": 3})
+        assert _job_add_store_snapshot(state_root) == after_start_now
 
         shutdown.set()
         assert stopped.wait(_WATCHDOG_SECONDS)
