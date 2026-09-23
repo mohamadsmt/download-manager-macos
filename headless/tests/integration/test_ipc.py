@@ -3205,3 +3205,694 @@ def test_job_control_client_rejects_nonclosed_or_duplicate_responses(
         assert requests == [
             b'{"action":"pause","expected_revision":2,"job":"job-1","op":"job_control","request_id":"pause-request"}'
         ]
+
+
+def _run_worker_process_with_job_add_guards(
+    state_root: str,
+    socket_path: str,
+    ready_event: object,
+    shutdown_event: object,
+    stopped_event: object,
+    results: object,
+    resolver_calls: Any,
+) -> None:
+    """Forbid engine/path work and count any outbound-name resolution."""
+
+    import builtins
+
+    assert "hermes_downloads.direct" not in sys.modules
+    assert "hermes_downloads.paths" not in sys.modules
+    assert "hermes_downloads.video" not in sys.modules
+    original_import = builtins.__import__
+    original_getaddrinfo: Any = socket.getaddrinfo
+
+    def guarded_import(
+        name: str,
+        globals: object = None,
+        locals: object = None,
+        fromlist: object = (),
+        level: int = 0,
+    ) -> object:
+        if name in {
+            "hermes_downloads.direct",
+            "hermes_downloads.paths",
+            "hermes_downloads.video",
+        }:
+            raise AssertionError("job add imported an engine or path resolver")
+        return cast(Any, original_import)(name, globals, locals, fromlist, level)
+
+    def guarded_getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+        if host == "job-add.example.test":
+            resolver_calls.value += 1
+            return original_getaddrinfo("127.0.0.1", *args, **kwargs)
+        return original_getaddrinfo(host, *args, **kwargs)
+
+    builtins.__import__ = guarded_import
+    socket.getaddrinfo = guarded_getaddrinfo
+    try:
+        _run_worker_process(
+            state_root,
+            socket_path,
+            ready_event,
+            shutdown_event,
+            stopped_event,
+            results,
+        )
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+        builtins.__import__ = original_import
+
+
+def _job_add_record(
+    *,
+    job: str = "job-add-1",
+    request_id: str = "job-add-request-1",
+    source_url: str = "https://downloads.example.test/payload.bin?signature=private-query",
+    priority: int = -7,
+    order_key: int = 9,
+    category: str = "Other",
+    partial_filename: str = "payload.bin",
+    selected_final_filename: str = "payload--job-add-1.bin",
+) -> dict[str, object]:
+    return {
+        "op": "job_add",
+        "job": job,
+        "request_id": request_id,
+        "source_url": source_url,
+        "source_kind": "direct",
+        "priority": priority,
+        "order_key": order_key,
+        "category": category,
+        "partial_filename": partial_filename,
+        "selected_final_filename": selected_final_filename,
+        "start": False,
+    }
+
+
+def _job_add_payload(record: dict[str, object]) -> bytes:
+    return (
+        json.dumps(record, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _job_add_store_snapshot(
+    state_root: Path,
+) -> tuple[
+    tuple[tuple[object, ...], ...],
+    tuple[tuple[object, ...], ...],
+    tuple[tuple[object, ...], ...],
+    tuple[tuple[object, ...], ...],
+    tuple[tuple[object, ...], ...],
+]:
+    """Capture add-visible durable state without exposing stored source URLs."""
+
+    store = SQLiteStore(state_root / "state.db")
+    try:
+        connection = store._connection
+        return (
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT job_id, generation, revision, state
+                    FROM jobs
+                    ORDER BY job_id
+                    """
+                ).fetchall()
+            ),
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT request_id, job_id, generation, revision
+                    FROM commands
+                    ORDER BY request_id
+                    """
+                ).fetchall()
+            ),
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT request_id, scope, action
+                    FROM command_receipts
+                    ORDER BY request_id
+                    """
+                ).fetchall()
+            ),
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT kind, job_id, generation, revision
+                    FROM events
+                    ORDER BY event_id
+                    """
+                ).fetchall()
+            ),
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT
+                        job_id,
+                        source_kind,
+                        priority,
+                        order_key,
+                        authorized,
+                        manual_hold,
+                        start_now_requested
+                    FROM materialized_jobs
+                    ORDER BY job_id
+                    """
+                ).fetchall()
+            ),
+        )
+    finally:
+        store.close()
+
+
+def _add_job(
+    socket_path: Path,
+    **overrides: object,
+) -> Any:
+    add_job = getattr(ipc, "add_job", None)
+    assert callable(add_job), "job_add client is missing"
+    record = _job_add_record(**cast(dict[str, Any], overrides))
+    return add_job(
+        socket_path,
+        job=record["job"],
+        request_id=record["request_id"],
+        source_url=record["source_url"],
+        priority=record["priority"],
+        order_key=record["order_key"],
+        category=record["category"],
+        partial_filename=record["partial_filename"],
+        selected_final_filename=record["selected_final_filename"],
+    )
+
+
+def test_job_add_client_uses_closed_envelope_and_full_derived_digest(
+    short_socket_root: Path,
+) -> None:
+    command_type = getattr(ipc, "JobAddCommand", None)
+    result_type = getattr(ipc, "JobAddResult", None)
+    add_job = getattr(ipc, "add_job", None)
+    assert isinstance(command_type, type), "job_add command is missing"
+    assert isinstance(result_type, type), "job_add result is missing"
+    assert callable(add_job), "job_add client is missing"
+
+    record = _job_add_record()
+    command = command_type(
+        job=record["job"],
+        request_id=record["request_id"],
+        source_url=record["source_url"],
+        priority=record["priority"],
+        order_key=record["order_key"],
+        category=record["category"],
+        partial_filename=record["partial_filename"],
+        selected_final_filename=record["selected_final_filename"],
+    )
+    assert command.to_record() == record
+    assert command.payload_digest == hashlib.sha256(
+        json.dumps(
+            {
+                "job": record["job"],
+                "request_id": record["request_id"],
+                "source_url": record["source_url"],
+                "source_kind": "direct",
+                "priority": record["priority"],
+                "order_key": record["order_key"],
+                "category": record["category"],
+                "partial_filename": record["partial_filename"],
+                "selected_final_filename": record["selected_final_filename"],
+                "start": False,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert "payload_digest" not in record
+
+    socket_path = short_socket_root / "worker.sock"
+    commands: list[ipc.JobAddCommand] = []
+
+    def job_add(command: ipc.JobAddCommand) -> ipc.JobAddResult:
+        commands.append(command)
+        return ipc.JobAddResult(
+            applied=True, job="job-add-1", generation=0, revision=0
+        )
+
+    server = ipc.HealthServer(
+        socket_path,
+        health=lambda: ipc.WorkerHealth(worker_epoch=1, queue_gate="paused"),
+        job_add=job_add,
+    )
+    try:
+        result = cast(
+            ipc.JobAddResult,
+            _serve_one(
+                server,
+                lambda: add_job(
+                    socket_path,
+                    job=record["job"],
+                    request_id=record["request_id"],
+                    source_url=record["source_url"],
+                    priority=record["priority"],
+                    order_key=record["order_key"],
+                    category=record["category"],
+                    partial_filename=record["partial_filename"],
+                    selected_final_filename=record["selected_final_filename"],
+                ),
+            ),
+        )
+    finally:
+        server.close()
+
+    assert result.to_record() == {
+        "applied": True,
+        "job": "job-add-1",
+        "generation": 0,
+        "revision": 0,
+    }
+    assert json.dumps(result.to_record()) == (
+        '{"applied": true, "job": "job-add-1", "generation": 0, "revision": 0}'
+    )
+    assert "private-query" not in json.dumps(result.to_record())
+    assert [captured.to_record() for captured in commands] == [record]
+
+
+def test_job_add_client_rejects_error_or_nonclosed_response(
+    short_socket_root: Path,
+) -> None:
+    add_job = getattr(ipc, "add_job", None)
+    assert callable(add_job), "job_add client is missing"
+    responses = (
+        (b'{"error":"command_conflict"}\n', "command_conflict"),
+        (b'{"error":"invalid_request"}\n', "invalid_request"),
+        (
+            b'{"applied":true,"job":"job-add-1","generation":0,"revision":0,"extra":0}\n',
+            "ipc_response_invalid",
+        ),
+        (
+            b'{"applied":true,"job":"job-add-1","generation":0,"revision":0,"revision":1}\n',
+            "ipc_response_invalid",
+        ),
+        (
+            b'{"applied":1,"job":"job-add-1","generation":0,"revision":0}\n',
+            "ipc_response_invalid",
+        ),
+    )
+    record = _job_add_record()
+    expected_request = _job_add_payload(record)[:-1]
+    for index, (response, error) in enumerate(responses):
+        socket_path = short_socket_root / f"worker-{index}.sock"
+        requests: list[bytes | None] = []
+        thread, errors = _start_response_server(socket_path, response, requests)
+        try:
+            with pytest.raises(ipc.IPCError, match=rf"^{error}$"):
+                add_job(
+                    socket_path,
+                    job=record["job"],
+                    request_id=record["request_id"],
+                    source_url=record["source_url"],
+                    priority=record["priority"],
+                    order_key=record["order_key"],
+                    category=record["category"],
+                    partial_filename=record["partial_filename"],
+                    selected_final_filename=record["selected_final_filename"],
+                )
+        finally:
+            thread.join(_WATCHDOG_SECONDS)
+            socket_path.unlink(missing_ok=True)
+        assert not thread.is_alive()
+        assert errors == []
+        assert requests == [expected_request]
+
+
+def test_worker_job_add_persists_a_cold_direct_job_without_engine_activation(
+    short_socket_root: Path,
+) -> None:
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    resolver_calls = context.Value("i", 0)
+
+    with _origin_type()() as origin:
+        process = context.Process(
+            target=_run_worker_process_with_job_add_guards,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                resolver_calls,
+            ),
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert set_queue_gate(
+                socket_path,
+                gate="running",
+                request_id="open-before-add",
+                expected_revision=1,
+            ).to_record() == {
+                "applied": True,
+                "queue_gate": "running",
+                "revision": 2,
+            }
+            state_entries_before = tuple(sorted(path.name for path in state_root.iterdir()))
+            source_url = (
+                f"http://job-add.example.test:{origin.port}/range?signature=source-private"
+            )
+            result = _add_job(
+                socket_path,
+                job="cold-direct-job",
+                request_id="cold-direct-request",
+                source_url=source_url,
+                priority=-17,
+                order_key=23,
+                category="Documents",
+                partial_filename="cold.bin",
+                selected_final_filename="cold--cold-direct-job.bin",
+            )
+            assert result.to_record() == {
+                "applied": True,
+                "job": "cold-direct-job",
+                "generation": 0,
+                "revision": 0,
+            }
+            assert "source-private" not in json.dumps(result.to_record())
+            assert tuple(sorted(path.name for path in state_root.iterdir())) == state_entries_before
+            assert resolver_calls.value == 0
+            assert origin.ledger.request_count == 0
+            assert origin.ledger.response_body_bytes == 0
+            assert not (state_root / "direct-runtime").exists()
+
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                job = observer.get_job("cold-direct-job")
+                materialized = observer.get_materialized_job("cold-direct-job")
+                assert job is not None
+                assert materialized is not None
+                assert (job.generation, job.revision, job.state) == (0, 0, "queued")
+                assert hashlib.sha256(job.source_url).hexdigest() == hashlib.sha256(
+                    source_url.encode("utf-8")
+                ).hexdigest()
+                assert materialized.source_kind is SourceKind.DIRECT
+                assert materialized.queue_collection_id is None
+                assert materialized.scheduled_for is None
+                assert materialized.destination_collection is None
+                assert (
+                    materialized.priority,
+                    materialized.order_key,
+                    materialized.category,
+                    materialized.partial_filename,
+                    materialized.selected_final_filename,
+                ) == (
+                    -17,
+                    23,
+                    "Documents",
+                    "cold.bin",
+                    "cold--cold-direct-job.bin",
+                )
+                assert (
+                    materialized.authorized,
+                    materialized.manual_hold,
+                    materialized.start_now_requested,
+                    materialized.intent.expected_revision,
+                ) == (False, False, False, None)
+                assert [event.kind for event in observer.list_events()] == ["job_added"]
+            finally:
+                observer.close()
+
+            started = ipc.control_job(
+                socket_path,
+                job="cold-direct-job",
+                action="start_now",
+                request_id="cold-direct-start",
+                expected_revision=0,
+            )
+            assert started == ipc.JobControlResult(
+                status="applied",
+                job="cold-direct-job",
+                generation=0,
+                revision=1,
+                state="queued",
+                authorized=True,
+            )
+            assert resolver_calls.value == 0
+            assert origin.ledger.request_count == 0
+            assert origin.ledger.response_body_bytes == 0
+            assert not (state_root / "direct-runtime").exists()
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+        finally:
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+def test_worker_job_add_replays_conflicts_globally_and_has_no_partial_write(
+    short_socket_root: Path,
+) -> None:
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_run_worker_process,
+        args=(str(state_root), str(socket_path), ready, shutdown, stopped, results),
+    )
+    process.start()
+    try:
+        assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+        base = {
+            "job": "replay-job",
+            "request_id": "replay-request",
+            "source_url": "https://downloads.example.test/replay.bin?signature=first",
+            "priority": -3,
+            "order_key": 5,
+            "category": "Other",
+            "partial_filename": "replay.bin",
+            "selected_final_filename": "replay.bin",
+        }
+        first = _add_job(socket_path, **base)
+        assert first.to_record() == {
+            "applied": True,
+            "job": "replay-job",
+            "generation": 0,
+            "revision": 0,
+        }
+        after_first = _job_add_store_snapshot(state_root)
+        assert _add_job(socket_path, **base).to_record() == {
+            "applied": False,
+            "job": "replay-job",
+            "generation": 0,
+            "revision": 0,
+        }
+        assert _job_add_store_snapshot(state_root) == after_first
+
+        for changed in (
+            {"job": "different-job"},
+            {"source_url": "https://downloads.example.test/replay.bin?signature=changed"},
+            {"priority": 4},
+            {"order_key": 6},
+            {"category": "Documents"},
+            {
+                "partial_filename": "changed.bin",
+                "selected_final_filename": "changed.bin",
+            },
+            {"selected_final_filename": "replay--replay-job.bin"},
+        ):
+            with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+                _add_job(socket_path, **{**base, **changed})
+            assert _job_add_store_snapshot(state_root) == after_first
+
+        with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+            ipc.control_job(
+                socket_path,
+                job="replay-job",
+                action="pause",
+                request_id="replay-request",
+                expected_revision=0,
+            )
+        assert _job_add_store_snapshot(state_root) == after_first
+
+        _add_job(
+            socket_path,
+            job="occupied-job",
+            request_id="occupied-request",
+            source_url="https://downloads.example.test/occupied.bin",
+            priority=0,
+            order_key=6,
+            category="Other",
+            partial_filename="occupied.bin",
+            selected_final_filename="occupied.bin",
+        )
+        before_occupied_conflict = _job_add_store_snapshot(state_root)
+        with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+            _add_job(
+                socket_path,
+                job="occupied-job",
+                request_id="new-request-for-occupied-job",
+                source_url="https://downloads.example.test/new.bin",
+                priority=0,
+                order_key=7,
+                category="Other",
+                partial_filename="new.bin",
+                selected_final_filename="new.bin",
+            )
+        assert _job_add_store_snapshot(state_root) == before_occupied_conflict
+
+        assert set_queue_gate(
+            socket_path,
+            gate="running",
+            request_id="queue-gate-collision",
+            expected_revision=1,
+        ).applied is True
+        before_queue_collision = _job_add_store_snapshot(state_root)
+        with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+            _add_job(
+                socket_path,
+                job="queue-gate-collision-job",
+                request_id="queue-gate-collision",
+                source_url="https://downloads.example.test/gate.bin",
+                priority=0,
+                order_key=8,
+                category="Other",
+                partial_filename="gate.bin",
+                selected_final_filename="gate.bin",
+            )
+        assert _job_add_store_snapshot(state_root) == before_queue_collision
+
+        _add_job(
+            socket_path,
+            job="controlled-job",
+            request_id="controlled-add-request",
+            source_url="https://downloads.example.test/controlled.bin",
+            priority=0,
+            order_key=9,
+            category="Other",
+            partial_filename="controlled.bin",
+            selected_final_filename="controlled.bin",
+        )
+        assert ipc.control_job(
+            socket_path,
+            job="controlled-job",
+            action="pause",
+            request_id="job-control-collision",
+            expected_revision=0,
+        ).status == "applied"
+        before_control_collision = _job_add_store_snapshot(state_root)
+        with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+            _add_job(
+                socket_path,
+                job="job-control-collision-job",
+                request_id="job-control-collision",
+                source_url="https://downloads.example.test/control.bin",
+                priority=0,
+                order_key=10,
+                category="Other",
+                partial_filename="control.bin",
+                selected_final_filename="control.bin",
+            )
+        assert _job_add_store_snapshot(state_root) == before_control_collision
+
+        shutdown.set()
+        assert stopped.wait(_WATCHDOG_SECONDS)
+        _join(process)
+        assert _result(results) == ("result", None)
+    finally:
+        shutdown.set()
+        if process.is_alive():
+            _join(process)
+
+
+def test_worker_job_add_rejects_closed_invalid_source_and_oversized_requests(
+    short_socket_root: Path,
+) -> None:
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_run_worker_process,
+        args=(str(state_root), str(socket_path), ready, shutdown, stopped, results),
+    )
+    process.start()
+    try:
+        assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+        valid = _job_add_record()
+        baseline = _job_add_store_snapshot(state_root)
+        malformed_records = (
+            {key: value for key, value in valid.items() if key != "source_url"},
+            {**valid, "unexpected": True},
+            {**valid, "payload_digest": "a" * 64},
+            {**valid, "job": "bad/job"},
+            {**valid, "source_kind": "video"},
+            {**valid, "start": True},
+            {**valid, "priority": True},
+            {**valid, "priority": 1 << 31},
+            {**valid, "priority": -(1 << 31) - 1},
+            {**valid, "order_key": True},
+            {**valid, "order_key": -1},
+            {**valid, "order_key": 1 << 63},
+            {**valid, "category": "Unexpected"},
+            {**valid, "partial_filename": "../unsafe.bin"},
+            {**valid, "selected_final_filename": "another.bin"},
+            {**valid, "source_url": True},
+            {**valid, "source_url": "not a URL"},
+            {**valid, "source_url": "https://user:pass@example.test/private.bin"},
+            {**valid, "source_url": "http://127.0.0.1:18080/range"},
+            {**valid, "source_url": "https://downloads.example.test/" + "x" * 8193},
+            {**valid, "request_id": "x" * 129},
+        )
+        for record in malformed_records:
+            assert _raw_request(socket_path, _job_add_payload(record)) == {
+                "error": "invalid_request"
+            }
+            assert _job_add_store_snapshot(state_root) == baseline
+
+        duplicate = _job_add_payload(valid).replace(
+            b'"op":"job_add",', b'"op":"job_add","op":"health",', 1
+        )
+        assert _raw_request(socket_path, duplicate) == {"error": "invalid_request"}
+        assert _raw_request(socket_path, b"x" * (MAX_MESSAGE_BYTES + 1)) == {
+            "error": "invalid_request"
+        }
+        assert _job_add_store_snapshot(state_root) == baseline
+        assert request_health(socket_path).to_record() == {
+            "protocol_version": 1,
+            "worker_epoch": 1,
+            "queue_gate": "paused",
+        }
+
+        shutdown.set()
+        assert stopped.wait(_WATCHDOG_SECONDS)
+        _join(process)
+        assert _result(results) == ("result", None)
+    finally:
+        shutdown.set()
+        if process.is_alive():
+            _join(process)

@@ -15,6 +15,8 @@ from hermes_downloads.ipc import (
     HealthServer,
     IPCError,
     IPCStateError,
+    JobAddCommand,
+    JobAddResult,
     JobControlCommand,
     JobControlResult,
     JobsPage,
@@ -24,6 +26,8 @@ from hermes_downloads.ipc import (
     WorkerHealth,
     validate_available_socket_path,
 )
+from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
+from hermes_downloads.network import validate_source_url
 from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.store import (
     DirectEngineActivationFence,
@@ -193,6 +197,49 @@ def _queue_gate_from_store(
     return QueueGateResult(
         applied=result.applied,
         queue_gate=result.gate,
+        revision=result.revision,
+    )
+
+
+def _job_add_from_store(store: SQLiteStore, command: JobAddCommand) -> JobAddResult:
+    """Materialize one validated, inactive direct job without activating an engine."""
+
+    try:
+        source = validate_source_url(command.source_url)
+        intent = DownloadIntent(
+            job_id=command.job,
+            request_id=command.request_id,
+            payload_digest=command.payload_digest,
+            source_url=source.raw_url,
+            expected_revision=None,
+            generation=0,
+            revision=0,
+        )
+        materialized = MaterializedJob(
+            job_id=command.job,
+            intent=intent,
+            source_kind=SourceKind.DIRECT,
+            queue_collection_id=None,
+            priority=command.priority,
+            order_key=command.order_key,
+            scheduled_for=None,
+            authorized=False,
+            manual_hold=False,
+            start_now_requested=False,
+            category=command.category,
+            destination_collection=None,
+            partial_filename=command.partial_filename,
+            selected_final_filename=command.selected_final_filename,
+        )
+        result = store.apply_add(intent, materialized=materialized)
+    except RequestConflictError:
+        raise
+    except (TypeError, UnicodeError, ValueError):
+        raise IPCError("invalid_request") from None
+    return JobAddResult(
+        applied=result.applied,
+        job=result.job,
+        generation=result.generation,
         revision=result.revision,
     )
 
@@ -489,6 +536,7 @@ def run_worker(
                     health=lambda: _health_from_store(store),
                     jobs_page=lambda cursor: _jobs_page_from_store(store, cursor),
                     queue_gate=lambda command: _queue_gate_from_store(store, command),
+                    job_add=lambda command: _job_add_from_store(store, command),
                     job_control=lambda command: _job_control_from_store(store, command),
                     direct_engine_activate=direct_engine_activate,
                 )
