@@ -208,6 +208,14 @@ def _create_v5_database(database_path: Path) -> tuple[object, ...]:
     return legacy_job
 
 
+def _create_v6_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v5_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA)
+        connection.execute("PRAGMA user_version = 6")
+    return legacy_job
+
+
 def _process_birth_identity(**overrides: Any) -> ProcessBirthIdentity:
     values: dict[str, int | str] = {
         "leader_pid": 4242,
@@ -238,6 +246,28 @@ def _queue_command_rows(store: SQLiteStore) -> tuple[tuple[object, ...], ...]:
             """
             SELECT request_id, payload_digest, gate, revision
             FROM queue_commands
+            ORDER BY request_id
+            """
+        ).fetchall()
+    )
+
+
+def _job_control_command_rows(store: SQLiteStore) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        tuple(row)
+        for row in store._connection.execute(
+            """
+            SELECT
+                request_id,
+                payload_digest,
+                job_id,
+                action,
+                status,
+                generation,
+                revision,
+                state,
+                authorized
+            FROM job_control_commands
             ORDER BY request_id
             """
         ).fetchall()
@@ -1096,7 +1126,7 @@ def test_cold_recovery_epoch_survives_reopen(tmp_path: Path) -> None:
         final.close()
 
 
-def test_v6_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+def test_v7_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     expected_legacy_job = _create_v1_database(database_path)
     legacy_source_url = expected_legacy_job[1]
@@ -1116,7 +1146,7 @@ def test_v6_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1125,8 +1155,8 @@ def test_v6_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
             """
         ).fetchone() == expected_legacy_job
     v1_tables = {"settings", "jobs", "commands", "events"}
-    v6_tables = _table_names(database_path)
-    assert v1_tables <= v6_tables
+    v7_tables = _table_names(database_path)
+    assert v1_tables <= v7_tables
     assert {
         "collection_holds",
         "job_retry",
@@ -1134,8 +1164,9 @@ def test_v6_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         "queue_commands",
         "engine_instances",
         "direct_engine_activation_fences",
-    } <= v6_tables
-    assert len(v6_tables - v1_tables) >= 7
+        "job_control_commands",
+    } <= v7_tables
+    assert len(v7_tables - v1_tables) >= 8
 
 
 def test_v2_migration_failure_leaves_v1_database_unchanged(
@@ -1218,7 +1249,7 @@ def test_v3_migration_failure_leaves_v2_database_unchanged(
     }
 
 
-def test_v6_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
+def test_v7_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     expected_legacy_job = _create_v3_database(database_path)
     legacy_source_url = expected_legacy_job[1]
@@ -1238,7 +1269,7 @@ def test_v6_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         schema = connection.execute(
             """
             SELECT sql
@@ -1445,17 +1476,17 @@ def test_v0_rejects_sqlite_prefix_lookalike_before_bootstrap_writes(tmp_path: Pa
     assert _table_names(database_path) == {lookalike}
 
 
-def test_v6_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v7_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 7")
+        connection.execute("PRAGMA user_version = 8")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1614,7 +1645,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1680,7 +1711,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
     ),
     ids=("v1", "v2", "v3", "v4", "v5"),
 )
-def test_v6_migrates_every_supported_legacy_schema_to_the_exact_catalog(
+def test_v7_migrates_every_supported_legacy_schema_to_the_exact_catalog(
     tmp_path: Path, legacy_builder: Any
 ) -> None:
     database_path = tmp_path / "queue.sqlite3"
@@ -1699,17 +1730,17 @@ def test_v6_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V6_TABLE_SCHEMAS
+    assert table_schemas == store_module._V7_TABLE_SCHEMAS
 
 
-def test_v6_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
+def test_v7_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     _create_v5_database(database_path)
     record = store_module.DirectEngineRecord(
@@ -1750,7 +1781,7 @@ def test_v6_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert [
             row[1]
             for row in connection.execute(
@@ -2456,3 +2487,406 @@ def test_v3_cold_recovery_rolls_back_when_retry_audit_cannot_be_fenced(
         assert store.get_retry_budget("job-1") == budget
     finally:
         store.close()
+
+
+def test_job_control_persists_pause_resume_and_start_now_without_implicit_authorization(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    materialized = replace(
+        _materialized_job(),
+        authorized=False,
+        manual_hold=False,
+        start_now_requested=False,
+    )
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        assert store.initialize_cold_start() == "paused"
+
+        paused = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="pause",
+            request_id="pause-request",
+            payload_digest="c" * 64,
+            expected_revision=materialized.intent.revision,
+        )
+        assert paused == store_module.JobControlResult(
+            status="applied",
+            job="job-1",
+            generation=4,
+            revision=8,
+            state="paused",
+            authorized=False,
+        )
+        assert store.get_materialized_job("job-1") == replace(
+            materialized,
+            intent=replace(materialized.intent, revision=8),
+            manual_hold=True,
+        )
+
+        resumed = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="resume",
+            request_id="resume-request",
+            payload_digest="d" * 64,
+            expected_revision=8,
+        )
+        assert resumed == store_module.JobControlResult(
+            status="applied",
+            job="job-1",
+            generation=4,
+            revision=9,
+            state="queued",
+            authorized=False,
+        )
+        assert store.get_materialized_job("job-1") == replace(
+            materialized,
+            intent=replace(materialized.intent, revision=9),
+        )
+
+        events_before_noop = store.list_events()
+        unchanged_resume = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="resume",
+            request_id="resume-again-request",
+            payload_digest="e" * 64,
+            expected_revision=9,
+        )
+        assert unchanged_resume == store_module.JobControlResult(
+            status="applied",
+            job="job-1",
+            generation=4,
+            revision=9,
+            state="queued",
+            authorized=False,
+        )
+        assert store.list_events() == events_before_noop
+
+        blocked = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="start_now",
+            request_id="start-blocked-request",
+            payload_digest="f" * 64,
+            expected_revision=9,
+        )
+        assert blocked == store_module.JobControlResult(
+            status="blocked",
+            job="job-1",
+            generation=4,
+            revision=9,
+            state="queued",
+            authorized=False,
+        )
+        assert store.get_materialized_job("job-1") == replace(
+            materialized,
+            intent=replace(materialized.intent, revision=9),
+        )
+
+        assert store.apply_queue_gate(
+            gate="running",
+            request_id="queue-open-request",
+            payload_digest="a" * 64,
+            expected_revision=1,
+        ) == store_module.QueueGateResult(applied=True, gate="running", revision=2)
+        started = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="start_now",
+            request_id="start-request",
+            payload_digest="b" * 64,
+            expected_revision=9,
+        )
+        assert started == store_module.JobControlResult(
+            status="applied",
+            job="job-1",
+            generation=4,
+            revision=10,
+            state="queued",
+            authorized=True,
+        )
+        assert store.get_materialized_job("job-1") == replace(
+            materialized,
+            intent=replace(materialized.intent, revision=10),
+            authorized=True,
+            start_now_requested=True,
+        )
+        assert [event.kind for event in store.list_events()] == [
+            "job_added",
+            "job_paused",
+            "job_resumed",
+            "job_start_now_requested",
+        ]
+    finally:
+        store.close()
+
+
+def test_job_control_replays_its_original_result_and_conflicts_on_digest_reuse(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    materialized = _materialized_job()
+    store = SQLiteStore(database_path)
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        first = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="pause",
+            request_id="pause-request",
+            payload_digest="c" * 64,
+            expected_revision=7,
+        )
+        replay = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="pause",
+            request_id="pause-request",
+            payload_digest="c" * 64,
+            expected_revision=7,
+        )
+        assert replay == first
+        before_conflict = (
+            store.get_job("job-1"),
+            store.get_materialized_job("job-1"),
+            store.list_events(),
+            _job_control_command_rows(store),
+        )
+
+        with pytest.raises(RequestConflictError):
+            store.apply_job_control(
+                job_id=materialized.job_id,
+                action="pause",
+                request_id="pause-request",
+                payload_digest="d" * 64,
+                expected_revision=8,
+            )
+
+        assert (
+            store.get_job("job-1"),
+            store.get_materialized_job("job-1"),
+            store.list_events(),
+            _job_control_command_rows(store),
+        ) == before_conflict
+    finally:
+        store.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.apply_job_control(
+            job_id=materialized.job_id,
+            action="pause",
+            request_id="pause-request",
+            payload_digest="c" * 64,
+            expected_revision=7,
+        ) == first
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("job_id", "request_id", "expected_revision"),
+    (
+        pytest.param("missing-job", "missing-job-request", 0, id="unknown-job"),
+        pytest.param("job-1", "nonmaterialized-job-request", 7, id="nonmaterialized-job"),
+    ),
+)
+def test_job_control_rejects_nonmaterialized_targets_without_mutation(
+    tmp_path: Path,
+    job_id: str,
+    request_id: str,
+    expected_revision: int,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(_intent())
+        before = (store.list_jobs(), store.list_events(), _job_control_command_rows(store))
+
+        with pytest.raises(ValueError, match="not a materialized job"):
+            store.apply_job_control(
+                job_id=job_id,
+                action="pause",
+                request_id=request_id,
+                payload_digest="c" * 64,
+                expected_revision=expected_revision,
+            )
+
+        assert (store.list_jobs(), store.list_events(), _job_control_command_rows(store)) == before
+    finally:
+        store.close()
+
+
+def test_job_control_stale_fence_persists_a_readback_without_mutating_the_job(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    materialized = replace(_materialized_job(), authorized=False, start_now_requested=False)
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        before = (
+            store.get_job("job-1"),
+            store.get_materialized_job("job-1"),
+            store.list_events(),
+        )
+        stale = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="pause",
+            request_id="stale-request",
+            payload_digest="c" * 64,
+            expected_revision=materialized.intent.revision - 1,
+        )
+        assert stale == store_module.JobControlResult(
+            status="stale",
+            job="job-1",
+            generation=4,
+            revision=7,
+            state="queued",
+            authorized=False,
+        )
+        assert store.apply_job_control(
+            job_id=materialized.job_id,
+            action="pause",
+            request_id="stale-request",
+            payload_digest="c" * 64,
+            expected_revision=materialized.intent.revision - 1,
+        ) == stale
+        assert (
+            store.get_job("job-1"),
+            store.get_materialized_job("job-1"),
+            store.list_events(),
+        ) == before
+        assert _job_control_command_rows(store) == (
+            (
+                "stale-request",
+                "c" * 64,
+                "job-1",
+                "pause",
+                "stale",
+                4,
+                7,
+                "queued",
+                0,
+            ),
+        )
+    finally:
+        store.close()
+
+
+def test_job_control_receipt_failure_rolls_back_lifecycle_projection_and_audit(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    materialized = _materialized_job()
+    store = SQLiteStore(database_path)
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        before = (
+            store.get_job("job-1"),
+            store.get_materialized_job("job-1"),
+            store.list_events(),
+            _job_control_command_rows(store),
+        )
+        _install_failing_insert_trigger(
+            database_path,
+            table="job_control_commands",
+            trigger_name="fail_job_control_receipt_insert",
+            message="injected job control receipt failure",
+        )
+
+        with pytest.raises(sqlite3.DatabaseError, match="injected job control receipt failure"):
+            store.apply_job_control(
+                job_id=materialized.job_id,
+                action="pause",
+                request_id="pause-request",
+                payload_digest="c" * 64,
+                expected_revision=7,
+            )
+
+        assert (
+            store.get_job("job-1"),
+            store.get_materialized_job("job-1"),
+            store.list_events(),
+            _job_control_command_rows(store),
+        ) == before
+    finally:
+        store.close()
+
+
+def test_v7_migrates_v6_database_to_the_exact_job_control_catalog(tmp_path: Path) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v6_database(database_path)
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_job("legacy-job") == store_module.JobRecord(
+            job="legacy-job",
+            source_url=expected_legacy_job[1],
+            generation=23,
+            revision=41,
+            state="downloading",
+        )
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V7_TABLE_SCHEMAS
+
+
+def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v6_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_migration_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="CREATE TABLE job_control_commands",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_migration_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V6_TABLE_SCHEMAS
+
+
+def test_v7_rejects_incomplete_job_control_schema_before_bootstrap_writes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v6_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE job_control_commands (request_id TEXT PRIMARY KEY)")
+        connection.execute("PRAGMA user_version = 7")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        SQLiteStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA table_info(job_control_commands)").fetchall() == [
+            (0, "request_id", "TEXT", 0, None, 1)
+        ]
+    assert _table_names(database_path) == {
+        *store_module._V6_TABLE_SCHEMAS,
+        "job_control_commands",
+    }

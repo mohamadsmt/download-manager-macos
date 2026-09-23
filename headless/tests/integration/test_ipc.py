@@ -2924,3 +2924,284 @@ def test_worker_health_ipc_is_bounded_read_only_and_removed_on_shutdown() -> Non
             shutdown.set()
             if process.is_alive():
                 _join(process)
+
+
+def test_worker_job_control_is_durable_typed_and_never_imports_or_transfers(
+    short_socket_root: Path,
+) -> None:
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    direct_import_allowed = context.Event()
+
+    with _origin_type()() as origin:
+        intent = DownloadIntent(
+            job_id="fixture-job",
+            request_id="fixture-add-request",
+            payload_digest="a" * 64,
+            source_url=origin.url("/range").encode("utf-8"),
+            generation=7,
+            revision=11,
+        )
+        seeded = SQLiteStore(state_root / "state.db")
+        try:
+            seeded.apply_add(
+                intent,
+                materialized=MaterializedJob(
+                    job_id=intent.job_id,
+                    intent=intent,
+                    source_kind=SourceKind.DIRECT,
+                    queue_collection_id=None,
+                    priority=0,
+                    order_key=0,
+                    scheduled_for=None,
+                    authorized=False,
+                    manual_hold=False,
+                    start_now_requested=False,
+                    category="Other",
+                    destination_collection=None,
+                    partial_filename="fixture.bin",
+                    selected_final_filename="fixture--fixture-job.bin",
+                ),
+            )
+        finally:
+            seeded.close()
+
+        process = context.Process(
+            target=_run_worker_process_with_engine_imports_gated,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                direct_import_allowed,
+            ),
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert request_health(socket_path).to_record() == {
+                "protocol_version": 1,
+                "worker_epoch": 1,
+                "queue_gate": "paused",
+            }
+
+            blocked = ipc.control_job(
+                socket_path,
+                job="fixture-job",
+                action="start_now",
+                request_id="start-blocked-request",
+                expected_revision=12,
+            )
+            assert blocked == ipc.JobControlResult(
+                status="blocked",
+                job="fixture-job",
+                generation=8,
+                revision=12,
+                state="paused",
+                authorized=False,
+            )
+            paused = ipc.control_job(
+                socket_path,
+                job="fixture-job",
+                action="pause",
+                request_id="pause-request",
+                expected_revision=12,
+            )
+            assert paused == ipc.JobControlResult(
+                status="applied",
+                job="fixture-job",
+                generation=8,
+                revision=13,
+                state="paused",
+                authorized=False,
+            )
+            assert ipc.control_job(
+                socket_path,
+                job="fixture-job",
+                action="pause",
+                request_id="pause-request",
+                expected_revision=12,
+            ) == paused
+            resumed = ipc.control_job(
+                socket_path,
+                job="fixture-job",
+                action="resume",
+                request_id="resume-request",
+                expected_revision=13,
+            )
+            assert resumed == ipc.JobControlResult(
+                status="applied",
+                job="fixture-job",
+                generation=8,
+                revision=14,
+                state="queued",
+                authorized=False,
+            )
+            assert set_queue_gate(
+                socket_path,
+                gate="running",
+                request_id="queue-open-request",
+                expected_revision=1,
+            ).to_record() == {
+                "applied": True,
+                "queue_gate": "running",
+                "revision": 2,
+            }
+            started = ipc.control_job(
+                socket_path,
+                job="fixture-job",
+                action="start_now",
+                request_id="start-request",
+                expected_revision=14,
+            )
+            assert started == ipc.JobControlResult(
+                status="applied",
+                job="fixture-job",
+                generation=8,
+                revision=15,
+                state="queued",
+                authorized=True,
+            )
+            assert ipc.control_job(
+                socket_path,
+                job="fixture-job",
+                action="pause",
+                request_id="stale-request",
+                expected_revision=14,
+            ) == ipc.JobControlResult(
+                status="stale",
+                job="fixture-job",
+                generation=8,
+                revision=15,
+                state="queued",
+                authorized=True,
+            )
+            with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+                ipc.control_job(
+                    socket_path,
+                    job="fixture-job",
+                    action="resume",
+                    request_id="pause-request",
+                    expected_revision=15,
+                )
+
+            for payload in (
+                b'{"op":"job_control"}\n',
+                b'{"op":"job_control","job":"fixture-job","action":"delete","request_id":"bad-request","expected_revision":15}\n',
+                b'{"op":"job_control","job":"fixture-job","action":"pause","request_id":"bad-request","expected_revision":true}\n',
+                b'{"op":"job_control","job":"fixture-job","action":"pause","request_id":"bad-request","expected_revision":15,"extra":true}\n',
+                b'{"op":"job_control","job":"fixture-job","action":"pause","action":"resume","request_id":"bad-request","expected_revision":15}\n',
+                b'{"op":"job_control","job":"unknown-job","action":"pause","request_id":"unknown-request","expected_revision":0}\n',
+            ):
+                assert _raw_request(socket_path, payload) == {"error": "invalid_request"}
+
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                store_job = observer.get_job("fixture-job")
+                assert store_job is not None
+                assert (
+                    store_job.generation,
+                    store_job.revision,
+                    store_job.state,
+                ) == (8, 15, "queued")
+                materialized = observer.get_materialized_job("fixture-job")
+                assert materialized is not None
+                assert (
+                    materialized.authorized,
+                    materialized.manual_hold,
+                    materialized.start_now_requested,
+                ) == (True, False, True)
+                receipt = observer._connection.execute(
+                    """
+                    SELECT payload_digest, action, status, generation, revision, state, authorized
+                    FROM job_control_commands
+                    WHERE request_id = 'pause-request'
+                    """
+                ).fetchone()
+                assert receipt is not None
+                assert tuple(receipt) == (
+                    hashlib.sha256(
+                        json.dumps(
+                            {
+                                "action": "pause",
+                                "expected_revision": 12,
+                                "job": "fixture-job",
+                                "request_id": "pause-request",
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "pause",
+                    "applied",
+                    8,
+                    13,
+                    "paused",
+                    0,
+                )
+                assert [event.kind for event in observer.list_events()] == [
+                    "job_added",
+                    "job_paused",
+                    "job_paused",
+                    "job_resumed",
+                    "job_start_now_requested",
+                ]
+            finally:
+                observer.close()
+
+            assert direct_import_allowed.is_set() is False
+            assert origin.ledger.request_count == 0
+            assert origin.ledger.response_body_bytes == 0
+            assert not (state_root / "direct-runtime").exists()
+            assert request_health(socket_path).queue_gate == "running"
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+        finally:
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+def test_job_control_client_rejects_nonclosed_or_duplicate_responses(
+    short_socket_root: Path,
+) -> None:
+    control_job = getattr(ipc, "control_job", None)
+    assert callable(control_job)
+    responses = (
+        b'{"status":"applied","job":"job-1","generation":1,"revision":2,"state":"queued","authorized":true,"extra":0}\n',
+        b'{"status":"applied","job":"job-1","generation":1,"revision":2,"state":"queued","authorized":true,"status":"stale"}\n',
+        b'{"status":"applied","job":"job-1","generation":1,"revision":2,"state":"queued","authorized":1}\n',
+        b'{"status":"unexpected","job":"job-1","generation":1,"revision":2,"state":"queued","authorized":true}\n',
+    )
+    for index, response in enumerate(responses):
+        socket_path = short_socket_root / f"worker-{index}.sock"
+        requests: list[bytes | None] = []
+        thread, errors = _start_response_server(socket_path, response, requests)
+        try:
+            with pytest.raises(ipc.IPCError, match="^ipc_response_invalid$"):
+                control_job(
+                    socket_path,
+                    job="job-1",
+                    action="pause",
+                    request_id="pause-request",
+                    expected_revision=2,
+                )
+        finally:
+            thread.join(_WATCHDOG_SECONDS)
+            socket_path.unlink(missing_ok=True)
+        assert not thread.is_alive()
+        assert errors == []
+        assert requests == [
+            b'{"action":"pause","expected_revision":2,"job":"job-1","op":"job_control","request_id":"pause-request"}'
+        ]

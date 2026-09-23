@@ -10,7 +10,7 @@ import secrets
 import sqlite3
 from typing import Final
 
-from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
+from hermes_downloads.models import DownloadIntent, JobState, MaterializedJob, SourceKind
 from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.retry import (
     RetryAuditEvent,
@@ -26,6 +26,7 @@ __all__ = [
     "DirectEngineActivationFence",
     "DirectEngineRecord",
     "EventRecord",
+    "JobControlResult",
     "JobPageRecord",
     "JobRecord",
     "QueueGateResult",
@@ -124,6 +125,20 @@ CREATE TABLE queue_commands (
 );
 """
 
+_JOB_CONTROL_COMMANDS_SCHEMA: Final = """
+CREATE TABLE job_control_commands (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    action TEXT NOT NULL CHECK (action IN ('pause', 'resume', 'start_now')),
+    status TEXT NOT NULL CHECK (status IN ('applied', 'blocked', 'stale')),
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    authorized INTEGER NOT NULL CHECK (authorized IN (0, 1))
+);
+"""
+
 _ENGINE_INSTANCES_SCHEMA: Final = """
 CREATE TABLE engine_instances (
     engine_kind TEXT PRIMARY KEY CHECK (engine_kind = 'direct'),
@@ -176,7 +191,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 6
+_SUPPORTED_SCHEMA_VERSION: Final = 7
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -219,9 +234,27 @@ _V6_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _ENGINE_INSTANCES_SCHEMA,
     _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
 )
+_V7_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _JOB_CONTROL_COMMANDS_SCHEMA,
+)
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
+_JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now"})
+_JOB_CONTROL_STATUSES: Final = frozenset({"applied", "blocked", "stale"})
+_JOB_CONTROL_EVENT_KINDS: Final = {
+    "pause": "job_paused",
+    "resume": "job_resumed",
+    "start_now": "job_start_now_requested",
+}
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _PAGE_SIZE: Final = 100
 _RECOVERABLE_COLD_START_STATES: Final = (
@@ -265,6 +298,31 @@ def _require_queue_gate(value: object) -> str:
     if value not in _QUEUE_GATES:
         raise ValueError("gate must be 'paused' or 'running'")
     return value
+
+
+def _require_job_control_action(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("action must be a string")
+    if value not in _JOB_CONTROL_ACTIONS:
+        raise ValueError("action is not a job-control action")
+    return value
+
+
+def _require_job_control_status(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("status must be a string")
+    if value not in _JOB_CONTROL_STATUSES:
+        raise ValueError("status is not a job-control status")
+    return value
+
+
+def _require_public_job_state(value: object, name: str) -> str:
+    state = _require_sqlite_text(value, name)
+    try:
+        JobState(state)
+    except ValueError:
+        raise ValueError(f"persisted {name} is not a public job state") from None
+    return state
 
 
 def _require_counter(value: object, name: str) -> int:
@@ -347,6 +405,54 @@ class QueueGateResult:
     applied: bool
     gate: str
     revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class JobControlResult:
+    """The durable public readback for one materialized-job control command."""
+
+    status: str
+    job: str
+    generation: int
+    revision: int
+    state: str
+    authorized: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", _require_job_control_status(self.status))
+        object.__setattr__(self, "job", _require_identifier(self.job, "job"))
+        object.__setattr__(
+            self, "generation", _require_counter(self.generation, "generation")
+        )
+        object.__setattr__(self, "revision", _require_counter(self.revision, "revision"))
+        object.__setattr__(
+            self, "state", _require_public_job_state(self.state, "job control state")
+        )
+        if type(self.authorized) is not bool:
+            raise TypeError("authorized must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class _JobControlProjection:
+    """The validated mutable fields needed for one serialized control transition."""
+
+    job: str
+    generation: int
+    revision: int
+    state: str
+    authorized: bool
+    manual_hold: bool
+    start_now_requested: bool
+
+    def to_result(self, status: str) -> JobControlResult:
+        return JobControlResult(
+            status=status,
+            job=self.job,
+            generation=self.generation,
+            revision=self.revision,
+            state=self.state,
+            authorized=self.authorized,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,7 +541,7 @@ class SQLiteStore:
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
-            self._migrate_schema_v6(connection)
+            self._migrate_schema_v7(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -465,6 +571,7 @@ class SQLiteStore:
             4: _V4_TABLE_SCHEMAS,
             5: _V5_TABLE_SCHEMAS,
             6: _V6_TABLE_SCHEMAS,
+            7: _V7_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -495,8 +602,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v6(connection: sqlite3.Connection) -> None:
-        """Apply additive v2 through v6 schema migrations in one transaction."""
+    def _migrate_schema_v7(connection: sqlite3.Connection) -> None:
+        """Apply additive v2 through v7 schema migrations in one transaction."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -534,8 +641,14 @@ class SQLiteStore:
                 connection.execute(_DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA)
                 connection.execute("PRAGMA user_version = 6")
                 version = 6
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 6:
                 if not SQLiteStore._has_table_schemas(connection, _V6_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_JOB_CONTROL_COMMANDS_SCHEMA)
+                connection.execute("PRAGMA user_version = 7")
+                version = 7
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V7_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -872,6 +985,299 @@ class SQLiteStore:
             connection.rollback()
             raise
         return result
+
+    def apply_job_control(
+        self,
+        *,
+        job_id: str,
+        action: str,
+        request_id: str,
+        payload_digest: str,
+        expected_revision: int,
+    ) -> JobControlResult:
+        """Atomically apply or replay one revision-fenced materialized-job command."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        action = _require_job_control_action(action)
+        request_id = _require_identifier(request_id, "request_id")
+        payload_digest = _require_payload_digest(payload_digest)
+        expected_revision = _require_counter(expected_revision, "expected_revision")
+
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            receipt = connection.execute(
+                """
+                SELECT
+                    payload_digest,
+                    job_id,
+                    action,
+                    status,
+                    generation,
+                    revision,
+                    state,
+                    authorized
+                FROM job_control_commands
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if receipt is not None:
+                result = self._job_control_result_from_receipt(receipt)
+                receipt_digest = _require_payload_digest(receipt["payload_digest"])
+                receipt_action = _require_job_control_action(
+                    _require_sqlite_text(receipt["action"], "job control action")
+                )
+                if (
+                    receipt_digest != payload_digest
+                    or result.job != job_id
+                    or receipt_action != action
+                ):
+                    raise RequestConflictError(
+                        "request_id is already bound to a different job-control command"
+                    )
+            else:
+                current = self._read_job_control_projection(connection, job_id)
+                if current.revision != expected_revision:
+                    result = current.to_result("stale")
+                elif action == "start_now" and self._current_queue_gate(connection) != "running":
+                    result = current.to_result("blocked")
+                else:
+                    next_state = current.state
+                    next_authorized = current.authorized
+                    next_manual_hold = current.manual_hold
+                    next_start_now_requested = current.start_now_requested
+                    if action == "pause":
+                        next_manual_hold = True
+                        next_state = "paused"
+                    elif action == "resume":
+                        next_manual_hold = False
+                        if current.state == "paused":
+                            next_state = "queued"
+                    else:
+                        next_manual_hold = False
+                        next_authorized = True
+                        next_start_now_requested = True
+                        next_state = "queued"
+
+                    if (
+                        next_state == current.state
+                        and next_authorized == current.authorized
+                        and next_manual_hold == current.manual_hold
+                        and next_start_now_requested == current.start_now_requested
+                    ):
+                        result = current.to_result("applied")
+                    else:
+                        if current.revision == _MAX_COUNTER:
+                            raise OverflowError(
+                                "job revision exceeds persisted counter range"
+                            )
+                        updated = _JobControlProjection(
+                            job=current.job,
+                            generation=current.generation,
+                            revision=current.revision + 1,
+                            state=next_state,
+                            authorized=next_authorized,
+                            manual_hold=next_manual_hold,
+                            start_now_requested=next_start_now_requested,
+                        )
+                        self._persist_job_control_mutation(
+                            connection, action=action, updated=updated
+                        )
+                        result = updated.to_result("applied")
+                self._insert_job_control_receipt(
+                    connection,
+                    request_id=request_id,
+                    payload_digest=payload_digest,
+                    action=action,
+                    result=result,
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return result
+
+    @staticmethod
+    def _read_job_control_projection(
+        connection: sqlite3.Connection, job_id: str
+    ) -> _JobControlProjection:
+        """Read only a complete materialized-job control target or fail closed."""
+
+        rows = connection.execute(
+            """
+            SELECT
+                job.job_id AS job_id,
+                job.generation AS generation,
+                job.revision AS revision,
+                job.state AS state,
+                domain.authorized AS authorized,
+                domain.manual_hold AS manual_hold,
+                domain.start_now_requested AS start_now_requested
+            FROM jobs AS job
+            JOIN materialized_jobs AS domain ON domain.job_id = job.job_id
+            WHERE job.job_id = ?
+            LIMIT 2
+            """,
+            (job_id,),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("job control target is not a materialized job")
+        row = rows[0]
+        stored_job_id = _require_identifier(
+            _require_sqlite_text(row["job_id"], "job control job_id"), "job_id"
+        )
+        if stored_job_id != job_id:
+            raise ValueError("job control target does not match its lookup")
+        return _JobControlProjection(
+            job=stored_job_id,
+            generation=_require_counter(
+                _require_sqlite_integer(row["generation"], "job control generation"),
+                "job control generation",
+            ),
+            revision=_require_counter(
+                _require_sqlite_integer(row["revision"], "job control revision"),
+                "job control revision",
+            ),
+            state=_require_public_job_state(row["state"], "job control state"),
+            authorized=_require_sqlite_boolean(
+                row["authorized"], "job control authorized"
+            ),
+            manual_hold=_require_sqlite_boolean(
+                row["manual_hold"], "job control manual_hold"
+            ),
+            start_now_requested=_require_sqlite_boolean(
+                row["start_now_requested"], "job control start_now_requested"
+            ),
+        )
+
+    @staticmethod
+    def _current_queue_gate(connection: sqlite3.Connection) -> str:
+        """Read the single durable queue gate required by start-now admission."""
+
+        rows = connection.execute(
+            "SELECT value FROM settings WHERE key = 'queue_gate' LIMIT 2"
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("queue gate is not initialized")
+        return _require_queue_gate(
+            _require_sqlite_text(rows[0]["value"], "queue gate value")
+        )
+
+    @staticmethod
+    def _persist_job_control_mutation(
+        connection: sqlite3.Connection,
+        *,
+        action: str,
+        updated: _JobControlProjection,
+    ) -> None:
+        """Persist exactly one lifecycle/domain transition and its audit event."""
+
+        connection.execute(
+            """
+            UPDATE jobs
+            SET revision = ?, state = ?
+            WHERE job_id = ?
+            """,
+            (updated.revision, updated.state, updated.job),
+        )
+        SQLiteStore._require_one_changed_row(connection, "job control lifecycle update")
+        connection.execute(
+            """
+            UPDATE materialized_jobs
+            SET authorized = ?, manual_hold = ?, start_now_requested = ?
+            WHERE job_id = ?
+            """,
+            (
+                1 if updated.authorized else 0,
+                1 if updated.manual_hold else 0,
+                1 if updated.start_now_requested else 0,
+                updated.job,
+            ),
+        )
+        SQLiteStore._require_one_changed_row(connection, "job control projection update")
+        connection.execute(
+            """
+            INSERT INTO events (kind, job_id, generation, revision)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                _JOB_CONTROL_EVENT_KINDS[action],
+                updated.job,
+                updated.generation,
+                updated.revision,
+            ),
+        )
+
+    @staticmethod
+    def _require_one_changed_row(connection: sqlite3.Connection, operation: str) -> None:
+        row = connection.execute("SELECT changes()").fetchone()
+        if row is None or type(row[0]) is not int or row[0] != 1:
+            raise RuntimeError(f"{operation} did not affect exactly one row")
+
+    @staticmethod
+    def _insert_job_control_receipt(
+        connection: sqlite3.Connection,
+        *,
+        request_id: str,
+        payload_digest: str,
+        action: str,
+        result: JobControlResult,
+    ) -> None:
+        """Persist the exact original public result for idempotent replay."""
+
+        connection.execute(
+            """
+            INSERT INTO job_control_commands (
+                request_id,
+                payload_digest,
+                job_id,
+                action,
+                status,
+                generation,
+                revision,
+                state,
+                authorized
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                payload_digest,
+                result.job,
+                action,
+                result.status,
+                result.generation,
+                result.revision,
+                result.state,
+                1 if result.authorized else 0,
+            ),
+        )
+
+    @staticmethod
+    def _job_control_result_from_receipt(row: sqlite3.Row) -> JobControlResult:
+        """Decode a stored command readback without coercing malformed values."""
+
+        return JobControlResult(
+            status=_require_job_control_status(
+                _require_sqlite_text(row["status"], "job control status")
+            ),
+            job=_require_identifier(
+                _require_sqlite_text(row["job_id"], "job control job_id"), "job_id"
+            ),
+            generation=_require_counter(
+                _require_sqlite_integer(row["generation"], "job control generation"),
+                "job control generation",
+            ),
+            revision=_require_counter(
+                _require_sqlite_integer(row["revision"], "job control revision"),
+                "job control revision",
+            ),
+            state=_require_public_job_state(row["state"], "job control state"),
+            authorized=_require_sqlite_boolean(
+                row["authorized"], "job control authorized"
+            ),
+        )
 
     def recover_cold_start(self) -> int:
         """Atomically fence a cold worker epoch and pause incomplete jobs."""

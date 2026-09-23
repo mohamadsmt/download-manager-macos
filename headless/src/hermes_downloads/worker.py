@@ -13,7 +13,10 @@ from hermes_downloads.ipc import (
     DirectEngineActivateCommand,
     DirectEngineActivateResult,
     HealthServer,
+    IPCError,
     IPCStateError,
+    JobControlCommand,
+    JobControlResult,
     JobsPage,
     PublicJobRecord,
     QueueGateCommand,
@@ -25,6 +28,7 @@ from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.store import (
     DirectEngineActivationFence,
     DirectEngineRecord,
+    RequestConflictError,
     SQLiteStore,
 )
 
@@ -190,6 +194,33 @@ def _queue_gate_from_store(
         applied=result.applied,
         queue_gate=result.gate,
         revision=result.revision,
+    )
+
+
+def _job_control_from_store(
+    store: SQLiteStore, command: JobControlCommand
+) -> JobControlResult:
+    """Bridge a closed IPC command to its durable public readback only."""
+
+    try:
+        result = store.apply_job_control(
+            job_id=command.job,
+            action=command.action,
+            request_id=command.request_id,
+            payload_digest=command.payload_digest,
+            expected_revision=command.expected_revision,
+        )
+    except RequestConflictError:
+        raise
+    except (TypeError, ValueError):
+        raise IPCError("invalid_request") from None
+    return JobControlResult(
+        status=result.status,
+        job=result.job,
+        generation=result.generation,
+        revision=result.revision,
+        state=result.state,
+        authorized=result.authorized,
     )
 
 
@@ -458,6 +489,7 @@ def run_worker(
                     health=lambda: _health_from_store(store),
                     jobs_page=lambda cursor: _jobs_page_from_store(store, cursor),
                     queue_gate=lambda command: _queue_gate_from_store(store, command),
+                    job_control=lambda command: _job_control_from_store(store, command),
                     direct_engine_activate=direct_engine_activate,
                 )
             except IPCStateError:

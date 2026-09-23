@@ -20,6 +20,8 @@ __all__ = [
     "HealthServer",
     "IPCError",
     "IPCStateError",
+    "JobControlCommand",
+    "JobControlResult",
     "JobsPage",
     "MAX_MESSAGE_BYTES",
     "PublicJobRecord",
@@ -27,6 +29,7 @@ __all__ = [
     "QueueGateResult",
     "WorkerHealth",
     "activate_direct_engine",
+    "control_job",
     "request_health",
     "request_jobs_page",
     "set_queue_gate",
@@ -47,6 +50,8 @@ _COMMAND_CONFLICT: Final = {"error": "command_conflict"}
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_COUNTER: Final = (1 << 63) - 1
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
+_JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now"})
+_JOB_CONTROL_STATUSES: Final = frozenset({"applied", "blocked", "stale"})
 _DIRECT_ENGINE_ACTIVATE_STATUSES: Final = frozenset(
     {"active", "blocked", "stale_epoch"}
 )
@@ -73,6 +78,22 @@ def _require_queue_gate(value: object) -> str:
         raise TypeError("gate must be a string")
     if value not in _QUEUE_GATES:
         raise ValueError("gate must be 'paused' or 'running'")
+    return value
+
+
+def _require_job_control_action(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("action must be a string")
+    if value not in _JOB_CONTROL_ACTIONS:
+        raise ValueError("action is not a job-control action")
+    return value
+
+
+def _require_job_control_status(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("status must be a string")
+    if value not in _JOB_CONTROL_STATUSES:
+        raise ValueError("status is not a job-control status")
     return value
 
 
@@ -317,6 +338,127 @@ class QueueGateResult:
 
 
 @dataclass(frozen=True, slots=True)
+class JobControlCommand:
+    """One typed, revision-fenced materialized-job control command."""
+
+    job: str
+    action: str
+    request_id: str
+    expected_revision: int
+    payload_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        job = _require_identifier(self.job, "job")
+        action = _require_job_control_action(self.action)
+        request_id = _require_identifier(self.request_id, "request_id")
+        expected_revision = _require_counter(
+            self.expected_revision, "expected_revision"
+        )
+        object.__setattr__(self, "job", job)
+        object.__setattr__(self, "action", action)
+        object.__setattr__(self, "request_id", request_id)
+        object.__setattr__(self, "expected_revision", expected_revision)
+        object.__setattr__(
+            self,
+            "payload_digest",
+            _canonical_payload_digest(
+                {
+                    "action": action,
+                    "expected_revision": expected_revision,
+                    "job": job,
+                    "request_id": request_id,
+                }
+            ),
+        )
+
+    def to_record(self) -> dict[str, int | str]:
+        """Return the exact job-control wire record without an injectable digest."""
+
+        return {
+            "op": "job_control",
+            "job": self.job,
+            "action": self.action,
+            "request_id": self.request_id,
+            "expected_revision": self.expected_revision,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "JobControlCommand":
+        if type(record) is not dict or set(record) != {
+            "op",
+            "job",
+            "action",
+            "request_id",
+            "expected_revision",
+        }:
+            raise ValueError("job-control request is invalid")
+        if record["op"] != "job_control":
+            raise ValueError("job-control request is invalid")
+        return cls(
+            job=record["job"],
+            action=record["action"],
+            request_id=record["request_id"],
+            expected_revision=record["expected_revision"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobControlResult:
+    """The fixed public readback for one materialized-job control command."""
+
+    status: str
+    job: str
+    generation: int
+    revision: int
+    state: str
+    authorized: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", _require_job_control_status(self.status))
+        object.__setattr__(self, "job", _require_identifier(self.job, "job"))
+        object.__setattr__(
+            self, "generation", _require_counter(self.generation, "generation")
+        )
+        object.__setattr__(self, "revision", _require_counter(self.revision, "revision"))
+        object.__setattr__(self, "state", _require_public_job_state(self.state))
+        if type(self.authorized) is not bool:
+            raise TypeError("authorized must be a boolean")
+
+    def to_record(self) -> dict[str, bool | int | str]:
+        return {
+            "status": self.status,
+            "job": self.job,
+            "generation": self.generation,
+            "revision": self.revision,
+            "state": self.state,
+            "authorized": self.authorized,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "JobControlResult":
+        if type(record) is not dict or set(record) != {
+            "status",
+            "job",
+            "generation",
+            "revision",
+            "state",
+            "authorized",
+        }:
+            raise IPCError("ipc_response_invalid")
+        try:
+            return cls(
+                status=record["status"],
+                job=record["job"],
+                generation=record["generation"],
+                revision=record["revision"],
+                state=record["state"],
+                authorized=record["authorized"],
+            )
+        except (TypeError, ValueError):
+            raise IPCError("ipc_response_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
 class PublicJobRecord:
     """The redacted, immutable job projection exposed by jobs-page IPC."""
 
@@ -505,6 +647,13 @@ def _decode_queue_gate_request(request: object) -> QueueGateCommand | None:
         return None
 
 
+def _decode_job_control_request(request: object) -> JobControlCommand | None:
+    try:
+        return JobControlCommand.from_record(request)
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 def _decode_direct_engine_activate_request(
     request: object,
 ) -> DirectEngineActivateCommand | None:
@@ -524,6 +673,7 @@ class HealthServer:
         health: Callable[[], WorkerHealth],
         jobs_page: Callable[[str | None], JobsPage] | None = None,
         queue_gate: Callable[[QueueGateCommand], QueueGateResult] | None = None,
+        job_control: Callable[[JobControlCommand], JobControlResult] | None = None,
         direct_engine_activate: Callable[
             [DirectEngineActivateCommand], DirectEngineActivateResult
         ]
@@ -536,6 +686,8 @@ class HealthServer:
             raise TypeError("jobs_page must be callable")
         if queue_gate is not None and not callable(queue_gate):
             raise TypeError("queue_gate must be callable")
+        if job_control is not None and not callable(job_control):
+            raise TypeError("job_control must be callable")
         if direct_engine_activate is not None and not callable(direct_engine_activate):
             raise TypeError("direct_engine_activate must be callable")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -560,6 +712,7 @@ class HealthServer:
         self._health = health
         self._jobs_page = jobs_page
         self._queue_gate = queue_gate
+        self._job_control = job_control
         self._direct_engine_activate = direct_engine_activate
         self._listener = listener
         self._identity = socket_identity
@@ -609,16 +762,36 @@ class HealthServer:
                                 except Exception:
                                     response = _encoded_record(_COMMAND_CONFLICT)
                         else:
-                            command = _decode_queue_gate_request(request)
-                            if command is None or self._queue_gate is None:
-                                response = _encoded_record(_INVALID_REQUEST)
+                            job_control_command = _decode_job_control_request(request)
+                            if job_control_command is not None:
+                                if self._job_control is None:
+                                    response = _encoded_record(_INVALID_REQUEST)
+                                else:
+                                    try:
+                                        result = self._job_control(job_control_command)
+                                        if type(result) is not JobControlResult:
+                                            raise TypeError(
+                                                "job_control result is invalid"
+                                            )
+                                        response = _encoded_record(result.to_record())
+                                    except IPCError as error:
+                                        if str(error) == "invalid_request":
+                                            response = _encoded_record(_INVALID_REQUEST)
+                                        else:
+                                            response = _encoded_record(_COMMAND_CONFLICT)
+                                    except Exception:
+                                        response = _encoded_record(_COMMAND_CONFLICT)
                             else:
-                                try:
-                                    response = _encoded_record(
-                                        self._queue_gate(command).to_record()
-                                    )
-                                except Exception:
-                                    response = _encoded_record(_COMMAND_CONFLICT)
+                                command = _decode_queue_gate_request(request)
+                                if command is None or self._queue_gate is None:
+                                    response = _encoded_record(_INVALID_REQUEST)
+                                else:
+                                    try:
+                                        response = _encoded_record(
+                                            self._queue_gate(command).to_record()
+                                        )
+                                    except Exception:
+                                        response = _encoded_record(_COMMAND_CONFLICT)
             except (IPCStateError, TypeError, ValueError):
                 response = _encoded_record(_INVALID_REQUEST)
             try:
@@ -738,6 +911,48 @@ def set_queue_gate(
     if record == _COMMAND_CONFLICT:
         raise IPCError("command_conflict")
     return QueueGateResult.from_record(record)
+
+
+def control_job(
+    socket_path: Path,
+    *,
+    job: str,
+    action: str,
+    request_id: str,
+    expected_revision: int,
+) -> JobControlResult:
+    """Apply one typed materialized-job control command through the worker."""
+
+    path = _require_socket_path(socket_path)
+    command = JobControlCommand(
+        job=job,
+        action=action,
+        request_id=request_id,
+        expected_revision=expected_revision,
+    )
+    request = _encoded_record(command.to_record())
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(_CLIENT_TIMEOUT_SECONDS)
+        try:
+            client.connect(str(path))
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            response = _read_line(client)
+        except (OSError, TimeoutError):
+            raise IPCError("ipc_unavailable") from None
+    if response is None:
+        raise IPCError("ipc_response_invalid")
+    try:
+        record = json.loads(
+            response.decode("utf-8"), object_pairs_hook=_reject_duplicate_object_keys
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
+        raise IPCError("ipc_response_invalid") from None
+    if record == _COMMAND_CONFLICT:
+        raise IPCError("command_conflict")
+    if record == _INVALID_REQUEST:
+        raise IPCError("invalid_request")
+    return JobControlResult.from_record(record)
 
 
 def activate_direct_engine(
