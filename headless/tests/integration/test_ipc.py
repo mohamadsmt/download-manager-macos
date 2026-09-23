@@ -357,6 +357,8 @@ def _run_worker_process_with_fake_direct(
     controller_construction_count: Any | None = None,
     fence_before_construction: _LifecycleEvent | None = None,
     release_before_start: _LifecycleEvent | None = None,
+    shutdown_reconciliation: str | None = None,
+    shutdown_reconciliation_called: _LifecycleEvent | None = None,
 ) -> None:
     """Install a deterministic direct controller before the worker imports it lazily."""
 
@@ -364,10 +366,27 @@ def _run_worker_process_with_fake_direct(
         raise AssertionError("invalid fake direct start mode")
     if close_mode not in {"succeeds", "fails"}:
         raise AssertionError("invalid fake direct close mode")
+    if shutdown_reconciliation not in {None, "absent", "current", "indeterminate"}:
+        raise AssertionError("invalid fake shutdown reconciliation")
 
     original_bind_direct_engine_activation_fence = (
         worker.SQLiteStore.bind_direct_engine_activation_fence
     )
+    processes: Any | None = None
+    original_reconcile_process_birth: Any | None = None
+    if shutdown_reconciliation is not None:
+        processes = importlib.import_module("hermes_downloads.processes")
+        original_reconcile_process_birth = processes.reconcile_process_birth
+
+        def reconcile_for_shutdown(identity: object) -> str:
+            if identity == fake_identity:
+                if shutdown_reconciliation_called is not None:
+                    shutdown_reconciliation_called.set()
+                return shutdown_reconciliation
+            assert original_reconcile_process_birth is not None
+            return original_reconcile_process_birth(identity)
+
+        processes.reconcile_process_birth = reconcile_for_shutdown
     if persistence_attempted is not None:
 
         def fail_direct_record_persistence(
@@ -452,6 +471,9 @@ def _run_worker_process_with_fake_direct(
         worker.SQLiteStore.bind_direct_engine_activation_fence = (
             original_bind_direct_engine_activation_fence
         )
+        if processes is not None:
+            assert original_reconcile_process_birth is not None
+            processes.reconcile_process_birth = original_reconcile_process_birth
 
 
 def _run_worker_process_with_absent_fake_direct(
@@ -469,12 +491,31 @@ def _run_worker_process_with_absent_fake_direct(
     stale_close_guard: _ImportGateEvent,
     stale_close_attempted: _LifecycleEvent,
     replacement_claim_cleared: _LifecycleEvent,
+    reconciliation: str = "absent",
+    replacement_identity: ProcessBirthIdentity | None = None,
+    clear_failures: int = 0,
+    clear_attempts: Any | None = None,
+    discard_attempts: Any | None = None,
 ) -> None:
-    """Install an absent-owner controller whose normal close path is forbidden."""
+    """Install a controlled reconciled-owner controller for direct lifecycle tests."""
+
+    if reconciliation not in {"absent", "current", "indeterminate"}:
+        raise AssertionError("invalid fake reconciliation")
+    if replacement_identity is not None and (
+        type(replacement_identity) is not ProcessBirthIdentity
+        or replacement_identity == fake_identity
+    ):
+        raise AssertionError("invalid fake replacement identity")
+    if type(clear_failures) is not int or clear_failures < 0:
+        raise AssertionError("invalid fake clear failure count")
 
     processes: Any = importlib.import_module("hermes_downloads.processes")
     original_reconcile_process_birth = processes.reconcile_process_birth
+    original_clear_direct_engine_record = worker.SQLiteStore.clear_direct_engine_record
+    expected_record = DirectEngineRecord(worker_epoch=1, identity=fake_identity)
     controller_index = 0
+    clear_attempt_count = 0
+    clear_patched = clear_failures != 0 or clear_attempts is not None
 
     class FakeDirectAria2Controller:
         def __init__(
@@ -503,13 +544,19 @@ def _run_worker_process_with_absent_fake_direct(
                 replacement_claim_cleared.set()
 
         def start(self) -> object:
-            self._on_engine_bound(fake_identity)
+            self._on_engine_bound(
+                fake_identity
+                if self._index == 0 or replacement_identity is None
+                else replacement_identity
+            )
             return object()
 
         def discard_absent(self) -> None:
             if self._index != 0:
                 raise AssertionError("worker discarded a fresh direct controller")
             discard_called.set()
+            if discard_attempts is not None:
+                discard_attempts.value += 1
             if discard_fails:
                 raise RuntimeError("fake direct absent discard failure")
 
@@ -518,18 +565,38 @@ def _run_worker_process_with_absent_fake_direct(
                 stale_close_attempted.set()
                 raise AssertionError("stale absent direct controller used normal close")
 
-    def reconcile_absent(identity: object) -> str:
+    def reconcile_owned(identity: object) -> str:
         if identity == fake_identity:
             reconciliation_called.set()
-            return "absent"
+            return reconciliation
+        if identity == replacement_identity:
+            return "current"
         return original_reconcile_process_birth(identity)
+
+    if clear_patched:
+
+        def clear_exact_direct_claim(
+            self: SQLiteStore, record: DirectEngineRecord
+        ) -> bool:
+            nonlocal clear_attempt_count
+
+            if type(self) is not SQLiteStore or record != expected_record:
+                raise AssertionError("worker did not compare-clear its exact direct record")
+            clear_attempt_count += 1
+            if clear_attempts is not None:
+                clear_attempts.value += 1
+            if clear_attempt_count <= clear_failures:
+                return False
+            return original_clear_direct_engine_record(self, record)
+
+        worker.SQLiteStore.clear_direct_engine_record = clear_exact_direct_claim
 
     fake_module = types.ModuleType("hermes_downloads.direct")
     setattr(fake_module, "DirectAria2Controller", FakeDirectAria2Controller)
     sys.modules["hermes_downloads.direct"] = fake_module
     package = importlib.import_module("hermes_downloads")
     setattr(package, "direct", fake_module)
-    processes.reconcile_process_birth = reconcile_absent
+    processes.reconcile_process_birth = reconcile_owned
     try:
         _run_worker_process(
             state_root,
@@ -541,6 +608,10 @@ def _run_worker_process_with_absent_fake_direct(
         )
     finally:
         processes.reconcile_process_birth = original_reconcile_process_birth
+        if clear_patched:
+            worker.SQLiteStore.clear_direct_engine_record = (
+                original_clear_direct_engine_record
+            )
 
 
 def _synthetic_birth(*, owner_uid: int) -> ProcessBirthIdentity:
@@ -1241,6 +1312,10 @@ def test_worker_direct_activation_uses_absent_discard_without_normal_close(
         socket_path = state_root / "worker.sock"
         identity = _fake_unowned_birth()
         expected_record = DirectEngineRecord(worker_epoch=1, identity=identity)
+        replacement_identity = _synthetic_birth(owner_uid=os.geteuid())
+        expected_replacement_record = DirectEngineRecord(
+            worker_epoch=1, identity=replacement_identity
+        )
         context = multiprocessing.get_context("spawn")
         ready = context.Event()
         shutdown = context.Event()
@@ -1252,6 +1327,7 @@ def test_worker_direct_activation_uses_absent_discard_without_normal_close(
         stale_close_guard = context.Event()
         stale_close_attempted = context.Event()
         replacement_claim_cleared = context.Event()
+        discard_attempts = context.Value("i", 0)
         process = context.Process(
             target=_run_worker_process_with_absent_fake_direct,
             args=(
@@ -1270,6 +1346,10 @@ def test_worker_direct_activation_uses_absent_discard_without_normal_close(
                 stale_close_attempted,
                 replacement_claim_cleared,
             ),
+            kwargs={
+                "replacement_identity": replacement_identity,
+                "discard_attempts": discard_attempts,
+            },
         )
         process.start()
         try:
@@ -1289,6 +1369,7 @@ def test_worker_direct_activation_uses_absent_discard_without_normal_close(
             )
             assert reconciliation_called.wait(_WATCHDOG_SECONDS)
             assert discard_called.wait(_WATCHDOG_SECONDS)
+            assert discard_attempts.value == 1
             assert not stale_close_attempted.is_set()
 
             if discard_fails:
@@ -1306,18 +1387,23 @@ def test_worker_direct_activation_uses_absent_discard_without_normal_close(
                     "RuntimeError",
                     "fake direct absent discard failure",
                 )
+                assert discard_attempts.value == 2
                 assert not stale_close_attempted.is_set()
                 assert _direct_engine_claims(state_root) == (expected_record, None)
             else:
                 assert controller_construction_count.value == 2
                 assert replacement_claim_cleared.wait(_WATCHDOG_SECONDS)
-                assert _direct_engine_claims(state_root) == (expected_record, None)
+                assert _direct_engine_claims(state_root) == (
+                    expected_replacement_record,
+                    None,
+                )
 
                 stale_close_guard.clear()
                 shutdown.set()
                 assert stopped.wait(_WATCHDOG_SECONDS)
                 _join(process)
                 assert _result(results) == ("result", None)
+                assert discard_attempts.value == 1
                 assert _direct_engine_claims(state_root) == (None, None)
         finally:
             stale_close_guard.clear()
@@ -1429,6 +1515,256 @@ def test_worker_shutdown_retries_absent_discard_private_cleanup_without_signals(
                 _join(process)
             if record is not None:
                 _force_stop_group(record.identity.process_group_id)
+
+
+def test_worker_shutdown_discards_an_absent_owned_controller_without_normal_close() -> None:
+    """A stale owned record is discarded locally before its exact claim is cleared."""
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        socket_path = state_root / "worker.sock"
+        identity = _fake_unowned_birth()
+        expected_record = DirectEngineRecord(worker_epoch=1, identity=identity)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        shutdown = context.Event()
+        stopped = context.Event()
+        results = context.Queue()
+        controller_construction_count = context.Value("i", 0)
+        reconciliation_called = context.Event()
+        discard_called = context.Event()
+        stale_close_guard = context.Event()
+        stale_close_attempted = context.Event()
+        replacement_claim_cleared = context.Event()
+        clear_attempts = context.Value("i", 0)
+        discard_attempts = context.Value("i", 0)
+        process = context.Process(
+            target=_run_worker_process_with_absent_fake_direct,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                identity,
+                False,
+                controller_construction_count,
+                reconciliation_called,
+                discard_called,
+                stale_close_guard,
+                stale_close_attempted,
+                replacement_claim_cleared,
+            ),
+            kwargs={
+                "clear_attempts": clear_attempts,
+                "discard_attempts": discard_attempts,
+            },
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+            assert controller_construction_count.value == 1
+            assert _direct_engine_claims(state_root) == (expected_record, None)
+
+            stale_close_guard.set()
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+            assert reconciliation_called.wait(_WATCHDOG_SECONDS)
+            assert discard_called.wait(_WATCHDOG_SECONDS)
+            assert discard_attempts.value == 1
+            assert clear_attempts.value == 1
+            assert not stale_close_attempted.is_set()
+            assert _direct_engine_claims(state_root) == (None, None)
+        finally:
+            stale_close_guard.clear()
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+def test_worker_shutdown_retains_an_indeterminate_owned_controller_without_side_effects() -> None:
+    """An indeterminate owned record cannot be closed, discarded, or cleared."""
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        socket_path = state_root / "worker.sock"
+        identity = _fake_unowned_birth()
+        expected_record = DirectEngineRecord(worker_epoch=1, identity=identity)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        shutdown = context.Event()
+        stopped = context.Event()
+        results = context.Queue()
+        controller_construction_count = context.Value("i", 0)
+        reconciliation_called = context.Event()
+        discard_called = context.Event()
+        stale_close_guard = context.Event()
+        stale_close_attempted = context.Event()
+        replacement_claim_cleared = context.Event()
+        clear_attempts = context.Value("i", 0)
+        discard_attempts = context.Value("i", 0)
+        process = context.Process(
+            target=_run_worker_process_with_absent_fake_direct,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                identity,
+                False,
+                controller_construction_count,
+                reconciliation_called,
+                discard_called,
+                stale_close_guard,
+                stale_close_attempted,
+                replacement_claim_cleared,
+            ),
+            kwargs={
+                "reconciliation": "indeterminate",
+                "clear_attempts": clear_attempts,
+                "discard_attempts": discard_attempts,
+            },
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+            assert controller_construction_count.value == 1
+            assert _direct_engine_claims(state_root) == (expected_record, None)
+
+            stale_close_guard.set()
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+            assert reconciliation_called.wait(_WATCHDOG_SECONDS)
+            assert not discard_called.is_set()
+            assert discard_attempts.value == 0
+            assert clear_attempts.value == 0
+            assert not stale_close_attempted.is_set()
+            assert _direct_engine_claims(state_root) == (expected_record, None)
+        finally:
+            stale_close_guard.clear()
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+@pytest.mark.parametrize(
+    ("clear_failures", "expected_result", "claim_retained"),
+    (
+        pytest.param(1, ("result", None), False, id="retry-succeeds"),
+        pytest.param(
+            2,
+            ("error", "IPCStateError", "ipc_health_invalid"),
+            True,
+            id="persistent-failure-retains-claim",
+        ),
+    ),
+)
+def test_worker_shutdown_retries_only_the_exact_claim_clear_after_absent_discard(
+    clear_failures: int,
+    expected_result: tuple[object, ...],
+    claim_retained: bool,
+) -> None:
+    """A completed no-signal discard leaves only its exact durable CAS to retry."""
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        socket_path = state_root / "worker.sock"
+        identity = _fake_unowned_birth()
+        expected_record = DirectEngineRecord(worker_epoch=1, identity=identity)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        shutdown = context.Event()
+        stopped = context.Event()
+        results = context.Queue()
+        controller_construction_count = context.Value("i", 0)
+        reconciliation_called = context.Event()
+        discard_called = context.Event()
+        stale_close_guard = context.Event()
+        stale_close_attempted = context.Event()
+        replacement_claim_cleared = context.Event()
+        clear_attempts = context.Value("i", 0)
+        discard_attempts = context.Value("i", 0)
+        process = context.Process(
+            target=_run_worker_process_with_absent_fake_direct,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                identity,
+                False,
+                controller_construction_count,
+                reconciliation_called,
+                discard_called,
+                stale_close_guard,
+                stale_close_attempted,
+                replacement_claim_cleared,
+            ),
+            kwargs={
+                "clear_failures": clear_failures,
+                "clear_attempts": clear_attempts,
+                "discard_attempts": discard_attempts,
+            },
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+            assert _direct_engine_claims(state_root) == (expected_record, None)
+
+            stale_close_guard.set()
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="blocked")
+            assert reconciliation_called.wait(_WATCHDOG_SECONDS)
+            assert discard_called.wait(_WATCHDOG_SECONDS)
+            assert discard_attempts.value == 1
+            assert clear_attempts.value == 1
+            assert not stale_close_attempted.is_set()
+            assert _direct_engine_claims(state_root) == (expected_record, None)
+
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="blocked")
+            assert discard_attempts.value == 1
+            assert clear_attempts.value == 1
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == expected_result
+            assert discard_attempts.value == 1
+            assert clear_attempts.value == 2
+            assert not stale_close_attempted.is_set()
+            assert _direct_engine_claims(state_root) == (
+                (expected_record if claim_retained else None),
+                None,
+            )
+        finally:
+            stale_close_guard.clear()
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
 
 
 def test_worker_direct_activation_fences_stale_epoch_before_engine_or_record_touch() -> None:
@@ -1994,6 +2330,7 @@ def test_worker_direct_activation_shutdown_close_failure_retains_exact_record() 
         callback_entered = context.Event()
         callback_completed = context.Event()
         close_called = context.Event()
+        reconciliation_called = context.Event()
         process = context.Process(
             target=_run_worker_process_with_fake_direct,
             args=(
@@ -2012,6 +2349,10 @@ def test_worker_direct_activation_shutdown_close_failure_retains_exact_record() 
                 callback_completed,
                 close_called,
             ),
+            kwargs={
+                "shutdown_reconciliation": "current",
+                "shutdown_reconciliation_called": reconciliation_called,
+            },
         )
         process.start()
         try:
@@ -2024,6 +2365,7 @@ def test_worker_direct_activation_shutdown_close_failure_retains_exact_record() 
             assert callback_entered.wait(_WATCHDOG_SECONDS)
             assert callback_completed.wait(_WATCHDOG_SECONDS)
             assert not close_called.wait(0.05)
+            assert not reconciliation_called.is_set()
 
             observer = SQLiteStore(state_root / "state.db")
             try:
@@ -2040,6 +2382,7 @@ def test_worker_direct_activation_shutdown_close_failure_retains_exact_record() 
                 "RuntimeError",
                 "fake direct close failure",
             )
+            assert reconciliation_called.wait(_WATCHDOG_SECONDS)
             assert close_called.wait(_WATCHDOG_SECONDS)
             assert not socket_path.exists()
             assert _group_is_gone(identity.process_group_id)

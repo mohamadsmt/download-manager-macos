@@ -212,6 +212,7 @@ def run_worker(
     direct_record_persisted = False
     direct_controller_ready = False
     direct_controller_absent_discard_failed = False
+    direct_controller_absent_local_cleanup_complete = False
     try:
         root = _validate_state_root(state_root)
         requested_socket_path: Path | None = None
@@ -244,39 +245,40 @@ def run_worker(
                     raise IPCStateError("ipc_health_invalid")
                 direct_fence = None
 
-        def close_owned_direct_controller() -> None:
+        def clear_owned_direct_controller_state() -> None:
             nonlocal direct_controller, direct_fence, direct_record
             nonlocal direct_record_persisted, direct_controller_ready
             nonlocal direct_controller_absent_discard_failed
+            nonlocal direct_controller_absent_local_cleanup_complete
 
+            direct_controller = None
+            direct_fence = None
+            direct_record = None
+            direct_record_persisted = False
+            direct_controller_ready = False
+            direct_controller_absent_discard_failed = False
+            direct_controller_absent_local_cleanup_complete = False
+
+        def close_owned_direct_controller() -> None:
             controller = direct_controller
             if controller is None:
                 return
             controller.close()
             clear_owned_direct_claim()
-            direct_controller = None
-            direct_fence = None
-            direct_record = None
-            direct_record_persisted = False
-            direct_controller_ready = False
-            direct_controller_absent_discard_failed = False
+            clear_owned_direct_controller_state()
 
         def discard_absent_owned_direct_controller() -> None:
-            nonlocal direct_controller, direct_fence, direct_record
-            nonlocal direct_record_persisted, direct_controller_ready
             nonlocal direct_controller_absent_discard_failed
+            nonlocal direct_controller_absent_local_cleanup_complete
 
             controller = direct_controller
             if controller is None:
                 raise IPCStateError("ipc_health_invalid")
             controller.discard_absent()
-            clear_owned_direct_claim()
-            direct_controller = None
-            direct_fence = None
-            direct_record = None
-            direct_record_persisted = False
-            direct_controller_ready = False
             direct_controller_absent_discard_failed = False
+            direct_controller_absent_local_cleanup_complete = True
+            clear_owned_direct_claim()
+            clear_owned_direct_controller_state()
 
         def cleanup_owned_direct_candidate() -> None:
             if direct_controller is None:
@@ -284,12 +286,43 @@ def run_worker(
             else:
                 close_owned_direct_controller()
 
+        def shutdown_owned_direct_controller() -> None:
+            nonlocal direct_controller_absent_discard_failed
+
+            if direct_controller_absent_local_cleanup_complete:
+                clear_owned_direct_claim()
+                clear_owned_direct_controller_state()
+                return
+            if direct_controller is None:
+                return
+            if not direct_record_persisted:
+                close_owned_direct_controller()
+                return
+            owned_record = direct_record
+            if owned_record is None:
+                raise IPCStateError("ipc_health_invalid")
+            from hermes_downloads.processes import reconcile_process_birth
+
+            reconciliation = reconcile_process_birth(owned_record.identity)
+            if reconciliation == "current":
+                close_owned_direct_controller()
+                return
+            if reconciliation != "absent":
+                return
+            try:
+                discard_absent_owned_direct_controller()
+            except BaseException:
+                if not direct_controller_absent_local_cleanup_complete:
+                    direct_controller_absent_discard_failed = True
+                raise
+
         def direct_engine_activate(
             command: DirectEngineActivateCommand,
         ) -> DirectEngineActivateResult:
             nonlocal direct_controller, direct_fence, direct_record
             nonlocal direct_record_persisted, direct_controller_ready
             nonlocal direct_controller_absent_discard_failed
+            nonlocal direct_controller_absent_local_cleanup_complete
 
             current_epoch = store.worker_epoch()
             if current_epoch is None:
@@ -299,7 +332,10 @@ def run_worker(
                     worker_epoch=current_epoch, status="stale_epoch"
                 )
             if direct_controller is not None:
-                if direct_controller_absent_discard_failed:
+                if (
+                    direct_controller_absent_discard_failed
+                    or direct_controller_absent_local_cleanup_complete
+                ):
                     return DirectEngineActivateResult(
                         worker_epoch=current_epoch, status="blocked"
                     )
@@ -331,7 +367,8 @@ def run_worker(
                 try:
                     discard_absent_owned_direct_controller()
                 except BaseException:
-                    direct_controller_absent_discard_failed = True
+                    if not direct_controller_absent_local_cleanup_complete:
+                        direct_controller_absent_discard_failed = True
                     return DirectEngineActivateResult(
                         worker_epoch=current_epoch, status="blocked"
                     )
@@ -393,6 +430,7 @@ def run_worker(
                 direct_record_persisted = False
                 direct_controller_ready = False
                 direct_controller_absent_discard_failed = False
+                direct_controller_absent_local_cleanup_complete = False
                 candidate.start()
             except BaseException:
                 try:
@@ -435,10 +473,7 @@ def run_worker(
         try:
             try:
                 if direct_controller is not None:
-                    if direct_controller_absent_discard_failed:
-                        discard_absent_owned_direct_controller()
-                    else:
-                        close_owned_direct_controller()
+                    shutdown_owned_direct_controller()
             finally:
                 try:
                     if health_server is not None:
