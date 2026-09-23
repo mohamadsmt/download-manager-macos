@@ -139,6 +139,21 @@ CREATE TABLE job_control_commands (
 );
 """
 
+_COMMAND_RECEIPTS_SCHEMA: Final = """
+CREATE TABLE command_receipts (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL CHECK (
+        length(payload_digest) = 64 AND payload_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    scope TEXT NOT NULL CHECK (scope IN ('add', 'queue_gate', 'job_control')),
+    action TEXT NOT NULL CHECK (
+        (scope = 'add' AND action = 'add')
+        OR (scope = 'queue_gate' AND action = 'queue_gate')
+        OR (scope = 'job_control' AND action IN ('pause', 'resume', 'start_now'))
+    )
+);
+"""
+
 _ENGINE_INSTANCES_SCHEMA: Final = """
 CREATE TABLE engine_instances (
     engine_kind TEXT PRIMARY KEY CHECK (engine_kind = 'direct'),
@@ -191,7 +206,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 7
+_SUPPORTED_SCHEMA_VERSION: Final = 8
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -245,11 +260,32 @@ _V7_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
     _JOB_CONTROL_COMMANDS_SCHEMA,
 )
+_V8_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _JOB_CONTROL_COMMANDS_SCHEMA,
+    _COMMAND_RECEIPTS_SCHEMA,
+)
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
 _JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now"})
+_COMMAND_RECEIPT_SCOPES: Final = frozenset({"add", "queue_gate", "job_control"})
+_ADD_COMMAND_SCOPE: Final = "add"
+_ADD_COMMAND_ACTION: Final = "add"
+_QUEUE_GATE_COMMAND_SCOPE: Final = "queue_gate"
+_QUEUE_GATE_COMMAND_ACTION: Final = "queue_gate"
+_JOB_CONTROL_COMMAND_SCOPE: Final = "job_control"
 _JOB_CONTROL_STATUSES: Final = frozenset({"applied", "blocked", "stale"})
+_TERMINAL_JOB_CONTROL_STATES: Final = frozenset(
+    {"removed", "completed", "cancelled", "failed"}
+)
 _JOB_CONTROL_EVENT_KINDS: Final = {
     "pause": "job_paused",
     "resume": "job_resumed",
@@ -306,6 +342,24 @@ def _require_job_control_action(value: object) -> str:
     if value not in _JOB_CONTROL_ACTIONS:
         raise ValueError("action is not a job-control action")
     return value
+
+
+def _require_command_receipt_scope(value: object) -> str:
+    if type(value) is not str or value not in _COMMAND_RECEIPT_SCOPES:
+        raise ValueError("persisted command receipt scope is invalid")
+    return value
+
+
+def _require_command_receipt_action(scope: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("persisted command receipt action is invalid")
+    if (
+        (scope == _ADD_COMMAND_SCOPE and value == _ADD_COMMAND_ACTION)
+        or (scope == _QUEUE_GATE_COMMAND_SCOPE and value == _QUEUE_GATE_COMMAND_ACTION)
+        or (scope == _JOB_CONTROL_COMMAND_SCOPE and value in _JOB_CONTROL_ACTIONS)
+    ):
+        return value
+    raise ValueError("persisted command receipt action is invalid")
 
 
 def _require_job_control_status(value: object) -> str:
@@ -541,7 +595,7 @@ class SQLiteStore:
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
-            self._migrate_schema_v7(connection)
+            self._migrate_schema_v8(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -572,6 +626,7 @@ class SQLiteStore:
             5: _V5_TABLE_SCHEMAS,
             6: _V6_TABLE_SCHEMAS,
             7: _V7_TABLE_SCHEMAS,
+            8: _V8_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -602,8 +657,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v7(connection: sqlite3.Connection) -> None:
-        """Apply additive v2 through v7 schema migrations in one transaction."""
+    def _migrate_schema_v8(connection: sqlite3.Connection) -> None:
+        """Apply additive v2 through v8 schema migrations in one transaction."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -647,8 +702,15 @@ class SQLiteStore:
                 connection.execute(_JOB_CONTROL_COMMANDS_SCHEMA)
                 connection.execute("PRAGMA user_version = 7")
                 version = 7
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 7:
                 if not SQLiteStore._has_table_schemas(connection, _V7_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_COMMAND_RECEIPTS_SCHEMA)
+                SQLiteStore._backfill_command_receipts(connection)
+                connection.execute("PRAGMA user_version = 8")
+                version = 8
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V8_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -660,10 +722,170 @@ class SQLiteStore:
                 pass
             raise
 
+    @staticmethod
+    def _backfill_command_receipts(connection: sqlite3.Connection) -> None:
+        """Backfill v7 receipts without choosing a cross-surface collision."""
+
+        receipts: list[tuple[str, str, str, str]] = []
+        request_ids: set[str] = set()
+
+        def append_receipt(
+            request_id_value: object,
+            payload_digest_value: object,
+            scope_value: str,
+            action_value: object,
+        ) -> None:
+            request_id = _require_identifier(
+                _require_sqlite_text(request_id_value, "command receipt request_id"),
+                "command receipt request_id",
+            )
+            payload_digest = _require_payload_digest(payload_digest_value)
+            scope = _require_command_receipt_scope(scope_value)
+            action = _require_command_receipt_action(scope, action_value)
+            if request_id in request_ids:
+                raise RuntimeError(
+                    "duplicate request_id across legacy command receipt tables"
+                )
+            request_ids.add(request_id)
+            receipts.append((request_id, payload_digest, scope, action))
+
+        for row in connection.execute("SELECT request_id, payload_digest FROM commands"):
+            append_receipt(
+                row["request_id"],
+                row["payload_digest"],
+                _ADD_COMMAND_SCOPE,
+                _ADD_COMMAND_ACTION,
+            )
+        for row in connection.execute("SELECT request_id, payload_digest FROM queue_commands"):
+            append_receipt(
+                row["request_id"],
+                row["payload_digest"],
+                _QUEUE_GATE_COMMAND_SCOPE,
+                _QUEUE_GATE_COMMAND_ACTION,
+            )
+        for row in connection.execute(
+            "SELECT request_id, payload_digest, action FROM job_control_commands"
+        ):
+            append_receipt(
+                row["request_id"],
+                row["payload_digest"],
+                _JOB_CONTROL_COMMAND_SCOPE,
+                _require_job_control_action(
+                    _require_sqlite_text(row["action"], "job control action")
+                ),
+            )
+        connection.executemany(
+            """
+            INSERT INTO command_receipts (request_id, payload_digest, scope, action)
+            VALUES (?, ?, ?, ?)
+            """,
+            tuple(receipts),
+        )
+
     def close(self) -> None:
         """Release the SQLite connection."""
 
         self._connection.close()
+
+    @staticmethod
+    def _read_command_receipt(
+        connection: sqlite3.Connection, request_id: str
+    ) -> tuple[str, str, str] | None:
+        """Read one exact shared receipt or fail closed on malformed state."""
+
+        rows = connection.execute(
+            """
+            SELECT request_id, payload_digest, scope, action
+            FROM command_receipts
+            WHERE request_id = ?
+            LIMIT 2
+            """,
+            (request_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeError("command receipt is not unique")
+        row = rows[0]
+        stored_request_id = _require_identifier(
+            _require_sqlite_text(row["request_id"], "command receipt request_id"),
+            "command receipt request_id",
+        )
+        if stored_request_id != request_id:
+            raise RuntimeError("command receipt request_id does not match its lookup")
+        payload_digest = _require_payload_digest(
+            _require_sqlite_text(row["payload_digest"], "command receipt payload_digest")
+        )
+        scope = _require_command_receipt_scope(
+            _require_sqlite_text(row["scope"], "command receipt scope")
+        )
+        action = _require_command_receipt_action(
+            scope, _require_sqlite_text(row["action"], "command receipt action")
+        )
+        return payload_digest, scope, action
+
+    @staticmethod
+    def _match_command_receipt(
+        connection: sqlite3.Connection,
+        *,
+        request_id: str,
+        payload_digest: str,
+        scope: str,
+        action: str,
+    ) -> bool:
+        """Match the global command identity before any surface-specific replay."""
+
+        receipt = SQLiteStore._read_command_receipt(connection, request_id)
+        if receipt is None:
+            SQLiteStore._reject_unregistered_legacy_receipt(connection, request_id)
+            return False
+        if receipt != (payload_digest, scope, action):
+            raise RequestConflictError(
+                "request_id is already bound to a different command receipt"
+            )
+        return True
+
+    @staticmethod
+    def _reject_unregistered_legacy_receipt(
+        connection: sqlite3.Connection, request_id: str
+    ) -> None:
+        """Prevent a damaged v8 registry from opening a cross-surface reuse hole."""
+
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM (
+                SELECT request_id FROM commands WHERE request_id = ?
+                UNION ALL
+                SELECT request_id FROM queue_commands WHERE request_id = ?
+                UNION ALL
+                SELECT request_id FROM job_control_commands WHERE request_id = ?
+            )
+            LIMIT 1
+            """,
+            (request_id, request_id, request_id),
+        ).fetchone()
+        if row is not None:
+            raise RuntimeError("command receipt registry is incomplete")
+
+    @staticmethod
+    def _insert_command_receipt(
+        connection: sqlite3.Connection,
+        *,
+        request_id: str,
+        payload_digest: str,
+        scope: str,
+        action: str,
+    ) -> None:
+        """Persist one shared receipt in the caller's active transaction."""
+
+        connection.execute(
+            """
+            INSERT INTO command_receipts (request_id, payload_digest, scope, action)
+            VALUES (?, ?, ?, ?)
+            """,
+            (request_id, payload_digest, scope, action),
+        )
 
     def apply_add(
         self, intent: DownloadIntent, *, materialized: MaterializedJob | None = None
@@ -681,6 +903,13 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
+            replay = self._match_command_receipt(
+                connection,
+                request_id=intent.request_id,
+                payload_digest=intent.payload_digest,
+                scope=_ADD_COMMAND_SCOPE,
+                action=_ADD_COMMAND_ACTION,
+            )
             existing = connection.execute(
                 """
                 SELECT payload_digest, job_id, generation, revision
@@ -689,11 +918,14 @@ class SQLiteStore:
                 """,
                 (intent.request_id,),
             ).fetchone()
-            if existing is not None:
-                if existing["payload_digest"] != intent.payload_digest:
-                    raise RequestConflictError(
-                        "request_id is already bound to a different payload digest"
-                    )
+            if replay:
+                if existing is None:
+                    raise RuntimeError("command receipt is missing its add readback")
+                receipt_digest = _require_payload_digest(
+                    _require_sqlite_text(existing["payload_digest"], "command payload_digest")
+                )
+                if receipt_digest != intent.payload_digest:
+                    raise RuntimeError("command receipt does not match its add readback")
                 if materialized is not None and not self._stored_projection_matches(
                     connection, existing["job_id"], intent, materialized
                 ):
@@ -707,6 +939,8 @@ class SQLiteStore:
                     revision=existing["revision"],
                 )
             else:
+                if existing is not None:
+                    raise RuntimeError("command receipt registry is incomplete")
                 connection.execute(
                     """
                     INSERT INTO jobs (job_id, source_url, generation, revision, state)
@@ -733,6 +967,13 @@ class SQLiteStore:
                         intent.generation,
                         intent.revision,
                     ),
+                )
+                self._insert_command_receipt(
+                    connection,
+                    request_id=intent.request_id,
+                    payload_digest=intent.payload_digest,
+                    scope=_ADD_COMMAND_SCOPE,
+                    action=_ADD_COMMAND_ACTION,
                 )
                 if materialized is not None:
                     self._insert_materialized_projection(connection, materialized)
@@ -910,6 +1151,13 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
+            replay = self._match_command_receipt(
+                connection,
+                request_id=request_id,
+                payload_digest=payload_digest,
+                scope=_QUEUE_GATE_COMMAND_SCOPE,
+                action=_QUEUE_GATE_COMMAND_ACTION,
+            )
             receipt = connection.execute(
                 """
                 SELECT payload_digest, gate, revision
@@ -918,9 +1166,13 @@ class SQLiteStore:
                 """,
                 (request_id,),
             ).fetchone()
-            if receipt is not None:
-                receipt_digest = _require_sqlite_text(
-                    receipt["payload_digest"], "queue command payload_digest"
+            if replay:
+                if receipt is None:
+                    raise RuntimeError("command receipt is missing its queue-gate readback")
+                receipt_digest = _require_payload_digest(
+                    _require_sqlite_text(
+                        receipt["payload_digest"], "queue command payload_digest"
+                    )
                 )
                 receipt_gate = _require_queue_gate(
                     _require_sqlite_text(receipt["gate"], "queue command gate")
@@ -931,7 +1183,11 @@ class SQLiteStore:
                     ),
                     "queue command revision",
                 )
-                if receipt_digest != payload_digest or receipt_gate != gate:
+                if receipt_digest != payload_digest:
+                    raise RuntimeError(
+                        "command receipt does not match its queue-gate readback"
+                    )
+                if receipt_gate != gate:
                     raise RequestConflictError(
                         "request_id is already bound to a different queue-gate command"
                     )
@@ -939,6 +1195,8 @@ class SQLiteStore:
                     applied=False, gate=receipt_gate, revision=receipt_revision
                 )
             else:
+                if receipt is not None:
+                    raise RuntimeError("command receipt registry is incomplete")
                 setting = connection.execute(
                     """
                     SELECT value, revision
@@ -977,6 +1235,13 @@ class SQLiteStore:
                     """,
                     (request_id, payload_digest, gate, next_revision),
                 )
+                self._insert_command_receipt(
+                    connection,
+                    request_id=request_id,
+                    payload_digest=payload_digest,
+                    scope=_QUEUE_GATE_COMMAND_SCOPE,
+                    action=_QUEUE_GATE_COMMAND_ACTION,
+                )
                 result = QueueGateResult(
                     applied=True, gate=gate, revision=next_revision
                 )
@@ -1006,6 +1271,13 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
+            replay = self._match_command_receipt(
+                connection,
+                request_id=request_id,
+                payload_digest=payload_digest,
+                scope=_JOB_CONTROL_COMMAND_SCOPE,
+                action=action,
+            )
             receipt = connection.execute(
                 """
                 SELECT
@@ -1022,24 +1294,34 @@ class SQLiteStore:
                 """,
                 (request_id,),
             ).fetchone()
-            if receipt is not None:
+            if replay:
+                if receipt is None:
+                    raise RuntimeError("command receipt is missing its job-control readback")
                 result = self._job_control_result_from_receipt(receipt)
-                receipt_digest = _require_payload_digest(receipt["payload_digest"])
+                receipt_digest = _require_payload_digest(
+                    _require_sqlite_text(
+                        receipt["payload_digest"], "job control payload_digest"
+                    )
+                )
                 receipt_action = _require_job_control_action(
                     _require_sqlite_text(receipt["action"], "job control action")
                 )
-                if (
-                    receipt_digest != payload_digest
-                    or result.job != job_id
-                    or receipt_action != action
-                ):
+                if receipt_digest != payload_digest:
+                    raise RuntimeError(
+                        "command receipt does not match its job-control readback"
+                    )
+                if result.job != job_id or receipt_action != action:
                     raise RequestConflictError(
                         "request_id is already bound to a different job-control command"
                     )
             else:
+                if receipt is not None:
+                    raise RuntimeError("command receipt registry is incomplete")
                 current = self._read_job_control_projection(connection, job_id)
                 if current.revision != expected_revision:
                     result = current.to_result("stale")
+                elif current.state in _TERMINAL_JOB_CONTROL_STATES:
+                    result = current.to_result("blocked")
                 elif action == "start_now" and self._current_queue_gate(connection) != "running":
                     result = current.to_result("blocked")
                 else:
@@ -1091,6 +1373,13 @@ class SQLiteStore:
                     payload_digest=payload_digest,
                     action=action,
                     result=result,
+                )
+                self._insert_command_receipt(
+                    connection,
+                    request_id=request_id,
+                    payload_digest=payload_digest,
+                    scope=_JOB_CONTROL_COMMAND_SCOPE,
+                    action=action,
                 )
             connection.commit()
         except BaseException:
