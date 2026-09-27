@@ -35,6 +35,7 @@ __all__ = [
     "JobControlResult",
     "JobPageRecord",
     "JobRecord",
+    "PublicationMarkerBinding",
     "QueueGateResult",
     "RequestConflictError",
     "RevisionConflictError",
@@ -131,6 +132,27 @@ CREATE TABLE publication_reservations (
         AND claim_token NOT GLOB '*[^0-9a-f]*'
     ),
     UNIQUE(target_component, final_filename)
+);
+"""
+
+_PUBLICATION_MARKER_BINDINGS_SCHEMA: Final = """
+CREATE TABLE publication_marker_bindings (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES publication_reservations(job_id) ON DELETE CASCADE CHECK (
+        typeof(job_id) = 'text'
+        AND length(job_id) BETWEEN 1 AND 128
+        AND substr(job_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND job_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+    ),
+    marker_device INTEGER NOT NULL CHECK (
+        typeof(marker_device) = 'integer'
+        AND marker_device >= 0
+        AND marker_device <= 9223372036854775807
+    ),
+    marker_inode INTEGER NOT NULL CHECK (
+        typeof(marker_inode) = 'integer'
+        AND marker_inode >= 0
+        AND marker_inode <= 9223372036854775807
+    )
 );
 """
 
@@ -282,7 +304,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 10
+_SUPPORTED_SCHEMA_VERSION: Final = 11
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -364,6 +386,20 @@ _V10_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _SCHEMA,
     _MATERIALIZED_JOBS_SCHEMA,
     _PUBLICATION_RESERVATIONS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _JOB_CONTROL_COMMANDS_SCHEMA,
+    _COMMAND_RECEIPTS_SCHEMA,
+)
+_V11_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _PUBLICATION_RESERVATIONS_SCHEMA,
+    _PUBLICATION_MARKER_BINDINGS_SCHEMA,
     _COLLECTION_HOLDS_SCHEMA,
     _JOB_RETRY_SCHEMA,
     _JOB_RETRY_AUDIT_SCHEMA,
@@ -626,6 +662,28 @@ class JobRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicationMarkerBinding:
+    """The durable filesystem identity of one job-local publication marker."""
+
+    job_id: str
+    marker_device: int
+    marker_inode: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "job_id", _require_identifier(self.job_id, "job_id"))
+        object.__setattr__(
+            self,
+            "marker_device",
+            _require_counter(self.marker_device, "marker_device"),
+        )
+        object.__setattr__(
+            self,
+            "marker_inode",
+            _require_counter(self.marker_inode, "marker_inode"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class JobPageRecord:
     """Lifecycle fields needed to render one bounded job page."""
 
@@ -699,7 +757,7 @@ class SQLiteStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
-            self._migrate_schema_v10(connection)
+            self._migrate_schema_v11(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -733,6 +791,7 @@ class SQLiteStore:
             8: _V8_TABLE_SCHEMAS,
             9: _V9_TABLE_SCHEMAS,
             10: _V10_TABLE_SCHEMAS,
+            11: _V11_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -763,8 +822,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v10(connection: sqlite3.Connection) -> None:
-        """Bootstrap v1 then apply additive v2 through v10 migrations atomically."""
+    def _migrate_schema_v11(connection: sqlite3.Connection) -> None:
+        """Bootstrap v1 then apply additive v2 through v11 migrations atomically."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -875,8 +934,14 @@ class SQLiteStore:
                 connection.execute(_PUBLICATION_RESERVATIONS_SCHEMA)
                 connection.execute("PRAGMA user_version = 10")
                 version = 10
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 10:
                 if not SQLiteStore._has_table_schemas(connection, _V10_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_PUBLICATION_MARKER_BINDINGS_SCHEMA)
+                connection.execute("PRAGMA user_version = 11")
+                version = 11
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V11_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -2655,6 +2720,14 @@ class SQLiteStore:
         job_id = _require_identifier(job_id, "job_id")
         return self._read_publication_reservation(self._connection, job_id)
 
+    def get_publication_marker_binding(
+        self, job_id: str
+    ) -> PublicationMarkerBinding | None:
+        """Read one exact job-local marker identity, if the receipt owns one."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        return self._read_publication_marker_binding(self._connection, job_id)
+
     @staticmethod
     def _read_publication_reservation(
         connection: sqlite3.Connection, job_id: str
@@ -2768,6 +2841,112 @@ class SQLiteStore:
                 "publication reservation does not match its materialized destination"
             )
         return reservation
+
+    @staticmethod
+    def _read_publication_marker_binding(
+        connection: sqlite3.Connection, job_id: str
+    ) -> PublicationMarkerBinding | None:
+        """Read a marker identity only through its current reservation owner chain."""
+
+        reservation = SQLiteStore._read_publication_reservation(connection, job_id)
+        rows = connection.execute(
+            """
+            SELECT job_id, marker_device, marker_inode
+            FROM publication_marker_bindings
+            WHERE job_id = ?
+            LIMIT 2
+            """,
+            (job_id,),
+        ).fetchall()
+        if reservation is None:
+            if rows:
+                raise ValueError(
+                    "publication marker binding is missing its publication reservation"
+                )
+            return None
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("publication reservation has multiple marker bindings")
+        row = rows[0]
+        try:
+            binding = PublicationMarkerBinding(
+                job_id=_require_sqlite_text(
+                    row["job_id"], "publication marker binding job_id"
+                ),
+                marker_device=_require_counter(
+                    _require_sqlite_integer(
+                        row["marker_device"], "publication marker binding marker_device"
+                    ),
+                    "publication marker binding marker_device",
+                ),
+                marker_inode=_require_counter(
+                    _require_sqlite_integer(
+                        row["marker_inode"], "publication marker binding marker_inode"
+                    ),
+                    "publication marker binding marker_inode",
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("persisted publication marker binding is invalid") from error
+        if binding.job_id != job_id or binding.job_id != reservation.job_id:
+            raise ValueError("publication marker binding job_id does not match its owner")
+        return binding
+
+    def bind_publication_marker(
+        self,
+        job_id: str,
+        *,
+        claim_token: str,
+        marker_device: object,
+        marker_inode: object,
+    ) -> PublicationMarkerBinding:
+        """Persist or exactly replay the marker identity bound to one reservation."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        claim_token = _require_reservation_token(claim_token)
+        marker_device = _require_counter(marker_device, "marker_device")
+        marker_inode = _require_counter(marker_inode, "marker_inode")
+        requested = PublicationMarkerBinding(
+            job_id=job_id,
+            marker_device=marker_device,
+            marker_inode=marker_inode,
+        )
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            reservation = self._read_publication_reservation(connection, job_id)
+            if reservation is None:
+                raise ValueError(
+                    "publication marker binding requires a current publication reservation"
+                )
+            if reservation.claim_token != claim_token:
+                raise ValueError("publication marker claim token does not match")
+            existing = self._read_publication_marker_binding(connection, job_id)
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO publication_marker_bindings (
+                        job_id, marker_device, marker_inode
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        requested.job_id,
+                        requested.marker_device,
+                        requested.marker_inode,
+                    ),
+                )
+                result = requested
+            else:
+                if existing != requested:
+                    raise ValueError("publication marker binding does not match")
+                result = existing
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return result
 
     @staticmethod
     def _materialized_job_from_row(row: sqlite3.Row) -> MaterializedJob:
