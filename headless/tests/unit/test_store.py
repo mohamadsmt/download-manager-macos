@@ -3768,3 +3768,87 @@ def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
             ).fetchall()
         }
     assert table_schemas == store_module._V9_TABLE_SCHEMAS
+
+
+def test_v9_receipt_rebuild_failure_restores_v8_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v8_database(database_path)
+    expected_job_control_commands = (
+        (
+            "control-request",
+            "d" * 64,
+            "legacy-job",
+            "pause",
+            "blocked",
+            23,
+            41,
+            "completed",
+            0,
+        ),
+    )
+    expected_command_receipts = (
+        ("control-request", "d" * 64, "job_control", "pause"),
+        ("legacy-request", "b" * 64, "add", "add"),
+    )
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_receipt_rebuild_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="INSERT INTO command_receipts",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(
+        store_module.sqlite3, "connect", connect_with_receipt_rebuild_failure
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert connection.execute(
+            """
+            SELECT job_id, source_url, generation, revision, state
+            FROM jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone() == expected_legacy_job
+        assert connection.execute(
+            """
+            SELECT
+                request_id,
+                payload_digest,
+                job_id,
+                action,
+                status,
+                generation,
+                revision,
+                state,
+                authorized
+            FROM job_control_commands
+            ORDER BY request_id
+            """
+        ).fetchall() == list(expected_job_control_commands)
+        assert connection.execute(
+            """
+            SELECT request_id, payload_digest, scope, action
+            FROM command_receipts
+            ORDER BY request_id
+            """
+        ).fetchall() == list(expected_command_receipts)
+    assert table_schemas == store_module._V8_TABLE_SCHEMAS
+    assert not {name for name in table_schemas if name.endswith("_v8")}
