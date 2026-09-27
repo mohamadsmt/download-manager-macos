@@ -432,9 +432,10 @@ class _BootstrapFailureConnection:
     def row_factory(self, value: Any) -> None:
         self._connection.row_factory = value
 
-    def executescript(self, script: str) -> None:
-        self._connection.execute("BEGIN EXCLUSIVE")
-        raise sqlite3.OperationalError("injected bootstrap failure")
+    def execute(self, statement: str, *args: Any, **kwargs: Any) -> Any:
+        if statement.lstrip().startswith("CREATE TABLE IF NOT EXISTS settings"):
+            raise sqlite3.OperationalError("injected bootstrap failure")
+        return self._connection.execute(statement, *args, **kwargs)
 
     def close(self) -> None:
         self.closed = True
@@ -4225,6 +4226,60 @@ def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fail
     assert "publication_reservations" not in table_schemas
 
 
+def test_fresh_v10_bootstrap_retries_after_publication_receipt_ddl_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_publication_receipt_ddl_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="CREATE TABLE publication_reservations",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(
+        store_module.sqlite3, "connect", connect_with_publication_receipt_ddl_failure
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert (version == 0 and table_schemas == {}) or (
+        version == 1 and table_schemas == store_module._V1_TABLE_SCHEMAS
+    )
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
+    recovered = SQLiteStore(database_path)
+    try:
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 10
+    finally:
+        recovered.close()
+
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V10_TABLE_SCHEMAS
+
+
 @pytest.mark.parametrize(
     ("column", "corrupt_value"),
     (
@@ -4247,12 +4302,14 @@ def test_materialized_receipt_readback_and_replay_reject_mismatched_projection(
         with pytest.raises(ValueError):
             store.get_publication_reservation(materialized.job_id)
         with pytest.raises(ValueError):
+            store.apply_add(materialized.intent)
+        with pytest.raises(ValueError):
             store.apply_add(materialized.intent, materialized=materialized)
     finally:
         store.close()
 
 
-def test_materialized_receipt_replay_rejects_missing_receipt_after_readback_returns_none(
+def test_materialized_receipt_replay_rejects_missing_receipt_without_materialized_argument(
     tmp_path: Path,
 ) -> None:
     materialized = _materialized_job()
@@ -4264,7 +4321,9 @@ def test_materialized_receipt_replay_rejects_missing_receipt_after_readback_retu
         )
 
         assert store.get_publication_reservation(materialized.job_id) is None
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="missing publication reservation"):
+            store.apply_add(materialized.intent)
+        with pytest.raises(ValueError, match="missing publication reservation"):
             store.apply_add(materialized.intent, materialized=materialized)
         assert (
             store._connection.execute(
@@ -4286,6 +4345,60 @@ def test_publication_reservation_readback_rejects_receipt_without_projection(
     try:
         store._connection.execute("PRAGMA foreign_keys = OFF")
         try:
+            store._connection.execute(
+                """
+                INSERT INTO publication_reservations (
+                    job_id, target_component, final_filename, claim_token
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    materialized.job_id,
+                    target_component,
+                    materialized.selected_final_filename,
+                    "a" * 64,
+                ),
+            )
+        finally:
+            store._connection.execute("PRAGMA foreign_keys = ON")
+
+        with pytest.raises(ValueError, match="owner"):
+            store.get_publication_reservation(materialized.job_id)
+    finally:
+        store.close()
+
+
+def test_publication_reservation_readback_rejects_projection_and_receipt_without_job_parent(
+    tmp_path: Path,
+) -> None:
+    materialized = _materialized_job()
+    target_component = materialized.destination_collection or materialized.category
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store._connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            store._connection.execute(
+                """
+                INSERT INTO materialized_jobs (
+                    job_id,
+                    source_kind,
+                    queue_collection_id,
+                    priority,
+                    order_key,
+                    scheduled_for_us,
+                    authorized,
+                    manual_hold,
+                    start_now_requested,
+                    category,
+                    destination_collection,
+                    partial_filename,
+                    selected_final_filename,
+                    expected_revision
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (materialized.job_id, *SQLiteStore._projection_values(materialized)),
+            )
             store._connection.execute(
                 """
                 INSERT INTO publication_reservations (

@@ -699,7 +699,6 @@ class SQLiteStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
-            connection.executescript(_SCHEMA)
             self._migrate_schema_v10(connection)
         except BaseException:
             try:
@@ -765,7 +764,7 @@ class SQLiteStore:
 
     @staticmethod
     def _migrate_schema_v10(connection: sqlite3.Connection) -> None:
-        """Apply additive v2 through v10 schema migrations in one transaction."""
+        """Bootstrap v1 then apply additive v2 through v10 migrations atomically."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -773,6 +772,12 @@ class SQLiteStore:
             if row is None or type(row[0]) is not int or row[0] < 0:
                 raise RuntimeError("database schema version is invalid")
             version = row[0]
+            if version == 0:
+                for statement in _SCHEMA.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+                connection.execute("PRAGMA user_version = 1")
+                version = 1
             if version <= 1:
                 connection.execute(_MATERIALIZED_JOBS_SCHEMA)
                 connection.execute(_COLLECTION_HOLDS_SCHEMA)
@@ -1092,7 +1097,13 @@ class SQLiteStore:
                     "command job_id",
                 )
                 reservation = self._read_publication_reservation(connection, stored_job_id)
-                if materialized is not None and reservation is None:
+                has_stored_projection = (
+                    connection.execute(
+                        "SELECT 1 FROM materialized_jobs WHERE job_id = ?", (stored_job_id,)
+                    ).fetchone()
+                    is not None
+                )
+                if (materialized is not None or has_stored_projection) and reservation is None:
                     raise ValueError("materialized add replay is missing publication reservation")
                 if materialized is not None and not self._stored_projection_matches(
                     connection, stored_job_id, intent, materialized
@@ -2648,7 +2659,7 @@ class SQLiteStore:
     def _read_publication_reservation(
         connection: sqlite3.Connection, job_id: str
     ) -> PublicationReservation | None:
-        """Read one receipt only when it is bound to one immutable projection."""
+        """Read one receipt only from a jobs-to-projection-to-receipt chain."""
 
         projection_rows = connection.execute(
             """
@@ -2670,10 +2681,27 @@ class SQLiteStore:
         ).fetchall()
         if not projection_rows and not reservation_rows:
             return None
-        if len(projection_rows) == 1 and not reservation_rows:
-            return None
+        job_rows = connection.execute(
+            """
+            SELECT job_id
+            FROM jobs
+            WHERE job_id = ?
+            LIMIT 2
+            """,
+            (job_id,),
+        ).fetchall()
+        if len(job_rows) != 1:
+            raise ValueError("publication reservation owner is not a unique job")
+        owner_job_id = _require_identifier(
+            _require_sqlite_text(job_rows[0]["job_id"], "publication reservation owner job_id"),
+            "publication reservation owner job_id",
+        )
+        if owner_job_id != job_id:
+            raise ValueError("publication reservation owner job_id does not match its lookup")
         if len(projection_rows) != 1:
             raise ValueError("publication reservation owner is not a unique materialized job")
+        if not reservation_rows:
+            return None
         if len(reservation_rows) != 1:
             raise ValueError("materialized job must have exactly one publication reservation")
 
