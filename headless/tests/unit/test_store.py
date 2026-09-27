@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import hermes_downloads.models as models_module
 import hermes_downloads.retry as retry_module
 import hermes_downloads.store as store_module
 from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
@@ -286,6 +287,54 @@ def _create_v8_database(database_path: Path) -> tuple[object, ...]:
             ),
         )
         connection.execute("PRAGMA user_version = 8")
+    return legacy_job
+
+
+def _create_v9_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v8_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "ALTER TABLE job_control_commands RENAME TO job_control_commands_v8"
+        )
+        connection.execute(store_module._JOB_CONTROL_COMMANDS_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO job_control_commands (
+                request_id,
+                payload_digest,
+                job_id,
+                action,
+                status,
+                generation,
+                revision,
+                state,
+                authorized
+            )
+            SELECT
+                request_id,
+                payload_digest,
+                job_id,
+                action,
+                status,
+                generation,
+                revision,
+                state,
+                authorized
+            FROM job_control_commands_v8
+            """
+        )
+        connection.execute("DROP TABLE job_control_commands_v8")
+        connection.execute("ALTER TABLE command_receipts RENAME TO command_receipts_v8")
+        connection.execute(store_module._COMMAND_RECEIPTS_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO command_receipts (request_id, payload_digest, scope, action)
+            SELECT request_id, payload_digest, scope, action
+            FROM command_receipts_v8
+            """
+        )
+        connection.execute("DROP TABLE command_receipts_v8")
+        connection.execute("PRAGMA user_version = 9")
     return legacy_job
 
 
@@ -1232,7 +1281,7 @@ def test_v8_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1356,7 +1405,7 @@ def test_v8_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         schema = connection.execute(
             """
             SELECT sql
@@ -1563,17 +1612,17 @@ def test_v0_rejects_sqlite_prefix_lookalike_before_bootstrap_writes(tmp_path: Pa
     assert _table_names(database_path) == {lookalike}
 
 
-def test_v9_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v10_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 10")
+        connection.execute("PRAGMA user_version = 11")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1732,7 +1781,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1817,14 +1866,14 @@ def test_v8_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V9_TABLE_SCHEMAS
+    assert table_schemas == store_module._V10_TABLE_SCHEMAS
 
 
 def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
@@ -1868,7 +1917,7 @@ def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert [
             row[1]
             for row in connection.execute(
@@ -2395,6 +2444,106 @@ def test_materialized_domain_apply_add_reopens_exact_projection(tmp_path: Path) 
         assert reopened.get_materialized_job(materialized.job_id) == materialized
     finally:
         reopened.close()
+
+
+def test_materialized_add_persists_durable_publication_reservation_and_replays_its_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    materialized = _materialized_job()
+    generated_sizes: list[int] = []
+
+    def token_hex(size: int) -> str:
+        generated_sizes.append(size)
+        return "c" * 64
+
+    monkeypatch.setattr(store_module.secrets, "token_hex", token_hex)
+    store = SQLiteStore(database_path)
+    try:
+        assert store.apply_add(materialized.intent, materialized=materialized).applied is True
+        reservation = store.get_publication_reservation(materialized.job_id)
+
+        assert type(reservation) is models_module.PublicationReservation
+        assert reservation == models_module.PublicationReservation(
+            job_id=materialized.job_id,
+            target_component=materialized.destination_collection,
+            final_filename=materialized.selected_final_filename,
+            claim_token="c" * 64,
+        )
+        assert store.get_publication_reservation("missing-job") is None
+        assert store.apply_add(materialized.intent, materialized=materialized).applied is False
+        assert store.get_publication_reservation(materialized.job_id) == reservation
+        assert generated_sizes == [32]
+    finally:
+        store.close()
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened.apply_add(materialized.intent, materialized=materialized).applied is False
+        assert reopened.get_publication_reservation(materialized.job_id) == reservation
+        assert generated_sizes == [32]
+    finally:
+        reopened.close()
+
+
+def test_materialized_add_uses_category_when_no_destination_collection_is_selected(
+    tmp_path: Path,
+) -> None:
+    materialized = replace(_materialized_job(), destination_collection=None)
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.apply_add(materialized.intent, materialized=materialized).applied is True
+        reservation = store.get_publication_reservation(materialized.job_id)
+
+        assert reservation is not None
+        assert reservation.target_component == materialized.category
+        assert reservation.final_filename == materialized.selected_final_filename
+    finally:
+        store.close()
+
+
+def test_conflicting_publication_target_and_final_filename_rolls_back_add_transaction(
+    tmp_path: Path,
+) -> None:
+    first = replace(
+        _materialized_job(),
+        partial_filename="shared.webm",
+        selected_final_filename="shared.webm",
+    )
+    second = replace(
+        first,
+        job_id="job-2",
+        intent=_intent(job_id="job-2", request_id="request-2"),
+    )
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.apply_add(first.intent, materialized=first).applied is True
+        before = (
+            store.list_jobs(),
+            store.get_command(first.intent.request_id),
+            _command_receipt_rows(store),
+            store.list_events(),
+            store.get_materialized_job(first.job_id),
+            store.get_publication_reservation(first.job_id),
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.apply_add(second.intent, materialized=second)
+
+        assert store.get_job(second.job_id) is None
+        assert store.get_command(second.intent.request_id) is None
+        assert store.get_materialized_job(second.job_id) is None
+        assert store.get_publication_reservation(second.job_id) is None
+        assert (
+            store.list_jobs(),
+            store.get_command(first.intent.request_id),
+            _command_receipt_rows(store),
+            store.list_events(),
+            store.get_materialized_job(first.job_id),
+            store.get_publication_reservation(first.job_id),
+        ) == before
+    finally:
+        store.close()
 
 
 def test_materialized_domain_duplicate_is_idempotent_but_changed_domain_conflicts(
@@ -2991,14 +3140,14 @@ def test_v8_migrates_v6_database_to_the_exact_command_receipt_catalog(tmp_path: 
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V9_TABLE_SCHEMAS
+    assert table_schemas == store_module._V10_TABLE_SCHEMAS
 
 
 def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
@@ -3261,7 +3410,7 @@ def test_v8_migrates_v7_receipts_to_the_shared_global_registry(tmp_path: Path) -
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
     assert "command_receipts" in _table_names(database_path)
 
 
@@ -3760,14 +3909,14 @@ def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V9_TABLE_SCHEMAS
+    assert table_schemas == store_module._V10_TABLE_SCHEMAS
 
 
 def test_v9_receipt_rebuild_failure_restores_v8_database(
@@ -3852,3 +4001,171 @@ def test_v9_receipt_rebuild_failure_restores_v8_database(
         ).fetchall() == list(expected_command_receipts)
     assert table_schemas == store_module._V8_TABLE_SCHEMAS
     assert not {name for name in table_schemas if name.endswith("_v8")}
+
+
+def test_v10_migrates_v9_materialized_projection_without_inventing_a_receipt(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v9_database(database_path)
+    legacy_source_url = expected_legacy_job[1]
+    assert type(legacy_source_url) is bytes
+    materialized = MaterializedJob(
+        job_id="legacy-job",
+        intent=DownloadIntent(
+            job_id="legacy-job",
+            request_id="legacy-request",
+            payload_digest="b" * 64,
+            source_url=legacy_source_url,
+            generation=23,
+            revision=41,
+        ),
+        source_kind=SourceKind.VIDEO,
+        queue_collection_id="legacy-queue",
+        priority=9,
+        order_key=17,
+        scheduled_for=None,
+        authorized=True,
+        manual_hold=False,
+        start_now_requested=False,
+        category="Videos",
+        destination_collection="Legacy collection",
+        partial_filename="legacy.webm",
+        selected_final_filename="legacy.webm",
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO materialized_jobs (
+                job_id,
+                source_kind,
+                queue_collection_id,
+                priority,
+                order_key,
+                scheduled_for_us,
+                authorized,
+                manual_hold,
+                start_now_requested,
+                category,
+                destination_collection,
+                partial_filename,
+                selected_final_filename,
+                expected_revision
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (materialized.job_id, *SQLiteStore._projection_values(materialized)),
+        )
+        projection_before = connection.execute(
+            """
+            SELECT
+                job_id,
+                source_kind,
+                queue_collection_id,
+                priority,
+                order_key,
+                scheduled_for_us,
+                authorized,
+                manual_hold,
+                start_now_requested,
+                category,
+                destination_collection,
+                partial_filename,
+                selected_final_filename,
+                expected_revision
+            FROM materialized_jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone()
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_job("legacy-job") == store_module.JobRecord(
+            job="legacy-job",
+            source_url=legacy_source_url,
+            generation=23,
+            revision=41,
+            state="downloading",
+        )
+        assert store.get_materialized_job("legacy-job") == materialized
+        assert store.get_publication_reservation("legacy-job") is None
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        projection_after = connection.execute(
+            """
+            SELECT
+                job_id,
+                source_kind,
+                queue_collection_id,
+                priority,
+                order_key,
+                scheduled_for_us,
+                authorized,
+                manual_hold,
+                start_now_requested,
+                category,
+                destination_collection,
+                partial_filename,
+                selected_final_filename,
+                expected_revision
+            FROM materialized_jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone()
+        receipts = connection.execute(
+            "SELECT job_id, target_component, final_filename, claim_token FROM publication_reservations"
+        ).fetchall()
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert projection_after == projection_before
+    assert receipts == []
+    assert table_schemas == store_module._V10_TABLE_SCHEMAS
+
+
+def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v9_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_version_bump_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="PRAGMA user_version = 10",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_version_bump_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute(
+            """
+            SELECT job_id, source_url, generation, revision, state
+            FROM jobs
+            WHERE job_id = 'legacy-job'
+            """
+        ).fetchone() == expected_legacy_job
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V9_TABLE_SCHEMAS
+    assert "publication_reservations" not in table_schemas

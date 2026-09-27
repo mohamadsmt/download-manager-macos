@@ -13,11 +13,13 @@ __all__ = [
     "DownloadIntent",
     "JobState",
     "MaterializedJob",
+    "PublicationReservation",
     "SourceKind",
 ]
 
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_PATH_COMPONENT_LENGTH: Final = 255
 _MAX_COUNTER: Final = (1 << 63) - 1
 _MIN_PRIORITY: Final = -(1 << 31)
 _MAX_PRIORITY: Final = (1 << 31) - 1
@@ -66,6 +68,14 @@ def _require_payload_digest(value: object) -> str:
     return value
 
 
+def _require_claim_token(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("claim_token must be a string")
+    if _SHA256_DIGEST.fullmatch(value) is None:
+        raise ValueError("claim_token must be 64 lowercase hexadecimal characters")
+    return value
+
+
 def _require_counter(value: object, name: str) -> int:
     if type(value) is not int:
         raise TypeError(f"{name} must be an integer")
@@ -93,6 +103,13 @@ def _require_path_component(value: object, name: str) -> str:
     if any(unicodedata.category(character) in {"Cc", "Cs"} for character in value):
         raise ValueError(f"{name} contains a control character")
     return value
+
+
+def _require_publication_component(value: object, name: str) -> str:
+    component = _require_path_component(value, name)
+    if len(component) > _MAX_PATH_COMPONENT_LENGTH:
+        raise ValueError(f"{name} exceeds the publication component length limit")
+    return component
 
 
 def _collision_filename(filename: str, job_id: str) -> str:
@@ -218,3 +235,19 @@ class MaterializedJob:
             _collision_filename(partial_filename, job_id),
         }:
             raise ValueError("selected_final_filename is not a managed final name")
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationReservation:
+    """The durable, opaque claim receipt for one materialized publication target."""
+
+    job_id: str
+    target_component: str
+    final_filename: str
+    claim_token: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.job_id, "job_id")
+        _require_publication_component(self.target_component, "target_component")
+        _require_publication_component(self.final_filename, "final_filename")
+        _require_claim_token(self.claim_token)

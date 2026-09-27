@@ -466,6 +466,63 @@ def test_materialized_job_preserves_absent_queue_and_schedule_projections() -> N
     assert materialized.scheduled_for is None
 
 
+def test_publication_reservation_is_immutable_and_contains_only_store_readback_fields() -> None:
+    models = _models()
+    reservation = models.PublicationReservation(
+        job_id="job-1",
+        target_component="Course material",
+        final_filename="selected--job-1.webm",
+        claim_token="a" * 64,
+    )
+
+    assert tuple(models.PublicationReservation.__dataclass_fields__) == (
+        "job_id",
+        "target_component",
+        "final_filename",
+        "claim_token",
+    )
+    assert "PublicationReservation" in models.__all__
+    assert (
+        reservation.job_id,
+        reservation.target_component,
+        reservation.final_filename,
+        reservation.claim_token,
+    ) == ("job-1", "Course material", "selected--job-1.webm", "a" * 64)
+    with pytest.raises(FrozenInstanceError):
+        reservation.claim_token = "b" * 64
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"job_id": "nested/job"},
+        {"target_component": ".hidden"},
+        {"target_component": "nested/component"},
+        {"target_component": "a" * 256},
+        {"final_filename": "../outside.webm"},
+        {"final_filename": "nested/final.webm"},
+        {"final_filename": "a" * 256},
+        {"claim_token": "a" * 63},
+        {"claim_token": "A" * 64},
+        {"claim_token": "g" * 64},
+        {"claim_token": None},
+    ),
+)
+def test_publication_reservation_rejects_malformed_persisted_fields(
+    overrides: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "job_id": "job-1",
+        "target_component": "Course material",
+        "final_filename": "selected--job-1.webm",
+        "claim_token": "a" * 64,
+    }
+    values.update(overrides)
+
+    with pytest.raises((TypeError, ValueError)):
+        _models().PublicationReservation(**values)
+
+
 @pytest.mark.parametrize(
     "overrides",
     (
