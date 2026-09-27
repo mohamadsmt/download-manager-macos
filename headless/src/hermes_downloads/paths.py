@@ -28,6 +28,7 @@ __all__ = [
     "attest_publication_reservation_marker",
     "claim_final_path",
     "observe_job_space",
+    "prepare_persisted_destination_workspace",
     "rehydrate_destination",
     "resolve_destination",
 ]
@@ -199,6 +200,42 @@ def rehydrate_destination(
         incomplete_dir=incomplete_dir,
         partial_path=incomplete_dir / partial_filename,
     )
+
+
+def prepare_persisted_destination_workspace(
+    destination: DestinationIntent,
+) -> DestinationIntent:
+    """Provision only the managed directories for an exact persisted intent.
+
+    The final and partial payload paths remain absent.  In particular, this
+    does not resolve a collision, claim a final name, or attest a reservation.
+    """
+
+    root, final_component = _validate_destination_intent(destination)
+    _require_safe_writable_root(root)
+
+    root_fd = _open_root(root)
+    try:
+        _preflight_persisted_workspace(root_fd, final_component, destination.job_id)
+        final_fd = _open_or_create_directory(root_fd, final_component)
+        try:
+            incomplete_fd = _open_or_create_directory(root_fd, _INCOMPLETE)
+            try:
+                job_fd = _open_or_create_directory(incomplete_fd, destination.job_id)
+                try:
+                    _require_writable_directory(destination.final_path.parent)
+                    _require_writable_directory(destination.incomplete_dir)
+                    _require_same_filesystem(final_fd, job_fd)
+                finally:
+                    os.close(job_fd)
+            finally:
+                os.close(incomplete_fd)
+        finally:
+            os.close(final_fd)
+    finally:
+        os.close(root_fd)
+
+    return destination
 
 
 def claim_final_path(destination: DestinationIntent) -> Path:
@@ -835,6 +872,28 @@ def _open_root(root: Path) -> int:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _preflight_persisted_workspace(
+    root_fd: int,
+    final_component: str,
+    job_id: str,
+) -> None:
+    """Reject every existing workspace component before creating any of them."""
+
+    if _entry_exists(root_fd, final_component):
+        descriptor = _open_existing_directory(root_fd, final_component)
+        os.close(descriptor)
+
+    if not _entry_exists(root_fd, _INCOMPLETE):
+        return
+    incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)
+    try:
+        if _entry_exists(incomplete_fd, job_id):
+            descriptor = _open_existing_directory(incomplete_fd, job_id)
+            os.close(descriptor)
+    finally:
+        os.close(incomplete_fd)
 
 
 def _open_or_create_directory(parent_fd: int, name: str) -> int:

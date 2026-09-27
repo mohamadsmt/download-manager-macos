@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib
 import importlib.util
 import os
@@ -730,3 +731,189 @@ def test_attesting_a_marker_never_claims_or_changes_existing_final_or_partial_pa
     assert destination.final_path.read_bytes() == b"preexisting final bytes"
     assert _entry_signature(destination.partial_path) == partial_before
     assert destination.partial_path.read_bytes() == b"partial payload bytes"
+
+
+def _rehydrate_under_home(paths, monkeypatch: pytest.MonkeyPatch, home: Path, **overrides):
+    values = {
+        "category": "Videos",
+        "collection": None,
+        "partial_filename": "selected.webm",
+        "selected_final_filename": "selected.webm",
+        "job_id": "job-42",
+    }
+    values.update(overrides)
+    monkeypatch.setattr(paths.Path, "home", classmethod(lambda _cls: home))
+    return paths.rehydrate_destination(**values)
+
+
+def test_prepares_only_the_exact_rehydrated_workspace_and_preserves_collision_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths()
+    home = tmp_path / "persisted-home"
+    root = home / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    destination = _rehydrate_under_home(
+        paths,
+        monkeypatch,
+        home,
+        collection="Course material",
+        selected_final_filename="selected--job-42.webm",
+    )
+
+    def forbidden(name: str):
+        def _forbidden(*_args, **_kwargs):
+            raise AssertionError(f"workspace preparation must not call {name}")
+
+        return _forbidden
+
+    monkeypatch.setattr(paths, "resolve_destination", forbidden("resolve_destination"))
+    monkeypatch.setattr(paths, "claim_final_path", forbidden("claim_final_path"))
+    monkeypatch.setattr(paths, "_select_available_name", forbidden("_select_available_name"))
+    monkeypatch.setattr(
+        paths,
+        "attest_publication_reservation_marker",
+        forbidden("attest_publication_reservation_marker"),
+    )
+
+    prepared = paths.prepare_persisted_destination_workspace(destination)
+
+    assert prepared == destination
+    assert prepared.root == root
+    assert prepared.final_path == root / "Course material" / "selected--job-42.webm"
+    assert prepared.incomplete_dir == root / ".incomplete" / "job-42"
+    assert {path.name for path in root.iterdir()} == {"Course material", ".incomplete"}
+    assert {path.name for path in prepared.incomplete_dir.parent.iterdir()} == {"job-42"}
+    assert not (root / "Videos").exists()
+    assert not prepared.final_path.exists()
+    assert not prepared.partial_path.exists()
+    assert not _marker_path(prepared).exists()
+
+
+def test_prepare_persisted_workspace_is_idempotent_for_existing_safe_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths()
+    home = tmp_path / "persisted-home"
+    root = home / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    destination = _rehydrate_under_home(paths, monkeypatch, home)
+
+    first = paths.prepare_persisted_destination_workspace(destination)
+    before = {
+        path: _entry_signature(path)
+        for path in (
+            root,
+            first.final_path.parent,
+            first.incomplete_dir.parent,
+            first.incomplete_dir,
+        )
+    }
+    second = paths.prepare_persisted_destination_workspace(destination)
+
+    assert second == first
+    assert {
+        path: _entry_signature(path)
+        for path in (
+            root,
+            second.final_path.parent,
+            second.incomplete_dir.parent,
+            second.incomplete_dir,
+        )
+    } == before
+    assert not second.final_path.exists()
+    assert not second.partial_path.exists()
+    assert not _marker_path(second).exists()
+
+
+@pytest.mark.parametrize("unsafe_component", ("final", "incomplete", "job"))
+@pytest.mark.parametrize("shape", ("symlink", "file"))
+def test_prepare_persisted_workspace_rejects_unsafe_existing_components_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_component: str,
+    shape: str,
+) -> None:
+    paths = _paths()
+    home = tmp_path / "persisted-home"
+    root = home / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    destination = _rehydrate_under_home(paths, monkeypatch, home)
+
+    if unsafe_component == "final":
+        target = destination.final_path.parent
+    elif unsafe_component == "incomplete":
+        target = destination.incomplete_dir.parent
+    else:
+        target = destination.incomplete_dir
+    target.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / f"outside-{unsafe_component}-{shape}"
+    if shape == "symlink":
+        outside.mkdir()
+        target.symlink_to(outside, target_is_directory=True)
+    else:
+        target.write_bytes(b"unsafe existing component")
+
+    root_before = _entry_signature(root)
+    parent_before = {
+        path.name: _entry_signature(path) for path in target.parent.iterdir()
+    }
+    target_before = _entry_signature(target)
+
+    with pytest.raises(paths.PathValidationError):
+        paths.prepare_persisted_destination_workspace(destination)
+
+    assert _entry_signature(root) == root_before
+    assert {
+        path.name: _entry_signature(path) for path in target.parent.iterdir()
+    } == parent_before
+    assert _entry_signature(target) == target_before
+    if shape == "symlink":
+        assert tuple(outside.iterdir()) == ()
+    assert not os.path.lexists(destination.final_path)
+    assert not os.path.lexists(destination.partial_path)
+    assert not os.path.lexists(_marker_path(destination))
+
+
+def test_prepare_persisted_workspace_rejects_a_mismatched_intent_without_creating_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths()
+    home = tmp_path / "persisted-home"
+    root = home / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    destination = _rehydrate_under_home(paths, monkeypatch, home)
+    mismatched = replace(
+        destination,
+        final_path=root / "Audio" / destination.final_path.name,
+    )
+    root_before = _entry_signature(root)
+
+    with pytest.raises(paths.PathValidationError):
+        paths.prepare_persisted_destination_workspace(mismatched)
+
+    assert _entry_signature(root) == root_before
+    assert tuple(root.iterdir()) == ()
+
+
+def test_provisioned_rehydrated_workspace_can_be_separately_marker_attested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths()
+    home = tmp_path / "persisted-home"
+    root = home / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    destination = _rehydrate_under_home(paths, monkeypatch, home)
+
+    prepared = paths.prepare_persisted_destination_workspace(destination)
+    assert not _marker_path(prepared).exists()
+
+    marker = paths.attest_publication_reservation_marker(
+        prepared,
+        _reservation(prepared),
+    )
+
+    assert marker.path == _marker_path(prepared)
+    assert marker.path.is_file()
+    assert not prepared.final_path.exists()
+    assert not prepared.partial_path.exists()
