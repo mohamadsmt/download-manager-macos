@@ -192,7 +192,7 @@ def _validate_setting_value(value: object, label: str, depth: int = 0) -> None:
             raise BenchmarkValidationError(f"{label} has too many keys")
         for key, item in value.items():
             key_name = _validate_identifier(key, f"{label} key")
-            normalized = key_name.casefold().replace("-", "_")
+            normalized = key_name.casefold().replace("_", "").replace("-", "")
             if any(
                 token in normalized
                 for token in (
@@ -204,7 +204,7 @@ def _validate_setting_value(value: object, label: str, depth: int = 0) -> None:
                     "authorization",
                     "password",
                     "secret",
-                    "api_key",
+                    "apikey",
                     "auth",
                     "header",
                     "input",

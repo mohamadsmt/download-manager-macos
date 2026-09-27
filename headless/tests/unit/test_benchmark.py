@@ -176,7 +176,19 @@ def test_validates_complete_records_and_rejects_fake_or_nonfinite_measurements()
         benchmark.validate_trial_record(with_url)
 
 
-@pytest.mark.parametrize("credential_key", ("password", "secret", "api_key", "auth"))
+@pytest.mark.parametrize(
+    "credential_key",
+    (
+        "password",
+        "secret",
+        "api_key",
+        "api-key",
+        "apiKey",
+        "APIKey",
+        "auth",
+        "authToken",
+    ),
+)
 def test_rejects_raw_credential_like_setting_keys_at_all_depths(credential_key: str) -> None:
     benchmark = _benchmark()
 
