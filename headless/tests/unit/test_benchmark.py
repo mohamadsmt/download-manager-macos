@@ -58,6 +58,12 @@ SENSITIVE_METADATA_KEYS = (
     "input",
     "inputs",
 )
+TRAILING_ACRONYM_PLURAL_METADATA_KEYS = (
+    "URLs",
+    "URIs",
+    "sourceURLs",
+    "sourceURIs",
+)
 
 
 def _benchmark():
@@ -253,6 +259,61 @@ def test_rejects_sensitive_version_metadata_keys(sensitive_key: str) -> None:
     malformed["configuration"]["versions"] = {sensitive_key: "1.0"}
     with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
         benchmark.validate_trial_record(malformed)
+
+
+@pytest.mark.parametrize(
+    "sensitive_key",
+    TRAILING_ACRONYM_PLURAL_METADATA_KEYS,
+)
+def test_rejects_trailing_acronym_plural_version_metadata_keys(
+    sensitive_key: str,
+) -> None:
+    benchmark = _benchmark()
+    record = _passed_record("curl-single", 1)
+    record["configuration"]["versions"] = {sensitive_key: "1.0"}
+
+    with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
+        benchmark.validate_trial_record(record)
+
+
+@pytest.mark.parametrize(
+    "sensitive_key",
+    TRAILING_ACRONYM_PLURAL_METADATA_KEYS,
+)
+def test_rejects_trailing_acronym_plural_setting_keys_recursively(
+    sensitive_key: str,
+) -> None:
+    benchmark = _benchmark()
+    record = _passed_record("curl-single", 1)
+    record["configuration"]["settings"]["transport"] = {
+        "metadata": {sensitive_key: "parallel"}
+    }
+
+    with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
+        benchmark.validate_trial_record(record)
+
+
+@pytest.mark.parametrize(
+    ("key_name", "expected_tokens"),
+    (
+        ("URLs", ("urls",)),
+        ("URIs", ("uris",)),
+        ("sourceURLs", ("source", "urls")),
+        ("sourceURIs", ("source", "uris")),
+        ("APIKeys", ("api", "keys")),
+        ("apiKeys", ("api", "keys")),
+        ("sourceUrl", ("source", "url")),
+        ("source_url", ("source", "url")),
+        ("source-url", ("source", "url")),
+        ("curl", ("curl",)),
+    ),
+)
+def test_tokenizes_camel_snake_and_kebab_metadata_keys(
+    key_name: str, expected_tokens: tuple[str, ...]
+) -> None:
+    benchmark = _benchmark()
+
+    assert benchmark._metadata_key_tokens(key_name) == expected_tokens
 
 
 def test_accepts_safe_version_inventory_metadata() -> None:

@@ -37,7 +37,7 @@ _TIMESTAMP_RE: Final = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
 _IDENTIFIER_SEGMENT_RE: Final = re.compile(
-    r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+"
+    r"[A-Z]+s(?=$)|[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+"
 )
 _VERSION_METADATA_VALUE_RE: Final = re.compile(
     r"^(?:[A-Za-z][A-Za-z0-9]{0,31}[-_])?[vV]?\d+(?:\.\d+){0,7}"
