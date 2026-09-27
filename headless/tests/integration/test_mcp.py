@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from queue import Empty
 import tempfile
+import tomllib
 from typing import Any
 
 import pytest
@@ -214,6 +215,20 @@ def _result_text(result: types.CallToolResult) -> str:
     content = result.content[0]
     assert isinstance(content, types.TextContent)
     return content.text
+
+
+def test_mcp_sdk_is_pinned_runtime_dependency() -> None:
+    """The MCP server's official SDK ships with the production package."""
+
+    with (_HEADLESS_ROOT / "pyproject.toml").open("rb") as manifest_file:
+        manifest = tomllib.load(manifest_file)
+
+    runtime_mcp_requirements = [
+        dependency
+        for dependency in manifest["project"]["dependencies"]
+        if dependency.split("[", 1)[0] == "mcp"
+    ]
+    assert runtime_mcp_requirements == ["mcp[cli]==1.29.1"]
 
 
 def test_downloads_query_server_factory_is_available() -> None:

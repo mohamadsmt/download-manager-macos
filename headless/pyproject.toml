@@ -7,7 +7,10 @@ name = "hermes-downloads"
 version = "0.0.0"
 description = "Headless Hermes download service"
 requires-python = ">=3.12,<3.13"
-dependencies = ["yt-dlp==2026.6.9"]
+dependencies = [
+  "yt-dlp==2026.6.9",
+  "mcp[cli]==1.29.1",
+]
 
 [project.scripts]
 hermes-downloads = "hermes_downloads.cli:main"
@@ -16,7 +19,6 @@ hermes-downloads-worker = "hermes_downloads.worker:main"
 
 [dependency-groups]
 dev = [
-  "mcp[cli]==1.29.1",
   "pytest>=8.4,<9",
 ]
 

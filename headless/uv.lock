@@ -143,23 +143,23 @@ name = "hermes-downloads"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "mcp", extra = ["cli"] },
     { name = "yt-dlp" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "mcp", extra = ["cli"] },
     { name = "pytest" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "yt-dlp", specifier = "==2026.6.9" }]
+requires-dist = [
+    { name = "mcp", extras = ["cli"], specifier = "==1.29.1" },
+    { name = "yt-dlp", specifier = "==2026.6.9" },
+]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "mcp", extras = ["cli"], specifier = "==1.29.1" },
-    { name = "pytest", specifier = ">=8.4,<9" },
-]
+dev = [{ name = "pytest", specifier = ">=8.4,<9" }]
 
 [[package]]
 name = "httpcore"
