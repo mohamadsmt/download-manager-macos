@@ -96,12 +96,14 @@ CREATE TABLE materialized_jobs (
 _PUBLICATION_RESERVATIONS_SCHEMA: Final = """
 CREATE TABLE publication_reservations (
     job_id TEXT PRIMARY KEY NOT NULL REFERENCES materialized_jobs(job_id) ON DELETE CASCADE CHECK (
-        length(job_id) BETWEEN 1 AND 128
+        typeof(job_id) = 'text'
+        AND length(job_id) BETWEEN 1 AND 128
         AND substr(job_id, 1, 1) GLOB '[A-Za-z0-9]'
         AND job_id NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     target_component TEXT NOT NULL CHECK (
-        length(target_component) BETWEEN 1 AND 255
+        typeof(target_component) = 'text'
+        AND length(target_component) BETWEEN 1 AND 255
         AND target_component NOT IN ('.', '..')
         AND substr(target_component, 1, 1) != '.'
         AND instr(target_component, '/') = 0
@@ -112,7 +114,8 @@ CREATE TABLE publication_reservations (
         )
     ),
     final_filename TEXT NOT NULL CHECK (
-        length(final_filename) BETWEEN 1 AND 255
+        typeof(final_filename) = 'text'
+        AND length(final_filename) BETWEEN 1 AND 255
         AND final_filename NOT IN ('.', '..')
         AND substr(final_filename, 1, 1) != '.'
         AND instr(final_filename, '/') = 0
@@ -123,7 +126,8 @@ CREATE TABLE publication_reservations (
         )
     ),
     claim_token TEXT NOT NULL CHECK (
-        length(claim_token) = 64
+        typeof(claim_token) = 'text'
+        AND length(claim_token) = 64
         AND claim_token NOT GLOB '*[^0-9a-f]*'
     ),
     UNIQUE(target_component, final_filename)
@@ -1083,21 +1087,28 @@ class SQLiteStore:
                 )
                 if receipt_digest != intent.payload_digest:
                     raise RuntimeError("command receipt does not match its add readback")
+                stored_job_id = _require_identifier(
+                    _require_sqlite_text(existing["job_id"], "command job_id"),
+                    "command job_id",
+                )
+                self._read_publication_reservation(connection, stored_job_id)
                 if materialized is not None and not self._stored_projection_matches(
-                    connection, existing["job_id"], intent, materialized
+                    connection, stored_job_id, intent, materialized
                 ):
                     raise RequestConflictError(
                         "request_id is already bound to a different materialized projection"
                     )
                 result = CommandResult(
                     applied=False,
-                    job=existing["job_id"],
+                    job=stored_job_id,
                     generation=existing["generation"],
                     revision=existing["revision"],
                 )
             else:
                 if existing is not None:
                     raise RuntimeError("command receipt registry is incomplete")
+                if materialized is not None:
+                    self._ensure_publication_target_is_available(connection, materialized)
                 connection.execute(
                     """
                     INSERT INTO jobs (job_id, source_url, generation, revision, state)
@@ -1209,6 +1220,31 @@ class SQLiteStore:
                 reservation.claim_token,
             ),
         )
+
+    @staticmethod
+    def _ensure_publication_target_is_available(
+        connection: sqlite3.Connection, materialized: MaterializedJob
+    ) -> None:
+        """Reject a destination already owned by any materialized projection."""
+
+        target_component = materialized.destination_collection or materialized.category
+        conflict = connection.execute(
+            """
+            SELECT 1
+            FROM materialized_jobs
+            WHERE job_id != ?
+              AND COALESCE(destination_collection, category) = ?
+              AND selected_final_filename = ?
+            LIMIT 1
+            """,
+            (
+                materialized.job_id,
+                target_component,
+                materialized.selected_final_filename,
+            ),
+        ).fetchone()
+        if conflict is not None:
+            raise sqlite3.IntegrityError("publication target is already reserved")
 
     @staticmethod
     def _stored_projection_matches(
@@ -2604,7 +2640,24 @@ class SQLiteStore:
         """Read one exact materialized-job publication receipt, if present."""
 
         job_id = _require_identifier(job_id, "job_id")
-        rows = self._connection.execute(
+        return self._read_publication_reservation(self._connection, job_id)
+
+    @staticmethod
+    def _read_publication_reservation(
+        connection: sqlite3.Connection, job_id: str
+    ) -> PublicationReservation | None:
+        """Read one receipt only when it is bound to one immutable projection."""
+
+        projection_rows = connection.execute(
+            """
+            SELECT job_id, category, destination_collection, selected_final_filename
+            FROM materialized_jobs
+            WHERE job_id = ?
+            LIMIT 2
+            """,
+            (job_id,),
+        ).fetchall()
+        reservation_rows = connection.execute(
             """
             SELECT job_id, target_component, final_filename, claim_token
             FROM publication_reservations
@@ -2613,11 +2666,41 @@ class SQLiteStore:
             """,
             (job_id,),
         ).fetchall()
-        if not rows:
+        if not projection_rows and not reservation_rows:
             return None
-        if len(rows) != 1:
-            raise ValueError("publication reservation is not unique")
-        row = rows[0]
+        if len(projection_rows) != 1:
+            raise ValueError("publication reservation owner is not a unique materialized job")
+        if len(reservation_rows) != 1:
+            raise ValueError("materialized job must have exactly one publication reservation")
+
+        projection = projection_rows[0]
+        projection_job_id = _require_identifier(
+            _require_sqlite_text(
+                projection["job_id"], "publication reservation materialized job_id"
+            ),
+            "publication reservation materialized job_id",
+        )
+        if projection_job_id != job_id:
+            raise ValueError(
+                "publication reservation materialized job_id does not match its lookup"
+            )
+        destination_collection = _require_optional_sqlite_text(
+            projection["destination_collection"],
+            "publication reservation destination_collection",
+        )
+        target_component = (
+            _require_sqlite_text(
+                projection["category"], "publication reservation category"
+            )
+            if destination_collection is None
+            else destination_collection
+        )
+        final_filename = _require_sqlite_text(
+            projection["selected_final_filename"],
+            "publication reservation selected_final_filename",
+        )
+
+        row = reservation_rows[0]
         persisted_job_id = _require_identifier(
             _require_sqlite_text(row["job_id"], "publication reservation job_id"),
             "publication reservation job_id",
@@ -2625,7 +2708,7 @@ class SQLiteStore:
         if persisted_job_id != job_id:
             raise ValueError("publication reservation job_id does not match its lookup")
         try:
-            return PublicationReservation(
+            reservation = PublicationReservation(
                 job_id=persisted_job_id,
                 target_component=_require_sqlite_text(
                     row["target_component"], "publication reservation target_component"
@@ -2637,8 +2720,22 @@ class SQLiteStore:
                     row["claim_token"], "publication reservation claim_token"
                 ),
             )
+            expected = PublicationReservation(
+                job_id=projection_job_id,
+                target_component=target_component,
+                final_filename=final_filename,
+                claim_token=reservation.claim_token,
+            )
         except (TypeError, ValueError) as error:
             raise ValueError("persisted publication reservation is invalid") from error
+        if (
+            reservation.target_component != expected.target_component
+            or reservation.final_filename != expected.final_filename
+        ):
+            raise ValueError(
+                "publication reservation does not match its materialized destination"
+            )
+        return reservation
 
     @staticmethod
     def _materialized_job_from_row(row: sqlite3.Row) -> MaterializedJob:
