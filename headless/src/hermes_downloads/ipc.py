@@ -57,7 +57,7 @@ _MIN_PRIORITY: Final = -(1 << 31)
 _MAX_PRIORITY: Final = (1 << 31) - 1
 _CATEGORIES: Final = frozenset({"Videos", "Audio", "Documents", "Software", "Other"})
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
-_JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now"})
+_JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now", "remove"})
 _JOB_CONTROL_STATUSES: Final = frozenset({"applied", "blocked", "stale"})
 _DIRECT_ENGINE_ACTIVATE_STATUSES: Final = frozenset(
     {"active", "blocked", "stale_epoch"}

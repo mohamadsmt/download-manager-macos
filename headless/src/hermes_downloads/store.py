@@ -125,7 +125,7 @@ CREATE TABLE queue_commands (
 );
 """
 
-_JOB_CONTROL_COMMANDS_SCHEMA: Final = """
+_V7_JOB_CONTROL_COMMANDS_SCHEMA: Final = """
 CREATE TABLE job_control_commands (
     request_id TEXT PRIMARY KEY,
     payload_digest TEXT NOT NULL,
@@ -139,7 +139,21 @@ CREATE TABLE job_control_commands (
 );
 """
 
-_COMMAND_RECEIPTS_SCHEMA: Final = """
+_JOB_CONTROL_COMMANDS_SCHEMA: Final = """
+CREATE TABLE job_control_commands (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    action TEXT NOT NULL CHECK (action IN ('pause', 'resume', 'start_now', 'remove')),
+    status TEXT NOT NULL CHECK (status IN ('applied', 'blocked', 'stale')),
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    authorized INTEGER NOT NULL CHECK (authorized IN (0, 1))
+);
+"""
+
+_V8_COMMAND_RECEIPTS_SCHEMA: Final = """
 CREATE TABLE command_receipts (
     request_id TEXT PRIMARY KEY,
     payload_digest TEXT NOT NULL CHECK (
@@ -150,6 +164,21 @@ CREATE TABLE command_receipts (
         (scope = 'add' AND action = 'add')
         OR (scope = 'queue_gate' AND action = 'queue_gate')
         OR (scope = 'job_control' AND action IN ('pause', 'resume', 'start_now'))
+    )
+);
+"""
+
+_COMMAND_RECEIPTS_SCHEMA: Final = """
+CREATE TABLE command_receipts (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL CHECK (
+        length(payload_digest) = 64 AND payload_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    scope TEXT NOT NULL CHECK (scope IN ('add', 'queue_gate', 'job_control')),
+    action TEXT NOT NULL CHECK (
+        (scope = 'add' AND action = 'add')
+        OR (scope = 'queue_gate' AND action = 'queue_gate')
+        OR (scope = 'job_control' AND action IN ('pause', 'resume', 'start_now', 'remove'))
     )
 );
 """
@@ -206,7 +235,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 8
+_SUPPORTED_SCHEMA_VERSION: Final = 9
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -258,9 +287,21 @@ _V7_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _QUEUE_COMMANDS_SCHEMA,
     _ENGINE_INSTANCES_SCHEMA,
     _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
-    _JOB_CONTROL_COMMANDS_SCHEMA,
+    _V7_JOB_CONTROL_COMMANDS_SCHEMA,
 )
 _V8_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _V7_JOB_CONTROL_COMMANDS_SCHEMA,
+    _V8_COMMAND_RECEIPTS_SCHEMA,
+)
+_V9_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _SCHEMA,
     _MATERIALIZED_JOBS_SCHEMA,
     _COLLECTION_HOLDS_SCHEMA,
@@ -275,7 +316,7 @@ _V8_TABLE_SCHEMAS: Final = _expected_table_schemas(
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
-_JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now"})
+_JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now", "remove"})
 _COMMAND_RECEIPT_SCOPES: Final = frozenset({"add", "queue_gate", "job_control"})
 _ADD_COMMAND_SCOPE: Final = "add"
 _ADD_COMMAND_ACTION: Final = "add"
@@ -286,10 +327,14 @@ _JOB_CONTROL_STATUSES: Final = frozenset({"applied", "blocked", "stale"})
 _TERMINAL_JOB_CONTROL_STATES: Final = frozenset(
     {"removed", "completed", "cancelled", "failed"}
 )
+_ACTIVE_JOB_CONTROL_STATES: Final = frozenset(
+    {"resolving", "downloading", "pausing", "finalizing"}
+)
 _JOB_CONTROL_EVENT_KINDS: Final = {
     "pause": "job_paused",
     "resume": "job_resumed",
     "start_now": "job_start_now_requested",
+    "remove": "job_removed",
 }
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _PAGE_SIZE: Final = 100
@@ -595,7 +640,7 @@ class SQLiteStore:
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
-            self._migrate_schema_v8(connection)
+            self._migrate_schema_v9(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -627,6 +672,7 @@ class SQLiteStore:
             6: _V6_TABLE_SCHEMAS,
             7: _V7_TABLE_SCHEMAS,
             8: _V8_TABLE_SCHEMAS,
+            9: _V9_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -657,8 +703,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v8(connection: sqlite3.Connection) -> None:
-        """Apply additive v2 through v8 schema migrations in one transaction."""
+    def _migrate_schema_v9(connection: sqlite3.Connection) -> None:
+        """Apply additive v2 through v9 schema migrations in one transaction."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -699,18 +745,66 @@ class SQLiteStore:
             if version == 6:
                 if not SQLiteStore._has_table_schemas(connection, _V6_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
-                connection.execute(_JOB_CONTROL_COMMANDS_SCHEMA)
+                connection.execute(_V7_JOB_CONTROL_COMMANDS_SCHEMA)
                 connection.execute("PRAGMA user_version = 7")
                 version = 7
             if version == 7:
                 if not SQLiteStore._has_table_schemas(connection, _V7_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
-                connection.execute(_COMMAND_RECEIPTS_SCHEMA)
+                connection.execute(_V8_COMMAND_RECEIPTS_SCHEMA)
                 SQLiteStore._backfill_command_receipts(connection)
                 connection.execute("PRAGMA user_version = 8")
                 version = 8
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 8:
                 if not SQLiteStore._has_table_schemas(connection, _V8_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(
+                    "ALTER TABLE job_control_commands RENAME TO job_control_commands_v8"
+                )
+                connection.execute(_JOB_CONTROL_COMMANDS_SCHEMA)
+                connection.execute(
+                    """
+                    INSERT INTO job_control_commands (
+                        request_id,
+                        payload_digest,
+                        job_id,
+                        action,
+                        status,
+                        generation,
+                        revision,
+                        state,
+                        authorized
+                    )
+                    SELECT
+                        request_id,
+                        payload_digest,
+                        job_id,
+                        action,
+                        status,
+                        generation,
+                        revision,
+                        state,
+                        authorized
+                    FROM job_control_commands_v8
+                    """
+                )
+                connection.execute("DROP TABLE job_control_commands_v8")
+                connection.execute(
+                    "ALTER TABLE command_receipts RENAME TO command_receipts_v8"
+                )
+                connection.execute(_COMMAND_RECEIPTS_SCHEMA)
+                connection.execute(
+                    """
+                    INSERT INTO command_receipts (request_id, payload_digest, scope, action)
+                    SELECT request_id, payload_digest, scope, action
+                    FROM command_receipts_v8
+                    """
+                )
+                connection.execute("DROP TABLE command_receipts_v8")
+                connection.execute("PRAGMA user_version = 9")
+                version = 9
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V9_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1333,6 +1427,8 @@ class SQLiteStore:
                     result = current.to_result("stale")
                 elif current.state in _TERMINAL_JOB_CONTROL_STATES:
                     result = current.to_result("blocked")
+                elif action == "remove" and current.state in _ACTIVE_JOB_CONTROL_STATES:
+                    result = current.to_result("blocked")
                 elif action == "start_now" and self._current_queue_gate(connection) != "running":
                     result = current.to_result("blocked")
                 else:
@@ -1347,6 +1443,11 @@ class SQLiteStore:
                         next_manual_hold = False
                         if current.state == "paused":
                             next_state = "queued"
+                    elif action == "remove":
+                        next_state = "removed"
+                        next_authorized = False
+                        next_manual_hold = True
+                        next_start_now_requested = False
                     else:
                         next_manual_hold = False
                         next_authorized = True

@@ -49,6 +49,35 @@ CREATE TABLE events (
 );
 """
 
+_V8_JOB_CONTROL_COMMANDS_SCHEMA = """
+CREATE TABLE job_control_commands (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    action TEXT NOT NULL CHECK (action IN ('pause', 'resume', 'start_now')),
+    status TEXT NOT NULL CHECK (status IN ('applied', 'blocked', 'stale')),
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    authorized INTEGER NOT NULL CHECK (authorized IN (0, 1))
+);
+"""
+
+_V8_COMMAND_RECEIPTS_SCHEMA = """
+CREATE TABLE command_receipts (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL CHECK (
+        length(payload_digest) = 64 AND payload_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    scope TEXT NOT NULL CHECK (scope IN ('add', 'queue_gate', 'job_control')),
+    action TEXT NOT NULL CHECK (
+        (scope = 'add' AND action = 'add')
+        OR (scope = 'queue_gate' AND action = 'queue_gate')
+        OR (scope = 'job_control' AND action IN ('pause', 'resume', 'start_now'))
+    )
+);
+"""
+
 
 def _intent(**overrides: Any) -> DownloadIntent:
     values: dict[str, Any] = {
@@ -219,8 +248,44 @@ def _create_v6_database(database_path: Path) -> tuple[object, ...]:
 def _create_v7_database(database_path: Path) -> tuple[object, ...]:
     legacy_job = _create_v6_database(database_path)
     with sqlite3.connect(database_path) as connection:
-        connection.execute(store_module._JOB_CONTROL_COMMANDS_SCHEMA)
+        connection.execute(store_module._V7_JOB_CONTROL_COMMANDS_SCHEMA)
         connection.execute("PRAGMA user_version = 7")
+    return legacy_job
+
+
+def _create_v8_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v6_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(_V8_JOB_CONTROL_COMMANDS_SCHEMA)
+        connection.execute(_V8_COMMAND_RECEIPTS_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO job_control_commands (
+                request_id,
+                payload_digest,
+                job_id,
+                action,
+                status,
+                generation,
+                revision,
+                state,
+                authorized
+            )
+            VALUES ('control-request', ?, 'legacy-job', 'pause', 'blocked', 23, 41, 'completed', 0)
+            """,
+            ("d" * 64,),
+        )
+        connection.executemany(
+            """
+            INSERT INTO command_receipts (request_id, payload_digest, scope, action)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                ("legacy-request", "b" * 64, "add", "add"),
+                ("control-request", "d" * 64, "job_control", "pause"),
+            ),
+        )
+        connection.execute("PRAGMA user_version = 8")
     return legacy_job
 
 
@@ -1167,7 +1232,7 @@ def test_v8_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1291,7 +1356,7 @@ def test_v8_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         schema = connection.execute(
             """
             SELECT sql
@@ -1498,17 +1563,17 @@ def test_v0_rejects_sqlite_prefix_lookalike_before_bootstrap_writes(tmp_path: Pa
     assert _table_names(database_path) == {lookalike}
 
 
-def test_v8_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v9_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 9")
+        connection.execute("PRAGMA user_version = 10")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1667,7 +1732,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1752,14 +1817,14 @@ def test_v8_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V8_TABLE_SCHEMAS
+    assert table_schemas == store_module._V9_TABLE_SCHEMAS
 
 
 def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
@@ -1803,7 +1868,7 @@ def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         assert [
             row[1]
             for row in connection.execute(
@@ -2926,14 +2991,14 @@ def test_v8_migrates_v6_database_to_the_exact_command_receipt_catalog(tmp_path: 
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V8_TABLE_SCHEMAS
+    assert table_schemas == store_module._V9_TABLE_SCHEMAS
 
 
 def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
@@ -3196,7 +3261,7 @@ def test_v8_migrates_v7_receipts_to_the_shared_global_registry(tmp_path: Path) -
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
     assert "command_receipts" in _table_names(database_path)
 
 
@@ -3266,7 +3331,7 @@ def test_v8_migration_rejects_duplicate_request_ids_across_legacy_receipt_tables
 
 
 @pytest.mark.parametrize("state", ("removed", "completed", "cancelled", "failed"))
-@pytest.mark.parametrize("action", ("pause", "resume", "start_now"))
+@pytest.mark.parametrize("action", ("pause", "resume", "start_now", "remove"))
 def test_job_control_blocks_terminal_materialized_jobs_without_lifecycle_mutation(
     tmp_path: Path, state: str, action: str
 ) -> None:
@@ -3370,3 +3435,336 @@ def test_job_control_blocks_terminal_materialized_jobs_without_lifecycle_mutatio
         assert tuple(receipt) == (request_id, "b" * 64, "job_control", action)
     finally:
         store.close()
+
+
+def test_job_control_remove_tombstones_an_inactive_materialized_job_and_preserves_history(
+    tmp_path: Path,
+) -> None:
+    materialized = replace(
+        _materialized_job(),
+        source_kind=SourceKind.DIRECT,
+        queue_collection_id=None,
+        scheduled_for=None,
+        authorized=True,
+        manual_hold=False,
+        start_now_requested=True,
+        category="Other",
+        destination_collection=None,
+        partial_filename="remove.bin",
+        selected_final_filename="remove--job-1.bin",
+    )
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        original_job = store.get_job(materialized.job_id)
+        assert original_job is not None
+
+        removed = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="remove",
+            request_id="remove-request",
+            payload_digest="b" * 64,
+            expected_revision=materialized.intent.revision,
+        )
+
+        assert removed == store_module.JobControlResult(
+            status="applied",
+            job=materialized.job_id,
+            generation=materialized.intent.generation,
+            revision=materialized.intent.revision + 1,
+            state="removed",
+            authorized=False,
+        )
+        assert store.get_job(materialized.job_id) == store_module.JobRecord(
+            job=materialized.job_id,
+            source_url=original_job.source_url,
+            generation=materialized.intent.generation,
+            revision=materialized.intent.revision + 1,
+            state="removed",
+        )
+        assert store.get_materialized_job(materialized.job_id) == replace(
+            materialized,
+            intent=replace(
+                materialized.intent, revision=materialized.intent.revision + 1
+            ),
+            authorized=False,
+            manual_hold=True,
+            start_now_requested=False,
+        )
+        assert [
+            (event.kind, event.job, event.generation, event.revision)
+            for event in store.list_events()
+        ] == [
+            (
+                "job_added",
+                materialized.job_id,
+                materialized.intent.generation,
+                materialized.intent.revision,
+            ),
+            (
+                "job_removed",
+                materialized.job_id,
+                materialized.intent.generation,
+                materialized.intent.revision + 1,
+            ),
+        ]
+        assert _job_control_command_rows(store) == (
+            (
+                "remove-request",
+                "b" * 64,
+                materialized.job_id,
+                "remove",
+                "applied",
+                materialized.intent.generation,
+                materialized.intent.revision + 1,
+                "removed",
+                0,
+            ),
+        )
+        assert _command_receipt_rows(store) == (
+            ("remove-request", "b" * 64, "job_control", "remove"),
+            ("request-1", "a" * 64, "add", "add"),
+        )
+    finally:
+        store.close()
+
+
+def test_job_control_remove_replays_and_preserves_global_request_collisions(
+    tmp_path: Path,
+) -> None:
+    materialized = replace(
+        _materialized_job(),
+        authorized=True,
+        manual_hold=False,
+        start_now_requested=True,
+    )
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        first = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="remove",
+            request_id="remove-request",
+            payload_digest="b" * 64,
+            expected_revision=materialized.intent.revision,
+        )
+        after_first = (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_events(),
+            _job_control_command_rows(store),
+            _command_receipt_rows(store),
+        )
+
+        assert store.apply_job_control(
+            job_id=materialized.job_id,
+            action="remove",
+            request_id="remove-request",
+            payload_digest="b" * 64,
+            expected_revision=materialized.intent.revision,
+        ) == first
+        assert (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_events(),
+            _job_control_command_rows(store),
+            _command_receipt_rows(store),
+        ) == after_first
+
+        with pytest.raises(RequestConflictError):
+            store.apply_job_control(
+                job_id=materialized.job_id,
+                action="remove",
+                request_id="remove-request",
+                payload_digest="c" * 64,
+                expected_revision=materialized.intent.revision + 1,
+            )
+        with pytest.raises(RequestConflictError):
+            store.apply_job_control(
+                job_id=materialized.job_id,
+                action="pause",
+                request_id="remove-request",
+                payload_digest="b" * 64,
+                expected_revision=materialized.intent.revision + 1,
+            )
+        with pytest.raises(RequestConflictError):
+            store.apply_add(
+                _intent(
+                    job_id="job-2",
+                    request_id="remove-request",
+                    payload_digest="d" * 64,
+                )
+            )
+        assert (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_events(),
+            _job_control_command_rows(store),
+            _command_receipt_rows(store),
+        ) == after_first
+    finally:
+        store.close()
+
+
+def test_job_control_remove_stale_revision_preserves_the_target_and_replays(
+    tmp_path: Path,
+) -> None:
+    materialized = replace(
+        _materialized_job(),
+        authorized=True,
+        manual_hold=False,
+        start_now_requested=True,
+    )
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        before = (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_events(),
+        )
+
+        stale = store.apply_job_control(
+            job_id=materialized.job_id,
+            action="remove",
+            request_id="stale-remove-request",
+            payload_digest="b" * 64,
+            expected_revision=materialized.intent.revision - 1,
+        )
+
+        assert stale == store_module.JobControlResult(
+            status="stale",
+            job=materialized.job_id,
+            generation=materialized.intent.generation,
+            revision=materialized.intent.revision,
+            state="queued",
+            authorized=True,
+        )
+        assert store.apply_job_control(
+            job_id=materialized.job_id,
+            action="remove",
+            request_id="stale-remove-request",
+            payload_digest="b" * 64,
+            expected_revision=materialized.intent.revision - 1,
+        ) == stale
+        assert (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_events(),
+        ) == before
+        assert _job_control_command_rows(store) == (
+            (
+                "stale-remove-request",
+                "b" * 64,
+                materialized.job_id,
+                "remove",
+                "stale",
+                materialized.intent.generation,
+                materialized.intent.revision,
+                "queued",
+                1,
+            ),
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("state", ("resolving", "downloading", "pausing", "finalizing"))
+def test_job_control_remove_blocks_active_like_states_without_lifecycle_mutation(
+    tmp_path: Path, state: str
+) -> None:
+    materialized = replace(
+        _materialized_job(),
+        authorized=True,
+        manual_hold=False,
+        start_now_requested=True,
+    )
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store.apply_add(materialized.intent, materialized=materialized)
+        store._connection.execute(
+            "UPDATE jobs SET state = ? WHERE job_id = ?", (state, materialized.job_id)
+        )
+        before = (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_events(),
+        )
+        expected = store_module.JobControlResult(
+            status="blocked",
+            job=materialized.job_id,
+            generation=materialized.intent.generation,
+            revision=materialized.intent.revision,
+            state=state,
+            authorized=True,
+        )
+
+        assert store.apply_job_control(
+            job_id=materialized.job_id,
+            action="remove",
+            request_id=f"active-{state}-remove-request",
+            payload_digest="b" * 64,
+            expected_revision=materialized.intent.revision,
+        ) == expected
+        assert store.apply_job_control(
+            job_id=materialized.job_id,
+            action="remove",
+            request_id=f"active-{state}-remove-request",
+            payload_digest="b" * 64,
+            expected_revision=materialized.intent.revision,
+        ) == expected
+        assert (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_events(),
+        ) == before
+    finally:
+        store.close()
+
+
+def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    expected_legacy_job = _create_v8_database(database_path)
+    legacy_source_url = expected_legacy_job[1]
+    assert isinstance(legacy_source_url, bytes)
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_job("legacy-job") == store_module.JobRecord(
+            job="legacy-job",
+            source_url=legacy_source_url,
+            generation=23,
+            revision=41,
+            state="downloading",
+        )
+        assert _job_control_command_rows(store) == (
+            (
+                "control-request",
+                "d" * 64,
+                "legacy-job",
+                "pause",
+                "blocked",
+                23,
+                41,
+                "completed",
+                0,
+            ),
+        )
+        assert _command_receipt_rows(store) == (
+            ("control-request", "d" * 64, "job_control", "pause"),
+            ("legacy-request", "b" * 64, "add", "add"),
+        )
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V9_TABLE_SCHEMAS

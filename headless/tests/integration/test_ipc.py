@@ -4192,3 +4192,130 @@ def test_worker_job_add_rejects_closed_invalid_source_and_oversized_requests(
         shutdown.set()
         if process.is_alive():
             _join(process)
+
+
+def test_worker_job_remove_tombstones_cold_direct_job_without_engine_or_file_side_effects(
+    short_socket_root: Path,
+) -> None:
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    payload_path = short_socket_root / "user-owned-payload.bin"
+    payload_path.write_bytes(b"preserve this payload")
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    resolver_calls = context.Value("i", 0)
+
+    with _origin_type()() as origin:
+        process = context.Process(
+            target=_run_worker_process_with_job_add_guards,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                resolver_calls,
+            ),
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            state_entries_before = tuple(sorted(path.name for path in state_root.iterdir()))
+            source_url = (
+                f"http://job-add.example.test:{origin.port}/range?"
+                "X-Amz-Signature=remove-preserves-owned-data"
+            )
+            assert _add_job(
+                socket_path,
+                job="removed-direct-job",
+                request_id="removed-direct-add-request",
+                source_url=source_url,
+                priority=-4,
+                order_key=17,
+                category="Documents",
+                partial_filename="remove.bin",
+                selected_final_filename="remove--removed-direct-job.bin",
+            ).to_record() == {
+                "applied": True,
+                "job": "removed-direct-job",
+                "generation": 0,
+                "revision": 0,
+            }
+
+            removed = ipc.control_job(
+                socket_path,
+                job="removed-direct-job",
+                action="remove",
+                request_id="removed-direct-request",
+                expected_revision=0,
+            )
+            assert removed.to_record() == {
+                "status": "applied",
+                "job": "removed-direct-job",
+                "generation": 0,
+                "revision": 1,
+                "state": "removed",
+                "authorized": False,
+            }
+            assert ipc.control_job(
+                socket_path,
+                job="removed-direct-job",
+                action="remove",
+                request_id="removed-direct-request",
+                expected_revision=0,
+            ) == removed
+            assert source_url not in json.dumps(removed.to_record())
+            assert payload_path.read_bytes() == b"preserve this payload"
+            assert tuple(sorted(path.name for path in state_root.iterdir())) == state_entries_before
+            assert resolver_calls.value == 0
+            assert origin.ledger.request_count == 0
+            assert origin.ledger.response_body_bytes == 0
+            assert not (state_root / "direct-runtime").exists()
+
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                job = observer.get_job("removed-direct-job")
+                materialized = observer.get_materialized_job("removed-direct-job")
+                assert job is not None
+                assert materialized is not None
+                assert (
+                    job.source_url,
+                    job.generation,
+                    job.revision,
+                    job.state,
+                ) == (source_url.encode("utf-8"), 0, 1, "removed")
+                assert materialized.source_kind is SourceKind.DIRECT
+                assert (
+                    materialized.authorized,
+                    materialized.manual_hold,
+                    materialized.start_now_requested,
+                ) == (False, True, False)
+                assert [event.kind for event in observer.list_events()] == [
+                    "job_added",
+                    "job_removed",
+                ]
+                receipt = observer._connection.execute(
+                    """
+                    SELECT action, status, generation, revision, state, authorized
+                    FROM job_control_commands
+                    WHERE request_id = 'removed-direct-request'
+                    """
+                ).fetchone()
+                assert receipt is not None
+                assert tuple(receipt) == ("remove", "applied", 0, 1, "removed", 0)
+            finally:
+                observer.close()
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+        finally:
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
