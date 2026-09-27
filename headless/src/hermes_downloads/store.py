@@ -10,7 +10,13 @@ import secrets
 import sqlite3
 from typing import Final
 
-from hermes_downloads.models import DownloadIntent, JobState, MaterializedJob, SourceKind
+from hermes_downloads.models import (
+    DownloadIntent,
+    JobState,
+    MaterializedJob,
+    PublicationReservation,
+    SourceKind,
+)
 from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.retry import (
     RetryAuditEvent,
@@ -84,6 +90,43 @@ CREATE TABLE materialized_jobs (
     partial_filename TEXT NOT NULL,
     selected_final_filename TEXT NOT NULL,
     expected_revision INTEGER
+);
+"""
+
+_PUBLICATION_RESERVATIONS_SCHEMA: Final = """
+CREATE TABLE publication_reservations (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES materialized_jobs(job_id) ON DELETE CASCADE CHECK (
+        length(job_id) BETWEEN 1 AND 128
+        AND substr(job_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND job_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+    ),
+    target_component TEXT NOT NULL CHECK (
+        length(target_component) BETWEEN 1 AND 255
+        AND target_component NOT IN ('.', '..')
+        AND substr(target_component, 1, 1) != '.'
+        AND instr(target_component, '/') = 0
+        AND instr(target_component, char(92)) = 0
+        AND instr(target_component, char(0)) = 0
+        AND target_component NOT GLOB (
+            '*[' || char(1) || '-' || char(31) || char(127) || '-' || char(159) || ']*'
+        )
+    ),
+    final_filename TEXT NOT NULL CHECK (
+        length(final_filename) BETWEEN 1 AND 255
+        AND final_filename NOT IN ('.', '..')
+        AND substr(final_filename, 1, 1) != '.'
+        AND instr(final_filename, '/') = 0
+        AND instr(final_filename, char(92)) = 0
+        AND instr(final_filename, char(0)) = 0
+        AND final_filename NOT GLOB (
+            '*[' || char(1) || '-' || char(31) || char(127) || '-' || char(159) || ']*'
+        )
+    ),
+    claim_token TEXT NOT NULL CHECK (
+        length(claim_token) = 64
+        AND claim_token NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE(target_component, final_filename)
 );
 """
 
@@ -235,7 +278,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 9
+_SUPPORTED_SCHEMA_VERSION: Final = 10
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -304,6 +347,19 @@ _V8_TABLE_SCHEMAS: Final = _expected_table_schemas(
 _V9_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _SCHEMA,
     _MATERIALIZED_JOBS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _JOB_CONTROL_COMMANDS_SCHEMA,
+    _COMMAND_RECEIPTS_SCHEMA,
+)
+_V10_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _PUBLICATION_RESERVATIONS_SCHEMA,
     _COLLECTION_HOLDS_SCHEMA,
     _JOB_RETRY_SCHEMA,
     _JOB_RETRY_AUDIT_SCHEMA,
@@ -640,7 +696,7 @@ class SQLiteStore:
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
             connection.executescript(_SCHEMA)
-            self._migrate_schema_v9(connection)
+            self._migrate_schema_v10(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -673,6 +729,7 @@ class SQLiteStore:
             7: _V7_TABLE_SCHEMAS,
             8: _V8_TABLE_SCHEMAS,
             9: _V9_TABLE_SCHEMAS,
+            10: _V10_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -703,8 +760,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v9(connection: sqlite3.Connection) -> None:
-        """Apply additive v2 through v9 schema migrations in one transaction."""
+    def _migrate_schema_v10(connection: sqlite3.Connection) -> None:
+        """Apply additive v2 through v10 schema migrations in one transaction."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -803,8 +860,14 @@ class SQLiteStore:
                 connection.execute("DROP TABLE command_receipts_v8")
                 connection.execute("PRAGMA user_version = 9")
                 version = 9
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 9:
                 if not SQLiteStore._has_table_schemas(connection, _V9_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_PUBLICATION_RESERVATIONS_SCHEMA)
+                connection.execute("PRAGMA user_version = 10")
+                version = 10
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V10_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1071,6 +1134,7 @@ class SQLiteStore:
                 )
                 if materialized is not None:
                     self._insert_materialized_projection(connection, materialized)
+                    self._insert_publication_reservation(connection, materialized)
                 connection.execute(
                     """
                     INSERT INTO events (kind, job_id, generation, revision)
@@ -1117,6 +1181,33 @@ class SQLiteStore:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (materialized.job_id, *SQLiteStore._projection_values(materialized)),
+        )
+
+    @staticmethod
+    def _insert_publication_reservation(
+        connection: sqlite3.Connection, materialized: MaterializedJob
+    ) -> None:
+        """Persist one opaque publication receipt in the caller's add transaction."""
+
+        reservation = PublicationReservation(
+            job_id=materialized.job_id,
+            target_component=materialized.destination_collection or materialized.category,
+            final_filename=materialized.selected_final_filename,
+            claim_token=secrets.token_hex(32),
+        )
+        connection.execute(
+            """
+            INSERT INTO publication_reservations (
+                job_id, target_component, final_filename, claim_token
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                reservation.job_id,
+                reservation.target_component,
+                reservation.final_filename,
+                reservation.claim_token,
+            ),
         )
 
     @staticmethod
@@ -2506,6 +2597,48 @@ class SQLiteStore:
         if len(rows) != 1:
             raise ValueError("materialized job must have exactly one command row")
         return self._materialized_job_from_row(rows[0])
+
+    def get_publication_reservation(
+        self, job_id: str
+    ) -> PublicationReservation | None:
+        """Read one exact materialized-job publication receipt, if present."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        rows = self._connection.execute(
+            """
+            SELECT job_id, target_component, final_filename, claim_token
+            FROM publication_reservations
+            WHERE job_id = ?
+            LIMIT 2
+            """,
+            (job_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("publication reservation is not unique")
+        row = rows[0]
+        persisted_job_id = _require_identifier(
+            _require_sqlite_text(row["job_id"], "publication reservation job_id"),
+            "publication reservation job_id",
+        )
+        if persisted_job_id != job_id:
+            raise ValueError("publication reservation job_id does not match its lookup")
+        try:
+            return PublicationReservation(
+                job_id=persisted_job_id,
+                target_component=_require_sqlite_text(
+                    row["target_component"], "publication reservation target_component"
+                ),
+                final_filename=_require_sqlite_text(
+                    row["final_filename"], "publication reservation final_filename"
+                ),
+                claim_token=_require_sqlite_text(
+                    row["claim_token"], "publication reservation claim_token"
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("persisted publication reservation is invalid") from error
 
     @staticmethod
     def _materialized_job_from_row(row: sqlite3.Row) -> MaterializedJob:
