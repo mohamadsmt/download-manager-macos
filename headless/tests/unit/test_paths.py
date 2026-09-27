@@ -376,7 +376,7 @@ def test_attests_a_durable_publication_reservation_marker_without_claiming_paylo
     assert sidecar.read_bytes() == b"preserve this sidecar"
     assert not destination.final_path.exists()
     assert not destination.partial_path.exists()
-    assert fsync_kinds == [stat.S_IFREG, stat.S_IFDIR]
+    assert fsync_kinds == [stat.S_IFREG, stat.S_IFDIR, stat.S_IFREG]
 
     before = _entry_signature(marker)
     reattached = paths.attest_publication_reservation_marker(destination, reservation)
@@ -386,7 +386,47 @@ def test_attests_a_durable_publication_reservation_marker_without_claiming_paylo
     assert sidecar.read_bytes() == b"preserve this sidecar"
     assert not destination.final_path.exists()
     assert not destination.partial_path.exists()
-    assert fsync_kinds == [stat.S_IFREG, stat.S_IFDIR, stat.S_IFDIR]
+    assert fsync_kinds == [
+        stat.S_IFREG,
+        stat.S_IFDIR,
+        stat.S_IFREG,
+        stat.S_IFREG,
+        stat.S_IFDIR,
+        stat.S_IFREG,
+    ]
+
+
+def test_existing_marker_file_fsync_precedes_job_directory_sync_on_reattest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination = _resolve(paths, _root())
+    reservation = _reservation(destination)
+    created = paths.attest_publication_reservation_marker(destination, reservation)
+    marker = _marker_path(destination)
+    marker_details = os.lstat(marker)
+    job_details = os.lstat(destination.incomplete_dir)
+    fsync_targets: list[tuple[int, int, int]] = []
+    original_fsync = paths.os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        details = os.fstat(descriptor)
+        fsync_targets.append(
+            (stat.S_IFMT(details.st_mode), details.st_dev, details.st_ino)
+        )
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(paths.os, "fsync", record_fsync)
+
+    reattached = paths.attest_publication_reservation_marker(destination, reservation)
+
+    assert reattached == created
+    assert fsync_targets[:2] == [
+        (stat.S_IFREG, marker_details.st_dev, marker_details.st_ino),
+        (stat.S_IFDIR, job_details.st_dev, job_details.st_ino),
+    ]
+    assert not destination.final_path.exists()
+    assert not destination.partial_path.exists()
 
 
 def test_marker_creation_is_exclusive_descriptor_relative_and_handles_short_writes(

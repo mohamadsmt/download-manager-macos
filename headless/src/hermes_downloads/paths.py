@@ -519,6 +519,7 @@ def _attest_existing_reservation_marker(
         _require_matching_reservation_marker_identity(after_read, visible)
         if contents != expected_bytes:
             raise PathValidationError("publication reservation marker contents do not match")
+        _fsync_reservation_marker(descriptor)
         st_dev, st_ino = _reservation_marker_identity(visible)
         return PublicationReservationMarker(
             path=marker_path,
