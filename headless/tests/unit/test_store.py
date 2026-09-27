@@ -4078,6 +4078,12 @@ def test_v10_migrates_v9_materialized_projection_without_inventing_a_receipt(
             """
         ).fetchone()
 
+    conflicting = replace(
+        materialized,
+        job_id="new-job",
+        intent=_intent(job_id="new-job", request_id="new-request"),
+    )
+
     store = SQLiteStore(database_path)
     try:
         assert store.get_job("legacy-job") == store_module.JobRecord(
@@ -4088,7 +4094,56 @@ def test_v10_migrates_v9_materialized_projection_without_inventing_a_receipt(
             state="downloading",
         )
         assert store.get_materialized_job("legacy-job") == materialized
-        assert store.get_publication_reservation("legacy-job") is None
+        before = (
+            tuple(store.list_jobs()),
+            tuple(
+                tuple(row)
+                for row in store._connection.execute(
+                    "SELECT request_id FROM commands ORDER BY request_id"
+                ).fetchall()
+            ),
+            tuple(store.list_events()),
+            tuple(
+                tuple(row)
+                for row in store._connection.execute(
+                    "SELECT job_id FROM materialized_jobs ORDER BY job_id"
+                ).fetchall()
+            ),
+            tuple(
+                tuple(row)
+                for row in store._connection.execute(
+                    "SELECT job_id FROM publication_reservations ORDER BY job_id"
+                ).fetchall()
+            ),
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.apply_add(conflicting.intent, materialized=conflicting)
+
+        assert (
+            tuple(store.list_jobs()),
+            tuple(
+                tuple(row)
+                for row in store._connection.execute(
+                    "SELECT request_id FROM commands ORDER BY request_id"
+                ).fetchall()
+            ),
+            tuple(store.list_events()),
+            tuple(
+                tuple(row)
+                for row in store._connection.execute(
+                    "SELECT job_id FROM materialized_jobs ORDER BY job_id"
+                ).fetchall()
+            ),
+            tuple(
+                tuple(row)
+                for row in store._connection.execute(
+                    "SELECT job_id FROM publication_reservations ORDER BY job_id"
+                ).fetchall()
+            ),
+        ) == before
+        with pytest.raises(ValueError):
+            store.get_publication_reservation("legacy-job")
     finally:
         store.close()
 
@@ -4169,3 +4224,102 @@ def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fail
         }
     assert table_schemas == store_module._V9_TABLE_SCHEMAS
     assert "publication_reservations" not in table_schemas
+
+
+@pytest.mark.parametrize(
+    ("column", "corrupt_value"),
+    (
+        ("target_component", "Other collection"),
+        ("final_filename", "different.webm"),
+    ),
+)
+def test_materialized_receipt_readback_and_replay_reject_mismatched_projection(
+    tmp_path: Path, column: str, corrupt_value: str
+) -> None:
+    materialized = _materialized_job()
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.apply_add(materialized.intent, materialized=materialized).applied is True
+        store._connection.execute(
+            f"UPDATE publication_reservations SET {column} = ? WHERE job_id = ?",
+            (corrupt_value, materialized.job_id),
+        )
+
+        with pytest.raises(ValueError):
+            store.get_publication_reservation(materialized.job_id)
+        with pytest.raises(ValueError):
+            store.apply_add(materialized.intent, materialized=materialized)
+    finally:
+        store.close()
+
+
+def test_materialized_receipt_readback_and_replay_reject_missing_receipt(
+    tmp_path: Path,
+) -> None:
+    materialized = _materialized_job()
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        assert store.apply_add(materialized.intent, materialized=materialized).applied is True
+        store._connection.execute(
+            "DELETE FROM publication_reservations WHERE job_id = ?", (materialized.job_id,)
+        )
+
+        with pytest.raises(ValueError):
+            store.get_publication_reservation(materialized.job_id)
+        with pytest.raises(ValueError):
+            store.apply_add(materialized.intent, materialized=materialized)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "blob_value"),
+    (
+        ("job_id", sqlite3.Binary(b"job-1")),
+        ("target_component", sqlite3.Binary(b"Course material")),
+        ("final_filename", sqlite3.Binary(b"selected--job-1.webm")),
+        ("claim_token", sqlite3.Binary(b"a" * 64)),
+    ),
+)
+def test_publication_reservation_schema_rejects_blob_insert_and_update(
+    tmp_path: Path, column: str, blob_value: object
+) -> None:
+    materialized = _materialized_job()
+    target_component = materialized.destination_collection or materialized.category
+    assert target_component is not None
+    values: dict[str, object] = {
+        "job_id": materialized.job_id,
+        "target_component": target_component,
+        "final_filename": materialized.selected_final_filename,
+        "claim_token": "a" * 64,
+    }
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store._connection.execute("PRAGMA foreign_keys = OFF")
+        values[column] = blob_value
+        try:
+            with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+                store._connection.execute(
+                    """
+                    INSERT INTO publication_reservations (
+                        job_id, target_component, final_filename, claim_token
+                    )
+                    VALUES (:job_id, :target_component, :final_filename, :claim_token)
+                    """,
+                    values,
+                )
+        finally:
+            store._connection.execute("PRAGMA foreign_keys = ON")
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM publication_reservations").fetchone()[0]
+            == 0
+        )
+
+        assert store.apply_add(materialized.intent, materialized=materialized).applied is True
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            store._connection.execute(
+                f"UPDATE publication_reservations SET {column} = ? WHERE job_id = ?",
+                (blob_value, materialized.job_id),
+            )
+    finally:
+        store.close()
