@@ -16,6 +16,7 @@ hermes-downloads-worker = "hermes_downloads.worker:main"
 
 [dependency-groups]
 dev = [
+  "mcp[cli]==1.29.1",
   "pytest>=8.4,<9",
 ]
 
