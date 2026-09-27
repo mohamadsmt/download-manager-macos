@@ -177,7 +177,7 @@ def test_validates_complete_records_and_rejects_fake_or_nonfinite_measurements()
 
 
 @pytest.mark.parametrize(
-    "credential_key",
+    "sensitive_key",
     (
         "password",
         "secret",
@@ -187,24 +187,29 @@ def test_validates_complete_records_and_rejects_fake_or_nonfinite_measurements()
         "APIKey",
         "auth",
         "authToken",
+        "source_url",
+        "source-url",
+        "sourceUrl",
+        "URL",
+        "sourceURI",
     ),
 )
-def test_rejects_raw_credential_like_setting_keys_at_all_depths(credential_key: str) -> None:
+def test_rejects_sensitive_setting_keys_at_all_depths(sensitive_key: str) -> None:
     benchmark = _benchmark()
 
     direct = _passed_record("curl-single", 1)
-    direct["configuration"]["settings"][credential_key] = "raw-secret"
+    direct["configuration"]["settings"][sensitive_key] = "parallel"
     with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
         benchmark.validate_trial_record(direct)
 
     nested = _passed_record("curl-single", 1)
-    nested["configuration"]["settings"]["transport"] = {credential_key: "raw-secret"}
+    nested["configuration"]["settings"]["transport"] = {sensitive_key: "parallel"}
     with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
         benchmark.validate_trial_record(nested)
 
 
 @pytest.mark.parametrize(
-    "credential_key",
+    "sensitive_key",
     (
         "password",
         "secret",
@@ -214,9 +219,14 @@ def test_rejects_raw_credential_like_setting_keys_at_all_depths(credential_key: 
         "APIKey",
         "auth",
         "authToken",
+        "source_url",
+        "source-url",
+        "sourceUrl",
+        "URL",
+        "sourceURI",
     ),
 )
-def test_rejects_raw_credential_like_version_metadata_keys(credential_key: str) -> None:
+def test_rejects_sensitive_version_metadata_keys(sensitive_key: str) -> None:
     benchmark = _benchmark()
 
     normal = _passed_record("curl-single", 1)
@@ -227,9 +237,21 @@ def test_rejects_raw_credential_like_version_metadata_keys(credential_key: str) 
     assert benchmark.validate_trial_record(normal) == normal
 
     malformed = deepcopy(normal)
-    malformed["configuration"]["versions"] = {credential_key: "raw-secret"}
+    malformed["configuration"]["versions"] = {sensitive_key: "1.0"}
     with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
         benchmark.validate_trial_record(malformed)
+
+
+def test_accepts_safe_version_inventory_metadata() -> None:
+    benchmark = _benchmark()
+    record = _passed_record("curl-single", 1)
+    record["configuration"]["versions"] = {
+        "curl": "8.7.1",
+        "engine": "aria2-1.37.0",
+        "Python": "3.12.12",
+    }
+
+    assert benchmark.validate_trial_record(record) == record
 
 
 def test_accepts_ordinary_bounded_benchmark_settings() -> None:
@@ -243,6 +265,38 @@ def test_accepts_ordinary_bounded_benchmark_settings() -> None:
     )
 
     assert benchmark.validate_trial_record(record) == record
+
+
+@pytest.mark.parametrize(
+    ("container", "value"),
+    (
+        ("versions", "ghp_" + "0123456789012345678901234567890123456789"),
+        ("settings", "private raw user content"),
+        ("versions", "//private.example/path"),
+        ("settings", "https://private.example/path"),
+    ),
+)
+def test_rejects_raw_metadata_string_values(container: str, value: str) -> None:
+    benchmark = _benchmark()
+    record = _passed_record("curl-single", 1)
+    if container == "versions":
+        record["configuration"]["versions"] = {"engine": value}
+    else:
+        record["configuration"]["settings"]["note"] = value
+
+    with pytest.raises(benchmark.BenchmarkValidationError):
+        benchmark.validate_trial_record(record)
+
+
+def test_rejects_more_than_32_version_metadata_entries() -> None:
+    benchmark = _benchmark()
+    record = _passed_record("curl-single", 1)
+    record["configuration"]["versions"] = {
+        f"tool{index}": "1.0" for index in range(33)
+    }
+
+    with pytest.raises(benchmark.BenchmarkValidationError):
+        benchmark.validate_trial_record(record)
 
 
 def test_failed_record_requires_a_bounded_classification_and_null_unobserved_metrics() -> None:

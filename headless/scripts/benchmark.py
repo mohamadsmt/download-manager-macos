@@ -36,19 +36,36 @@ _SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 _TIMESTAMP_RE: Final = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
-_SENSITIVE_METADATA_KEY_TOKENS: Final = (
-    "url",
-    "uri",
-    "cookie",
-    "token",
-    "credential",
-    "authorization",
-    "password",
-    "secret",
-    "apikey",
-    "auth",
-    "header",
-    "input",
+_IDENTIFIER_SEGMENT_RE: Final = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+"
+)
+_VERSION_METADATA_VALUE_RE: Final = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9]{0,31}[-_])?[vV]?\d+(?:\.\d+){0,7}"
+    r"(?:[-+._][A-Za-z0-9]{1,16}){0,4}$"
+)
+_CREDENTIAL_SHAPED_VALUE_RE: Final = re.compile(
+    r"^(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|"
+    r"sk-[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]+)$",
+    re.IGNORECASE,
+)
+_MAX_METADATA_ENTRIES: Final = 32
+_MAX_METADATA_STRING_LENGTH: Final = 64
+_SAFE_SETTING_LABELS: Final = frozenset({"none", "parallel"})
+_SENSITIVE_METADATA_KEY_TOKENS: Final = frozenset(
+    {
+        "url",
+        "uri",
+        "cookie",
+        "token",
+        "credential",
+        "authorization",
+        "password",
+        "secret",
+        "apikey",
+        "auth",
+        "header",
+        "input",
+    }
 )
 
 TRIAL_FIELDS: Final = frozenset(
@@ -179,13 +196,38 @@ def _validate_observed_at_utc(value: object) -> str:
 
 
 def _contains_external_source(value: str) -> bool:
-    return "://" in value or value.startswith(("file:", "data:"))
+    return value.startswith("//") or "://" in value or value.startswith(("file:", "data:"))
+
+
+def _metadata_key_tokens(key_name: str) -> tuple[str, ...]:
+    return tuple(
+        segment.casefold()
+        for part in re.split(r"[_-]+", key_name)
+        for segment in _IDENTIFIER_SEGMENT_RE.findall(part)
+    )
+
+
+def _validate_metadata_string(
+    value: object, label: str, *, allow_setting_label: bool = False
+) -> str:
+    if type(value) is not str or not value or len(value) > _MAX_METADATA_STRING_LENGTH:
+        raise BenchmarkValidationError(f"{label} must contain bounded metadata strings")
+    if _contains_external_source(value) or _CREDENTIAL_SHAPED_VALUE_RE.fullmatch(value):
+        raise BenchmarkValidationError(f"{label} must not contain raw external input")
+    if _VERSION_METADATA_VALUE_RE.fullmatch(value):
+        return value
+    if allow_setting_label and value in _SAFE_SETTING_LABELS:
+        return value
+    raise BenchmarkValidationError(f"{label} must contain bounded metadata strings")
 
 
 def _validate_metadata_key(value: object, key_label: str, container_label: str) -> str:
     key_name = _validate_identifier(value, key_label)
-    normalized = key_name.casefold().replace("_", "").replace("-", "")
-    if any(token in normalized for token in _SENSITIVE_METADATA_KEY_TOKENS):
+    tokens = _metadata_key_tokens(key_name)
+    if (
+        any(token in _SENSITIVE_METADATA_KEY_TOKENS for token in tokens)
+        or ("api", "key") in zip(tokens, tokens[1:])
+    ):
         raise BenchmarkValidationError(f"{container_label} must not contain raw external input")
     return key_name
 
@@ -200,17 +242,16 @@ def _validate_setting_value(value: object, label: str, depth: int = 0) -> None:
             raise BenchmarkValidationError(f"{label} must not contain a nonfinite number")
         return
     if type(value) is str:
-        if not value or len(value) > 256 or _contains_external_source(value):
-            raise BenchmarkValidationError(f"{label} must not contain raw external input")
+        _validate_metadata_string(value, label, allow_setting_label=True)
         return
     if type(value) is list:
-        if len(value) > 32:
+        if len(value) > _MAX_METADATA_ENTRIES:
             raise BenchmarkValidationError(f"{label} has too many values")
         for index, item in enumerate(value):
             _validate_setting_value(item, f"{label}[{index}]", depth + 1)
         return
     if type(value) is dict:
-        if len(value) > 32:
+        if len(value) > _MAX_METADATA_ENTRIES:
             raise BenchmarkValidationError(f"{label} has too many keys")
         for key, item in value.items():
             key_name = _validate_metadata_key(key, f"{label} key", label)
@@ -235,19 +276,15 @@ def _validate_configuration(value: object) -> dict[str, Any]:
     versions = value["versions"]
     if type(versions) is not dict or not versions:
         raise BenchmarkValidationError("configuration.versions must be a nonempty object")
+    if len(versions) > _MAX_METADATA_ENTRIES:
+        raise BenchmarkValidationError("configuration.versions has too many keys")
     for name, version in versions.items():
         _validate_metadata_key(
             name,
             "configuration.versions key",
             "configuration.versions",
         )
-        if (
-            type(version) is not str
-            or not version
-            or len(version) > 128
-            or _contains_external_source(version)
-        ):
-            raise BenchmarkValidationError("configuration.versions must contain bounded strings")
+        _validate_metadata_string(version, "configuration.versions")
 
     settings = value["settings"]
     if type(settings) is not dict or not settings:
