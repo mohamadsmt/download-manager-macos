@@ -1,7 +1,8 @@
 """Safe, deterministic destination intent for Hermes downloads.
 
-This module owns pathname validation and final-name reservation only.  It does
-not write payload bytes, publish completed files, clean partials, or fsync.
+This module owns pathname validation, final-name reservation, and durable
+publication-reservation markers. It does not write payload bytes, publish
+completed files, or clean partials.
 """
 
 from __future__ import annotations
@@ -13,14 +14,18 @@ import stat
 from typing import Final
 import unicodedata
 
+from hermes_downloads.models import PublicationReservation
+
 __all__ = [
     "CATEGORIES",
     "DestinationIntent",
     "FinalPathCollisionError",
     "JobSpace",
     "PathValidationError",
+    "PublicationReservationMarker",
     "StorageUsage",
     "UnsafePathError",
+    "attest_publication_reservation_marker",
     "claim_final_path",
     "observe_job_space",
     "rehydrate_destination",
@@ -31,6 +36,16 @@ CATEGORIES: Final = frozenset({"Videos", "Audio", "Documents", "Software", "Othe
 _INCOMPLETE: Final = ".incomplete"
 _DIRECTORY_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _CLAIM_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_RESERVATION_MARKER: Final = ".hermes-reservation"
+_RESERVATION_MARKER_VERSION: Final = "v1"
+_RESERVATION_MARKER_MODE: Final = 0o600
+_MAX_RESERVATION_MARKER_BYTES: Final = 4096
+_RESERVATION_MARKER_CREATE_FLAGS: Final = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+_RESERVATION_MARKER_READ_FLAGS: Final = (
+    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+)
 
 
 class PathValidationError(ValueError):
@@ -75,6 +90,15 @@ class DestinationIntent:
     final_path: Path
     incomplete_dir: Path
     partial_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationReservationMarker:
+    """The visible marker inode that durably binds one publication reservation."""
+
+    path: Path
+    st_dev: int
+    st_ino: int
 
 
 def resolve_destination(
@@ -212,6 +236,72 @@ def claim_final_path(destination: DestinationIntent) -> Path:
     return destination.final_path.parent / name
 
 
+def attest_publication_reservation_marker(
+    destination: DestinationIntent,
+    reservation: PublicationReservation,
+) -> PublicationReservationMarker:
+    """Create or attest the durable job-local receipt for one final destination.
+
+    This binds persisted reservation data to the incomplete-job directory only.
+    It never claims a final name or reads, writes, or publishes payload bytes.
+    """
+
+    root, final_component = _validate_destination_intent(destination)
+    reservation = _validate_publication_reservation(
+        destination,
+        final_component,
+        reservation,
+    )
+    expected_bytes = _reservation_marker_bytes(reservation)
+    _require_safe_writable_root(root)
+
+    root_fd = _open_root(root)
+    try:
+        final_fd = _open_existing_directory(root_fd, final_component)
+        try:
+            incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)
+            try:
+                job_fd = _open_existing_directory(incomplete_fd, destination.job_id)
+                try:
+                    _require_writable_directory(destination.final_path.parent)
+                    _require_writable_directory(destination.incomplete_dir)
+                    _require_same_filesystem(final_fd, job_fd)
+                    marker_path = destination.incomplete_dir / _RESERVATION_MARKER
+                    before_directory_sync = _create_reservation_marker(
+                        job_fd,
+                        marker_path,
+                        expected_bytes,
+                    )
+                    if before_directory_sync is None:
+                        before_directory_sync = _attest_existing_reservation_marker(
+                            job_fd,
+                            marker_path,
+                            expected_bytes,
+                        )
+                    _fsync_reservation_marker_directory(job_fd)
+                    attested = _attest_existing_reservation_marker(
+                        job_fd,
+                        marker_path,
+                        expected_bytes,
+                    )
+                    if (attested.st_dev, attested.st_ino) != (
+                        before_directory_sync.st_dev,
+                        before_directory_sync.st_ino,
+                    ):
+                        raise UnsafePathError(
+                            "publication reservation marker changed during attestation"
+                        )
+                    return attested
+                finally:
+                    os.close(job_fd)
+            finally:
+                os.close(incomplete_fd)
+        finally:
+            os.close(final_fd)
+    finally:
+        os.close(root_fd)
+
+
 def observe_job_space(
     destination: DestinationIntent,
     *,
@@ -297,6 +387,247 @@ def _validate_destination_intent(destination: DestinationIntent) -> tuple[Path, 
     ):
         raise PathValidationError("destination intent does not match the managed root")
     return root, final_component
+
+
+def _validate_publication_reservation(
+    destination: DestinationIntent,
+    final_component: str,
+    reservation: PublicationReservation,
+) -> PublicationReservation:
+    if type(reservation) is not PublicationReservation:
+        raise TypeError("reservation must be a PublicationReservation")
+    try:
+        validated = PublicationReservation(
+            job_id=reservation.job_id,
+            target_component=reservation.target_component,
+            final_filename=reservation.final_filename,
+            claim_token=reservation.claim_token,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("publication reservation is invalid") from error
+    if (
+        validated.job_id != destination.job_id
+        or validated.target_component != final_component
+        or validated.final_filename != destination.final_path.name
+    ):
+        raise PathValidationError("publication reservation does not match destination")
+    return validated
+
+
+def _reservation_marker_bytes(reservation: PublicationReservation) -> bytes:
+    try:
+        marker_bytes = (
+            "\n".join(
+                (
+                    _RESERVATION_MARKER_VERSION,
+                    reservation.job_id,
+                    reservation.target_component,
+                    reservation.final_filename,
+                    reservation.claim_token,
+                )
+            ).encode("utf-8")
+            + b"\n"
+        )
+    except UnicodeError as error:
+        raise PathValidationError("publication reservation marker cannot be encoded") from error
+    if not marker_bytes or len(marker_bytes) > _MAX_RESERVATION_MARKER_BYTES:
+        raise PathValidationError("publication reservation marker exceeds the size limit")
+    return marker_bytes
+
+
+def _create_reservation_marker(
+    parent_fd: int,
+    marker_path: Path,
+    expected_bytes: bytes,
+) -> PublicationReservationMarker | None:
+    try:
+        descriptor = os.open(
+            _RESERVATION_MARKER,
+            _RESERVATION_MARKER_CREATE_FLAGS,
+            _RESERVATION_MARKER_MODE,
+            dir_fd=parent_fd,
+        )
+    except FileExistsError:
+        return None
+    except OSError as error:
+        raise PathValidationError("publication reservation marker cannot be created") from error
+
+    try:
+        try:
+            os.fchmod(descriptor, _RESERVATION_MARKER_MODE)
+        except OSError as error:
+            raise PathValidationError("publication reservation marker mode cannot be set") from error
+        created = _require_reservation_marker_details(
+            _fstat_reservation_marker(descriptor),
+            expected_size=0,
+        )
+        visible = _require_reservation_marker_details(
+            _stat_reservation_marker(parent_fd),
+            expected_size=0,
+        )
+        _require_matching_reservation_marker_identity(created, visible)
+        _write_reservation_marker(descriptor, expected_bytes)
+        _fsync_reservation_marker(descriptor)
+        details = _require_reservation_marker_details(
+            _fstat_reservation_marker(descriptor),
+            expected_size=len(expected_bytes),
+        )
+        st_dev, st_ino = _reservation_marker_identity(details)
+        return PublicationReservationMarker(
+            path=marker_path,
+            st_dev=st_dev,
+            st_ino=st_ino,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _attest_existing_reservation_marker(
+    parent_fd: int,
+    marker_path: Path,
+    expected_bytes: bytes,
+) -> PublicationReservationMarker:
+    preflight = _require_reservation_marker_details(
+        _stat_reservation_marker(parent_fd),
+        expected_size=len(expected_bytes),
+    )
+    try:
+        descriptor = os.open(
+            _RESERVATION_MARKER,
+            _RESERVATION_MARKER_READ_FLAGS,
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        raise UnsafePathError("publication reservation marker cannot be opened safely") from error
+
+    try:
+        opened = _require_reservation_marker_details(
+            _fstat_reservation_marker(descriptor),
+            expected_size=len(expected_bytes),
+        )
+        _require_matching_reservation_marker_identity(preflight, opened)
+        contents = _read_reservation_marker(descriptor, len(expected_bytes))
+        after_read = _require_reservation_marker_details(
+            _fstat_reservation_marker(descriptor),
+            expected_size=len(expected_bytes),
+        )
+        _require_matching_reservation_marker_identity(opened, after_read)
+        visible = _require_reservation_marker_details(
+            _stat_reservation_marker(parent_fd),
+            expected_size=len(expected_bytes),
+        )
+        _require_matching_reservation_marker_identity(after_read, visible)
+        if contents != expected_bytes:
+            raise PathValidationError("publication reservation marker contents do not match")
+        st_dev, st_ino = _reservation_marker_identity(visible)
+        return PublicationReservationMarker(
+            path=marker_path,
+            st_dev=st_dev,
+            st_ino=st_ino,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _stat_reservation_marker(parent_fd: int) -> os.stat_result:
+    try:
+        return os.stat(_RESERVATION_MARKER, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise PathValidationError("publication reservation marker is missing") from error
+    except OSError as error:
+        raise PathValidationError("publication reservation marker is inaccessible") from error
+
+
+def _fstat_reservation_marker(descriptor: int) -> os.stat_result:
+    try:
+        return os.fstat(descriptor)
+    except OSError as error:
+        raise PathValidationError("publication reservation marker is inaccessible") from error
+
+
+def _require_reservation_marker_details(
+    details: os.stat_result,
+    *,
+    expected_size: int,
+) -> os.stat_result:
+    details = _require_regular_single_link_file(details)
+    try:
+        mode = details.st_mode
+        size = details.st_size
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("publication reservation marker metadata is invalid") from error
+    if (mode & 0o7777) != _RESERVATION_MARKER_MODE:
+        raise PathValidationError("publication reservation marker mode is not private")
+    if size != expected_size:
+        raise PathValidationError("publication reservation marker size does not match")
+    _reservation_marker_identity(details)
+    return details
+
+
+def _reservation_marker_identity(details: os.stat_result) -> tuple[int, int]:
+    try:
+        st_dev = details.st_dev
+        st_ino = details.st_ino
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("publication reservation marker identity is invalid") from error
+    if type(st_dev) is not int or st_dev < 0 or type(st_ino) is not int or st_ino < 0:
+        raise PathValidationError("publication reservation marker identity is invalid")
+    return st_dev, st_ino
+
+
+def _require_matching_reservation_marker_identity(
+    first: os.stat_result,
+    second: os.stat_result,
+) -> None:
+    if _reservation_marker_identity(first) != _reservation_marker_identity(second):
+        raise UnsafePathError("publication reservation marker changed during attestation")
+
+
+def _write_reservation_marker(descriptor: int, marker_bytes: bytes) -> None:
+    offset = 0
+    while offset < len(marker_bytes):
+        try:
+            written = os.write(descriptor, marker_bytes[offset:])
+        except OSError as error:
+            raise PathValidationError("publication reservation marker cannot be written") from error
+        remaining = len(marker_bytes) - offset
+        if type(written) is not int or written <= 0 or written > remaining:
+            raise PathValidationError("publication reservation marker write was incomplete")
+        offset += written
+
+
+def _read_reservation_marker(descriptor: int, expected_size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = expected_size + 1
+    while remaining:
+        try:
+            chunk = os.read(descriptor, remaining)
+        except OSError as error:
+            raise PathValidationError("publication reservation marker cannot be read") from error
+        if type(chunk) is not bytes or len(chunk) > remaining:
+            raise PathValidationError("publication reservation marker read is invalid")
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    marker_bytes = b"".join(chunks)
+    if len(marker_bytes) > expected_size:
+        raise PathValidationError("publication reservation marker exceeds the size limit")
+    return marker_bytes
+
+
+def _fsync_reservation_marker(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise PathValidationError("publication reservation marker cannot be synced") from error
+
+
+def _fsync_reservation_marker_directory(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise PathValidationError("publication reservation directory cannot be synced") from error
 
 
 def _require_expected_output_logical_bytes(value: object) -> int | None:
