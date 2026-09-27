@@ -13,6 +13,12 @@ import pytest
 
 
 CATEGORIES = ("Videos", "Audio", "Documents", "Software", "Other")
+_PERSISTED_INTENT_SHAPES = tuple(
+    (category, collection, selected_final_filename)
+    for category in CATEGORIES
+    for collection in (None, "Course material")
+    for selected_final_filename in ("selected.webm", "selected--job-42.webm")
+)
 
 
 def _paths():
@@ -331,6 +337,13 @@ def _entry_signature(path: Path) -> tuple[int, int, int, int, int]:
         details.st_mode,
         details.st_nlink,
         details.st_size,
+    )
+
+
+def _directory_identity_inventory(path: Path):
+    return (
+        _entry_signature(path),
+        tuple(sorted((entry.name, _entry_signature(entry)) for entry in path.iterdir())),
     )
 
 
@@ -917,3 +930,116 @@ def test_provisioned_rehydrated_workspace_can_be_separately_marker_attested(
     assert marker.path.is_file()
     assert not prepared.final_path.exists()
     assert not prepared.partial_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("category", "collection", "selected_final_filename"),
+    _PERSISTED_INTENT_SHAPES,
+)
+def test_prepare_persisted_workspace_preflights_existing_nonwritable_final_before_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    category: str,
+    collection: str | None,
+    selected_final_filename: str,
+) -> None:
+    paths = _paths()
+    home = tmp_path / "persisted-home"
+    root = home / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    destination = _rehydrate_under_home(
+        paths,
+        monkeypatch,
+        home,
+        category=category,
+        collection=collection,
+        selected_final_filename=selected_final_filename,
+    )
+    final_directory = destination.final_path.parent
+    final_directory.mkdir(mode=0o700)
+    final_directory.chmod(0o500)
+    root_before = _directory_identity_inventory(root)
+    original_access = paths.os.access
+
+    def deny_final_directory_access(path, mode, *args, **kwargs):
+        if Path(path) == final_directory and mode == os.W_OK | os.X_OK:
+            return False
+        return original_access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(paths.os, "access", deny_final_directory_access)
+
+    try:
+        with pytest.raises(paths.PathValidationError, match="not writable"):
+            paths.prepare_persisted_destination_workspace(destination)
+
+        assert _directory_identity_inventory(root) == root_before
+        assert not os.path.lexists(destination.incomplete_dir.parent)
+        assert not os.path.lexists(destination.final_path)
+        assert not os.path.lexists(destination.partial_path)
+        assert not os.path.lexists(_marker_path(destination))
+    finally:
+        final_directory.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    ("category", "collection", "selected_final_filename"),
+    _PERSISTED_INTENT_SHAPES,
+)
+def test_prepare_persisted_workspace_preflights_cross_filesystem_final_before_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    category: str,
+    collection: str | None,
+    selected_final_filename: str,
+) -> None:
+    paths = _paths()
+    home = tmp_path / "persisted-home"
+    root = home / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    destination = _rehydrate_under_home(
+        paths,
+        monkeypatch,
+        home,
+        category=category,
+        collection=collection,
+        selected_final_filename=selected_final_filename,
+    )
+    final_directory = destination.final_path.parent
+    final_directory.mkdir(mode=0o700)
+    root_before = _directory_identity_inventory(root)
+    expected_checked_identities = (
+        (os.stat(final_directory).st_dev, os.stat(final_directory).st_ino),
+        (os.stat(root).st_dev, os.stat(root).st_ino),
+    )
+    checked_identities: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    mkdir_names: list[str] = []
+    original_mkdir = paths.os.mkdir
+
+    def record_mkdir(name, *args, **kwargs):
+        mkdir_names.append(os.fspath(name))
+        return original_mkdir(name, *args, **kwargs)
+
+    def reject_cross_filesystem(final_fd: int, incomplete_fd: int) -> None:
+        checked_identities.append(
+            (
+                (os.fstat(final_fd).st_dev, os.fstat(final_fd).st_ino),
+                (os.fstat(incomplete_fd).st_dev, os.fstat(incomplete_fd).st_ino),
+            )
+        )
+        raise paths.PathValidationError(
+            "final and incomplete destinations must share a filesystem"
+        )
+
+    monkeypatch.setattr(paths.os, "mkdir", record_mkdir)
+    monkeypatch.setattr(paths, "_require_same_filesystem", reject_cross_filesystem)
+
+    with pytest.raises(paths.PathValidationError, match="share a filesystem"):
+        paths.prepare_persisted_destination_workspace(destination)
+
+    assert checked_identities == [expected_checked_identities]
+    assert mkdir_names == []
+    assert _directory_identity_inventory(root) == root_before
+    assert not os.path.lexists(destination.incomplete_dir.parent)
+    assert not os.path.lexists(destination.final_path)
+    assert not os.path.lexists(destination.partial_path)
+    assert not os.path.lexists(_marker_path(destination))

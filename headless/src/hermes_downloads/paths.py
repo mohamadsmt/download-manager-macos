@@ -216,7 +216,7 @@ def prepare_persisted_destination_workspace(
 
     root_fd = _open_root(root)
     try:
-        _preflight_persisted_workspace(root_fd, final_component, destination.job_id)
+        _preflight_persisted_workspace(root_fd, destination, final_component)
         final_fd = _open_or_create_directory(root_fd, final_component)
         try:
             incomplete_fd = _open_or_create_directory(root_fd, _INCOMPLETE)
@@ -876,24 +876,40 @@ def _open_root(root: Path) -> int:
 
 def _preflight_persisted_workspace(
     root_fd: int,
+    destination: DestinationIntent,
     final_component: str,
-    job_id: str,
 ) -> None:
-    """Reject every existing workspace component before creating any of them."""
+    """Validate all existing workspace components before creating any entry."""
 
-    if _entry_exists(root_fd, final_component):
-        descriptor = _open_existing_directory(root_fd, final_component)
-        os.close(descriptor)
-
-    if not _entry_exists(root_fd, _INCOMPLETE):
-        return
-    incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)
+    final_fd: int | None = None
+    incomplete_fd: int | None = None
+    job_fd: int | None = None
+    final_filesystem_fd = root_fd
+    incomplete_filesystem_fd = root_fd
     try:
-        if _entry_exists(incomplete_fd, job_id):
-            descriptor = _open_existing_directory(incomplete_fd, job_id)
-            os.close(descriptor)
+        if _entry_exists(root_fd, final_component):
+            final_fd = _open_existing_directory(root_fd, final_component)
+            final_filesystem_fd = final_fd
+            _require_writable_directory(destination.final_path.parent)
+
+        if _entry_exists(root_fd, _INCOMPLETE):
+            incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)
+            incomplete_filesystem_fd = incomplete_fd
+            if _entry_exists(incomplete_fd, destination.job_id):
+                job_fd = _open_existing_directory(incomplete_fd, destination.job_id)
+                incomplete_filesystem_fd = job_fd
+                _require_writable_directory(destination.incomplete_dir)
+            else:
+                _require_writable_directory(destination.incomplete_dir.parent)
+
+        _require_same_filesystem(final_filesystem_fd, incomplete_filesystem_fd)
     finally:
-        os.close(incomplete_fd)
+        if job_fd is not None:
+            os.close(job_fd)
+        if incomplete_fd is not None:
+            os.close(incomplete_fd)
+        if final_fd is not None:
+            os.close(final_fd)
 
 
 def _open_or_create_directory(parent_fd: int, name: str) -> int:
