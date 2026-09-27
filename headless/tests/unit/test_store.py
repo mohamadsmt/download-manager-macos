@@ -4142,8 +4142,7 @@ def test_v10_migrates_v9_materialized_projection_without_inventing_a_receipt(
                 ).fetchall()
             ),
         ) == before
-        with pytest.raises(ValueError):
-            store.get_publication_reservation("legacy-job")
+        assert store.get_publication_reservation("legacy-job") is None
     finally:
         store.close()
 
@@ -4253,7 +4252,7 @@ def test_materialized_receipt_readback_and_replay_reject_mismatched_projection(
         store.close()
 
 
-def test_materialized_receipt_readback_and_replay_reject_missing_receipt(
+def test_materialized_receipt_replay_rejects_missing_receipt_after_readback_returns_none(
     tmp_path: Path,
 ) -> None:
     materialized = _materialized_job()
@@ -4264,10 +4263,48 @@ def test_materialized_receipt_readback_and_replay_reject_missing_receipt(
             "DELETE FROM publication_reservations WHERE job_id = ?", (materialized.job_id,)
         )
 
-        with pytest.raises(ValueError):
-            store.get_publication_reservation(materialized.job_id)
+        assert store.get_publication_reservation(materialized.job_id) is None
         with pytest.raises(ValueError):
             store.apply_add(materialized.intent, materialized=materialized)
+        assert (
+            store._connection.execute(
+                "SELECT claim_token FROM publication_reservations WHERE job_id = ?",
+                (materialized.job_id,),
+            ).fetchall()
+            == []
+        )
+    finally:
+        store.close()
+
+
+def test_publication_reservation_readback_rejects_receipt_without_projection(
+    tmp_path: Path,
+) -> None:
+    materialized = _materialized_job()
+    target_component = materialized.destination_collection or materialized.category
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        store._connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            store._connection.execute(
+                """
+                INSERT INTO publication_reservations (
+                    job_id, target_component, final_filename, claim_token
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    materialized.job_id,
+                    target_component,
+                    materialized.selected_final_filename,
+                    "a" * 64,
+                ),
+            )
+        finally:
+            store._connection.execute("PRAGMA foreign_keys = ON")
+
+        with pytest.raises(ValueError, match="owner"):
+            store.get_publication_reservation(materialized.job_id)
     finally:
         store.close()
 

@@ -1091,7 +1091,9 @@ class SQLiteStore:
                     _require_sqlite_text(existing["job_id"], "command job_id"),
                     "command job_id",
                 )
-                self._read_publication_reservation(connection, stored_job_id)
+                reservation = self._read_publication_reservation(connection, stored_job_id)
+                if materialized is not None and reservation is None:
+                    raise ValueError("materialized add replay is missing publication reservation")
                 if materialized is not None and not self._stored_projection_matches(
                     connection, stored_job_id, intent, materialized
                 ):
@@ -2667,6 +2669,8 @@ class SQLiteStore:
             (job_id,),
         ).fetchall()
         if not projection_rows and not reservation_rows:
+            return None
+        if len(projection_rows) == 1 and not reservation_rows:
             return None
         if len(projection_rows) != 1:
             raise ValueError("publication reservation owner is not a unique materialized job")
