@@ -176,6 +176,34 @@ def test_validates_complete_records_and_rejects_fake_or_nonfinite_measurements()
         benchmark.validate_trial_record(with_url)
 
 
+@pytest.mark.parametrize("credential_key", ("password", "secret", "api_key", "auth"))
+def test_rejects_raw_credential_like_setting_keys_at_all_depths(credential_key: str) -> None:
+    benchmark = _benchmark()
+
+    direct = _passed_record("curl-single", 1)
+    direct["configuration"]["settings"][credential_key] = "raw-secret"
+    with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
+        benchmark.validate_trial_record(direct)
+
+    nested = _passed_record("curl-single", 1)
+    nested["configuration"]["settings"]["transport"] = {credential_key: "raw-secret"}
+    with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
+        benchmark.validate_trial_record(nested)
+
+
+def test_accepts_ordinary_bounded_benchmark_settings() -> None:
+    benchmark = _benchmark()
+    record = _passed_record("curl-single", 1)
+    record["configuration"]["settings"].update(
+        {
+            "retry_count": 3,
+            "transport": {"mode": "parallel", "verify_tls": True},
+        }
+    )
+
+    assert benchmark.validate_trial_record(record) == record
+
+
 def test_failed_record_requires_a_bounded_classification_and_null_unobserved_metrics() -> None:
     benchmark = _benchmark()
     failed = _failed_record()

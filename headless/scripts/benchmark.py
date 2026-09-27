@@ -202,6 +202,10 @@ def _validate_setting_value(value: object, label: str, depth: int = 0) -> None:
                     "token",
                     "credential",
                     "authorization",
+                    "password",
+                    "secret",
+                    "api_key",
+                    "auth",
                     "header",
                     "input",
                 )
