@@ -207,6 +207,13 @@ def _metadata_key_tokens(key_name: str) -> tuple[str, ...]:
     )
 
 
+def _metadata_key_semantic_tokens(key_name: str) -> tuple[str, ...]:
+    return tuple(
+        token[:-1] if len(token) > 1 and token.endswith("s") else token
+        for token in _metadata_key_tokens(key_name)
+    )
+
+
 def _validate_metadata_string(
     value: object, label: str, *, allow_setting_label: bool = False
 ) -> str:
@@ -223,7 +230,7 @@ def _validate_metadata_string(
 
 def _validate_metadata_key(value: object, key_label: str, container_label: str) -> str:
     key_name = _validate_identifier(value, key_label)
-    tokens = _metadata_key_tokens(key_name)
+    tokens = _metadata_key_semantic_tokens(key_name)
     if (
         any(token in _SENSITIVE_METADATA_KEY_TOKENS for token in tokens)
         or ("api", "key") in zip(tokens, tokens[1:])

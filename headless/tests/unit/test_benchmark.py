@@ -19,6 +19,45 @@ BENCHMARK_PATH = HEADLESS_ROOT / "scripts" / "benchmark.py"
 FIXTURE_SHA256 = "a" * 64
 PAYLOAD_BYTES = 64 * 1024 * 1024
 EXPECTED_CONFIGURATIONS = {"curl-single", "aria2-single", "aria2-multi"}
+SENSITIVE_METADATA_KEYS = (
+    "password",
+    "passwords",
+    "secret",
+    "secrets",
+    "api_key",
+    "api-key",
+    "apiKey",
+    "APIKey",
+    "api_keys",
+    "api-keys",
+    "apiKeys",
+    "APIKeys",
+    "auth",
+    "authToken",
+    "authTokens",
+    "url",
+    "URL",
+    "urls",
+    "uri",
+    "uris",
+    "source_url",
+    "source-url",
+    "sourceUrl",
+    "sourceUrls",
+    "sourceURI",
+    "cookie",
+    "cookies",
+    "token",
+    "tokens",
+    "credential",
+    "credentials",
+    "header",
+    "headers",
+    "authorization",
+    "authorizations",
+    "input",
+    "inputs",
+)
 
 
 def _benchmark():
@@ -178,27 +217,15 @@ def test_validates_complete_records_and_rejects_fake_or_nonfinite_measurements()
 
 @pytest.mark.parametrize(
     "sensitive_key",
-    (
-        "password",
-        "secret",
-        "api_key",
-        "api-key",
-        "apiKey",
-        "APIKey",
-        "auth",
-        "authToken",
-        "source_url",
-        "source-url",
-        "sourceUrl",
-        "URL",
-        "sourceURI",
-    ),
+    SENSITIVE_METADATA_KEYS,
 )
 def test_rejects_sensitive_setting_keys_at_all_depths(sensitive_key: str) -> None:
     benchmark = _benchmark()
 
     direct = _passed_record("curl-single", 1)
-    direct["configuration"]["settings"][sensitive_key] = "parallel"
+    direct["configuration"]["settings"][sensitive_key] = (
+        {"XTest": "1.0"} if sensitive_key == "headers" else "parallel"
+    )
     with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
         benchmark.validate_trial_record(direct)
 
@@ -210,21 +237,7 @@ def test_rejects_sensitive_setting_keys_at_all_depths(sensitive_key: str) -> Non
 
 @pytest.mark.parametrize(
     "sensitive_key",
-    (
-        "password",
-        "secret",
-        "api_key",
-        "api-key",
-        "apiKey",
-        "APIKey",
-        "auth",
-        "authToken",
-        "source_url",
-        "source-url",
-        "sourceUrl",
-        "URL",
-        "sourceURI",
-    ),
+    SENSITIVE_METADATA_KEYS,
 )
 def test_rejects_sensitive_version_metadata_keys(sensitive_key: str) -> None:
     benchmark = _benchmark()
