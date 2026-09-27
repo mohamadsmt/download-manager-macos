@@ -203,6 +203,35 @@ def test_rejects_raw_credential_like_setting_keys_at_all_depths(credential_key: 
         benchmark.validate_trial_record(nested)
 
 
+@pytest.mark.parametrize(
+    "credential_key",
+    (
+        "password",
+        "secret",
+        "api_key",
+        "api-key",
+        "apiKey",
+        "APIKey",
+        "auth",
+        "authToken",
+    ),
+)
+def test_rejects_raw_credential_like_version_metadata_keys(credential_key: str) -> None:
+    benchmark = _benchmark()
+
+    normal = _passed_record("curl-single", 1)
+    normal["configuration"]["versions"] = {
+        "engine": "aria2-1.37.0",
+        "Python": "3.12.12",
+    }
+    assert benchmark.validate_trial_record(normal) == normal
+
+    malformed = deepcopy(normal)
+    malformed["configuration"]["versions"] = {credential_key: "raw-secret"}
+    with pytest.raises(benchmark.BenchmarkValidationError, match="raw external input"):
+        benchmark.validate_trial_record(malformed)
+
+
 def test_accepts_ordinary_bounded_benchmark_settings() -> None:
     benchmark = _benchmark()
     record = _passed_record("curl-single", 1)

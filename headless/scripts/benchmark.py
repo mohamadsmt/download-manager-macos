@@ -36,6 +36,20 @@ _SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 _TIMESTAMP_RE: Final = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
+_SENSITIVE_METADATA_KEY_TOKENS: Final = (
+    "url",
+    "uri",
+    "cookie",
+    "token",
+    "credential",
+    "authorization",
+    "password",
+    "secret",
+    "apikey",
+    "auth",
+    "header",
+    "input",
+)
 
 TRIAL_FIELDS: Final = frozenset(
     {
@@ -168,6 +182,14 @@ def _contains_external_source(value: str) -> bool:
     return "://" in value or value.startswith(("file:", "data:"))
 
 
+def _validate_metadata_key(value: object, key_label: str, container_label: str) -> str:
+    key_name = _validate_identifier(value, key_label)
+    normalized = key_name.casefold().replace("_", "").replace("-", "")
+    if any(token in normalized for token in _SENSITIVE_METADATA_KEY_TOKENS):
+        raise BenchmarkValidationError(f"{container_label} must not contain raw external input")
+    return key_name
+
+
 def _validate_setting_value(value: object, label: str, depth: int = 0) -> None:
     if depth > 4:
         raise BenchmarkValidationError(f"{label} exceeds the supported JSON nesting")
@@ -191,26 +213,7 @@ def _validate_setting_value(value: object, label: str, depth: int = 0) -> None:
         if len(value) > 32:
             raise BenchmarkValidationError(f"{label} has too many keys")
         for key, item in value.items():
-            key_name = _validate_identifier(key, f"{label} key")
-            normalized = key_name.casefold().replace("_", "").replace("-", "")
-            if any(
-                token in normalized
-                for token in (
-                    "url",
-                    "uri",
-                    "cookie",
-                    "token",
-                    "credential",
-                    "authorization",
-                    "password",
-                    "secret",
-                    "apikey",
-                    "auth",
-                    "header",
-                    "input",
-                )
-            ):
-                raise BenchmarkValidationError(f"{label} must not contain raw external input")
+            key_name = _validate_metadata_key(key, f"{label} key", label)
             _validate_setting_value(item, f"{label}.{key_name}", depth + 1)
         return
     raise BenchmarkValidationError(f"{label} must contain JSON values")
@@ -233,7 +236,11 @@ def _validate_configuration(value: object) -> dict[str, Any]:
     if type(versions) is not dict or not versions:
         raise BenchmarkValidationError("configuration.versions must be a nonempty object")
     for name, version in versions.items():
-        _validate_identifier(name, "configuration.versions key")
+        _validate_metadata_key(
+            name,
+            "configuration.versions key",
+            "configuration.versions",
+        )
         if (
             type(version) is not str
             or not version
