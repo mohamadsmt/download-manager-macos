@@ -8,6 +8,7 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import secrets
 from pathlib import Path
 from queue import Empty
 import signal
@@ -40,6 +41,7 @@ from hermes_downloads.store import (
     DirectEngineActivationFence,
     DirectEngineRecord,
     SQLiteStore,
+    _DirectEngineRecoveryCapability,
 )
 
 
@@ -359,6 +361,7 @@ def _run_worker_process_with_fake_direct(
     release_before_start: _LifecycleEvent | None = None,
     shutdown_reconciliation: str | None = None,
     shutdown_reconciliation_called: _LifecycleEvent | None = None,
+    capability_persistence_attempted: _LifecycleEvent | None = None,
 ) -> None:
     """Install a deterministic direct controller before the worker imports it lazily."""
 
@@ -371,6 +374,9 @@ def _run_worker_process_with_fake_direct(
 
     original_bind_direct_engine_activation_fence = (
         worker.SQLiteStore.bind_direct_engine_activation_fence
+    )
+    original_bind_direct_engine_recovery_capability = (
+        worker.SQLiteStore._bind_direct_engine_recovery_capability
     )
     processes: Any | None = None
     original_reconcile_process_birth: Any | None = None
@@ -406,6 +412,25 @@ def _run_worker_process_with_fake_direct(
         worker.SQLiteStore.bind_direct_engine_activation_fence = (
             fail_direct_record_persistence
         )
+    if capability_persistence_attempted is not None:
+
+        def fail_recovery_capability_persistence(
+            self: SQLiteStore,
+            record: DirectEngineRecord,
+            capability: _DirectEngineRecoveryCapability,
+        ) -> None:
+            if (
+                type(self) is not SQLiteStore
+                or type(record) is not DirectEngineRecord
+                or type(capability) is not _DirectEngineRecoveryCapability
+            ):
+                raise AssertionError("worker passed an invalid direct recovery capability")
+            capability_persistence_attempted.set()
+            raise RuntimeError("fake direct recovery-capability persistence failure")
+
+        worker.SQLiteStore._bind_direct_engine_recovery_capability = (
+            fail_recovery_capability_persistence
+        )
 
     class FakeDirectAria2Controller:
         def __init__(
@@ -427,6 +452,10 @@ def _run_worker_process_with_fake_direct(
                     observer.close()
                 fence_before_construction.set()
             self._on_engine_bound = on_engine_bound
+            self._capability = _DirectEngineRecoveryCapability(
+                rpc_port=43123,
+                rpc_secret=secrets.token_urlsafe(32),
+            )
             if controller_construction_count is not None:
                 controller_construction_count.value += 1
             controller_constructed.set()
@@ -447,6 +476,9 @@ def _run_worker_process_with_fake_direct(
                     raise RuntimeError("test did not release fake direct start failure")
                 raise RuntimeError("fake direct start failure")
             return object()
+
+        def _recovery_capability(self) -> _DirectEngineRecoveryCapability:
+            return self._capability
 
         def close(self) -> None:
             close_called.set()
@@ -470,6 +502,9 @@ def _run_worker_process_with_fake_direct(
     finally:
         worker.SQLiteStore.bind_direct_engine_activation_fence = (
             original_bind_direct_engine_activation_fence
+        )
+        worker.SQLiteStore._bind_direct_engine_recovery_capability = (
+            original_bind_direct_engine_recovery_capability
         )
         if processes is not None:
             assert original_reconcile_process_birth is not None
@@ -511,8 +546,11 @@ def _run_worker_process_with_absent_fake_direct(
 
     processes: Any = importlib.import_module("hermes_downloads.processes")
     original_reconcile_process_birth = processes.reconcile_process_birth
-    original_clear_direct_engine_record = worker.SQLiteStore.clear_direct_engine_record
+    original_clear_direct_engine_record_and_recovery_capability = (
+        worker.SQLiteStore._clear_direct_engine_record_and_recovery_capability
+    )
     expected_record = DirectEngineRecord(worker_epoch=1, identity=fake_identity)
+    expected_capability: _DirectEngineRecoveryCapability | None = None
     controller_index = 0
     clear_attempt_count = 0
     clear_patched = clear_failures != 0 or clear_attempts is not None
@@ -532,6 +570,10 @@ def _run_worker_process_with_absent_fake_direct(
             controller_index += 1
             controller_construction_count.value += 1
             self._on_engine_bound = on_engine_bound
+            self._capability = _DirectEngineRecoveryCapability(
+                rpc_port=43123 + self._index,
+                rpc_secret=secrets.token_urlsafe(32),
+            )
             if self._index == 1:
                 observer = SQLiteStore(Path(state_root) / "state.db")
                 try:
@@ -544,12 +586,19 @@ def _run_worker_process_with_absent_fake_direct(
                 replacement_claim_cleared.set()
 
         def start(self) -> object:
+            nonlocal expected_capability
+
             self._on_engine_bound(
                 fake_identity
                 if self._index == 0 or replacement_identity is None
                 else replacement_identity
             )
+            if self._index == 0:
+                expected_capability = self._capability
             return object()
+
+        def _recovery_capability(self) -> _DirectEngineRecoveryCapability:
+            return self._capability
 
         def discard_absent(self) -> None:
             if self._index != 0:
@@ -576,20 +625,30 @@ def _run_worker_process_with_absent_fake_direct(
     if clear_patched:
 
         def clear_exact_direct_claim(
-            self: SQLiteStore, record: DirectEngineRecord
+            self: SQLiteStore,
+            record: DirectEngineRecord,
+            capability: _DirectEngineRecoveryCapability,
         ) -> bool:
             nonlocal clear_attempt_count
 
-            if type(self) is not SQLiteStore or record != expected_record:
-                raise AssertionError("worker did not compare-clear its exact direct record")
+            if (
+                type(self) is not SQLiteStore
+                or record != expected_record
+                or capability != expected_capability
+            ):
+                raise AssertionError("worker did not compare-clear its exact direct claim")
             clear_attempt_count += 1
             if clear_attempts is not None:
                 clear_attempts.value += 1
             if clear_attempt_count <= clear_failures:
                 return False
-            return original_clear_direct_engine_record(self, record)
+            return original_clear_direct_engine_record_and_recovery_capability(
+                self, record, capability
+            )
 
-        worker.SQLiteStore.clear_direct_engine_record = clear_exact_direct_claim
+        worker.SQLiteStore._clear_direct_engine_record_and_recovery_capability = (
+            clear_exact_direct_claim
+        )
 
     fake_module = types.ModuleType("hermes_downloads.direct")
     setattr(fake_module, "DirectAria2Controller", FakeDirectAria2Controller)
@@ -609,8 +668,8 @@ def _run_worker_process_with_absent_fake_direct(
     finally:
         processes.reconcile_process_birth = original_reconcile_process_birth
         if clear_patched:
-            worker.SQLiteStore.clear_direct_engine_record = (
-                original_clear_direct_engine_record
+            worker.SQLiteStore._clear_direct_engine_record_and_recovery_capability = (
+                original_clear_direct_engine_record_and_recovery_capability
             )
 
 
@@ -728,6 +787,84 @@ def _recorded_direct_controller(
         return controller, records[0]
     finally:
         store.close()
+
+
+def test_worker_cold_recovery_shuts_down_current_paired_direct_engine_before_ready() -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        controller, record = _recorded_direct_controller(state_root)
+        capability = controller._recovery_capability()
+        process_group_id = record.identity.process_group_id
+        store = SQLiteStore(state_root / "state.db")
+        try:
+            store._bind_direct_engine_recovery_capability(record, capability)
+        finally:
+            store.close()
+
+        socket_path = state_root / "worker.sock"
+        reaped = threading.Event()
+
+        def reap_foreign_owner_after_shutdown() -> None:
+            # The test process remains the aria2 parent, unlike a crashed
+            # worker. Reap only after recovery asks aria2 to exit so its group
+            # can be proven absent without sending a stale-PGID signal.
+            owned_process = controller._process
+            assert owned_process is not None
+            deadline = time.monotonic() + _WATCHDOG_SECONDS
+            while time.monotonic() < deadline:
+                if owned_process.poll() is not None:
+                    reaped.set()
+                    return
+                time.sleep(0.01)
+
+        reaper = threading.Thread(target=reap_foreign_owner_after_shutdown)
+        reaper.start()
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        shutdown = context.Event()
+        stopped = context.Event()
+        results = context.Queue()
+        process = context.Process(
+            target=_run_worker_process,
+            args=(str(state_root), str(socket_path), ready, shutdown, stopped, results),
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert reaped.wait(_WATCHDOG_SECONDS)
+            _assert_group_gone(process_group_id)
+            health_record = request_health(socket_path).to_record()
+            assert health_record == {
+                "protocol_version": 1,
+                "worker_epoch": 2,
+                "queue_gate": "paused",
+            }
+            if capability.rpc_secret in json.dumps(health_record):
+                pytest.fail("health response exposed a private recovery capability")
+
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                assert observer.get_direct_engine_record() is None
+                assert observer._get_direct_engine_recovery_capability(record) is None
+            finally:
+                observer.close()
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+        finally:
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+            reaper.join(_WATCHDOG_SECONDS)
+            assert not reaper.is_alive()
+            if controller.engine_identity is not None:
+                try:
+                    controller.discard_absent()
+                except BaseException:
+                    _force_stop_group(process_group_id)
 
 
 def _group_is_gone(process_group_id: int) -> bool:
@@ -1163,6 +1300,7 @@ def test_worker_direct_activation_reserves_before_import_and_binds_before_rpc_re
                     assert record is not None
                     assert record.worker_epoch == 1
                     assert reconcile_process_birth(record.identity) == "current"
+                    assert observer._get_direct_engine_recovery_capability(record) is None
                     assert observer.get_direct_engine_activation_fence() is None
                 finally:
                     observer.close()
@@ -1184,6 +1322,7 @@ def test_worker_direct_activation_reserves_before_import_and_binds_before_rpc_re
                 observer = SQLiteStore(state_root / "state.db")
                 try:
                     assert observer.get_direct_engine_record() == record
+                    assert observer._get_direct_engine_recovery_capability(record) is not None
                     assert observer.get_direct_engine_activation_fence() is None
                 finally:
                     observer.close()
@@ -1198,6 +1337,7 @@ def test_worker_direct_activation_reserves_before_import_and_binds_before_rpc_re
                 reopened = SQLiteStore(state_root / "state.db")
                 try:
                     assert reopened.get_direct_engine_record() is None
+                    assert reopened._get_direct_engine_recovery_capability(record) is None
                     assert reopened.get_direct_engine_activation_fence() is None
                 finally:
                     reopened.close()
@@ -1927,7 +2067,9 @@ def test_worker_direct_activation_blocks_a_current_prior_record_without_importin
                 reopened.close()
 
 
-def test_worker_direct_activation_replaces_only_a_proven_absent_record() -> None:
+def test_worker_direct_activation_blocks_an_absent_legacy_record_without_capability() -> None:
+    """A pre-migration record cannot authorize replacement even after absence is proven."""
+
     with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
         state_root = Path(temporary_root) / "state"
         state_root.mkdir(mode=0o700)
@@ -1959,9 +2101,78 @@ def test_worker_direct_activation_replaces_only_a_proven_absent_record() -> None
             ),
         )
         process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=2
+            ) == DirectEngineActivateResult(worker_epoch=2, status="blocked")
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                assert observer.get_direct_engine_record() == stale
+                assert observer._get_direct_engine_recovery_capability(stale) is None
+            finally:
+                observer.close()
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+        finally:
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+def test_worker_direct_activation_replaces_an_absent_paired_record_after_cold_recovery() -> None:
+    """A proved-absent modern claim is compare-cleared before the next activation."""
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        stale_controller, stale = _recorded_direct_controller(state_root)
+        stale_group_id = stale.identity.process_group_id
+        capability = stale_controller._recovery_capability()
+        store = SQLiteStore(state_root / "state.db")
+        try:
+            store._bind_direct_engine_recovery_capability(stale, capability)
+        finally:
+            store.close()
+        try:
+            stale_controller.close()
+        finally:
+            _force_stop_group(stale_group_id)
+        assert reconcile_process_birth(stale.identity) == "absent"
+
+        socket_path = state_root / "worker.sock"
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        shutdown = context.Event()
+        stopped = context.Event()
+        results = context.Queue()
+        direct_import_allowed = context.Event()
+        process = context.Process(
+            target=_run_worker_process_with_engine_imports_gated,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                direct_import_allowed,
+            ),
+        )
+        process.start()
         replacement: DirectEngineRecord | None = None
         try:
             assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                assert observer.get_direct_engine_record() is None
+                assert observer._get_direct_engine_recovery_capability(stale) is None
+            finally:
+                observer.close()
+
             direct_import_allowed.set()
             assert activate_direct_engine(
                 socket_path, expected_worker_epoch=2
@@ -1972,6 +2183,7 @@ def test_worker_direct_activation_replaces_only_a_proven_absent_record() -> None
                 assert replacement is not None
                 assert replacement.worker_epoch == 2
                 assert replacement != stale
+                assert observer._get_direct_engine_recovery_capability(replacement) is not None
                 assert reconcile_process_birth(replacement.identity) == "current"
             finally:
                 observer.close()
@@ -1985,6 +2197,7 @@ def test_worker_direct_activation_replaces_only_a_proven_absent_record() -> None
             reopened = SQLiteStore(state_root / "state.db")
             try:
                 assert reopened.get_direct_engine_record() is None
+                assert reopened._get_direct_engine_recovery_capability(replacement) is None
             finally:
                 reopened.close()
         finally:
@@ -2183,6 +2396,80 @@ def test_worker_direct_activation_callback_persistence_failure_cleans_without_mu
             _join(process)
             assert _result(results) == ("result", None)
             assert not socket_path.exists()
+        finally:
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+def test_worker_direct_activation_recovery_capability_persistence_failure_closes_and_clears() -> None:
+    """A post-ready capability write failure leaves no active or durable direct owner."""
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-ipc-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        socket_path = state_root / "worker.sock"
+        identity = _fake_unowned_birth()
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        shutdown = context.Event()
+        stopped = context.Event()
+        results = context.Queue()
+        controller_constructed = context.Event()
+        start_called = context.Event()
+        callback_entered = context.Event()
+        callback_completed = context.Event()
+        close_called = context.Event()
+        capability_persistence_attempted = context.Event()
+        process = context.Process(
+            target=_run_worker_process_with_fake_direct,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                identity,
+                "succeeds",
+                "succeeds",
+                controller_constructed,
+                start_called,
+                callback_entered,
+                callback_completed,
+                close_called,
+            ),
+            kwargs={
+                "capability_persistence_attempted": capability_persistence_attempted,
+            },
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            with pytest.raises(ipc.IPCError, match="^command_conflict$"):
+                activate_direct_engine(socket_path, expected_worker_epoch=1)
+            assert controller_constructed.wait(_WATCHDOG_SECONDS)
+            assert start_called.wait(_WATCHDOG_SECONDS)
+            assert callback_entered.wait(_WATCHDOG_SECONDS)
+            assert callback_completed.wait(_WATCHDOG_SECONDS)
+            assert capability_persistence_attempted.wait(_WATCHDOG_SECONDS)
+            assert close_called.wait(_WATCHDOG_SECONDS)
+            assert _direct_engine_claims(state_root) == (None, None)
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                assert observer.get_direct_engine_record() is None
+            finally:
+                observer.close()
+            assert request_health(socket_path).to_record() == {
+                "protocol_version": 1,
+                "worker_epoch": 1,
+                "queue_gate": "paused",
+            }
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
         finally:
             shutdown.set()
             if process.is_alive():

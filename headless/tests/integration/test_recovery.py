@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import builtins
 import multiprocessing
 import os
 from pathlib import Path
 from queue import Empty
+import secrets
+import sqlite3
 import subprocess
 import sys
 import textwrap
-from typing import Protocol
+from typing import Any, Protocol
 
 import pytest
 
 from hermes_downloads import worker
+import hermes_downloads.store as store_module
 from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.store import DirectEngineRecord, SQLiteStore
 
@@ -485,6 +489,204 @@ def test_restarted_worker_preserves_a_prior_direct_record_without_importing_engi
         assert recovered.get_direct_engine_record() == prior
     finally:
         recovered.close()
+
+
+def test_restarted_worker_clears_an_absent_paired_direct_capability_without_importing_engines(
+    private_roots: dict[str, Path],
+) -> None:
+    state_root = private_roots["state"]
+    prior = DirectEngineRecord(
+        worker_epoch=1,
+        identity=ProcessBirthIdentity(
+            leader_pid=999_991,
+            process_group_id=999_991,
+            session_id=999_991,
+            owner_uid=os.geteuid(),
+            started_unix_us=1,
+            argv_sha256="a" * 64,
+        ),
+    )
+    capability = store_module._DirectEngineRecoveryCapability(
+        rpc_port=43123,
+        rpc_secret=secrets.token_urlsafe(32),
+    )
+    seeded = SQLiteStore(state_root / "state.db")
+    try:
+        assert seeded.recover_cold_start() == 1
+        seeded.set_direct_engine_record(prior)
+        seeded._bind_direct_engine_recovery_capability(prior, capability)
+    finally:
+        seeded.close()
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    restarted = context.Process(
+        target=_run_worker_process_with_engine_imports_forbidden,
+        args=(str(state_root), ready, shutdown, stopped, results),
+    )
+    restarted.start()
+    try:
+        assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+        shutdown.set()
+        assert stopped.wait(_WATCHDOG_SECONDS)
+        _join(restarted)
+        assert _result(results) == ("result", None)
+    finally:
+        shutdown.set()
+        if restarted.is_alive():
+            _join(restarted)
+
+    recovered = SQLiteStore(state_root / "state.db")
+    try:
+        assert recovered.worker_epoch() == 2
+        assert recovered.get_direct_engine_record() is None
+        assert recovered._get_direct_engine_recovery_capability(prior) is None
+    finally:
+        recovered.close()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ("missing", "raw_blob", "mismatch", "indeterminate", "unbound_fence"),
+)
+def test_cold_direct_recovery_blocks_unsafe_claims_without_importing_an_engine(
+    private_roots: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Unsafe durable claims stay intact and cannot trigger a replacement engine."""
+
+    state_root = private_roots["state"]
+    store = SQLiteStore(state_root / "state.db")
+    record = DirectEngineRecord(
+        worker_epoch=1,
+        identity=ProcessBirthIdentity(
+            leader_pid=999_991,
+            process_group_id=999_991,
+            session_id=999_991,
+            owner_uid=os.geteuid(),
+            started_unix_us=1,
+            argv_sha256="a" * 64,
+        ),
+    )
+    capability = store_module._DirectEngineRecoveryCapability(
+        rpc_port=43123,
+        rpc_secret=secrets.token_urlsafe(32),
+    )
+    try:
+        assert store.recover_cold_start() == 1
+        if mode == "unbound_fence":
+            fence = store.reserve_direct_engine_activation(worker_epoch=1)
+            assert fence is not None
+        else:
+            fence = None
+            store.set_direct_engine_record(record)
+            if mode != "missing":
+                store._bind_direct_engine_recovery_capability(record, capability)
+            if mode == "raw_blob":
+                store._connection.execute("PRAGMA ignore_check_constraints = ON")
+                try:
+                    store._connection.execute(
+                        "UPDATE direct_engine_recovery_capabilities SET rpc_secret = ?",
+                        (sqlite3.Binary(b"not-a-text-secret"),),
+                    )
+                finally:
+                    store._connection.execute("PRAGMA ignore_check_constraints = OFF")
+            elif mode == "mismatch":
+                store._connection.execute(
+                    """
+                    UPDATE direct_engine_recovery_capabilities
+                    SET leader_pid = ?, process_group_id = ?, session_id = ?
+                    """,
+                    (999_992, 999_992, 999_992),
+                )
+        assert store.recover_cold_start() == 2
+
+        original_import = builtins.__import__
+
+        def guarded_import(
+            name: str,
+            globals: Any = None,
+            locals: Any = None,
+            fromlist: Any = (),
+            level: int = 0,
+        ) -> object:
+            if name == "hermes_downloads.direct":
+                pytest.fail("unsafe cold recovery imported the direct engine")
+            return original_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        if mode == "indeterminate":
+            monkeypatch.setattr(
+                worker,
+                "reconcile_process_birth",
+                lambda _identity: "indeterminate",
+            )
+        assert worker._recover_cold_direct_engine(store) is True
+        assert store.worker_epoch() == 2
+        if fence is not None:
+            assert store.get_direct_engine_activation_fence() == fence
+            assert store.get_direct_engine_record() is None
+        else:
+            assert store.get_direct_engine_record() == record
+            if mode in {"raw_blob", "mismatch"}:
+                with pytest.raises(ValueError, match="recovery capability"):
+                    store._get_direct_engine_recovery_capability(record)
+            elif mode == "missing":
+                assert store._get_direct_engine_recovery_capability(record) is None
+            else:
+                assert store._get_direct_engine_recovery_capability(record) == capability
+    finally:
+        store.close()
+
+
+def test_cold_direct_recovery_retains_current_paired_claim_after_shutdown_failure(
+    private_roots: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authenticated shutdown failure cannot clear or replace a current owner."""
+
+    from hermes_downloads import direct
+
+    state_root = private_roots["state"]
+    store = SQLiteStore(state_root / "state.db")
+    record = DirectEngineRecord(
+        worker_epoch=1,
+        identity=ProcessBirthIdentity(
+            leader_pid=999_991,
+            process_group_id=999_991,
+            session_id=999_991,
+            owner_uid=os.geteuid(),
+            started_unix_us=1,
+            argv_sha256="a" * 64,
+        ),
+    )
+    capability = store_module._DirectEngineRecoveryCapability(
+        rpc_port=43123,
+        rpc_secret=secrets.token_urlsafe(32),
+    )
+    calls: list[tuple[object, object]] = []
+    try:
+        assert store.recover_cold_start() == 1
+        store.set_direct_engine_record(record)
+        store._bind_direct_engine_recovery_capability(record, capability)
+        assert store.recover_cold_start() == 2
+
+        def fail_shutdown(identity: object, recovered_capability: object) -> None:
+            calls.append((identity, recovered_capability))
+            raise direct.DirectEngineError("aria2 recovery failed")
+
+        monkeypatch.setattr(worker, "reconcile_process_birth", lambda _identity: "current")
+        monkeypatch.setattr(direct, "_recover_owned_direct_engine", fail_shutdown)
+        assert worker._recover_cold_direct_engine(store) is True
+        assert calls == [(record.identity, capability)]
+        assert store.get_direct_engine_record() == record
+        assert store._get_direct_engine_recovery_capability(record) == capability
+    finally:
+        store.close()
 
 
 def test_restarted_worker_preserves_an_unbound_direct_activation_fence_without_importing_engines(

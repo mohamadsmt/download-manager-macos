@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+import secrets
 import sqlite3
 from typing import Any
 
@@ -1290,7 +1291,7 @@ def test_v8_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1414,7 +1415,7 @@ def test_v8_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         schema = connection.execute(
             """
             SELECT sql
@@ -1621,17 +1622,17 @@ def test_v0_rejects_sqlite_prefix_lookalike_before_bootstrap_writes(tmp_path: Pa
     assert _table_names(database_path) == {lookalike}
 
 
-def test_v11_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v12_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 12")
+        connection.execute("PRAGMA user_version = 13")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1790,7 +1791,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1875,14 +1876,14 @@ def test_v8_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V11_TABLE_SCHEMAS
+    assert table_schemas == store_module._V12_TABLE_SCHEMAS
 
 
 def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
@@ -1926,7 +1927,7 @@ def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         assert [
             row[1]
             for row in connection.execute(
@@ -3149,14 +3150,14 @@ def test_v8_migrates_v6_database_to_the_exact_command_receipt_catalog(tmp_path: 
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V11_TABLE_SCHEMAS
+    assert table_schemas == store_module._V12_TABLE_SCHEMAS
 
 
 def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
@@ -3419,7 +3420,7 @@ def test_v8_migrates_v7_receipts_to_the_shared_global_registry(tmp_path: Path) -
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
     assert "command_receipts" in _table_names(database_path)
 
 
@@ -3918,14 +3919,14 @@ def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V11_TABLE_SCHEMAS
+    assert table_schemas == store_module._V12_TABLE_SCHEMAS
 
 
 def test_v9_receipt_rebuild_failure_restores_v8_database(
@@ -4164,7 +4165,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         projection_after = connection.execute(
             """
             SELECT
@@ -4197,7 +4198,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         }
     assert projection_after == projection_before
     assert receipts == []
-    assert table_schemas == store_module._V11_TABLE_SCHEMAS
+    assert table_schemas == store_module._V12_TABLE_SCHEMAS
 
 
 def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fails(
@@ -4280,19 +4281,19 @@ def test_fresh_v11_bootstrap_retries_after_publication_receipt_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 12
     finally:
         recovered.close()
 
     with original_connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V11_TABLE_SCHEMAS
+    assert table_schemas == store_module._V12_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -4541,7 +4542,7 @@ def test_publication_marker_binding_is_narrow_durable_and_exactly_idempotent(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         assert [
             row[1]
             for row in connection.execute(
@@ -4872,7 +4873,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         assert connection.execute(
             "SELECT job_id, marker_device, marker_inode FROM publication_marker_bindings"
         ).fetchall() == []
@@ -4882,7 +4883,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V11_TABLE_SCHEMAS
+    assert table_schemas == store_module._V12_TABLE_SCHEMAS
 
 
 def test_v11_migration_ddl_failure_leaves_the_exact_v10_database(
@@ -4960,7 +4961,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 12
     finally:
         recovered.close()
 
@@ -4971,27 +4972,27 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V11_TABLE_SCHEMAS
+    assert table_schemas == store_module._V12_TABLE_SCHEMAS
 
 
-def test_v11_rejects_unknown_current_table_without_bootstrap_writes(
+def test_v12_rejects_unknown_current_table_without_bootstrap_writes(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "queue.sqlite3"
     store = SQLiteStore(database_path)
     store.close()
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
-        connection.execute("CREATE TABLE unexpected_v11_table (value TEXT NOT NULL)")
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        connection.execute("CREATE TABLE unexpected_v12_table (value TEXT NOT NULL)")
 
     with pytest.raises(RuntimeError, match="incomplete"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
     assert _table_names(database_path) == {
-        *store_module._V11_TABLE_SCHEMAS,
-        "unexpected_v11_table",
+        *store_module._V12_TABLE_SCHEMAS,
+        "unexpected_v12_table",
     }
 
 
@@ -5048,5 +5049,274 @@ def test_publication_marker_binding_schema_rejects_blob_insert_and_update(
                 (blob_value, materialized.job_id),
             )
         assert store.get_publication_marker_binding(materialized.job_id) == binding
+    finally:
+        store.close()
+
+
+def _create_v11_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v10_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._PUBLICATION_MARKER_BINDINGS_SCHEMA)
+        connection.execute("PRAGMA user_version = 11")
+    return legacy_job
+
+
+def _recovery_capability(*, rpc_port: int = 43123) -> Any:
+    return store_module._DirectEngineRecoveryCapability(
+        rpc_port=rpc_port,
+        rpc_secret=secrets.token_urlsafe(32),
+    )
+
+
+def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capability(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v11_database(database_path)
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    with sqlite3.connect(database_path) as connection:
+        identity = record.identity
+        connection.execute(
+            """
+            INSERT INTO engine_instances (
+                engine_kind,
+                worker_epoch,
+                leader_pid,
+                process_group_id,
+                session_id,
+                owner_uid,
+                started_unix_us,
+                argv_sha256
+            )
+            VALUES ('direct', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.worker_epoch,
+                identity.leader_pid,
+                identity.process_group_id,
+                identity.session_id,
+                identity.owner_uid,
+                identity.started_unix_us,
+                identity.argv_sha256,
+            ),
+        )
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_direct_engine_record() == record
+        assert store._get_direct_engine_recovery_capability(record) is None
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute(
+            "SELECT COUNT(*) FROM direct_engine_recovery_capabilities"
+        ).fetchone()[0] == 0
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+
+
+def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v11_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_recovery_capability_ddl_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="CREATE TABLE direct_engine_recovery_capabilities",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(
+        store_module.sqlite3, "connect", connect_with_recovery_capability_ddl_failure
+    )
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V11_TABLE_SCHEMAS
+    assert "direct_engine_recovery_capabilities" not in table_schemas
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
+    recovered = SQLiteStore(database_path)
+    try:
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 12
+    finally:
+        recovered.close()
+
+
+def test_private_direct_recovery_capability_is_exactly_bound_and_compare_cleared(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    other_record = replace(
+        record,
+        identity=_process_birth_identity(
+            leader_pid=4343,
+            process_group_id=4343,
+            session_id=4343,
+            argv_sha256="b" * 64,
+        ),
+    )
+    capability = _recovery_capability()
+    different_capability = _recovery_capability(rpc_port=43124)
+    try:
+        assert store.recover_cold_start() == 1
+        store.set_direct_engine_record(record)
+        store._bind_direct_engine_recovery_capability(record, capability)
+
+        assert store._get_direct_engine_recovery_capability(record) == capability
+        assert store._clear_direct_engine_record_and_recovery_capability(
+            other_record, capability
+        ) is False
+        assert store._clear_direct_engine_record_and_recovery_capability(
+            record, different_capability
+        ) is False
+        assert store.get_direct_engine_record() == record
+        assert store._get_direct_engine_recovery_capability(record) == capability
+
+        assert store._clear_direct_engine_record_and_recovery_capability(
+            record, capability
+        ) is True
+        assert store.get_direct_engine_record() is None
+        assert store._get_direct_engine_recovery_capability(record) is None
+    finally:
+        store.close()
+
+
+def test_private_direct_recovery_capability_rejects_raw_types_malformed_values_and_record_mismatch(
+    tmp_path: Path,
+) -> None:
+    mutations: tuple[tuple[str, tuple[object, ...]], ...] = (
+        (
+            "UPDATE direct_engine_recovery_capabilities SET rpc_port = ?",
+            (sqlite3.Binary(b"43123"),),
+        ),
+        (
+            "UPDATE direct_engine_recovery_capabilities SET rpc_secret = ?",
+            (sqlite3.Binary(b"opaque"),),
+        ),
+        (
+            "UPDATE direct_engine_recovery_capabilities SET rpc_secret = ?",
+            ("malformed",),
+        ),
+        (
+            """
+            UPDATE direct_engine_recovery_capabilities
+            SET leader_pid = ?, process_group_id = ?, session_id = ?
+            """,
+            (4343, 4343, 4343),
+        ),
+    )
+    for index, (statement, values) in enumerate(mutations):
+        store = SQLiteStore(tmp_path / f"queue-{index}.sqlite3")
+        record = store_module.DirectEngineRecord(
+            worker_epoch=1, identity=_process_birth_identity()
+        )
+        capability = _recovery_capability(rpc_port=43123 + index)
+        try:
+            assert store.recover_cold_start() == 1
+            store.set_direct_engine_record(record)
+            store._bind_direct_engine_recovery_capability(record, capability)
+            store._connection.execute("PRAGMA ignore_check_constraints = ON")
+            try:
+                store._connection.execute(statement, values)
+            finally:
+                store._connection.execute("PRAGMA ignore_check_constraints = OFF")
+
+            with pytest.raises(ValueError, match="recovery capability") as raised:
+                store._get_direct_engine_recovery_capability(record)
+            if capability.rpc_secret in str(raised.value) or capability.rpc_secret in repr(
+                raised.value
+            ):
+                pytest.fail("store rejection exposed a private capability")
+            assert store.get_direct_engine_record() == record
+        finally:
+            store.close()
+
+
+def test_private_direct_recovery_capability_rejects_wrong_api_input_types(
+    tmp_path: Path,
+) -> None:
+    valid_secret = secrets.token_urlsafe(32)
+    for rpc_port, rpc_secret in (
+        ("43123", valid_secret),
+        (True, valid_secret),
+        (43123, b"not-a-text-secret"),
+        (43123, "malformed"),
+    ):
+        with pytest.raises(ValueError):
+            store_module._DirectEngineRecoveryCapability(
+                rpc_port=rpc_port,  # type: ignore[arg-type]
+                rpc_secret=rpc_secret,  # type: ignore[arg-type]
+            )
+
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    invalid: Any = object()
+    try:
+        assert store.recover_cold_start() == 1
+        store.set_direct_engine_record(record)
+        with pytest.raises(TypeError, match="capability"):
+            store._bind_direct_engine_recovery_capability(record, invalid)
+        with pytest.raises(TypeError, match="record"):
+            store._get_direct_engine_recovery_capability(invalid)
+        with pytest.raises(TypeError, match="capability"):
+            store._clear_direct_engine_record_and_recovery_capability(record, invalid)
+        assert store.get_direct_engine_record() == record
+        assert store._get_direct_engine_recovery_capability(record) is None
+    finally:
+        store.close()
+
+
+def test_private_direct_recovery_capability_is_absent_from_public_store_models(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    record = store_module.DirectEngineRecord(
+        worker_epoch=1, identity=_process_birth_identity()
+    )
+    capability = _recovery_capability()
+    try:
+        assert store.recover_cold_start() == 1
+        store.set_direct_engine_record(record)
+        store._bind_direct_engine_recovery_capability(record, capability)
+
+        assert "_DirectEngineRecoveryCapability" not in store_module.__all__
+        assert tuple(store_module.DirectEngineRecord.__dataclass_fields__) == (
+            "worker_epoch",
+            "identity",
+        )
+        if capability.rpc_secret in repr(capability):
+            pytest.fail("private capability representation exposed its secret")
+        assert store.list_jobs() == ()
+        assert store.list_events() == ()
     finally:
         store.close()

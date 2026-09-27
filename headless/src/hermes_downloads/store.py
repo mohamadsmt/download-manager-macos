@@ -278,6 +278,44 @@ CREATE TABLE direct_engine_activation_fences (
 );
 """
 
+_DIRECT_ENGINE_RECOVERY_CAPABILITIES_SCHEMA: Final = """
+CREATE TABLE direct_engine_recovery_capabilities (
+    engine_kind TEXT PRIMARY KEY NOT NULL CHECK (engine_kind = 'direct'),
+    worker_epoch INTEGER NOT NULL CHECK (
+        typeof(worker_epoch) = 'integer' AND worker_epoch > 0
+    ),
+    leader_pid INTEGER NOT NULL CHECK (
+        typeof(leader_pid) = 'integer' AND leader_pid > 0
+    ),
+    process_group_id INTEGER NOT NULL CHECK (
+        typeof(process_group_id) = 'integer' AND process_group_id = leader_pid
+    ),
+    session_id INTEGER NOT NULL CHECK (
+        typeof(session_id) = 'integer' AND session_id = leader_pid
+    ),
+    owner_uid INTEGER NOT NULL CHECK (
+        typeof(owner_uid) = 'integer' AND owner_uid >= 0
+    ),
+    started_unix_us INTEGER NOT NULL CHECK (
+        typeof(started_unix_us) = 'integer' AND started_unix_us > 0
+    ),
+    argv_sha256 TEXT NOT NULL CHECK (
+        typeof(argv_sha256) = 'text'
+        AND length(argv_sha256) = 64
+        AND argv_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    rpc_port INTEGER NOT NULL CHECK (
+        typeof(rpc_port) = 'integer' AND rpc_port BETWEEN 1024 AND 65535
+    ),
+    rpc_secret TEXT NOT NULL CHECK (
+        typeof(rpc_secret) = 'text'
+        AND length(rpc_secret) = 43
+        AND rpc_secret NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    FOREIGN KEY (engine_kind) REFERENCES engine_instances(engine_kind)
+);
+"""
+
 
 def _normalize_table_schema(schema: str) -> str:
     """Canonicalize static SQLite DDL for exact current-version validation."""
@@ -304,7 +342,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 11
+_SUPPORTED_SCHEMA_VERSION: Final = 12
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -409,8 +447,24 @@ _V11_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _JOB_CONTROL_COMMANDS_SCHEMA,
     _COMMAND_RECEIPTS_SCHEMA,
 )
+_V12_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _PUBLICATION_RESERVATIONS_SCHEMA,
+    _PUBLICATION_MARKER_BINDINGS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _DIRECT_ENGINE_RECOVERY_CAPABILITIES_SCHEMA,
+    _JOB_CONTROL_COMMANDS_SCHEMA,
+    _COMMAND_RECEIPTS_SCHEMA,
+)
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
+_DIRECT_ENGINE_RECOVERY_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
 _JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now", "remove"})
 _COMMAND_RECEIPT_SCOPES: Final = frozenset({"add", "queue_gate", "job_control"})
@@ -540,6 +594,18 @@ def _require_reservation_token(value: object) -> str:
         raise TypeError("reservation_token must be a string")
     if _SHA256_DIGEST.fullmatch(value) is None:
         raise ValueError("reservation_token must be 64 lowercase hexadecimal characters")
+    return value
+
+
+def _require_direct_engine_recovery_port(value: object) -> int:
+    if type(value) is not int or not 1024 <= value <= 65535:
+        raise ValueError("rpc_port must be a loopback TCP port")
+    return value
+
+
+def _require_direct_engine_recovery_secret(value: object) -> str:
+    if type(value) is not str or _DIRECT_ENGINE_RECOVERY_SECRET.fullmatch(value) is None:
+        raise ValueError("rpc_secret is invalid")
     return value
 
 
@@ -731,6 +797,29 @@ class DirectEngineActivationFence:
         )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectEngineRecoveryCapability:
+    """Private loopback shutdown authority paired to one direct-engine record."""
+
+    rpc_port: int
+    rpc_secret: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "rpc_port",
+            _require_direct_engine_recovery_port(self.rpc_port),
+        )
+        object.__setattr__(
+            self,
+            "rpc_secret",
+            _require_direct_engine_recovery_secret(self.rpc_secret),
+        )
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(rpc_port={self.rpc_port}, rpc_secret=<redacted>)"
+
+
 @dataclass(frozen=True, slots=True)
 class DirectEngineRecord:
     """One direct-engine process identity bound to its owning worker epoch."""
@@ -757,7 +846,7 @@ class SQLiteStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
-            self._migrate_schema_v11(connection)
+            self._migrate_schema_v12(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -792,6 +881,7 @@ class SQLiteStore:
             9: _V9_TABLE_SCHEMAS,
             10: _V10_TABLE_SCHEMAS,
             11: _V11_TABLE_SCHEMAS,
+            12: _V12_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -822,8 +912,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v11(connection: sqlite3.Connection) -> None:
-        """Bootstrap v1 then apply additive v2 through v11 migrations atomically."""
+    def _migrate_schema_v12(connection: sqlite3.Connection) -> None:
+        """Bootstrap v1 then apply additive v2 through v12 migrations atomically."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -940,8 +1030,14 @@ class SQLiteStore:
                 connection.execute(_PUBLICATION_MARKER_BINDINGS_SCHEMA)
                 connection.execute("PRAGMA user_version = 11")
                 version = 11
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 11:
                 if not SQLiteStore._has_table_schemas(connection, _V11_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_DIRECT_ENGINE_RECOVERY_CAPABILITIES_SCHEMA)
+                connection.execute("PRAGMA user_version = 12")
+                version = 12
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V12_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -2299,7 +2395,19 @@ class SQLiteStore:
                 LIMIT 1
                 """
             ).fetchone()
-            if direct_record is not None or existing_fence is not None:
+            recovery_capability = connection.execute(
+                """
+                SELECT 1
+                FROM direct_engine_recovery_capabilities
+                WHERE engine_kind = 'direct'
+                LIMIT 1
+                """
+            ).fetchone()
+            if (
+                direct_record is not None
+                or existing_fence is not None
+                or recovery_capability is not None
+            ):
                 result = None
             else:
                 result = DirectEngineActivationFence(
@@ -2447,6 +2555,16 @@ class SQLiteStore:
             ).fetchone()
             if direct_record is not None:
                 raise ValueError("direct engine record is already present")
+            recovery_capability = connection.execute(
+                """
+                SELECT 1
+                FROM direct_engine_recovery_capabilities
+                WHERE engine_kind = 'direct'
+                LIMIT 1
+                """
+            ).fetchone()
+            if recovery_capability is not None:
+                raise ValueError("direct engine recovery capability is already present")
 
             identity = record.identity
             connection.execute(
@@ -2514,6 +2632,16 @@ class SQLiteStore:
             ).fetchone()
             if activation_fence is not None:
                 raise ValueError("direct engine record conflicts with an activation fence")
+            recovery_capability = connection.execute(
+                """
+                SELECT 1
+                FROM direct_engine_recovery_capabilities
+                WHERE engine_kind = 'direct'
+                LIMIT 1
+                """
+            ).fetchone()
+            if recovery_capability is not None:
+                raise ValueError("direct engine record conflicts with a recovery capability")
             identity = record.identity
             connection.execute(
                 """
@@ -2609,6 +2737,287 @@ class SQLiteStore:
         except (TypeError, ValueError) as error:
             raise ValueError("persisted direct engine record is invalid") from error
 
+    def _get_direct_engine_recovery_capability(
+        self, record: DirectEngineRecord
+    ) -> _DirectEngineRecoveryCapability | None:
+        """Read only the private shutdown authority exactly paired to ``record``."""
+
+        if type(record) is not DirectEngineRecord:
+            raise TypeError("record must be a DirectEngineRecord")
+        record = DirectEngineRecord(
+            worker_epoch=record.worker_epoch,
+            identity=record.identity,
+        )
+        rows = self._connection.execute(
+            """
+            SELECT
+                engine_kind,
+                worker_epoch,
+                leader_pid,
+                process_group_id,
+                session_id,
+                owner_uid,
+                started_unix_us,
+                argv_sha256,
+                rpc_port,
+                rpc_secret
+            FROM direct_engine_recovery_capabilities
+            LIMIT 2
+            """
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("persisted direct engine recovery capability is invalid")
+        row = rows[0]
+        try:
+            if _require_sqlite_text(row["engine_kind"], "engine kind") != "direct":
+                raise ValueError
+            persisted_record = DirectEngineRecord(
+                worker_epoch=_require_worker_epoch(
+                    _require_sqlite_integer(row["worker_epoch"], "worker epoch"),
+                    "worker epoch",
+                ),
+                identity=ProcessBirthIdentity.from_record(
+                    {
+                        "leader_pid": _require_sqlite_integer(
+                            row["leader_pid"], "leader_pid"
+                        ),
+                        "process_group_id": _require_sqlite_integer(
+                            row["process_group_id"], "process_group_id"
+                        ),
+                        "session_id": _require_sqlite_integer(
+                            row["session_id"], "session_id"
+                        ),
+                        "owner_uid": _require_sqlite_integer(
+                            row["owner_uid"], "owner_uid"
+                        ),
+                        "started_unix_us": _require_sqlite_integer(
+                            row["started_unix_us"], "started_unix_us"
+                        ),
+                        "argv_sha256": _require_sqlite_text(
+                            row["argv_sha256"], "argv_sha256"
+                        ),
+                    }
+                ),
+            )
+            capability = _DirectEngineRecoveryCapability(
+                rpc_port=_require_direct_engine_recovery_port(
+                    _require_sqlite_integer(row["rpc_port"], "rpc_port")
+                ),
+                rpc_secret=_require_direct_engine_recovery_secret(
+                    _require_sqlite_text(row["rpc_secret"], "rpc_secret")
+                ),
+            )
+        except (TypeError, ValueError):
+            raise ValueError("persisted direct engine recovery capability is invalid") from None
+        if persisted_record != record:
+            raise ValueError(
+                "persisted direct engine recovery capability does not match direct record"
+            )
+        return capability
+
+    def _bind_direct_engine_recovery_capability(
+        self,
+        record: DirectEngineRecord,
+        capability: _DirectEngineRecoveryCapability,
+    ) -> None:
+        """Durably attach one private shutdown capability to an exact record."""
+
+        if type(record) is not DirectEngineRecord:
+            raise TypeError("record must be a DirectEngineRecord")
+        if type(capability) is not _DirectEngineRecoveryCapability:
+            raise TypeError("capability must be a direct engine recovery capability")
+        record = DirectEngineRecord(
+            worker_epoch=record.worker_epoch,
+            identity=record.identity,
+        )
+        capability = _DirectEngineRecoveryCapability(
+            rpc_port=capability.rpc_port,
+            rpc_secret=capability.rpc_secret,
+        )
+        identity = record.identity
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._current_worker_epoch(connection) != record.worker_epoch:
+                raise ValueError("direct engine recovery capability worker epoch is not current")
+            exact_record = connection.execute(
+                """
+                SELECT 1
+                FROM engine_instances
+                WHERE engine_kind = 'direct'
+                  AND worker_epoch = ?
+                  AND leader_pid = ?
+                  AND process_group_id = ?
+                  AND session_id = ?
+                  AND owner_uid = ?
+                  AND started_unix_us = ?
+                  AND argv_sha256 = ?
+                LIMIT 1
+                """,
+                (
+                    record.worker_epoch,
+                    identity.leader_pid,
+                    identity.process_group_id,
+                    identity.session_id,
+                    identity.owner_uid,
+                    identity.started_unix_us,
+                    identity.argv_sha256,
+                ),
+            ).fetchone()
+            if exact_record is None:
+                raise ValueError("direct engine recovery capability record is not present")
+            activation_fence = connection.execute(
+                """
+                SELECT 1
+                FROM direct_engine_activation_fences
+                WHERE engine_kind = 'direct'
+                LIMIT 1
+                """
+            ).fetchone()
+            if activation_fence is not None:
+                raise ValueError("direct engine recovery capability conflicts with an activation fence")
+            existing_capability = connection.execute(
+                """
+                SELECT 1
+                FROM direct_engine_recovery_capabilities
+                WHERE engine_kind = 'direct'
+                LIMIT 1
+                """
+            ).fetchone()
+            if existing_capability is not None:
+                raise ValueError("direct engine recovery capability is already present")
+            connection.execute(
+                """
+                INSERT INTO direct_engine_recovery_capabilities (
+                    engine_kind,
+                    worker_epoch,
+                    leader_pid,
+                    process_group_id,
+                    session_id,
+                    owner_uid,
+                    started_unix_us,
+                    argv_sha256,
+                    rpc_port,
+                    rpc_secret
+                )
+                VALUES ('direct', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.worker_epoch,
+                    identity.leader_pid,
+                    identity.process_group_id,
+                    identity.session_id,
+                    identity.owner_uid,
+                    identity.started_unix_us,
+                    identity.argv_sha256,
+                    capability.rpc_port,
+                    capability.rpc_secret,
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def _clear_direct_engine_record_and_recovery_capability(
+        self,
+        record: DirectEngineRecord,
+        capability: _DirectEngineRecoveryCapability,
+    ) -> bool:
+        """Compare-clear one exact record and its private shutdown authority."""
+
+        if type(record) is not DirectEngineRecord:
+            raise TypeError("record must be a DirectEngineRecord")
+        if type(capability) is not _DirectEngineRecoveryCapability:
+            raise TypeError("capability must be a direct engine recovery capability")
+        record = DirectEngineRecord(
+            worker_epoch=record.worker_epoch,
+            identity=record.identity,
+        )
+        capability = _DirectEngineRecoveryCapability(
+            rpc_port=capability.rpc_port,
+            rpc_secret=capability.rpc_secret,
+        )
+        identity = record.identity
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                DELETE FROM direct_engine_recovery_capabilities
+                WHERE engine_kind = 'direct'
+                  AND worker_epoch = ?
+                  AND leader_pid = ?
+                  AND process_group_id = ?
+                  AND session_id = ?
+                  AND owner_uid = ?
+                  AND started_unix_us = ?
+                  AND argv_sha256 = ?
+                  AND rpc_port = ?
+                  AND rpc_secret = ?
+                """,
+                (
+                    record.worker_epoch,
+                    identity.leader_pid,
+                    identity.process_group_id,
+                    identity.session_id,
+                    identity.owner_uid,
+                    identity.started_unix_us,
+                    identity.argv_sha256,
+                    capability.rpc_port,
+                    capability.rpc_secret,
+                ),
+            )
+            capability_changed = connection.execute("SELECT changes()").fetchone()
+            if (
+                capability_changed is None
+                or type(capability_changed[0]) is not int
+                or capability_changed[0] not in {0, 1}
+            ):
+                raise RuntimeError("direct engine recovery capability delete is invalid")
+            if capability_changed[0] == 0:
+                connection.commit()
+                return False
+            connection.execute(
+                """
+                DELETE FROM engine_instances
+                WHERE engine_kind = 'direct'
+                  AND worker_epoch = ?
+                  AND leader_pid = ?
+                  AND process_group_id = ?
+                  AND session_id = ?
+                  AND owner_uid = ?
+                  AND started_unix_us = ?
+                  AND argv_sha256 = ?
+                """,
+                (
+                    record.worker_epoch,
+                    identity.leader_pid,
+                    identity.process_group_id,
+                    identity.session_id,
+                    identity.owner_uid,
+                    identity.started_unix_us,
+                    identity.argv_sha256,
+                ),
+            )
+            record_changed = connection.execute("SELECT changes()").fetchone()
+            if (
+                record_changed is None
+                or type(record_changed[0]) is not int
+                or record_changed[0] not in {0, 1}
+            ):
+                raise RuntimeError("direct engine record delete is invalid")
+            if record_changed[0] == 0:
+                connection.rollback()
+                return False
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return True
+
     def clear_direct_engine_record(self, record: DirectEngineRecord) -> bool:
         """Delete only the exact direct-engine record supplied by the caller."""
 
@@ -2622,6 +3031,17 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
+            recovery_capability = connection.execute(
+                """
+                SELECT 1
+                FROM direct_engine_recovery_capabilities
+                WHERE engine_kind = 'direct'
+                LIMIT 1
+                """
+            ).fetchone()
+            if recovery_capability is not None:
+                connection.commit()
+                return False
             connection.execute(
                 """
                 DELETE FROM engine_instances

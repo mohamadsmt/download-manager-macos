@@ -5,8 +5,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
+import hmac
 import http.client
 import importlib.util
+import json
 import os
 from pathlib import Path
 import signal
@@ -1235,6 +1237,185 @@ def test_direct_binds_process_birth_before_rpc_ready(tmp_path: Path, monkeypatch
     finally:
         controller.close()
         _assert_group_gone(identity.process_group_id)
+
+
+def test_direct_recovery_uses_only_a_typed_loopback_force_shutdown_and_proves_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct = _direct_module()
+    secret = direct.secrets.token_urlsafe(32)
+    capability = direct._DirectEngineRecoveryCapability(
+        rpc_port=43123,
+        rpc_secret=secret,
+    )
+    identity = direct.ProcessBirthIdentity(
+        leader_pid=4242,
+        process_group_id=4242,
+        session_id=4242,
+        owner_uid=os.geteuid(),
+        started_unix_us=1,
+        argv_sha256="a" * 64,
+    )
+    requests: list[tuple[object, ...]] = []
+    reconciliations: list[object] = []
+
+    class Response:
+        status = 200
+
+        def read(self, amount: int) -> bytes:
+            assert amount == direct._MAX_RPC_RESPONSE_BYTES + 1
+            return b'{"jsonrpc":"2.0","id":"hermes-downloads-recovery","result":"OK"}'
+
+    class Connection:
+        def __init__(self, host: str, port: int, timeout: float) -> None:
+            assert host == "127.0.0.1"
+            assert port == capability.rpc_port
+            assert 0 < timeout <= direct._RPC_TIMEOUT_SECONDS
+
+        def request(
+            self, method: str, path: str, body: bytes, headers: dict[str, str]
+        ) -> None:
+            requests.append((method, path, json.loads(body), headers))
+
+        def getresponse(self) -> Response:
+            return Response()
+
+        def close(self) -> None:
+            pass
+
+    def reconcile(captured: object) -> str:
+        assert captured == identity
+        reconciliations.append(captured)
+        if len(reconciliations) < 3:
+            return "current"
+        if len(reconciliations) == 3:
+            return "indeterminate"
+        return "absent"
+
+    def forbidden_signal(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("recovery must not signal a persisted process group")
+
+    def forbidden_spawn(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("recovery must not launch an engine")
+
+    monkeypatch.setattr(direct.http.client, "HTTPConnection", Connection)
+    monkeypatch.setattr(direct, "reconcile_process_birth", reconcile)
+    monkeypatch.setattr(direct.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(direct.os, "killpg", forbidden_signal)
+    monkeypatch.setattr(direct.os, "kill", forbidden_signal)
+    monkeypatch.setattr(direct.subprocess, "Popen", forbidden_spawn)
+
+    direct._recover_owned_direct_engine(identity, capability)
+
+    assert len(requests) == 1
+    method, path, request, headers = requests[0]
+    assert method == "POST"
+    assert path == "/jsonrpc"
+    assert type(request) is dict
+    assert request["jsonrpc"] == "2.0"
+    assert request["id"] == "hermes-downloads-recovery"
+    assert request["method"] == "aria2.forceShutdown"
+    assert headers == {"Content-Type": "application/json"}
+    params = request.get("params")
+    if type(params) is not list or len(params) != 1 or type(params[0]) is not str:
+        pytest.fail("recovery request authentication shape is invalid")
+    token = params[0]
+    if not token.startswith("token:") or not hmac.compare_digest(token[6:], secret):
+        pytest.fail("recovery request did not authenticate with its capability")
+    assert len(reconciliations) >= 3
+    if secret in repr(capability):
+        pytest.fail("private capability representation exposed its secret")
+
+
+def test_direct_recovery_failed_rpc_or_missing_absence_fails_closed_without_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct = _direct_module()
+    capability = direct._DirectEngineRecoveryCapability(
+        rpc_port=43123,
+        rpc_secret=direct.secrets.token_urlsafe(32),
+    )
+    identity = direct.ProcessBirthIdentity(
+        leader_pid=4242,
+        process_group_id=4242,
+        session_id=4242,
+        owner_uid=os.geteuid(),
+        started_unix_us=1,
+        argv_sha256="a" * 64,
+    )
+
+    class FailingConnection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            raise OSError("private recovery fixture failure")
+
+        def close(self) -> None:
+            pass
+
+    def forbidden_signal(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("recovery must not signal a persisted process group")
+
+    monkeypatch.setattr(direct.http.client, "HTTPConnection", FailingConnection)
+    monkeypatch.setattr(direct, "reconcile_process_birth", lambda _identity: "current")
+    monkeypatch.setattr(direct.os, "killpg", forbidden_signal)
+    monkeypatch.setattr(direct.os, "kill", forbidden_signal)
+
+    with pytest.raises(direct.DirectEngineError) as raised:
+        direct._recover_owned_direct_engine(identity, capability)
+    if capability.rpc_secret in str(raised.value) or capability.rpc_secret in repr(raised.value):
+        pytest.fail("recovery failure exposed a private capability")
+
+
+def test_direct_recovery_times_out_when_authenticated_shutdown_never_proves_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct = _direct_module()
+    capability = direct._DirectEngineRecoveryCapability(
+        rpc_port=43123,
+        rpc_secret=direct.secrets.token_urlsafe(32),
+    )
+    identity = direct.ProcessBirthIdentity(
+        leader_pid=4242,
+        process_group_id=4242,
+        session_id=4242,
+        owner_uid=os.geteuid(),
+        started_unix_us=1,
+        argv_sha256="a" * 64,
+    )
+
+    class Response:
+        status = 200
+
+        def read(self, _amount: int) -> bytes:
+            return b'{"jsonrpc":"2.0","id":"hermes-downloads-recovery","result":"OK"}'
+
+    class Connection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def getresponse(self) -> Response:
+            return Response()
+
+        def close(self) -> None:
+            pass
+
+    def forbidden_side_effect(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("timed-out recovery must not signal or launch an engine")
+
+    monkeypatch.setattr(direct, "_RECOVERY_SHUTDOWN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(direct.http.client, "HTTPConnection", Connection)
+    monkeypatch.setattr(direct, "reconcile_process_birth", lambda _identity: "current")
+    monkeypatch.setattr(direct.os, "killpg", forbidden_side_effect)
+    monkeypatch.setattr(direct.os, "kill", forbidden_side_effect)
+    monkeypatch.setattr(direct.subprocess, "Popen", forbidden_side_effect)
+
+    with pytest.raises(direct.DirectEngineError, match="^aria2 recovery failed$"):
+        direct._recover_owned_direct_engine(identity, capability)
 
 
 def test_direct_contain_and_cleanup_on_process_birth_callback_failure(

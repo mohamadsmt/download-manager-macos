@@ -31,8 +31,10 @@ from hermes_downloads.processes import (
     EngineIdentity,
     ProcessBirthIdentity,
     capture_process_birth,
+    reconcile_process_birth,
 )
 from hermes_downloads.retry import CompletionVerification
+from hermes_downloads.store import _DirectEngineRecoveryCapability
 
 __all__ = [
     "CompletionVerification",
@@ -48,6 +50,7 @@ _DEFAULT_ARIA2C: Final = Path("/opt/homebrew/bin/aria2c")
 _MAX_RPC_RESPONSE_BYTES: Final = 64 * 1024
 _RPC_READY_TIMEOUT_SECONDS: Final = 3.0
 _RPC_TIMEOUT_SECONDS: Final = 1.0
+_RECOVERY_SHUTDOWN_TIMEOUT_SECONDS: Final = 5.0
 _GROUP_STOP_GRACE_SECONDS: Final = 0.5
 _GROUP_KILL_GRACE_SECONDS: Final = 0.5
 _POLL_INTERVAL_SECONDS: Final = 0.01
@@ -158,6 +161,12 @@ class DirectAria2Controller:
         """Return the exact identity of the currently-owned daemon, if any."""
 
         return self._identity
+
+    def _recovery_capability(self) -> _DirectEngineRecoveryCapability:
+        """Snapshot private shutdown authority only after RPC readiness succeeds."""
+
+        _process, port, secret = self._require_running()
+        return _DirectEngineRecoveryCapability(rpc_port=port, rpc_secret=secret)
 
     @property
     def launch_argv(self) -> tuple[str, ...]:
@@ -643,6 +652,91 @@ class DirectAria2Controller:
     def _clear_runtime_state(self) -> None:
         self._clear_stopped_process_state()
         self._clear_private_runtime_state()
+
+
+def _recover_owned_direct_engine(
+    identity: ProcessBirthIdentity,
+    capability: _DirectEngineRecoveryCapability,
+) -> None:
+    """Use one persisted loopback authority to stop a reconciled crashed owner.
+
+    This is deliberately not a controller lifecycle: it creates no subprocess,
+    reads no job state, submits no URI, and never signals the persisted PGID.
+    """
+
+    try:
+        identity = ProcessBirthIdentity.from_record(identity.to_record())
+        capability = _DirectEngineRecoveryCapability(
+            rpc_port=capability.rpc_port,
+            rpc_secret=capability.rpc_secret,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise DirectEngineError("aria2 recovery failed") from None
+    if reconcile_process_birth(identity) != "current":
+        raise DirectEngineError("aria2 recovery failed")
+
+    deadline = time.monotonic() + _RECOVERY_SHUTDOWN_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        timeout = min(_RPC_TIMEOUT_SECONDS, max(0.001, deadline - time.monotonic()))
+        if _request_recovery_force_shutdown(capability, timeout=timeout):
+            break
+        time.sleep(_POLL_INTERVAL_SECONDS)
+    else:
+        raise DirectEngineError("aria2 recovery failed")
+
+    while time.monotonic() < deadline:
+        reconciliation = reconcile_process_birth(identity)
+        if reconciliation == "absent":
+            return
+        # A daemon that has accepted forceShutdown can be briefly unreconcilable
+        # while its former parent reaps it.  Keep the state fail-closed until
+        # bounded final absence is proven; do not treat that transient as absent.
+        if reconciliation not in {"current", "indeterminate"}:
+            raise DirectEngineError("aria2 recovery failed")
+        time.sleep(_POLL_INTERVAL_SECONDS)
+    if reconcile_process_birth(identity) != "absent":
+        raise DirectEngineError("aria2 recovery failed")
+
+
+def _request_recovery_force_shutdown(
+    capability: _DirectEngineRecoveryCapability, *, timeout: float
+) -> bool:
+    """Issue only the fixed authenticated loopback recovery shutdown request."""
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": "hermes-downloads-recovery",
+        "method": "aria2.forceShutdown",
+        "params": [f"token:{capability.rpc_secret}"],
+    }
+    try:
+        encoded = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", capability.rpc_port, timeout=timeout
+        )
+        try:
+            connection.request(
+                "POST",
+                "/jsonrpc",
+                body=encoded,
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            body = response.read(_MAX_RPC_RESPONSE_BYTES + 1)
+        finally:
+            connection.close()
+        if response.status != 200 or len(body) > _MAX_RPC_RESPONSE_BYTES:
+            return False
+        parsed = json.loads(body)
+        return (
+            type(parsed) is dict
+            and parsed.get("jsonrpc") == "2.0"
+            and parsed.get("id") == "hermes-downloads-recovery"
+            and parsed.get("result") == "OK"
+            and "error" not in parsed
+        )
+    except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
+        return False
 
 
 def _require_executable(value: str | os.PathLike[str]) -> Path:

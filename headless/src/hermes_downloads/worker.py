@@ -28,12 +28,13 @@ from hermes_downloads.ipc import (
 )
 from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
 from hermes_downloads.network import validate_source_url
-from hermes_downloads.processes import ProcessBirthIdentity
+from hermes_downloads.processes import ProcessBirthIdentity, reconcile_process_birth
 from hermes_downloads.store import (
     DirectEngineActivationFence,
     DirectEngineRecord,
     RequestConflictError,
     SQLiteStore,
+    _DirectEngineRecoveryCapability,
 )
 
 __all__ = ["WorkerStateError", "main", "run_worker", "worker_busy"]
@@ -57,6 +58,8 @@ class _LifecycleEvent(Protocol):
 
 class _DirectController(Protocol):
     def start(self) -> object: ...
+
+    def _recovery_capability(self) -> _DirectEngineRecoveryCapability: ...
 
     def close(self) -> None: ...
 
@@ -271,6 +274,42 @@ def _job_control_from_store(
     )
 
 
+def _recover_cold_direct_engine(store: SQLiteStore) -> bool:
+    """Retire only a provably owned persisted direct daemon before worker ready.
+
+    ``True`` keeps this worker's future direct activation fail-closed.  The
+    normal cold bootstrap stays engine-import-free unless an exact matching
+    private capability requires authenticated shutdown.
+    """
+
+    if store.get_direct_engine_activation_fence() is not None:
+        return True
+    record = store.get_direct_engine_record()
+    if record is None:
+        return False
+    try:
+        capability = store._get_direct_engine_recovery_capability(record)
+    except (TypeError, ValueError):
+        return True
+    if capability is None:
+        return True
+
+    reconciliation = reconcile_process_birth(record.identity)
+    if reconciliation == "absent":
+        return not store._clear_direct_engine_record_and_recovery_capability(
+            record, capability
+        )
+    if reconciliation != "current":
+        return True
+    try:
+        from hermes_downloads.direct import _recover_owned_direct_engine
+
+        _recover_owned_direct_engine(record.identity, capability)
+    except Exception:
+        return True
+    return not store._clear_direct_engine_record_and_recovery_capability(record, capability)
+
+
 def run_worker(
     state_root: str | Path,
     *,
@@ -287,8 +326,11 @@ def run_worker(
     direct_controller: _DirectController | None = None
     direct_fence: DirectEngineActivationFence | None = None
     direct_record: DirectEngineRecord | None = None
+    direct_recovery_capability: _DirectEngineRecoveryCapability | None = None
     direct_record_persisted = False
+    direct_recovery_capability_persisted = False
     direct_controller_ready = False
+    direct_recovery_blocked = False
     direct_controller_absent_discard_failed = False
     direct_controller_absent_local_cleanup_complete = False
     try:
@@ -307,14 +349,26 @@ def run_worker(
 
         store = SQLiteStore(root / _STATE_DATABASE_NAME)
         store.recover_cold_start()
+        direct_recovery_blocked = _recover_cold_direct_engine(store)
 
         def clear_owned_direct_claim() -> None:
-            nonlocal direct_fence, direct_record, direct_record_persisted
+            nonlocal direct_fence, direct_record, direct_recovery_capability
+            nonlocal direct_record_persisted, direct_recovery_capability_persisted
 
             if direct_record_persisted:
-                if direct_record is None or not store.clear_direct_engine_record(
-                    direct_record
-                ):
+                if direct_record is None:
+                    raise IPCStateError("ipc_health_invalid")
+                if direct_recovery_capability_persisted:
+                    if (
+                        direct_recovery_capability is None
+                        or not store._clear_direct_engine_record_and_recovery_capability(
+                            direct_record, direct_recovery_capability
+                        )
+                    ):
+                        raise IPCStateError("ipc_health_invalid")
+                    direct_recovery_capability = None
+                    direct_recovery_capability_persisted = False
+                elif not store.clear_direct_engine_record(direct_record):
                     raise IPCStateError("ipc_health_invalid")
                 direct_record = None
                 direct_record_persisted = False
@@ -325,14 +379,18 @@ def run_worker(
 
         def clear_owned_direct_controller_state() -> None:
             nonlocal direct_controller, direct_fence, direct_record
-            nonlocal direct_record_persisted, direct_controller_ready
+            nonlocal direct_recovery_capability
+            nonlocal direct_record_persisted, direct_recovery_capability_persisted
+            nonlocal direct_controller_ready
             nonlocal direct_controller_absent_discard_failed
             nonlocal direct_controller_absent_local_cleanup_complete
 
             direct_controller = None
             direct_fence = None
             direct_record = None
+            direct_recovery_capability = None
             direct_record_persisted = False
+            direct_recovery_capability_persisted = False
             direct_controller_ready = False
             direct_controller_absent_discard_failed = False
             direct_controller_absent_local_cleanup_complete = False
@@ -398,7 +456,9 @@ def run_worker(
             command: DirectEngineActivateCommand,
         ) -> DirectEngineActivateResult:
             nonlocal direct_controller, direct_fence, direct_record
-            nonlocal direct_record_persisted, direct_controller_ready
+            nonlocal direct_recovery_capability
+            nonlocal direct_record_persisted, direct_recovery_capability_persisted
+            nonlocal direct_controller_ready
             nonlocal direct_controller_absent_discard_failed
             nonlocal direct_controller_absent_local_cleanup_complete
 
@@ -408,6 +468,10 @@ def run_worker(
             if command.expected_worker_epoch != current_epoch:
                 return DirectEngineActivateResult(
                     worker_epoch=current_epoch, status="stale_epoch"
+                )
+            if direct_recovery_blocked:
+                return DirectEngineActivateResult(
+                    worker_epoch=current_epoch, status="blocked"
                 )
             if direct_controller is not None:
                 if (
@@ -422,7 +486,9 @@ def run_worker(
                     not direct_controller_ready
                     or direct_fence is not None
                     or not direct_record_persisted
+                    or not direct_recovery_capability_persisted
                     or owned_record is None
+                    or direct_recovery_capability is None
                 ):
                     return DirectEngineActivateResult(
                         worker_epoch=current_epoch, status="blocked"
@@ -458,16 +524,9 @@ def run_worker(
 
             existing_record = store.get_direct_engine_record()
             if existing_record is not None:
-                from hermes_downloads.processes import reconcile_process_birth
-
-                if reconcile_process_birth(existing_record.identity) != "absent":
-                    return DirectEngineActivateResult(
-                        worker_epoch=current_epoch, status="blocked"
-                    )
-                if not store.clear_direct_engine_record(existing_record):
-                    return DirectEngineActivateResult(
-                        worker_epoch=current_epoch, status="blocked"
-                    )
+                return DirectEngineActivateResult(
+                    worker_epoch=current_epoch, status="blocked"
+                )
 
             existing_fence = store.get_direct_engine_activation_fence()
             if existing_fence is not None:
@@ -482,7 +541,8 @@ def run_worker(
             direct_fence = fence
 
             def on_engine_bound(identity: ProcessBirthIdentity) -> None:
-                nonlocal direct_fence, direct_record, direct_record_persisted
+                nonlocal direct_fence, direct_record, direct_recovery_capability
+                nonlocal direct_record_persisted, direct_recovery_capability_persisted
 
                 fence = direct_fence
                 if fence is None:
@@ -493,7 +553,9 @@ def run_worker(
                 )
                 store.bind_direct_engine_activation_fence(fence, record)
                 direct_record = record
+                direct_recovery_capability = None
                 direct_record_persisted = True
+                direct_recovery_capability_persisted = False
                 direct_fence = None
 
             try:
@@ -505,11 +567,20 @@ def run_worker(
                 )
                 direct_controller = candidate
                 direct_record = None
+                direct_recovery_capability = None
                 direct_record_persisted = False
+                direct_recovery_capability_persisted = False
                 direct_controller_ready = False
                 direct_controller_absent_discard_failed = False
                 direct_controller_absent_local_cleanup_complete = False
                 candidate.start()
+                record = direct_record
+                if record is None or not direct_record_persisted:
+                    raise IPCStateError("ipc_health_invalid")
+                capability = candidate._recovery_capability()
+                store._bind_direct_engine_recovery_capability(record, capability)
+                direct_recovery_capability = capability
+                direct_recovery_capability_persisted = True
             except BaseException:
                 try:
                     cleanup_owned_direct_candidate()
@@ -520,6 +591,8 @@ def run_worker(
                 direct_fence is not None
                 or direct_record is None
                 or not direct_record_persisted
+                or direct_recovery_capability is None
+                or not direct_recovery_capability_persisted
             ):
                 try:
                     cleanup_owned_direct_candidate()
