@@ -158,6 +158,32 @@ CREATE TABLE publication_marker_bindings (
 );
 """
 
+_STAGED_PAYLOAD_BINDINGS_SCHEMA: Final = """
+CREATE TABLE staged_payload_bindings (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES publication_marker_bindings(job_id) ON DELETE CASCADE CHECK (
+        typeof(job_id) = 'text'
+        AND length(job_id) BETWEEN 1 AND 128
+        AND substr(job_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND job_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+    ),
+    partial_device INTEGER NOT NULL CHECK (
+        typeof(partial_device) = 'integer'
+        AND partial_device >= 0
+        AND partial_device <= 9223372036854775807
+    ),
+    partial_inode INTEGER NOT NULL CHECK (
+        typeof(partial_inode) = 'integer'
+        AND partial_inode >= 0
+        AND partial_inode <= 9223372036854775807
+    ),
+    logical_size INTEGER NOT NULL CHECK (
+        typeof(logical_size) = 'integer'
+        AND logical_size >= 0
+        AND logical_size <= 9223372036854775807
+    )
+);
+"""
+
 _COLLECTION_HOLDS_SCHEMA: Final = """
 CREATE TABLE collection_holds (
     collection_id TEXT PRIMARY KEY
@@ -373,7 +399,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 13
+_SUPPORTED_SCHEMA_VERSION: Final = 14
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -498,6 +524,23 @@ _V13_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _MATERIALIZED_JOBS_SCHEMA,
     _PUBLICATION_RESERVATIONS_SCHEMA,
     _PUBLICATION_MARKER_BINDINGS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _DIRECT_ENGINE_RECOVERY_CAPABILITIES_SCHEMA,
+    _DIRECT_DISPATCH_COMMANDS_SCHEMA,
+    _JOB_CONTROL_COMMANDS_SCHEMA,
+    _COMMAND_RECEIPTS_SCHEMA,
+)
+_V14_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _PUBLICATION_RESERVATIONS_SCHEMA,
+    _PUBLICATION_MARKER_BINDINGS_SCHEMA,
+    _STAGED_PAYLOAD_BINDINGS_SCHEMA,
     _COLLECTION_HOLDS_SCHEMA,
     _JOB_RETRY_SCHEMA,
     _JOB_RETRY_AUDIT_SCHEMA,
@@ -865,6 +908,34 @@ class PublicationMarkerBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class _StagedPayloadBinding:
+    """Private durable identity for one verified staged partial payload."""
+
+    job_id: str
+    partial_device: int
+    partial_inode: int
+    logical_size: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "job_id", _require_identifier(self.job_id, "job_id"))
+        object.__setattr__(
+            self,
+            "partial_device",
+            _require_counter(self.partial_device, "partial_device"),
+        )
+        object.__setattr__(
+            self,
+            "partial_inode",
+            _require_counter(self.partial_inode, "partial_inode"),
+        )
+        object.__setattr__(
+            self,
+            "logical_size",
+            _require_counter(self.logical_size, "logical_size"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class JobPageRecord:
     """Lifecycle fields needed to render one bounded job page."""
 
@@ -961,7 +1032,7 @@ class SQLiteStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
-            self._migrate_schema_v13(connection)
+            self._migrate_schema_v14(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -998,6 +1069,7 @@ class SQLiteStore:
             11: _V11_TABLE_SCHEMAS,
             12: _V12_TABLE_SCHEMAS,
             13: _V13_TABLE_SCHEMAS,
+            14: _V14_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -1028,8 +1100,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v13(connection: sqlite3.Connection) -> None:
-        """Bootstrap v1 then apply additive v2 through v13 migrations atomically."""
+    def _migrate_schema_v14(connection: sqlite3.Connection) -> None:
+        """Bootstrap v1 then apply additive v2 through v14 migrations atomically."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1158,8 +1230,14 @@ class SQLiteStore:
                 connection.execute(_DIRECT_DISPATCH_COMMANDS_SCHEMA)
                 connection.execute("PRAGMA user_version = 13")
                 version = 13
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 13:
                 if not SQLiteStore._has_table_schemas(connection, _V13_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_STAGED_PAYLOAD_BINDINGS_SCHEMA)
+                connection.execute("PRAGMA user_version = 14")
+                version = 14
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V14_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -3790,6 +3868,12 @@ class SQLiteStore:
         job_id = _require_identifier(job_id, "job_id")
         return self._read_publication_marker_binding(self._connection, job_id)
 
+    def _get_staged_payload_binding(self, job_id: str) -> _StagedPayloadBinding | None:
+        """Read one private staged-payload identity through its owner chain."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        return self._read_staged_payload_binding(self._connection, job_id)
+
     @staticmethod
     def _read_publication_reservation(
         connection: sqlite3.Connection, job_id: str
@@ -3955,6 +4039,62 @@ class SQLiteStore:
             raise ValueError("publication marker binding job_id does not match its owner")
         return binding
 
+    @staticmethod
+    def _read_staged_payload_binding(
+        connection: sqlite3.Connection, job_id: str
+    ) -> _StagedPayloadBinding | None:
+        """Read staged identity only through complete current owner chains."""
+
+        requested: _StagedPayloadBinding | None = None
+        rows = connection.execute(
+            """
+            SELECT job_id, partial_device, partial_inode, logical_size
+            FROM staged_payload_bindings
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                binding = _StagedPayloadBinding(
+                    job_id=_require_sqlite_text(
+                        row["job_id"], "staged payload binding job_id"
+                    ),
+                    partial_device=_require_counter(
+                        _require_sqlite_integer(
+                            row["partial_device"],
+                            "staged payload binding partial_device",
+                        ),
+                        "staged payload binding partial_device",
+                    ),
+                    partial_inode=_require_counter(
+                        _require_sqlite_integer(
+                            row["partial_inode"],
+                            "staged payload binding partial_inode",
+                        ),
+                        "staged payload binding partial_inode",
+                    ),
+                    logical_size=_require_counter(
+                        _require_sqlite_integer(
+                            row["logical_size"],
+                            "staged payload binding logical_size",
+                        ),
+                        "staged payload binding logical_size",
+                    ),
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError("persisted staged payload binding is invalid") from error
+            marker = SQLiteStore._read_publication_marker_binding(
+                connection, binding.job_id
+            )
+            if marker is None:
+                raise ValueError("staged payload binding is missing its publication marker")
+            if marker.job_id != binding.job_id:
+                raise ValueError("staged payload binding job_id does not match its owner")
+            if binding.job_id == job_id:
+                if requested is not None:
+                    raise ValueError("materialized job has multiple staged payload bindings")
+                requested = binding
+        return requested
+
     def bind_publication_marker(
         self,
         job_id: str,
@@ -4003,6 +4143,69 @@ class SQLiteStore:
             else:
                 if existing != requested:
                     raise ValueError("publication marker binding does not match")
+                result = existing
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return result
+
+    def _bind_staged_payload(
+        self,
+        job_id: str,
+        *,
+        claim_token: str,
+        partial_device: object,
+        partial_inode: object,
+        logical_size: object,
+    ) -> _StagedPayloadBinding:
+        """Persist or exactly replay staged inode identity under its receipt chain."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        claim_token = _require_reservation_token(claim_token)
+        requested = _StagedPayloadBinding(
+            job_id=job_id,
+            partial_device=_require_counter(partial_device, "partial_device"),
+            partial_inode=_require_counter(partial_inode, "partial_inode"),
+            logical_size=_require_counter(logical_size, "logical_size"),
+        )
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            reservation = self._read_publication_reservation(connection, job_id)
+            if reservation is None:
+                raise ValueError(
+                    "staged payload binding requires a current publication reservation"
+                )
+            if reservation.claim_token != claim_token:
+                raise ValueError("staged payload claim token does not match")
+            marker = self._read_publication_marker_binding(connection, job_id)
+            if marker is None:
+                raise ValueError(
+                    "staged payload binding requires a current publication marker"
+                )
+            if marker.job_id != reservation.job_id:
+                raise ValueError("publication marker binding does not match its owner")
+            existing = self._read_staged_payload_binding(connection, job_id)
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO staged_payload_bindings (
+                        job_id, partial_device, partial_inode, logical_size
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        requested.job_id,
+                        requested.partial_device,
+                        requested.partial_inode,
+                        requested.logical_size,
+                    ),
+                )
+                result = requested
+            else:
+                if existing != requested:
+                    raise ValueError("staged payload binding does not match")
                 result = existing
             connection.commit()
         except BaseException:

@@ -1291,7 +1291,7 @@ def test_v8_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1415,7 +1415,7 @@ def test_v8_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         schema = connection.execute(
             """
             SELECT sql
@@ -1622,17 +1622,17 @@ def test_v0_rejects_sqlite_prefix_lookalike_before_bootstrap_writes(tmp_path: Pa
     assert _table_names(database_path) == {lookalike}
 
 
-def test_v13_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v14_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 14")
+        connection.execute("PRAGMA user_version = 15")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1791,7 +1791,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1876,14 +1876,14 @@ def test_v8_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
 
 
 def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
@@ -1927,7 +1927,7 @@ def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert [
             row[1]
             for row in connection.execute(
@@ -3150,14 +3150,14 @@ def test_v8_migrates_v6_database_to_the_exact_command_receipt_catalog(tmp_path: 
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
 
 
 def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
@@ -3420,7 +3420,7 @@ def test_v8_migrates_v7_receipts_to_the_shared_global_registry(tmp_path: Path) -
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
     assert "command_receipts" in _table_names(database_path)
 
 
@@ -3919,14 +3919,14 @@ def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
 
 
 def test_v9_receipt_rebuild_failure_restores_v8_database(
@@ -4165,7 +4165,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         projection_after = connection.execute(
             """
             SELECT
@@ -4198,7 +4198,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         }
     assert projection_after == projection_before
     assert receipts == []
-    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
 
 
 def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fails(
@@ -4281,19 +4281,19 @@ def test_fresh_v11_bootstrap_retries_after_publication_receipt_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 14
     finally:
         recovered.close()
 
     with original_connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -4542,7 +4542,7 @@ def test_publication_marker_binding_is_narrow_durable_and_exactly_idempotent(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert [
             row[1]
             for row in connection.execute(
@@ -4873,7 +4873,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert connection.execute(
             "SELECT job_id, marker_device, marker_inode FROM publication_marker_bindings"
         ).fetchall() == []
@@ -4883,7 +4883,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
 
 
 def test_v11_migration_ddl_failure_leaves_the_exact_v10_database(
@@ -4961,7 +4961,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 14
     finally:
         recovered.close()
 
@@ -4972,26 +4972,26 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
 
 
-def test_v12_rejects_unknown_current_table_without_bootstrap_writes(
+def test_v14_rejects_unknown_current_table_without_bootstrap_writes(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "queue.sqlite3"
     store = SQLiteStore(database_path)
     store.close()
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         connection.execute("CREATE TABLE unexpected_v12_table (value TEXT NOT NULL)")
 
     with pytest.raises(RuntimeError, match="incomplete"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
     assert _table_names(database_path) == {
-        *store_module._V13_TABLE_SCHEMAS,
+        *store_module._V14_TABLE_SCHEMAS,
         "unexpected_v12_table",
     }
 
@@ -5111,7 +5111,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert connection.execute(
             "SELECT COUNT(*) FROM direct_engine_recovery_capabilities"
         ).fetchone()[0] == 0
@@ -5121,7 +5121,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
 
 
 def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
@@ -5162,7 +5162,7 @@ def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 14
     finally:
         recovered.close()
 
@@ -5608,3 +5608,690 @@ def test_direct_dispatch_cold_recovery_never_resumes_a_cutpoint(
         assert paused.state == "paused"
     finally:
         recovered.close()
+
+
+def _create_v13_database(database_path: Path) -> tuple[object, ...]:
+    legacy_job = _create_v11_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(store_module._DIRECT_ENGINE_RECOVERY_CAPABILITIES_SCHEMA)
+        connection.execute(store_module._DIRECT_DISPATCH_COMMANDS_SCHEMA)
+        connection.execute("PRAGMA user_version = 13")
+    return legacy_job
+
+
+def _seed_v13_materialized_marker_chain(
+    database_path: Path,
+) -> tuple[MaterializedJob, str]:
+    legacy_job = _create_v13_database(database_path)
+    source_url = legacy_job[1]
+    assert type(source_url) is bytes
+    materialized = MaterializedJob(
+        job_id="legacy-job",
+        intent=DownloadIntent(
+            job_id="legacy-job",
+            request_id="legacy-request",
+            payload_digest="b" * 64,
+            source_url=source_url,
+            generation=23,
+            revision=41,
+        ),
+        source_kind=SourceKind.DIRECT,
+        queue_collection_id="legacy-queue",
+        priority=9,
+        order_key=17,
+        scheduled_for=None,
+        authorized=True,
+        manual_hold=False,
+        start_now_requested=False,
+        category="Videos",
+        destination_collection="Legacy collection",
+        partial_filename="legacy.webm",
+        selected_final_filename="legacy--legacy-job.webm",
+    )
+    claim_token = "c" * 64
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO materialized_jobs (
+                job_id,
+                source_kind,
+                queue_collection_id,
+                priority,
+                order_key,
+                scheduled_for_us,
+                authorized,
+                manual_hold,
+                start_now_requested,
+                category,
+                destination_collection,
+                partial_filename,
+                selected_final_filename,
+                expected_revision
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (materialized.job_id, *SQLiteStore._projection_values(materialized)),
+        )
+        connection.execute(
+            """
+            INSERT INTO publication_reservations (
+                job_id, target_component, final_filename, claim_token
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                materialized.job_id,
+                materialized.destination_collection,
+                materialized.selected_final_filename,
+                claim_token,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO publication_marker_bindings (job_id, marker_device, marker_inode)
+            VALUES (?, 901, 902)
+            """,
+            (materialized.job_id,),
+        )
+    return materialized, claim_token
+
+
+def _materialize_marker_for_staged_payload(
+    store: SQLiteStore,
+) -> tuple[MaterializedJob, models_module.PublicationReservation]:
+    materialized = _materialized_job()
+    assert store.apply_add(materialized.intent, materialized=materialized).applied is True
+    reservation = store.get_publication_reservation(materialized.job_id)
+    assert reservation is not None
+    assert store.bind_publication_marker(
+        materialized.job_id,
+        claim_token=reservation.claim_token,
+        marker_device=901,
+        marker_inode=902,
+    ) == store_module.PublicationMarkerBinding(
+        job_id=materialized.job_id,
+        marker_device=901,
+        marker_inode=902,
+    )
+    return materialized, reservation
+
+
+def test_v14_migrates_v13_owner_chain_without_backfilling_a_staged_payload_binding(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    materialized, claim_token = _seed_v13_materialized_marker_chain(database_path)
+
+    store = SQLiteStore(database_path)
+    try:
+        assert store.get_materialized_job(materialized.job_id) == materialized
+        assert store.get_publication_reservation(materialized.job_id) == models_module.PublicationReservation(
+            job_id=materialized.job_id,
+            target_component="Legacy collection",
+            final_filename=materialized.selected_final_filename,
+            claim_token=claim_token,
+        )
+        assert store.get_publication_marker_binding(materialized.job_id) == (
+            store_module.PublicationMarkerBinding(
+                job_id=materialized.job_id,
+                marker_device=901,
+                marker_inode=902,
+            )
+        )
+        assert store._get_staged_payload_binding(materialized.job_id) is None
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute(
+            """
+            SELECT job_id, partial_device, partial_inode, logical_size
+            FROM staged_payload_bindings
+            """
+        ).fetchall() == []
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
+
+
+def test_v14_migration_rolls_back_and_retries_from_v13(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    _create_v13_database(database_path)
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_staged_payload_ddl_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="CREATE TABLE staged_payload_bindings",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(
+        store_module.sqlite3, "connect", connect_with_staged_payload_ddl_failure
+    )
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
+    assert "staged_payload_bindings" not in table_schemas
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
+    recovered = SQLiteStore(database_path)
+    try:
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 14
+    finally:
+        recovered.close()
+
+
+def test_fresh_v14_bootstrap_retries_after_staged_payload_ddl_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    original_connect = sqlite3.connect
+    failed_connection: _MigrationFailureConnection | None = None
+
+    def connect_with_staged_payload_ddl_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_connection
+        failed_connection = _MigrationFailureConnection(
+            original_connect(*args, **kwargs),
+            failure_statement_prefix="CREATE TABLE staged_payload_bindings",
+        )
+        return failed_connection
+
+    monkeypatch.setattr(
+        store_module.sqlite3, "connect", connect_with_staged_payload_ddl_failure
+    )
+    with pytest.raises(sqlite3.OperationalError, match="injected migration failure"):
+        SQLiteStore(database_path)
+
+    assert failed_connection is not None
+    assert failed_connection.closed is True
+    with original_connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == {}
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
+    recovered = SQLiteStore(database_path)
+    try:
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 14
+    finally:
+        recovered.close()
+
+    with original_connect(database_path) as connection:
+        table_schemas = {
+            row[0]: store_module._normalize_table_schema(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert table_schemas == store_module._V14_TABLE_SCHEMAS
+
+
+def test_private_staged_payload_binding_is_exactly_idempotent_and_durable(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    try:
+        materialized, reservation = _materialize_marker_for_staged_payload(store)
+        public_before = (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_jobs(),
+            store.list_job_page(),
+            store.list_events(),
+        )
+
+        first = store._bind_staged_payload(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        )
+        repeated = store._bind_staged_payload(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        )
+
+        assert tuple(store_module._StagedPayloadBinding.__dataclass_fields__) == (
+            "job_id",
+            "partial_device",
+            "partial_inode",
+            "logical_size",
+        )
+        assert first == store_module._StagedPayloadBinding(
+            job_id=materialized.job_id,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        )
+        assert repeated == first
+        assert store._get_staged_payload_binding(materialized.job_id) == first
+        assert not hasattr(first, "claim_token")
+        assert reservation.claim_token not in repr(first)
+        assert "_StagedPayloadBinding" not in store_module.__all__
+        assert not hasattr(store, "get_staged_payload_binding")
+        assert public_before == (
+            store.get_job(materialized.job_id),
+            store.get_materialized_job(materialized.job_id),
+            store.list_jobs(),
+            store.list_job_page(),
+            store.list_events(),
+        )
+    finally:
+        store.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(staged_payload_bindings)"
+            ).fetchall()
+        ] == ["job_id", "partial_device", "partial_inode", "logical_size"]
+        assert connection.execute(
+            """
+            SELECT job_id, partial_device, partial_inode, logical_size
+            FROM staged_payload_bindings
+            """
+        ).fetchall() == [(materialized.job_id, 903, 904, 905)]
+
+    reopened = SQLiteStore(database_path)
+    try:
+        assert reopened._get_staged_payload_binding(materialized.job_id) == first
+        assert reopened._bind_staged_payload(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        ) == first
+    finally:
+        reopened.close()
+
+
+def test_private_staged_payload_binding_rejects_conflicts_and_never_leaks_claim_tokens(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        materialized, reservation = _materialize_marker_for_staged_payload(store)
+        original = store._bind_staged_payload(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        )
+        wrong_token = "0" * 64 if reservation.claim_token != "0" * 64 else "1" * 64
+        before = store._connection.execute(
+            """
+            SELECT job_id, partial_device, partial_inode, logical_size
+            FROM staged_payload_bindings
+            WHERE job_id = ?
+            """,
+            (materialized.job_id,),
+        ).fetchall()
+
+        for claim_token, partial_device, partial_inode, logical_size in (
+            (wrong_token, 903, 904, 905),
+            (reservation.claim_token, 906, 904, 905),
+            (reservation.claim_token, 903, 907, 905),
+            (reservation.claim_token, 903, 904, 908),
+        ):
+            with pytest.raises(ValueError) as raised:
+                store._bind_staged_payload(
+                    materialized.job_id,
+                    claim_token=claim_token,
+                    partial_device=partial_device,
+                    partial_inode=partial_inode,
+                    logical_size=logical_size,
+                )
+            assert reservation.claim_token not in str(raised.value)
+            assert reservation.claim_token not in repr(raised.value)
+            assert wrong_token not in str(raised.value)
+            assert wrong_token not in repr(raised.value)
+
+        assert store._get_staged_payload_binding(materialized.job_id) == original
+        assert store._connection.execute(
+            """
+            SELECT job_id, partial_device, partial_inode, logical_size
+            FROM staged_payload_bindings
+            WHERE job_id = ?
+            """,
+            (materialized.job_id,),
+        ).fetchall() == before
+    finally:
+        store.close()
+
+
+def test_private_staged_payload_binding_requires_an_intact_reservation_marker_chain(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        materialized = _materialized_job()
+        assert store.apply_add(materialized.intent, materialized=materialized).applied is True
+        reservation = store.get_publication_reservation(materialized.job_id)
+        assert reservation is not None
+
+        with pytest.raises(ValueError, match="marker"):
+            store._bind_staged_payload(
+                materialized.job_id,
+                claim_token=reservation.claim_token,
+                partial_device=903,
+                partial_inode=904,
+                logical_size=905,
+            )
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM staged_payload_bindings"
+        ).fetchone()[0] == 0
+
+        store.bind_publication_marker(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            marker_device=901,
+            marker_inode=902,
+        )
+        store._connection.execute(
+            """
+            UPDATE publication_reservations
+            SET target_component = 'Other collection'
+            WHERE job_id = ?
+            """,
+            (materialized.job_id,),
+        )
+        with pytest.raises(ValueError, match="publication reservation") as raised:
+            store._bind_staged_payload(
+                materialized.job_id,
+                claim_token=reservation.claim_token,
+                partial_device=903,
+                partial_inode=904,
+                logical_size=905,
+            )
+        assert reservation.claim_token not in str(raised.value)
+        assert reservation.claim_token not in repr(raised.value)
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM staged_payload_bindings"
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_private_staged_payload_binding_rejects_an_orphaned_marker_chain_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        materialized, reservation = _materialize_marker_for_staged_payload(store)
+        binding = store._bind_staged_payload(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        )
+        store._connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            store._connection.execute(
+                "DELETE FROM publication_marker_bindings WHERE job_id = ?",
+                (materialized.job_id,),
+            )
+        finally:
+            store._connection.execute("PRAGMA foreign_keys = ON")
+
+        with pytest.raises(ValueError, match="staged payload binding"):
+            store._get_staged_payload_binding(materialized.job_id)
+        with pytest.raises(ValueError, match="marker"):
+            store._bind_staged_payload(
+                materialized.job_id,
+                claim_token=reservation.claim_token,
+                partial_device=903,
+                partial_inode=904,
+                logical_size=905,
+            )
+        assert [
+            tuple(row)
+            for row in store._connection.execute(
+                """
+                SELECT job_id, partial_device, partial_inode, logical_size
+                FROM staged_payload_bindings
+                """
+            ).fetchall()
+        ] == [
+            (
+                binding.job_id,
+                binding.partial_device,
+                binding.partial_inode,
+                binding.logical_size,
+            )
+        ]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "blob_value"),
+    (
+        ("job_id", sqlite3.Binary(b"job-1")),
+        ("partial_device", sqlite3.Binary(b"903")),
+        ("partial_inode", sqlite3.Binary(b"904")),
+        ("logical_size", sqlite3.Binary(b"905")),
+    ),
+)
+def test_staged_payload_binding_schema_rejects_blob_insert_and_update(
+    tmp_path: Path, column: str, blob_value: object
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        materialized, reservation = _materialize_marker_for_staged_payload(store)
+        values: dict[str, object] = {
+            "job_id": materialized.job_id,
+            "partial_device": 903,
+            "partial_inode": 904,
+            "logical_size": 905,
+        }
+        values[column] = blob_value
+        store._connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+                store._connection.execute(
+                    """
+                    INSERT INTO staged_payload_bindings (
+                        job_id, partial_device, partial_inode, logical_size
+                    )
+                    VALUES (:job_id, :partial_device, :partial_inode, :logical_size)
+                    """,
+                    values,
+                )
+        finally:
+            store._connection.execute("PRAGMA foreign_keys = ON")
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM staged_payload_bindings"
+        ).fetchone()[0] == 0
+
+        binding = store._bind_staged_payload(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            store._connection.execute(
+                f"UPDATE staged_payload_bindings SET {column} = ? WHERE job_id = ?",
+                (blob_value, materialized.job_id),
+            )
+        assert store._get_staged_payload_binding(materialized.job_id) == binding
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("partial_device", "partial_inode", "logical_size"),
+    (
+        (-1, 904, 905),
+        (903, -1, 905),
+        (903, 904, -1),
+        (store_module._MAX_COUNTER + 1, 904, 905),
+        (903, store_module._MAX_COUNTER + 1, 905),
+        (903, 904, store_module._MAX_COUNTER + 1),
+        (True, 904, 905),
+        (903, False, 905),
+        (903, 904, True),
+        ("903", 904, 905),
+    ),
+)
+def test_private_staged_payload_binding_rejects_invalid_identity_without_mutation(
+    tmp_path: Path,
+    partial_device: object,
+    partial_inode: object,
+    logical_size: object,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        materialized, reservation = _materialize_marker_for_staged_payload(store)
+        with pytest.raises((TypeError, ValueError)):
+            store._bind_staged_payload(
+                materialized.job_id,
+                claim_token=reservation.claim_token,
+                partial_device=partial_device,
+                partial_inode=partial_inode,
+                logical_size=logical_size,
+            )
+        assert store._get_staged_payload_binding(materialized.job_id) is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("statement", "values", "disable_foreign_keys"),
+    (
+        (
+            "UPDATE staged_payload_bindings SET job_id = ?",
+            (sqlite3.Binary(b"job-1"),),
+            True,
+        ),
+        (
+            "UPDATE staged_payload_bindings SET partial_device = ?",
+            (sqlite3.Binary(b"903"),),
+            False,
+        ),
+        (
+            "UPDATE staged_payload_bindings SET partial_inode = ?",
+            ("not-an-integer",),
+            False,
+        ),
+        (
+            "UPDATE staged_payload_bindings SET logical_size = ?",
+            (-1,),
+            False,
+        ),
+    ),
+)
+def test_private_staged_payload_binding_getter_rejects_corrupt_rows_without_token_leak(
+    tmp_path: Path,
+    statement: str,
+    values: tuple[object, ...],
+    disable_foreign_keys: bool,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        materialized, reservation = _materialize_marker_for_staged_payload(store)
+        store._bind_staged_payload(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        )
+        if disable_foreign_keys:
+            store._connection.execute("PRAGMA foreign_keys = OFF")
+        store._connection.execute("PRAGMA ignore_check_constraints = ON")
+        try:
+            store._connection.execute(statement, values)
+        finally:
+            store._connection.execute("PRAGMA ignore_check_constraints = OFF")
+            if disable_foreign_keys:
+                store._connection.execute("PRAGMA foreign_keys = ON")
+
+        with pytest.raises(ValueError, match="staged payload binding") as raised:
+            store._get_staged_payload_binding(materialized.job_id)
+        assert reservation.claim_token not in str(raised.value)
+        assert reservation.claim_token not in repr(raised.value)
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM staged_payload_bindings"
+        ).fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_private_staged_payload_binding_insert_failure_rolls_back_and_retries(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    try:
+        materialized, reservation = _materialize_marker_for_staged_payload(store)
+        _install_failing_insert_trigger(
+            database_path,
+            table="staged_payload_bindings",
+            trigger_name="fail_staged_payload_binding_insert",
+            message="injected staged payload binding insert failure",
+        )
+
+        with pytest.raises(
+            sqlite3.DatabaseError, match="injected staged payload binding insert failure"
+        ):
+            store._bind_staged_payload(
+                materialized.job_id,
+                claim_token=reservation.claim_token,
+                partial_device=903,
+                partial_inode=904,
+                logical_size=905,
+            )
+
+        assert store._get_staged_payload_binding(materialized.job_id) is None
+        store._connection.execute("DROP TRIGGER fail_staged_payload_binding_insert")
+        assert store._bind_staged_payload(
+            materialized.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        ) == store_module._StagedPayloadBinding(
+            job_id=materialized.job_id,
+            partial_device=903,
+            partial_inode=904,
+            logical_size=905,
+        )
+    finally:
+        store.close()
