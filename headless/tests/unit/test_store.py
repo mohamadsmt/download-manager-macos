@@ -1291,7 +1291,7 @@ def test_v8_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1415,7 +1415,7 @@ def test_v8_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         schema = connection.execute(
             """
             SELECT sql
@@ -1622,17 +1622,17 @@ def test_v0_rejects_sqlite_prefix_lookalike_before_bootstrap_writes(tmp_path: Pa
     assert _table_names(database_path) == {lookalike}
 
 
-def test_v12_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
+def test_v13_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 13")
+        connection.execute("PRAGMA user_version = 14")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1791,7 +1791,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1876,14 +1876,14 @@ def test_v8_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
 
 
 def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
@@ -1927,7 +1927,7 @@ def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         assert [
             row[1]
             for row in connection.execute(
@@ -3150,14 +3150,14 @@ def test_v8_migrates_v6_database_to_the_exact_command_receipt_catalog(tmp_path: 
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
 
 
 def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
@@ -3420,7 +3420,7 @@ def test_v8_migrates_v7_receipts_to_the_shared_global_registry(tmp_path: Path) -
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
     assert "command_receipts" in _table_names(database_path)
 
 
@@ -3919,14 +3919,14 @@ def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
 
 
 def test_v9_receipt_rebuild_failure_restores_v8_database(
@@ -4165,7 +4165,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         projection_after = connection.execute(
             """
             SELECT
@@ -4198,7 +4198,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         }
     assert projection_after == projection_before
     assert receipts == []
-    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
 
 
 def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fails(
@@ -4281,19 +4281,19 @@ def test_fresh_v11_bootstrap_retries_after_publication_receipt_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 13
     finally:
         recovered.close()
 
     with original_connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -4542,7 +4542,7 @@ def test_publication_marker_binding_is_narrow_durable_and_exactly_idempotent(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         assert [
             row[1]
             for row in connection.execute(
@@ -4873,7 +4873,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         assert connection.execute(
             "SELECT job_id, marker_device, marker_inode FROM publication_marker_bindings"
         ).fetchall() == []
@@ -4883,7 +4883,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
 
 
 def test_v11_migration_ddl_failure_leaves_the_exact_v10_database(
@@ -4961,7 +4961,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 13
     finally:
         recovered.close()
 
@@ -4972,7 +4972,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
 
 
 def test_v12_rejects_unknown_current_table_without_bootstrap_writes(
@@ -4982,16 +4982,16 @@ def test_v12_rejects_unknown_current_table_without_bootstrap_writes(
     store = SQLiteStore(database_path)
     store.close()
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         connection.execute("CREATE TABLE unexpected_v12_table (value TEXT NOT NULL)")
 
     with pytest.raises(RuntimeError, match="incomplete"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
     assert _table_names(database_path) == {
-        *store_module._V12_TABLE_SCHEMAS,
+        *store_module._V13_TABLE_SCHEMAS,
         "unexpected_v12_table",
     }
 
@@ -5111,7 +5111,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
         assert connection.execute(
             "SELECT COUNT(*) FROM direct_engine_recovery_capabilities"
         ).fetchone()[0] == 0
@@ -5121,7 +5121,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V12_TABLE_SCHEMAS
+    assert table_schemas == store_module._V13_TABLE_SCHEMAS
 
 
 def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
@@ -5162,7 +5162,7 @@ def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 13
     finally:
         recovered.close()
 
@@ -5320,3 +5320,291 @@ def test_private_direct_recovery_capability_is_absent_from_public_store_models(
         assert store.list_events() == ()
     finally:
         store.close()
+
+
+def _admit_direct_dispatch_target(store: SQLiteStore, *, job_id: str = "job-1") -> None:
+    """Materialize one current-epoch direct target with every durable gate open."""
+
+    intent = _intent(
+        job_id=job_id,
+        request_id=f"{job_id}-add",
+        payload_digest=("b" if job_id == "job-1" else "c") * 64,
+        generation=0,
+        revision=0,
+        expected_revision=None,
+    )
+    materialized = _materialized_job(
+        job_id=job_id,
+        intent=intent,
+        source_kind=SourceKind.DIRECT,
+        queue_collection_id=None,
+        scheduled_for=None,
+        authorized=False,
+        manual_hold=False,
+        start_now_requested=False,
+    )
+    assert store.apply_add(intent, materialized=materialized).applied is True
+    assert store.recover_cold_start() == 1
+    assert store.apply_queue_gate(
+        gate="running",
+        request_id=f"{job_id}-queue",
+        payload_digest=("d" if job_id == "job-1" else "e") * 64,
+        expected_revision=1,
+    ).applied is True
+    assert store.apply_job_control(
+        job_id=job_id,
+        action="start_now",
+        request_id=f"{job_id}-start",
+        payload_digest=("f" if job_id == "job-1" else "a") * 64,
+        expected_revision=1,
+    ).status == "applied"
+
+
+def test_direct_dispatch_is_fenced_idempotent_and_allows_only_one_active_body(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _admit_direct_dispatch_target(store)
+        now = datetime(2032, 1, 2, tzinfo=UTC)
+
+        stale = store.prepare_direct_dispatch(
+            job_id="job-1",
+            expected_worker_epoch=2,
+            expected_generation=1,
+            expected_revision=2,
+            request_id="dispatch-stale",
+            payload_digest="1" * 64,
+            controller_ready=True,
+            now=now,
+        )
+        assert stale == store_module.DirectDispatchResult(
+            status="stale", job="job-1", generation=1, revision=2, state="queued"
+        )
+
+        blocked = store.prepare_direct_dispatch(
+            job_id="job-1",
+            expected_worker_epoch=1,
+            expected_generation=1,
+            expected_revision=2,
+            request_id="dispatch-no-controller",
+            payload_digest="2" * 64,
+            controller_ready=False,
+            now=now,
+        )
+        assert blocked == store_module.DirectDispatchResult(
+            status="blocked", job="job-1", generation=1, revision=2, state="queued"
+        )
+        assert (
+            store.prepare_direct_dispatch(
+                job_id="job-1",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=2,
+                request_id="dispatch-no-controller",
+                payload_digest="2" * 64,
+                controller_ready=False,
+                now=now,
+            )
+            == blocked
+        )
+        with pytest.raises(RequestConflictError):
+            store.prepare_direct_dispatch(
+                job_id="job-1",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=3,
+                request_id="dispatch-no-controller",
+                payload_digest="3" * 64,
+                controller_ready=False,
+                now=now,
+            )
+
+        prepared = store.prepare_direct_dispatch(
+            job_id="job-1",
+            expected_worker_epoch=1,
+            expected_generation=1,
+            expected_revision=2,
+            request_id="dispatch-started",
+            payload_digest="4" * 64,
+            controller_ready=True,
+            now=now,
+        )
+        assert type(prepared) is store_module._DirectDispatchPlan
+        assert store.get_job("job-1") == store_module.JobRecord(
+            job="job-1",
+            source_url=bytes(_intent().source_url),
+            generation=1,
+            revision=3,
+            state="resolving",
+        )
+        downloading = store.advance_direct_dispatch_to_downloading(prepared)
+        started = store.finish_direct_dispatch(downloading)
+        assert started == store_module.DirectDispatchResult(
+            status="started",
+            job="job-1",
+            generation=1,
+            revision=4,
+            state="downloading",
+        )
+        assert (
+            store.prepare_direct_dispatch(
+                job_id="job-1",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=2,
+                request_id="dispatch-started",
+                payload_digest="4" * 64,
+                controller_ready=False,
+                now=now,
+            )
+            == started
+        )
+
+        second_intent = _intent(
+            job_id="job-2",
+            request_id="job-2-add",
+            payload_digest="8" * 64,
+            generation=0,
+            revision=0,
+            expected_revision=None,
+        )
+        second_materialized = _materialized_job(
+            job_id="job-2",
+            intent=second_intent,
+            source_kind=SourceKind.DIRECT,
+            queue_collection_id=None,
+            scheduled_for=None,
+            authorized=False,
+            manual_hold=False,
+            start_now_requested=False,
+            selected_final_filename="selected--job-2.webm",
+        )
+        assert store.apply_add(second_intent, materialized=second_materialized).applied
+        assert store.apply_job_control(
+            job_id="job-2",
+            action="start_now",
+            request_id="job-2-start",
+            payload_digest="9" * 64,
+            expected_revision=0,
+        ).status == "applied"
+        second = store.prepare_direct_dispatch(
+            job_id="job-2",
+            expected_worker_epoch=1,
+            expected_generation=0,
+            expected_revision=1,
+            request_id="dispatch-second",
+            payload_digest="5" * 64,
+            controller_ready=True,
+            now=now,
+        )
+        assert second == store_module.DirectDispatchResult(
+            status="blocked", job="job-2", generation=0, revision=1, state="queued"
+        )
+    finally:
+        store.close()
+
+
+def test_direct_dispatch_prepare_rolls_back_if_its_pending_receipt_cannot_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _admit_direct_dispatch_target(store)
+
+        def fail_insert(*_args: object, **_kwargs: object) -> None:
+            raise sqlite3.OperationalError("injected direct dispatch receipt failure")
+
+        monkeypatch.setattr(
+            SQLiteStore, "_insert_direct_dispatch_command", staticmethod(fail_insert)
+        )
+        with pytest.raises(sqlite3.OperationalError, match="injected direct dispatch"):
+            store.prepare_direct_dispatch(
+                job_id="job-1",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=2,
+                request_id="dispatch-rollback",
+                payload_digest="6" * 64,
+                controller_ready=True,
+                now=datetime(2032, 1, 2, tzinfo=UTC),
+            )
+        assert store.get_job("job-1") == store_module.JobRecord(
+            job="job-1",
+            source_url=bytes(_intent().source_url),
+            generation=1,
+            revision=2,
+            state="queued",
+        )
+        assert store._connection.execute(
+            "SELECT request_id FROM direct_dispatch_commands"
+        ).fetchall() == []
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("cutpoint", ("resolving", "downloading", "started"))
+def test_direct_dispatch_cold_recovery_never_resumes_a_cutpoint(
+    tmp_path: Path, cutpoint: str
+) -> None:
+    database_path = tmp_path / "queue.sqlite3"
+    store = SQLiteStore(database_path)
+    try:
+        _admit_direct_dispatch_target(store)
+        prepared = store.prepare_direct_dispatch(
+            job_id="job-1",
+            expected_worker_epoch=1,
+            expected_generation=1,
+            expected_revision=2,
+            request_id="dispatch-cutpoint",
+            payload_digest="7" * 64,
+            controller_ready=True,
+            now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+        assert type(prepared) is store_module._DirectDispatchPlan
+        plan = prepared
+        if cutpoint in {"downloading", "started"}:
+            plan = store.advance_direct_dispatch_to_downloading(plan)
+        if cutpoint == "started":
+            assert store.finish_direct_dispatch(plan).status == "started"
+    finally:
+        store.close()
+
+    recovered = SQLiteStore(database_path)
+    try:
+        assert recovered.recover_cold_start() == 2
+        job = recovered.get_job("job-1")
+        assert job is not None
+        assert job.state == "paused"
+        assert recovered.queue_gate() == "paused"
+        replay = recovered.prepare_direct_dispatch(
+            job_id="job-1",
+            expected_worker_epoch=1,
+            expected_generation=1,
+            expected_revision=2,
+            request_id="dispatch-cutpoint",
+            payload_digest="7" * 64,
+            controller_ready=True,
+            now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+        if cutpoint == "started":
+            assert replay == store_module.DirectDispatchResult(
+                status="started",
+                job="job-1",
+                generation=1,
+                revision=4,
+                state="downloading",
+            )
+        else:
+            assert replay == store_module.DirectDispatchResult(
+                status="blocked",
+                job="job-1",
+                generation=2,
+                revision=4 if cutpoint == "resolving" else 5,
+                state="paused",
+            )
+        paused = recovered.get_job("job-1")
+        assert paused is not None
+        assert paused.state == "paused"
+    finally:
+        recovered.close()

@@ -920,8 +920,16 @@ def _raw_request(
         client.connect(str(socket_path))
         chunks = (payload,) if isinstance(payload, bytes) else payload
         for chunk in chunks:
-            client.sendall(chunk)
-        client.shutdown(socket.SHUT_WR)
+            try:
+                client.sendall(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                # Oversized input may be rejected as soon as the worker reads its
+                # bounded prefix, before this client finishes writing it.
+                break
+        try:
+            client.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
         response = bytearray()
         while not response.endswith(b"\n"):
             chunk = client.recv(4096)
@@ -3550,6 +3558,96 @@ def _run_worker_process_with_job_add_guards(
         builtins.__import__ = original_import
 
 
+def _run_worker_process_with_direct_dispatch_gates(
+    state_root: str,
+    socket_path: str,
+    ready_event: object,
+    shutdown_event: object,
+    stopped_event: object,
+    results: object,
+    origin_url: str,
+    marker_attested: _LifecycleEvent,
+    release_paused_add: _LifecycleEvent,
+    paused_add_complete: _LifecycleEvent,
+    release_resume: _LifecycleEvent,
+) -> None:
+    """Grant only this fixture origin and freeze dispatch at its body cutpoints."""
+
+    from hermes_downloads import direct as direct_module, network
+
+    direct: Any = direct_module
+    grant = network.LocalOriginGrant.for_url(origin_url)
+    original_validate_source_url = worker.validate_source_url
+    original_add_paused = direct.DirectAria2Controller.add_paused
+
+    def validate_fixture_source(value: Any) -> Any:
+        return original_validate_source_url(value, local_origin_grant=grant)
+
+    def gated_add_paused(controller: Any, **kwargs: Any) -> Any:
+        job_id = kwargs["job_id"]
+        assert type(job_id) is str
+        observer = SQLiteStore(Path(state_root) / "state.db")
+        try:
+            assert observer.get_publication_marker_binding(job_id) is not None
+        finally:
+            observer.close()
+        marker_attested.set()
+        assert release_paused_add.wait(_WATCHDOG_SECONDS)
+        result = original_add_paused(controller, **kwargs)
+        assert result.status == "paused"
+        assert result.completed_length == 0
+        paused_add_complete.set()
+        assert release_resume.wait(_WATCHDOG_SECONDS)
+        return result
+
+    worker.validate_source_url = validate_fixture_source
+    direct.DirectAria2Controller.add_paused = gated_add_paused
+    try:
+        _run_worker_process(
+            state_root,
+            socket_path,
+            ready_event,
+            shutdown_event,
+            stopped_event,
+            results,
+        )
+    finally:
+        direct.DirectAria2Controller.add_paused = original_add_paused
+        worker.validate_source_url = original_validate_source_url
+
+
+def _seed_local_direct_dispatch_job(state_root: Path, source_url: str) -> None:
+    intent = DownloadIntent(
+        job_id="dispatch-job",
+        request_id="dispatch-add-request",
+        payload_digest="d" * 64,
+        source_url=source_url.encode("utf-8"),
+        generation=0,
+        revision=0,
+    )
+    materialized = MaterializedJob(
+        job_id=intent.job_id,
+        intent=intent,
+        source_kind=SourceKind.DIRECT,
+        queue_collection_id=None,
+        priority=0,
+        order_key=0,
+        scheduled_for=None,
+        authorized=False,
+        manual_hold=False,
+        start_now_requested=False,
+        category="Other",
+        destination_collection=None,
+        partial_filename="dispatch.bin",
+        selected_final_filename="dispatch.bin",
+    )
+    store = SQLiteStore(state_root / "state.db")
+    try:
+        assert store.apply_add(intent, materialized=materialized).applied is True
+    finally:
+        store.close()
+
+
 def _job_add_record(
     *,
     job: str = "job-add-1",
@@ -4603,6 +4701,565 @@ def test_worker_job_remove_tombstones_cold_direct_job_without_engine_or_file_sid
             _join(process)
             assert _result(results) == ("result", None)
         finally:
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+def test_direct_job_dispatch_client_uses_a_closed_fenced_envelope(
+    short_socket_root: Path,
+) -> None:
+    command_type = getattr(ipc, "DirectJobDispatchCommand", None)
+    result_type = getattr(ipc, "DirectJobDispatchResult", None)
+    dispatch = getattr(ipc, "dispatch_direct_job", None)
+    assert isinstance(command_type, type), "direct dispatch command is missing"
+    assert isinstance(result_type, type), "direct dispatch result is missing"
+    assert callable(dispatch), "direct dispatch client is missing"
+
+    command = command_type(
+        job="dispatch-job",
+        expected_worker_epoch=2,
+        expected_generation=4,
+        expected_revision=7,
+        request_id="dispatch-request",
+    )
+    assert command.to_record() == {
+        "op": "direct_job_dispatch",
+        "job": "dispatch-job",
+        "expected_worker_epoch": 2,
+        "expected_generation": 4,
+        "expected_revision": 7,
+        "request_id": "dispatch-request",
+    }
+
+    socket_path = short_socket_root / "worker.sock"
+    commands: list[object] = []
+
+    def direct_job_dispatch(command: object) -> object:
+        commands.append(command)
+        return result_type(
+            status="started",
+            job="dispatch-job",
+            generation=4,
+            revision=9,
+            state="downloading",
+        )
+
+    server = ipc.HealthServer(
+        socket_path,
+        health=lambda: ipc.WorkerHealth(worker_epoch=2, queue_gate="running"),
+        direct_job_dispatch=direct_job_dispatch,
+    )
+    try:
+        result = _serve_one(
+            server,
+            lambda: dispatch(
+                socket_path,
+                job="dispatch-job",
+                expected_worker_epoch=2,
+                expected_generation=4,
+                expected_revision=7,
+                request_id="dispatch-request",
+            ),
+        )
+    finally:
+        server.close()
+
+    assert result.to_record() == {
+        "status": "started",
+        "job": "dispatch-job",
+        "generation": 4,
+        "revision": 9,
+        "state": "downloading",
+    }
+    assert [captured.to_record() for captured in commands] == [command.to_record()]
+
+
+def test_direct_job_dispatch_rejects_closed_malformed_envelopes(
+    short_socket_root: Path,
+) -> None:
+    socket_path = short_socket_root / "worker.sock"
+    commands: list[object] = []
+
+    def direct_job_dispatch(command: object) -> ipc.DirectJobDispatchResult:
+        commands.append(command)
+        return ipc.DirectJobDispatchResult(
+            status="blocked",
+            job="dispatch-job",
+            generation=1,
+            revision=2,
+            state="queued",
+        )
+
+    server = ipc.HealthServer(
+        socket_path,
+        health=lambda: ipc.WorkerHealth(worker_epoch=1, queue_gate="paused"),
+        direct_job_dispatch=direct_job_dispatch,
+    )
+    valid = {
+        "op": "direct_job_dispatch",
+        "job": "dispatch-job",
+        "expected_worker_epoch": 1,
+        "expected_generation": 1,
+        "expected_revision": 2,
+        "request_id": "dispatch-request",
+    }
+    malformed = (
+        {key: value for key, value in valid.items() if key != "expected_generation"},
+        {**valid, "unexpected": True},
+        {**valid, "expected_worker_epoch": 0},
+        {**valid, "expected_generation": True},
+        {**valid, "expected_revision": -1},
+        {**valid, "job": "../dispatch-job"},
+    )
+    try:
+        for record in malformed:
+            payload = json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+            assert _serve_one(server, lambda payload=payload: _raw_request(socket_path, payload)) == {
+                "error": "invalid_request"
+            }
+        duplicate = (
+            b'{"op":"direct_job_dispatch","op":"health","job":"dispatch-job",'
+            b'"expected_worker_epoch":1,"expected_generation":1,'
+            b'"expected_revision":2,"request_id":"dispatch-request"}\n'
+        )
+        assert _serve_one(server, lambda: _raw_request(socket_path, duplicate)) == {
+            "error": "invalid_request"
+        }
+    finally:
+        server.close()
+    assert commands == []
+
+
+def test_worker_direct_dispatch_attests_before_body_and_pause_stops_running_bytes(
+    short_socket_root: Path,
+) -> None:
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    shutdown = context.Event()
+    stopped = context.Event()
+    results = context.Queue()
+    marker_attested = context.Event()
+    release_paused_add = context.Event()
+    paused_add_complete = context.Event()
+    release_resume = context.Event()
+    destination_root = Path.home() / "Downloads" / "Hermes"
+    destination_root.mkdir(parents=True, mode=0o700)
+    destination_root.chmod(0o700)
+
+    with _origin_type()(payload_size=16 * 1024 * 1024) as origin:
+        _seed_local_direct_dispatch_job(state_root, origin.url("/range"))
+        process = context.Process(
+            target=_run_worker_process_with_direct_dispatch_gates,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                origin.url(),
+                marker_attested,
+                release_paused_add,
+                paused_add_complete,
+                release_resume,
+            ),
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert request_health(socket_path) == ipc.WorkerHealth(
+                worker_epoch=1, queue_gate="paused"
+            )
+            assert set_queue_gate(
+                socket_path,
+                gate="running",
+                request_id="dispatch-open-queue",
+                expected_revision=1,
+            ).to_record() == {
+                "applied": True,
+                "queue_gate": "running",
+                "revision": 2,
+            }
+            assert ipc.control_job(
+                socket_path,
+                job="dispatch-job",
+                action="start_now",
+                request_id="dispatch-start-now",
+                expected_revision=1,
+            ).to_record() == {
+                "status": "applied",
+                "job": "dispatch-job",
+                "generation": 1,
+                "revision": 2,
+                "state": "queued",
+                "authorized": True,
+            }
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+
+            responses: list[object] = []
+            failures: list[BaseException] = []
+
+            def dispatch() -> None:
+                try:
+                    responses.append(
+                        ipc.dispatch_direct_job(
+                            socket_path,
+                            job="dispatch-job",
+                            expected_worker_epoch=1,
+                            expected_generation=1,
+                            expected_revision=2,
+                            request_id="dispatch-request",
+                        )
+                    )
+                except BaseException as error:
+                    failures.append(error)
+
+            thread = threading.Thread(target=dispatch)
+            thread.start()
+            assert marker_attested.wait(_WATCHDOG_SECONDS), failures
+
+            incomplete_dir = Path.home() / "Downloads" / "Hermes" / ".incomplete" / "dispatch-job"
+            partial_path = incomplete_dir / "dispatch.bin"
+            marker_path = incomplete_dir / ".hermes-reservation"
+            final_path = Path.home() / "Downloads" / "Hermes" / "Other" / "dispatch.bin"
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                binding = observer.get_publication_marker_binding("dispatch-job")
+                assert binding is not None
+                marker_details = marker_path.stat()
+                assert (marker_details.st_dev, marker_details.st_ino) == (
+                    binding.marker_device,
+                    binding.marker_inode,
+                )
+            finally:
+                observer.close()
+            assert origin.ledger.response_body_bytes == 0
+            assert not partial_path.exists()
+            assert not final_path.exists()
+
+            release_paused_add.set()
+            assert paused_add_complete.wait(_WATCHDOG_SECONDS)
+            assert origin.ledger.response_body_bytes == 0
+            assert not partial_path.exists() or partial_path.stat().st_size == 0
+            release_resume.set()
+            thread.join(_WATCHDOG_SECONDS)
+            assert not thread.is_alive()
+            assert failures == []
+            assert responses == [
+                ipc.DirectJobDispatchResult(
+                    status="started",
+                    job="dispatch-job",
+                    generation=1,
+                    revision=4,
+                    state="downloading",
+                )
+            ]
+
+            deadline = time.monotonic() + _WATCHDOG_SECONDS
+            while (
+                (not partial_path.exists() or partial_path.stat().st_size == 0)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            assert partial_path.stat().st_size > 0
+            assert not final_path.exists()
+
+            paused = ipc.control_job(
+                socket_path,
+                job="dispatch-job",
+                action="pause",
+                request_id="dispatch-pause",
+                expected_revision=4,
+            )
+            assert paused == ipc.JobControlResult(
+                status="applied",
+                job="dispatch-job",
+                generation=1,
+                revision=5,
+                state="paused",
+                authorized=True,
+            )
+            paused_bytes = partial_path.stat().st_size
+            time.sleep(0.1)
+            assert partial_path.stat().st_size == paused_bytes
+            assert marker_path.exists()
+            assert not final_path.exists()
+
+            resumed = ipc.control_job(
+                socket_path,
+                job="dispatch-job",
+                action="resume",
+                request_id="dispatch-resume-only",
+                expected_revision=5,
+            )
+            assert resumed == ipc.JobControlResult(
+                status="applied",
+                job="dispatch-job",
+                generation=1,
+                revision=6,
+                state="queued",
+                authorized=True,
+            )
+            time.sleep(0.1)
+            assert partial_path.stat().st_size == paused_bytes
+            assert not final_path.exists()
+
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+            redispatched = ipc.dispatch_direct_job(
+                socket_path,
+                job="dispatch-job",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=6,
+                request_id="dispatch-queue-pause",
+            )
+            assert redispatched == ipc.DirectJobDispatchResult(
+                status="started",
+                job="dispatch-job",
+                generation=1,
+                revision=8,
+                state="downloading",
+            )
+            deadline = time.monotonic() + _WATCHDOG_SECONDS
+            while partial_path.stat().st_size == paused_bytes and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert partial_path.stat().st_size > paused_bytes
+
+            queue_paused = set_queue_gate(
+                socket_path,
+                gate="paused",
+                request_id="dispatch-queue-pause-gate",
+                expected_revision=2,
+            )
+            assert queue_paused == ipc.QueueGateResult(
+                applied=True, queue_gate="paused", revision=3
+            )
+            queue_paused_bytes = partial_path.stat().st_size
+            time.sleep(0.1)
+            assert partial_path.stat().st_size == queue_paused_bytes
+            assert request_jobs_page(socket_path).jobs == (
+                ipc.PublicJobRecord(
+                    job="dispatch-job",
+                    generation=1,
+                    revision=9,
+                    state="paused",
+                ),
+            )
+            assert marker_path.exists()
+            assert not final_path.exists()
+
+            assert set_queue_gate(
+                socket_path,
+                gate="running",
+                request_id="dispatch-reopen-queue",
+                expected_revision=3,
+            ) == ipc.QueueGateResult(applied=True, queue_gate="running", revision=4)
+            assert ipc.control_job(
+                socket_path,
+                job="dispatch-job",
+                action="resume",
+                request_id="dispatch-resume-for-remove",
+                expected_revision=9,
+            ) == ipc.JobControlResult(
+                status="applied",
+                job="dispatch-job",
+                generation=1,
+                revision=10,
+                state="queued",
+                authorized=True,
+            )
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+            removing = ipc.dispatch_direct_job(
+                socket_path,
+                job="dispatch-job",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=10,
+                request_id="dispatch-remove",
+            )
+            assert removing == ipc.DirectJobDispatchResult(
+                status="started",
+                job="dispatch-job",
+                generation=1,
+                revision=12,
+                state="downloading",
+            )
+            deadline = time.monotonic() + _WATCHDOG_SECONDS
+            while (
+                partial_path.stat().st_size == queue_paused_bytes
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            assert partial_path.stat().st_size > queue_paused_bytes
+            removed = ipc.control_job(
+                socket_path,
+                job="dispatch-job",
+                action="remove",
+                request_id="dispatch-remove-control",
+                expected_revision=12,
+            )
+            assert removed == ipc.JobControlResult(
+                status="applied",
+                job="dispatch-job",
+                generation=1,
+                revision=13,
+                state="removed",
+                authorized=False,
+            )
+            removed_bytes = partial_path.stat().st_size
+            time.sleep(0.1)
+            assert partial_path.stat().st_size == removed_bytes
+            assert marker_path.exists()
+            assert not final_path.exists()
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+        finally:
+            release_paused_add.set()
+            release_resume.set()
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+def test_worker_direct_dispatch_defers_completed_body_terminalization(
+    short_socket_root: Path,
+) -> None:
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    destination_root = Path.home() / "Downloads" / "Hermes"
+    destination_root.mkdir(parents=True, mode=0o700)
+    destination_root.chmod(0o700)
+    context = multiprocessing.get_context("spawn")
+    ready, shutdown, stopped = context.Event(), context.Event(), context.Event()
+    results = context.Queue()
+    marker_attested = context.Event()
+    release_paused_add = context.Event()
+    paused_add_complete = context.Event()
+    release_resume = context.Event()
+
+    with _origin_type()(payload_size=1024) as origin:
+        _seed_local_direct_dispatch_job(state_root, origin.url("/range"))
+        process = context.Process(
+            target=_run_worker_process_with_direct_dispatch_gates,
+            args=(
+                str(state_root),
+                str(socket_path),
+                ready,
+                shutdown,
+                stopped,
+                results,
+                origin.url(),
+                marker_attested,
+                release_paused_add,
+                paused_add_complete,
+                release_resume,
+            ),
+        )
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert set_queue_gate(
+                socket_path,
+                gate="running",
+                request_id="completed-open-queue",
+                expected_revision=1,
+            ) == ipc.QueueGateResult(applied=True, queue_gate="running", revision=2)
+            assert ipc.control_job(
+                socket_path,
+                job="dispatch-job",
+                action="start_now",
+                request_id="completed-start-now",
+                expected_revision=1,
+            ) == ipc.JobControlResult(
+                status="applied",
+                job="dispatch-job",
+                generation=1,
+                revision=2,
+                state="queued",
+                authorized=True,
+            )
+            assert activate_direct_engine(
+                socket_path, expected_worker_epoch=1
+            ) == DirectEngineActivateResult(worker_epoch=1, status="active")
+            release_paused_add.set()
+            release_resume.set()
+            dispatched = ipc.dispatch_direct_job(
+                socket_path,
+                job="dispatch-job",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=2,
+                request_id="completed-dispatch",
+            )
+            assert dispatched == ipc.DirectJobDispatchResult(
+                status="started",
+                job="dispatch-job",
+                generation=1,
+                revision=4,
+                state="downloading",
+            )
+            assert marker_attested.wait(_WATCHDOG_SECONDS)
+            assert paused_add_complete.wait(_WATCHDOG_SECONDS)
+            deadline = time.monotonic() + _WATCHDOG_SECONDS
+            while origin.ledger.response_body_bytes < 1024 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert origin.ledger.response_body_bytes >= 1024
+
+            incomplete_dir = Path.home() / "Downloads" / "Hermes" / ".incomplete" / "dispatch-job"
+            partial_path = incomplete_dir / "dispatch.bin"
+            marker_path = incomplete_dir / ".hermes-reservation"
+            final_path = Path.home() / "Downloads" / "Hermes" / "Other" / "dispatch.bin"
+            deadline = time.monotonic() + _WATCHDOG_SECONDS
+            while (
+                (not partial_path.exists() or partial_path.stat().st_size < 1024)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            assert partial_path.exists()
+            assert partial_path.stat().st_size == 1024
+            assert marker_path.exists()
+            assert not final_path.exists()
+            assert request_jobs_page(socket_path).jobs == (
+                ipc.PublicJobRecord(
+                    job="dispatch-job",
+                    generation=1,
+                    revision=4,
+                    state="downloading",
+                ),
+            )
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                event_kinds = [event.kind for event in observer.list_events()]
+                assert event_kinds == [
+                    "job_added",
+                    "job_paused",
+                    "job_start_now_requested",
+                    "job_resolving",
+                    "job_downloading",
+                ]
+            finally:
+                observer.close()
+
+            shutdown.set()
+            assert stopped.wait(_WATCHDOG_SECONDS)
+            _join(process)
+            assert _result(results) == ("result", None)
+        finally:
+            release_paused_add.set()
+            release_resume.set()
             shutdown.set()
             if process.is_alive():
                 _join(process)

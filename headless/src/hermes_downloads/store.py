@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
@@ -11,6 +11,7 @@ import sqlite3
 from typing import Final
 
 from hermes_downloads.models import (
+    Admission,
     DownloadIntent,
     JobState,
     MaterializedJob,
@@ -29,6 +30,7 @@ from hermes_downloads.retry import (
 __all__ = [
     "CommandRecord",
     "CommandResult",
+    "DirectDispatchResult",
     "DirectEngineActivationFence",
     "DirectEngineRecord",
     "EventRecord",
@@ -316,6 +318,35 @@ CREATE TABLE direct_engine_recovery_capabilities (
 );
 """
 
+_DIRECT_DISPATCH_COMMANDS_SCHEMA: Final = """
+CREATE TABLE direct_dispatch_commands (
+    request_id TEXT PRIMARY KEY NOT NULL CHECK (
+        typeof(request_id) = 'text'
+        AND length(request_id) BETWEEN 1 AND 128
+        AND substr(request_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND request_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+    ),
+    payload_digest TEXT NOT NULL CHECK (
+        typeof(payload_digest) = 'text'
+        AND length(payload_digest) = 64
+        AND payload_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'started', 'blocked', 'stale')),
+    generation INTEGER NOT NULL CHECK (
+        typeof(generation) = 'integer'
+        AND generation >= 0
+        AND generation <= 9223372036854775807
+    ),
+    revision INTEGER NOT NULL CHECK (
+        typeof(revision) = 'integer'
+        AND revision >= 0
+        AND revision <= 9223372036854775807
+    ),
+    state TEXT NOT NULL
+);
+"""
+
 
 def _normalize_table_schema(schema: str) -> str:
     """Canonicalize static SQLite DDL for exact current-version validation."""
@@ -342,7 +373,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 12
+_SUPPORTED_SCHEMA_VERSION: Final = 13
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -462,6 +493,22 @@ _V12_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _JOB_CONTROL_COMMANDS_SCHEMA,
     _COMMAND_RECEIPTS_SCHEMA,
 )
+_V13_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _PUBLICATION_RESERVATIONS_SCHEMA,
+    _PUBLICATION_MARKER_BINDINGS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _DIRECT_ENGINE_RECOVERY_CAPABILITIES_SCHEMA,
+    _DIRECT_DISPATCH_COMMANDS_SCHEMA,
+    _JOB_CONTROL_COMMANDS_SCHEMA,
+    _COMMAND_RECEIPTS_SCHEMA,
+)
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _DIRECT_ENGINE_RECOVERY_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}\Z")
@@ -474,6 +521,7 @@ _QUEUE_GATE_COMMAND_SCOPE: Final = "queue_gate"
 _QUEUE_GATE_COMMAND_ACTION: Final = "queue_gate"
 _JOB_CONTROL_COMMAND_SCOPE: Final = "job_control"
 _JOB_CONTROL_STATUSES: Final = frozenset({"applied", "blocked", "stale"})
+_DIRECT_DISPATCH_STATUSES: Final = frozenset({"started", "blocked", "stale"})
 _TERMINAL_JOB_CONTROL_STATES: Final = frozenset(
     {"removed", "completed", "cancelled", "failed"}
 )
@@ -562,6 +610,14 @@ def _require_job_control_status(value: object) -> str:
         raise TypeError("status must be a string")
     if value not in _JOB_CONTROL_STATUSES:
         raise ValueError("status is not a job-control status")
+    return value
+
+
+def _require_direct_dispatch_status(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("status must be a string")
+    if value not in _DIRECT_DISPATCH_STATUSES:
+        raise ValueError("status is not a direct-dispatch status")
     return value
 
 
@@ -691,6 +747,65 @@ class JobControlResult:
         )
         if type(self.authorized) is not bool:
             raise TypeError("authorized must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class DirectDispatchResult:
+    """A durable, redacted direct-dispatch readback."""
+
+    status: str
+    job: str
+    generation: int
+    revision: int
+    state: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", _require_direct_dispatch_status(self.status))
+        object.__setattr__(self, "job", _require_identifier(self.job, "job"))
+        object.__setattr__(
+            self, "generation", _require_counter(self.generation, "generation")
+        )
+        object.__setattr__(self, "revision", _require_counter(self.revision, "revision"))
+        object.__setattr__(
+            self, "state", _require_public_job_state(self.state, "direct dispatch state")
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectDispatchPlan:
+    """Private persisted inputs for one still-paused engine admission."""
+
+    job: MaterializedJob
+    reservation: PublicationReservation
+    admission: Admission
+    generation: int
+    revision: int
+    request_id: str
+    payload_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectDispatchCommand:
+    """Internal direct-dispatch idempotency receipt."""
+
+    request_id: str
+    payload_digest: str
+    job: str
+    status: str
+    generation: int
+    revision: int
+    state: str
+
+    def to_result(self) -> DirectDispatchResult:
+        if self.status == "pending":
+            raise ValueError("pending direct dispatch has no public result")
+        return DirectDispatchResult(
+            status=self.status,
+            job=self.job,
+            generation=self.generation,
+            revision=self.revision,
+            state=self.state,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -846,7 +961,7 @@ class SQLiteStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
-            self._migrate_schema_v12(connection)
+            self._migrate_schema_v13(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -882,6 +997,7 @@ class SQLiteStore:
             10: _V10_TABLE_SCHEMAS,
             11: _V11_TABLE_SCHEMAS,
             12: _V12_TABLE_SCHEMAS,
+            13: _V13_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -912,8 +1028,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v12(connection: sqlite3.Connection) -> None:
-        """Bootstrap v1 then apply additive v2 through v12 migrations atomically."""
+    def _migrate_schema_v13(connection: sqlite3.Connection) -> None:
+        """Bootstrap v1 then apply additive v2 through v13 migrations atomically."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1036,8 +1152,14 @@ class SQLiteStore:
                 connection.execute(_DIRECT_ENGINE_RECOVERY_CAPABILITIES_SCHEMA)
                 connection.execute("PRAGMA user_version = 12")
                 version = 12
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 12:
                 if not SQLiteStore._has_table_schemas(connection, _V12_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_DIRECT_DISPATCH_COMMANDS_SCHEMA)
+                connection.execute("PRAGMA user_version = 13")
+                version = 13
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V13_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1187,10 +1309,12 @@ class SQLiteStore:
                 SELECT request_id FROM queue_commands WHERE request_id = ?
                 UNION ALL
                 SELECT request_id FROM job_control_commands WHERE request_id = ?
+                UNION ALL
+                SELECT request_id FROM direct_dispatch_commands WHERE request_id = ?
             )
             LIMIT 1
             """,
-            (request_id, request_id, request_id),
+            (request_id, request_id, request_id, request_id),
         ).fetchone()
         if row is not None:
             raise RuntimeError("command receipt registry is incomplete")
@@ -1665,6 +1789,7 @@ class SQLiteStore:
         request_id: str,
         payload_digest: str,
         expected_revision: int,
+        _contained_direct_transfer: bool = False,
     ) -> JobControlResult:
         """Atomically apply or replay one revision-fenced materialized-job command."""
 
@@ -1673,6 +1798,8 @@ class SQLiteStore:
         request_id = _require_identifier(request_id, "request_id")
         payload_digest = _require_payload_digest(payload_digest)
         expected_revision = _require_counter(expected_revision, "expected_revision")
+        if type(_contained_direct_transfer) is not bool:
+            raise TypeError("_contained_direct_transfer must be a boolean")
 
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
@@ -1728,7 +1855,11 @@ class SQLiteStore:
                     result = current.to_result("stale")
                 elif current.state in _TERMINAL_JOB_CONTROL_STATES:
                     result = current.to_result("blocked")
-                elif action == "remove" and current.state in _ACTIVE_JOB_CONTROL_STATES:
+                elif (
+                    action == "remove"
+                    and current.state in _ACTIVE_JOB_CONTROL_STATES
+                    and not _contained_direct_transfer
+                ):
                     result = current.to_result("blocked")
                 elif action == "start_now" and self._current_queue_gate(connection) != "running":
                     result = current.to_result("blocked")
@@ -1981,6 +2112,501 @@ class SQLiteStore:
             ),
         )
 
+    def prepare_direct_dispatch(
+        self,
+        *,
+        job_id: str,
+        expected_worker_epoch: int,
+        expected_generation: int,
+        expected_revision: int,
+        request_id: str,
+        payload_digest: str,
+        controller_ready: bool,
+        now: datetime,
+    ) -> _DirectDispatchPlan | DirectDispatchResult:
+        """Fence and durably enter ``resolving`` before any engine admission.
+
+        The returned plan contains only immutable persisted job data and the
+        already-computed durable admission gates.  A pending receipt is
+        deliberately fail-closed after a crash: cold recovery pauses the job,
+        and replay resolves to a bounded ``blocked`` result instead of retrying
+        an uncertain engine side effect.
+        """
+
+        job_id = _require_identifier(job_id, "job_id")
+        expected_worker_epoch = _require_worker_epoch(
+            expected_worker_epoch, "expected_worker_epoch"
+        )
+        expected_generation = _require_counter(expected_generation, "expected_generation")
+        expected_revision = _require_counter(expected_revision, "expected_revision")
+        request_id = _require_identifier(request_id, "request_id")
+        payload_digest = _require_payload_digest(payload_digest)
+        if type(controller_ready) is not bool:
+            raise TypeError("controller_ready must be a boolean")
+        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+            raise TypeError("now must be a timezone-aware datetime")
+        now = now.astimezone(UTC)
+
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._read_command_receipt(connection, request_id) is not None:
+                raise RequestConflictError(
+                    "request_id is already bound to a different command receipt"
+                )
+            replay = self._read_direct_dispatch_command(connection, request_id)
+            if replay is not None:
+                if replay.payload_digest != payload_digest or replay.job != job_id:
+                    raise RequestConflictError(
+                        "request_id is already bound to a different direct dispatch"
+                    )
+                if replay.status == "pending":
+                    current = self._read_job_control_projection(connection, job_id)
+                    result = DirectDispatchResult(
+                        status="blocked",
+                        job=current.job,
+                        generation=current.generation,
+                        revision=current.revision,
+                        state=current.state,
+                    )
+                    self._update_direct_dispatch_command(
+                        connection, request_id=request_id, result=result
+                    )
+                else:
+                    result = replay.to_result()
+                connection.commit()
+                return result
+
+            self._reject_unregistered_legacy_receipt(connection, request_id)
+            current_epoch = self._current_worker_epoch(connection)
+            current = self._read_job_control_projection(connection, job_id)
+            materialized = self.get_materialized_job(job_id)
+            if materialized is None:
+                raise ValueError("direct dispatch target is not materialized")
+
+            if expected_worker_epoch != current_epoch:
+                result = self._direct_dispatch_result_from_current(current, "stale")
+            elif (
+                expected_generation != current.generation
+                or expected_revision != current.revision
+            ):
+                result = self._direct_dispatch_result_from_current(current, "stale")
+            elif materialized.source_kind is not SourceKind.DIRECT:
+                result = self._direct_dispatch_result_from_current(current, "blocked")
+            elif self._has_other_active_direct_dispatch(connection, job_id):
+                result = self._direct_dispatch_result_from_current(current, "blocked")
+            elif current.state != JobState.QUEUED.value:
+                result = self._direct_dispatch_result_from_current(current, "blocked")
+            else:
+                admission = self._direct_dispatch_admission(
+                    connection, materialized=materialized, now=now
+                )
+                if not controller_ready or not admission.allowed:
+                    result = self._direct_dispatch_result_from_current(current, "blocked")
+                else:
+                    reservation = self._read_publication_reservation(connection, job_id)
+                    if reservation is None:
+                        raise ValueError("direct dispatch target has no publication reservation")
+                    resolving = self._persist_direct_dispatch_lifecycle(
+                        connection,
+                        current=current,
+                        state=JobState.RESOLVING.value,
+                        event_kind="job_resolving",
+                    )
+                    self._insert_direct_dispatch_command(
+                        connection,
+                        request_id=request_id,
+                        payload_digest=payload_digest,
+                        job=job_id,
+                        status="pending",
+                        generation=resolving.generation,
+                        revision=resolving.revision,
+                        state=resolving.state,
+                    )
+                    updated_intent = replace(
+                        materialized.intent,
+                        generation=resolving.generation,
+                        revision=resolving.revision,
+                    )
+                    plan = _DirectDispatchPlan(
+                        job=replace(materialized, intent=updated_intent),
+                        reservation=reservation,
+                        admission=admission,
+                        generation=resolving.generation,
+                        revision=resolving.revision,
+                        request_id=request_id,
+                        payload_digest=payload_digest,
+                    )
+                    connection.commit()
+                    return plan
+
+            self._insert_direct_dispatch_command(
+                connection,
+                request_id=request_id,
+                payload_digest=payload_digest,
+                job=job_id,
+                status=result.status,
+                generation=result.generation,
+                revision=result.revision,
+                state=result.state,
+            )
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def advance_direct_dispatch_to_downloading(
+        self, plan: _DirectDispatchPlan
+    ) -> _DirectDispatchPlan:
+        """Persist ``resolving`` to ``downloading`` before engine unpause."""
+
+        if type(plan) is not _DirectDispatchPlan:
+            raise TypeError("plan must be a direct-dispatch plan")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            command = self._require_pending_direct_dispatch_command(connection, plan)
+            current = self._read_job_control_projection(connection, plan.job.job_id)
+            if (
+                current.generation != plan.generation
+                or current.revision != plan.revision
+                or current.state != JobState.RESOLVING.value
+                or command.generation != plan.generation
+                or command.revision != plan.revision
+                or command.state != JobState.RESOLVING.value
+            ):
+                raise ValueError("direct dispatch resolving state is stale")
+            downloading = self._persist_direct_dispatch_lifecycle(
+                connection,
+                current=current,
+                state=JobState.DOWNLOADING.value,
+                event_kind="job_downloading",
+            )
+            self._update_pending_direct_dispatch_command(
+                connection,
+                request_id=plan.request_id,
+                generation=downloading.generation,
+                revision=downloading.revision,
+                state=downloading.state,
+            )
+            connection.commit()
+            return replace(
+                plan,
+                job=replace(
+                    plan.job,
+                    intent=replace(
+                        plan.job.intent,
+                        generation=downloading.generation,
+                        revision=downloading.revision,
+                    ),
+                ),
+                generation=downloading.generation,
+                revision=downloading.revision,
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def finish_direct_dispatch(self, plan: _DirectDispatchPlan) -> DirectDispatchResult:
+        """Record a started receipt only after aria2 accepted the unpause."""
+
+        if type(plan) is not _DirectDispatchPlan:
+            raise TypeError("plan must be a direct-dispatch plan")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            command = self._require_pending_direct_dispatch_command(connection, plan)
+            current = self._read_job_control_projection(connection, plan.job.job_id)
+            if (
+                current.generation != plan.generation
+                or current.revision != plan.revision
+                or current.state != JobState.DOWNLOADING.value
+                or command.generation != plan.generation
+                or command.revision != plan.revision
+                or command.state != JobState.DOWNLOADING.value
+            ):
+                raise ValueError("direct dispatch downloading state is stale")
+            result = self._direct_dispatch_result_from_current(current, "started")
+            self._update_direct_dispatch_command(
+                connection, request_id=plan.request_id, result=result
+            )
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def abort_direct_dispatch(self, plan: _DirectDispatchPlan) -> DirectDispatchResult:
+        """Durably pause a contained uncertain dispatch without retrying it."""
+
+        if type(plan) is not _DirectDispatchPlan:
+            raise TypeError("plan must be a direct-dispatch plan")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            command = self._require_pending_direct_dispatch_command(connection, plan)
+            current = self._read_job_control_projection(connection, plan.job.job_id)
+            if current.generation != plan.generation:
+                raise ValueError("direct dispatch generation is stale")
+            if current.state in {JobState.RESOLVING.value, JobState.DOWNLOADING.value}:
+                current = self._persist_direct_dispatch_lifecycle(
+                    connection,
+                    current=current,
+                    state=JobState.PAUSED.value,
+                    event_kind="job_paused",
+                )
+            if current.state != JobState.PAUSED.value:
+                raise ValueError("direct dispatch cannot be safely aborted")
+            if command.job != current.job:
+                raise ValueError("direct dispatch command job does not match")
+            result = self._direct_dispatch_result_from_current(current, "blocked")
+            self._update_direct_dispatch_command(
+                connection, request_id=plan.request_id, result=result
+            )
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def pause_active_direct_job(
+        self, *, job_id: str, generation: int, revision: int
+    ) -> JobControlResult:
+        """Persist a contained active direct job as paused without a new request."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        generation = _require_counter(generation, "generation")
+        revision = _require_counter(revision, "revision")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._read_job_control_projection(connection, job_id)
+            if (
+                current.generation != generation
+                or current.revision != revision
+                or current.state != JobState.DOWNLOADING.value
+            ):
+                raise ValueError("active direct job is stale")
+            paused = self._persist_direct_dispatch_lifecycle(
+                connection,
+                current=current,
+                state=JobState.PAUSED.value,
+                event_kind="job_paused",
+            )
+            connection.commit()
+            return paused.to_result("applied")
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _direct_dispatch_result_from_current(
+        current: _JobControlProjection, status: str
+    ) -> DirectDispatchResult:
+        return DirectDispatchResult(
+            status=status,
+            job=current.job,
+            generation=current.generation,
+            revision=current.revision,
+            state=current.state,
+        )
+
+    @staticmethod
+    def _has_other_active_direct_dispatch(
+        connection: sqlite3.Connection, job_id: str
+    ) -> bool:
+        """Allow at most one body-capable direct lifecycle per worker."""
+
+        return (
+            connection.execute(
+                """
+                SELECT 1
+                FROM jobs AS job
+                JOIN materialized_jobs AS domain ON domain.job_id = job.job_id
+                WHERE job.job_id != ?
+                  AND domain.source_kind = 'direct'
+                  AND job.state IN ('resolving', 'downloading', 'pausing')
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _direct_dispatch_admission(
+        connection: sqlite3.Connection,
+        *,
+        materialized: MaterializedJob,
+        now: datetime,
+    ) -> Admission:
+        collection_held = (
+            materialized.queue_collection_id is not None
+            and connection.execute(
+                "SELECT 1 FROM collection_holds WHERE collection_id = ? LIMIT 1",
+                (materialized.queue_collection_id,),
+            ).fetchone()
+            is not None
+        )
+        due = materialized.start_now_requested or (
+            materialized.scheduled_for is None or materialized.scheduled_for <= now
+        )
+        return Admission(
+            queue_running=SQLiteStore._current_queue_gate(connection) == "running",
+            collection_held=collection_held,
+            authorized=materialized.authorized,
+            item_held=materialized.manual_hold,
+            due=due,
+        )
+
+    @staticmethod
+    def _persist_direct_dispatch_lifecycle(
+        connection: sqlite3.Connection,
+        *,
+        current: _JobControlProjection,
+        state: str,
+        event_kind: str,
+    ) -> _JobControlProjection:
+        if current.revision == _MAX_COUNTER:
+            raise OverflowError("job revision exceeds persisted counter range")
+        next_state = _require_public_job_state(state, "direct dispatch state")
+        updated = replace(current, revision=current.revision + 1, state=next_state)
+        connection.execute(
+            "UPDATE jobs SET revision = ?, state = ? WHERE job_id = ?",
+            (updated.revision, updated.state, updated.job),
+        )
+        SQLiteStore._require_one_changed_row(connection, "direct dispatch lifecycle update")
+        connection.execute(
+            """
+            INSERT INTO events (kind, job_id, generation, revision)
+            VALUES (?, ?, ?, ?)
+            """,
+            (event_kind, updated.job, updated.generation, updated.revision),
+        )
+        return updated
+
+    @staticmethod
+    def _insert_direct_dispatch_command(
+        connection: sqlite3.Connection,
+        *,
+        request_id: str,
+        payload_digest: str,
+        job: str,
+        status: str,
+        generation: int,
+        revision: int,
+        state: str,
+    ) -> None:
+        if status not in {"pending", *_DIRECT_DISPATCH_STATUSES}:
+            raise ValueError("direct dispatch persistence status is invalid")
+        connection.execute(
+            """
+            INSERT INTO direct_dispatch_commands (
+                request_id, payload_digest, job_id, status, generation, revision, state
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (request_id, payload_digest, job, status, generation, revision, state),
+        )
+
+    @staticmethod
+    def _update_pending_direct_dispatch_command(
+        connection: sqlite3.Connection,
+        *,
+        request_id: str,
+        generation: int,
+        revision: int,
+        state: str,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE direct_dispatch_commands
+            SET generation = ?, revision = ?, state = ?
+            WHERE request_id = ? AND status = 'pending'
+            """,
+            (generation, revision, state, request_id),
+        )
+        SQLiteStore._require_one_changed_row(connection, "pending direct dispatch update")
+
+    @staticmethod
+    def _update_direct_dispatch_command(
+        connection: sqlite3.Connection, *, request_id: str, result: DirectDispatchResult
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE direct_dispatch_commands
+            SET status = ?, generation = ?, revision = ?, state = ?
+            WHERE request_id = ? AND status = 'pending'
+            """,
+            (
+                result.status,
+                result.generation,
+                result.revision,
+                result.state,
+                request_id,
+            ),
+        )
+        SQLiteStore._require_one_changed_row(connection, "direct dispatch receipt update")
+
+    @staticmethod
+    def _read_direct_dispatch_command(
+        connection: sqlite3.Connection, request_id: str
+    ) -> _DirectDispatchCommand | None:
+        rows = connection.execute(
+            """
+            SELECT request_id, payload_digest, job_id, status, generation, revision, state
+            FROM direct_dispatch_commands
+            WHERE request_id = ?
+            LIMIT 2
+            """,
+            (request_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeError("direct dispatch receipt is not unique")
+        row = rows[0]
+        return _DirectDispatchCommand(
+            request_id=_require_identifier(
+                _require_sqlite_text(row["request_id"], "direct dispatch request_id"),
+                "direct dispatch request_id",
+            ),
+            payload_digest=_require_payload_digest(
+                _require_sqlite_text(
+                    row["payload_digest"], "direct dispatch payload_digest"
+                )
+            ),
+            job=_require_identifier(
+                _require_sqlite_text(row["job_id"], "direct dispatch job_id"),
+                "direct dispatch job_id",
+            ),
+            status=_require_sqlite_text(row["status"], "direct dispatch status"),
+            generation=_require_counter(
+                _require_sqlite_integer(row["generation"], "direct dispatch generation"),
+                "direct dispatch generation",
+            ),
+            revision=_require_counter(
+                _require_sqlite_integer(row["revision"], "direct dispatch revision"),
+                "direct dispatch revision",
+            ),
+            state=_require_public_job_state(row["state"], "direct dispatch state"),
+        )
+
+    @staticmethod
+    def _require_pending_direct_dispatch_command(
+        connection: sqlite3.Connection, plan: _DirectDispatchPlan
+    ) -> _DirectDispatchCommand:
+        command = SQLiteStore._read_direct_dispatch_command(connection, plan.request_id)
+        if (
+            command is None
+            or command.status != "pending"
+            or command.payload_digest != plan.payload_digest
+            or command.job != plan.job.job_id
+        ):
+            raise ValueError("direct dispatch receipt is not pending")
+        return command
+
     def recover_cold_start(self) -> int:
         """Atomically fence a cold worker epoch and pause incomplete jobs."""
 
@@ -2073,6 +2699,22 @@ class SQLiteStore:
             connection.rollback()
             raise
         return epoch
+
+    def queue_gate_snapshot(self) -> tuple[str, int] | None:
+        """Return the current durable queue gate and its fencing revision."""
+
+        row = self._connection.execute(
+            "SELECT value, revision FROM settings WHERE key = 'queue_gate'"
+        ).fetchone()
+        if row is None:
+            return None
+        return (
+            _require_queue_gate(_require_sqlite_text(row["value"], "queue gate value")),
+            _require_counter(
+                _require_sqlite_integer(row["revision"], "queue gate revision"),
+                "queue gate revision",
+            ),
+        )
 
     def queue_gate(self) -> str | None:
         """Return the persisted global admission gate, if initialized."""

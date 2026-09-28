@@ -18,6 +18,8 @@ from hermes_downloads.models import JobState
 __all__ = [
     "DirectEngineActivateCommand",
     "DirectEngineActivateResult",
+    "DirectJobDispatchCommand",
+    "DirectJobDispatchResult",
     "HealthServer",
     "IPCError",
     "IPCStateError",
@@ -34,6 +36,7 @@ __all__ = [
     "add_job",
     "activate_direct_engine",
     "control_job",
+    "dispatch_direct_job",
     "request_health",
     "request_jobs_page",
     "set_queue_gate",
@@ -62,6 +65,7 @@ _JOB_CONTROL_STATUSES: Final = frozenset({"applied", "blocked", "stale"})
 _DIRECT_ENGINE_ACTIVATE_STATUSES: Final = frozenset(
     {"active", "blocked", "stale_epoch"}
 )
+_DIRECT_JOB_DISPATCH_STATUSES: Final = frozenset({"started", "blocked", "stale"})
 
 
 class IPCError(RuntimeError):
@@ -165,6 +169,14 @@ def _require_direct_engine_activate_status(value: object) -> str:
         raise TypeError("status must be a string")
     if value not in _DIRECT_ENGINE_ACTIVATE_STATUSES:
         raise ValueError("status is not a direct-engine activation status")
+    return value
+
+
+def _require_direct_job_dispatch_status(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("status must be a string")
+    if value not in _DIRECT_JOB_DISPATCH_STATUSES:
+        raise ValueError("status is not a direct-job dispatch status")
     return value
 
 
@@ -511,6 +523,130 @@ class DirectEngineActivateResult:
             raise IPCError("ipc_response_invalid")
         try:
             return cls(worker_epoch=record["worker_epoch"], status=record["status"])
+        except (TypeError, ValueError):
+            raise IPCError("ipc_response_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class DirectJobDispatchCommand:
+    """One idempotent direct-body dispatch fenced by worker and job revisions."""
+
+    job: str
+    expected_worker_epoch: int
+    expected_generation: int
+    expected_revision: int
+    request_id: str
+    payload_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        job = _require_identifier(self.job, "job")
+        expected_worker_epoch = _require_positive_counter(
+            self.expected_worker_epoch, "expected_worker_epoch"
+        )
+        expected_generation = _require_counter(
+            self.expected_generation, "expected_generation"
+        )
+        expected_revision = _require_counter(
+            self.expected_revision, "expected_revision"
+        )
+        request_id = _require_identifier(self.request_id, "request_id")
+        object.__setattr__(self, "job", job)
+        object.__setattr__(self, "expected_worker_epoch", expected_worker_epoch)
+        object.__setattr__(self, "expected_generation", expected_generation)
+        object.__setattr__(self, "expected_revision", expected_revision)
+        object.__setattr__(self, "request_id", request_id)
+        object.__setattr__(
+            self,
+            "payload_digest",
+            _canonical_payload_digest(
+                {
+                    "expected_generation": expected_generation,
+                    "expected_revision": expected_revision,
+                    "expected_worker_epoch": expected_worker_epoch,
+                    "job": job,
+                    "request_id": request_id,
+                }
+            ),
+        )
+
+    def to_record(self) -> dict[str, int | str]:
+        return {
+            "op": "direct_job_dispatch",
+            "job": self.job,
+            "expected_worker_epoch": self.expected_worker_epoch,
+            "expected_generation": self.expected_generation,
+            "expected_revision": self.expected_revision,
+            "request_id": self.request_id,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "DirectJobDispatchCommand":
+        if type(record) is not dict or set(record) != {
+            "op",
+            "job",
+            "expected_worker_epoch",
+            "expected_generation",
+            "expected_revision",
+            "request_id",
+        }:
+            raise ValueError("direct-job dispatch request is invalid")
+        if record["op"] != "direct_job_dispatch":
+            raise ValueError("direct-job dispatch request is invalid")
+        return cls(
+            job=record["job"],
+            expected_worker_epoch=record["expected_worker_epoch"],
+            expected_generation=record["expected_generation"],
+            expected_revision=record["expected_revision"],
+            request_id=record["request_id"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectJobDispatchResult:
+    """A redacted bounded dispatch receipt with no engine or source authority."""
+
+    status: str
+    job: str
+    generation: int
+    revision: int
+    state: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", _require_direct_job_dispatch_status(self.status))
+        object.__setattr__(self, "job", _require_identifier(self.job, "job"))
+        object.__setattr__(
+            self, "generation", _require_counter(self.generation, "generation")
+        )
+        object.__setattr__(self, "revision", _require_counter(self.revision, "revision"))
+        object.__setattr__(self, "state", _require_public_job_state(self.state))
+
+    def to_record(self) -> dict[str, int | str]:
+        return {
+            "status": self.status,
+            "job": self.job,
+            "generation": self.generation,
+            "revision": self.revision,
+            "state": self.state,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> "DirectJobDispatchResult":
+        if type(record) is not dict or set(record) != {
+            "status",
+            "job",
+            "generation",
+            "revision",
+            "state",
+        }:
+            raise IPCError("ipc_response_invalid")
+        try:
+            return cls(
+                status=record["status"],
+                job=record["job"],
+                generation=record["generation"],
+                revision=record["revision"],
+                state=record["state"],
+            )
         except (TypeError, ValueError):
             raise IPCError("ipc_response_invalid") from None
 
@@ -945,6 +1081,15 @@ def _decode_direct_engine_activate_request(
         return None
 
 
+def _decode_direct_job_dispatch_request(
+    request: object,
+) -> DirectJobDispatchCommand | None:
+    try:
+        return DirectJobDispatchCommand.from_record(request)
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 class HealthServer:
     """A one-request AF_UNIX listener owned and serviced by the worker thread."""
 
@@ -961,6 +1106,10 @@ class HealthServer:
             [DirectEngineActivateCommand], DirectEngineActivateResult
         ]
         | None = None,
+        direct_job_dispatch: Callable[
+            [DirectJobDispatchCommand], DirectJobDispatchResult
+        ]
+        | None = None,
     ) -> None:
         self.socket_path = validate_available_socket_path(socket_path)
         if not callable(health):
@@ -975,6 +1124,8 @@ class HealthServer:
             raise TypeError("job_add must be callable")
         if direct_engine_activate is not None and not callable(direct_engine_activate):
             raise TypeError("direct_engine_activate must be callable")
+        if direct_job_dispatch is not None and not callable(direct_job_dispatch):
+            raise TypeError("direct_job_dispatch must be callable")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         socket_identity: tuple[int, int] | None = None
         try:
@@ -1000,6 +1151,7 @@ class HealthServer:
         self._job_control = job_control
         self._job_add = job_add
         self._direct_engine_activate = direct_engine_activate
+        self._direct_job_dispatch = direct_job_dispatch
         self._listener = listener
         self._identity = socket_identity
 
@@ -1066,16 +1218,20 @@ class HealthServer:
                                     except Exception:
                                         response = _encoded_record(_COMMAND_CONFLICT)
                             else:
-                                job_control_command = _decode_job_control_request(request)
-                                if job_control_command is not None:
-                                    if self._job_control is None:
+                                direct_job_command = _decode_direct_job_dispatch_request(
+                                    request
+                                )
+                                if direct_job_command is not None:
+                                    if self._direct_job_dispatch is None:
                                         response = _encoded_record(_INVALID_REQUEST)
                                     else:
                                         try:
-                                            result = self._job_control(job_control_command)
-                                            if type(result) is not JobControlResult:
+                                            result = self._direct_job_dispatch(
+                                                direct_job_command
+                                            )
+                                            if type(result) is not DirectJobDispatchResult:
                                                 raise TypeError(
-                                                    "job_control result is invalid"
+                                                    "direct_job_dispatch result is invalid"
                                                 )
                                             response = _encoded_record(result.to_record())
                                         except IPCError as error:
@@ -1086,16 +1242,36 @@ class HealthServer:
                                         except Exception:
                                             response = _encoded_record(_COMMAND_CONFLICT)
                                 else:
-                                    command = _decode_queue_gate_request(request)
-                                    if command is None or self._queue_gate is None:
-                                        response = _encoded_record(_INVALID_REQUEST)
+                                    job_control_command = _decode_job_control_request(request)
+                                    if job_control_command is not None:
+                                        if self._job_control is None:
+                                            response = _encoded_record(_INVALID_REQUEST)
+                                        else:
+                                            try:
+                                                result = self._job_control(job_control_command)
+                                                if type(result) is not JobControlResult:
+                                                    raise TypeError(
+                                                        "job_control result is invalid"
+                                                    )
+                                                response = _encoded_record(result.to_record())
+                                            except IPCError as error:
+                                                if str(error) == "invalid_request":
+                                                    response = _encoded_record(_INVALID_REQUEST)
+                                                else:
+                                                    response = _encoded_record(_COMMAND_CONFLICT)
+                                            except Exception:
+                                                response = _encoded_record(_COMMAND_CONFLICT)
                                     else:
-                                        try:
-                                            response = _encoded_record(
-                                                self._queue_gate(command).to_record()
-                                            )
-                                        except Exception:
-                                            response = _encoded_record(_COMMAND_CONFLICT)
+                                        command = _decode_queue_gate_request(request)
+                                        if command is None or self._queue_gate is None:
+                                            response = _encoded_record(_INVALID_REQUEST)
+                                        else:
+                                            try:
+                                                response = _encoded_record(
+                                                    self._queue_gate(command).to_record()
+                                                )
+                                            except Exception:
+                                                response = _encoded_record(_COMMAND_CONFLICT)
             except (IPCStateError, TypeError, ValueError):
                 response = _encoded_record(_INVALID_REQUEST)
             try:
@@ -1310,6 +1486,53 @@ def control_job(
     if record == _INVALID_REQUEST:
         raise IPCError("invalid_request")
     return JobControlResult.from_record(record)
+
+
+def dispatch_direct_job(
+    socket_path: Path,
+    *,
+    job: str,
+    expected_worker_epoch: int,
+    expected_generation: int,
+    expected_revision: int,
+    request_id: str,
+) -> DirectJobDispatchResult:
+    """Ask the worker to start one exact admitted direct body transfer."""
+
+    path = _require_socket_path(socket_path)
+    try:
+        command = DirectJobDispatchCommand(
+            job=job,
+            expected_worker_epoch=expected_worker_epoch,
+            expected_generation=expected_generation,
+            expected_revision=expected_revision,
+            request_id=request_id,
+        )
+    except (RecursionError, TypeError, ValueError):
+        raise IPCError("invalid_request") from None
+    request = _encoded_record(command.to_record())
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(_CLIENT_TIMEOUT_SECONDS)
+        try:
+            client.connect(str(path))
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            response = _read_line(client)
+        except (OSError, TimeoutError):
+            raise IPCError("ipc_unavailable") from None
+    if response is None:
+        raise IPCError("ipc_response_invalid")
+    try:
+        record = json.loads(
+            response.decode("utf-8"), object_pairs_hook=_reject_duplicate_object_keys
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
+        raise IPCError("ipc_response_invalid") from None
+    if record == _COMMAND_CONFLICT:
+        raise IPCError("command_conflict")
+    if record == _INVALID_REQUEST:
+        raise IPCError("invalid_request")
+    return DirectJobDispatchResult.from_record(record)
 
 
 def activate_direct_engine(

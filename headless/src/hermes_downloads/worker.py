@@ -7,11 +7,14 @@ import os
 from pathlib import Path
 import stat
 import threading
-from typing import Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
+from datetime import UTC, datetime
 
 from hermes_downloads.ipc import (
     DirectEngineActivateCommand,
     DirectEngineActivateResult,
+    DirectJobDispatchCommand,
+    DirectJobDispatchResult,
     HealthServer,
     IPCError,
     IPCStateError,
@@ -26,16 +29,21 @@ from hermes_downloads.ipc import (
     WorkerHealth,
     validate_available_socket_path,
 )
-from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
-from hermes_downloads.network import validate_source_url
+from hermes_downloads.models import Admission, DownloadIntent, MaterializedJob, SourceKind
+from hermes_downloads.network import SourceURL, validate_source_url
 from hermes_downloads.processes import ProcessBirthIdentity, reconcile_process_birth
 from hermes_downloads.store import (
     DirectEngineActivationFence,
+    DirectDispatchResult,
     DirectEngineRecord,
     RequestConflictError,
     SQLiteStore,
+    _DirectDispatchPlan,
     _DirectEngineRecoveryCapability,
 )
+
+if TYPE_CHECKING:
+    from hermes_downloads.paths import DestinationIntent
 
 __all__ = ["WorkerStateError", "main", "run_worker", "worker_busy"]
 
@@ -64,6 +72,21 @@ class _DirectController(Protocol):
     def close(self) -> None: ...
 
     def discard_absent(self) -> None: ...
+
+    def add_paused(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        source: SourceURL,
+        destination: DestinationIntent,
+        expected_sha256: str | None,
+        admission: Admission,
+    ) -> object: ...
+
+    def resume(
+        self, *, job_id: str, generation: int, admission: Admission
+    ) -> object: ...
 
 
 class WorkerStateError(ValueError):
@@ -333,6 +356,7 @@ def run_worker(
     direct_recovery_blocked = False
     direct_controller_absent_discard_failed = False
     direct_controller_absent_local_cleanup_complete = False
+    active_direct_plan: _DirectDispatchPlan | None = None
     try:
         root = _validate_state_root(state_root)
         requested_socket_path: Path | None = None
@@ -379,7 +403,7 @@ def run_worker(
 
         def clear_owned_direct_controller_state() -> None:
             nonlocal direct_controller, direct_fence, direct_record
-            nonlocal direct_recovery_capability
+            nonlocal direct_recovery_capability, active_direct_plan
             nonlocal direct_record_persisted, direct_recovery_capability_persisted
             nonlocal direct_controller_ready
             nonlocal direct_controller_absent_discard_failed
@@ -394,6 +418,7 @@ def run_worker(
             direct_controller_ready = False
             direct_controller_absent_discard_failed = False
             direct_controller_absent_local_cleanup_complete = False
+            active_direct_plan = None
 
         def close_owned_direct_controller() -> None:
             controller = direct_controller
@@ -602,16 +627,189 @@ def run_worker(
             direct_controller_ready = True
             return DirectEngineActivateResult(worker_epoch=current_epoch, status="active")
 
+        def direct_job_dispatch(
+            command: DirectJobDispatchCommand,
+        ) -> DirectJobDispatchResult:
+            """Run one bounded, marker-bound direct admission lifecycle."""
+
+            nonlocal active_direct_plan
+
+            controller = direct_controller
+            controller_ready = (
+                controller is not None
+                and direct_controller_ready
+                and not direct_recovery_blocked
+                and active_direct_plan is None
+            )
+            try:
+                prepared = store.prepare_direct_dispatch(
+                    job_id=command.job,
+                    expected_worker_epoch=command.expected_worker_epoch,
+                    expected_generation=command.expected_generation,
+                    expected_revision=command.expected_revision,
+                    request_id=command.request_id,
+                    payload_digest=command.payload_digest,
+                    controller_ready=controller_ready,
+                    now=datetime.now(UTC),
+                )
+            except RequestConflictError:
+                raise
+            except (TypeError, ValueError):
+                raise IPCError("invalid_request") from None
+
+            if type(prepared) is DirectDispatchResult:
+                return DirectJobDispatchResult(
+                    status=prepared.status,
+                    job=prepared.job,
+                    generation=prepared.generation,
+                    revision=prepared.revision,
+                    state=prepared.state,
+                )
+            if type(prepared) is not _DirectDispatchPlan or controller is None:
+                raise IPCError("direct_dispatch_blocked")
+
+            plan = prepared
+            try:
+                from hermes_downloads.paths import (
+                    attest_publication_reservation_marker,
+                    prepare_persisted_destination_workspace,
+                    rehydrate_destination,
+                )
+
+                destination = rehydrate_destination(
+                    category=plan.job.category,
+                    collection=plan.job.destination_collection,
+                    partial_filename=plan.job.partial_filename,
+                    selected_final_filename=plan.job.selected_final_filename,
+                    job_id=plan.job.job_id,
+                )
+                destination = prepare_persisted_destination_workspace(destination)
+                marker = attest_publication_reservation_marker(
+                    destination, plan.reservation
+                )
+                binding = store.bind_publication_marker(
+                    plan.job.job_id,
+                    claim_token=plan.reservation.claim_token,
+                    marker_device=marker.st_dev,
+                    marker_inode=marker.st_ino,
+                )
+                if (
+                    binding.marker_device != marker.st_dev
+                    or binding.marker_inode != marker.st_ino
+                ):
+                    raise ValueError("publication marker binding does not match")
+
+                source = validate_source_url(plan.job.intent.source_url)
+                if source.raw_url != plan.job.intent.source_url:
+                    raise ValueError("persisted source bytes changed during validation")
+                paused_transfer = controller.add_paused(
+                    job_id=plan.job.job_id,
+                    generation=plan.generation,
+                    source=source,
+                    destination=destination,
+                    expected_sha256=None,
+                    admission=plan.admission,
+                )
+                if getattr(paused_transfer, "status", None) != "paused":
+                    raise ValueError("direct engine did not remain paused")
+                plan = store.advance_direct_dispatch_to_downloading(plan)
+                controller.resume(
+                    job_id=plan.job.job_id,
+                    generation=plan.generation,
+                    admission=plan.admission,
+                )
+                active_direct_plan = plan
+                result = store.finish_direct_dispatch(plan)
+            except BaseException:
+                # No failed dispatch leaves a live body-capable controller.  The
+                # durable pending receipt becomes a fail-closed paused result.
+                try:
+                    close_owned_direct_controller()
+                    aborted = store.abort_direct_dispatch(plan)
+                except BaseException:
+                    raise IPCError("direct_dispatch_blocked") from None
+                return DirectJobDispatchResult(
+                    status=aborted.status,
+                    job=aborted.job,
+                    generation=aborted.generation,
+                    revision=aborted.revision,
+                    state=aborted.state,
+                )
+            return DirectJobDispatchResult(
+                status=result.status,
+                job=result.job,
+                generation=result.generation,
+                revision=result.revision,
+                state=result.state,
+            )
+
+        def job_control(command: JobControlCommand) -> JobControlResult:
+            """Contain the one active body before acknowledging pause/removal."""
+
+            plan = active_direct_plan
+            if (
+                plan is not None
+                and command.job == plan.job.job_id
+                and command.action in {"pause", "remove"}
+                and command.expected_revision == plan.revision
+            ):
+                try:
+                    close_owned_direct_controller()
+                    result = store.apply_job_control(
+                        job_id=command.job,
+                        action=command.action,
+                        request_id=command.request_id,
+                        payload_digest=command.payload_digest,
+                        expected_revision=command.expected_revision,
+                        _contained_direct_transfer=True,
+                    )
+                except RequestConflictError:
+                    raise
+                except (TypeError, ValueError):
+                    raise IPCError("direct_dispatch_blocked") from None
+                return JobControlResult(
+                    status=result.status,
+                    job=result.job,
+                    generation=result.generation,
+                    revision=result.revision,
+                    state=result.state,
+                    authorized=result.authorized,
+                )
+            return _job_control_from_store(store, command)
+
+        def queue_gate(command: QueueGateCommand) -> QueueGateResult:
+            """Contain the one active body before a durable queue pause reply."""
+
+            plan = active_direct_plan
+            snapshot = store.queue_gate_snapshot()
+            if (
+                command.gate == "paused"
+                and plan is not None
+                and snapshot is not None
+                and snapshot[1] == command.expected_revision
+            ):
+                try:
+                    close_owned_direct_controller()
+                    store.pause_active_direct_job(
+                        job_id=plan.job.job_id,
+                        generation=plan.generation,
+                        revision=plan.revision,
+                    )
+                except (TypeError, ValueError):
+                    raise IPCError("direct_dispatch_blocked") from None
+            return _queue_gate_from_store(store, command)
+
         if requested_socket_path is not None:
             try:
                 health_server = HealthServer(
                     requested_socket_path,
                     health=lambda: _health_from_store(store),
                     jobs_page=lambda cursor: _jobs_page_from_store(store, cursor),
-                    queue_gate=lambda command: _queue_gate_from_store(store, command),
+                    queue_gate=queue_gate,
                     job_add=lambda command: _job_add_from_store(store, command),
-                    job_control=lambda command: _job_control_from_store(store, command),
+                    job_control=job_control,
                     direct_engine_activate=direct_engine_activate,
+                    direct_job_dispatch=direct_job_dispatch,
                 )
             except IPCStateError:
                 raise WorkerStateError from None
