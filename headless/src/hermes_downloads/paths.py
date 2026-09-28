@@ -23,9 +23,11 @@ __all__ = [
     "JobSpace",
     "PathValidationError",
     "PublicationReservationMarker",
+    "StagedPartialPayload",
     "StorageUsage",
     "UnsafePathError",
     "attest_publication_reservation_marker",
+    "attest_staged_partial_payload",
     "claim_final_path",
     "observe_job_space",
     "prepare_persisted_destination_workspace",
@@ -45,6 +47,9 @@ _RESERVATION_MARKER_CREATE_FLAGS: Final = (
     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 )
 _RESERVATION_MARKER_READ_FLAGS: Final = (
+    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+_STAGED_PARTIAL_READ_FLAGS: Final = (
     os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
 )
 
@@ -100,6 +105,16 @@ class PublicationReservationMarker:
     path: Path
     st_dev: int
     st_ino: int
+
+
+@dataclass(frozen=True, slots=True)
+class StagedPartialPayload:
+    """The visible completed partial payload identity retained for publication."""
+
+    path: Path
+    st_dev: int
+    st_ino: int
+    logical_size: int
 
 
 def resolve_destination(
@@ -329,6 +344,124 @@ def attest_publication_reservation_marker(
                             "publication reservation marker changed during attestation"
                         )
                     return attested
+                finally:
+                    os.close(job_fd)
+            finally:
+                os.close(incomplete_fd)
+        finally:
+            os.close(final_fd)
+    finally:
+        os.close(root_fd)
+
+
+def attest_staged_partial_payload(
+    destination: DestinationIntent,
+    reservation: PublicationReservation,
+) -> StagedPartialPayload:
+    """Attest one completed staged payload without publishing or claiming its final name."""
+
+    root, final_component = _validate_destination_intent(destination)
+    reservation = _validate_publication_reservation(
+        destination,
+        final_component,
+        reservation,
+    )
+    expected_marker_bytes = _reservation_marker_bytes(reservation)
+    _require_safe_writable_root(root)
+
+    root_fd = _open_root(root)
+    try:
+        final_fd = _open_existing_directory(root_fd, final_component)
+        try:
+            incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)
+            try:
+                job_fd = _open_existing_directory(incomplete_fd, destination.job_id)
+                try:
+                    _require_writable_directory(destination.final_path.parent)
+                    _require_writable_directory(destination.incomplete_dir)
+                    _require_same_filesystem(final_fd, job_fd)
+                    marker = _attest_existing_reservation_marker(
+                        job_fd,
+                        destination.incomplete_dir / _RESERVATION_MARKER,
+                        expected_marker_bytes,
+                    )
+                    _require_absent_final_name(final_fd, destination.final_path.name)
+                    preflight = _stat_staged_partial_payload(
+                        job_fd,
+                        destination.partial_path.name,
+                    )
+                    payload_fd = _open_staged_partial_payload(
+                        job_fd,
+                        destination.partial_path.name,
+                    )
+                    try:
+                        opened = _fstat_staged_partial_payload(payload_fd)
+                        _require_matching_staged_partial_details(preflight, opened)
+                        visible_before_sync = _stat_staged_partial_payload(
+                            job_fd,
+                            destination.partial_path.name,
+                        )
+                        _require_matching_staged_partial_details(
+                            opened,
+                            visible_before_sync,
+                        )
+                        _require_absent_final_name(final_fd, destination.final_path.name)
+                        _fsync_staged_partial_payload(payload_fd)
+                        after_file_sync = _fstat_staged_partial_payload(payload_fd)
+                        _require_matching_staged_partial_details(
+                            opened,
+                            after_file_sync,
+                        )
+                        visible_after_file_sync = _stat_staged_partial_payload(
+                            job_fd,
+                            destination.partial_path.name,
+                        )
+                        _require_matching_staged_partial_details(
+                            after_file_sync,
+                            visible_after_file_sync,
+                        )
+                        _require_absent_final_name(final_fd, destination.final_path.name)
+                        _fsync_staged_partial_directory(job_fd)
+                        after_directory_sync = _fstat_staged_partial_payload(payload_fd)
+                        _require_matching_staged_partial_details(
+                            after_file_sync,
+                            after_directory_sync,
+                        )
+                        visible_after_directory_sync = _stat_staged_partial_payload(
+                            job_fd,
+                            destination.partial_path.name,
+                        )
+                        _require_matching_staged_partial_details(
+                            after_directory_sync,
+                            visible_after_directory_sync,
+                        )
+                        _verify_attested_reservation_marker(
+                            job_fd,
+                            expected_marker_bytes,
+                            marker,
+                        )
+                        after_marker_reattest = _fstat_staged_partial_payload(payload_fd)
+                        _require_matching_staged_partial_details(
+                            after_directory_sync,
+                            after_marker_reattest,
+                        )
+                        visible_after_marker_reattest = _stat_staged_partial_payload(
+                            job_fd,
+                            destination.partial_path.name,
+                        )
+                        _require_matching_staged_partial_details(
+                            after_marker_reattest,
+                            visible_after_marker_reattest,
+                        )
+                        _require_absent_final_name(final_fd, destination.final_path.name)
+                        return StagedPartialPayload(
+                            path=destination.partial_path,
+                            st_dev=preflight[0],
+                            st_ino=preflight[1],
+                            logical_size=preflight[2],
+                        )
+                    finally:
+                        os.close(payload_fd)
                 finally:
                     os.close(job_fd)
             finally:
@@ -666,6 +799,168 @@ def _fsync_reservation_marker_directory(descriptor: int) -> None:
         os.fsync(descriptor)
     except OSError as error:
         raise PathValidationError("publication reservation directory cannot be synced") from error
+
+
+def _verify_attested_reservation_marker(
+    parent_fd: int,
+    expected_bytes: bytes,
+    expected_marker: PublicationReservationMarker,
+) -> None:
+    preflight = _require_reservation_marker_details(
+        _stat_reservation_marker(parent_fd),
+        expected_size=len(expected_bytes),
+    )
+    _require_attested_reservation_marker_identity(preflight, expected_marker)
+    try:
+        descriptor = os.open(
+            _RESERVATION_MARKER,
+            _RESERVATION_MARKER_READ_FLAGS,
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        raise UnsafePathError("publication reservation marker cannot be opened safely") from error
+
+    try:
+        opened = _require_reservation_marker_details(
+            _fstat_reservation_marker(descriptor),
+            expected_size=len(expected_bytes),
+        )
+        _require_matching_reservation_marker_identity(preflight, opened)
+        _require_attested_reservation_marker_identity(opened, expected_marker)
+        contents = _read_reservation_marker(descriptor, len(expected_bytes))
+        after_read = _require_reservation_marker_details(
+            _fstat_reservation_marker(descriptor),
+            expected_size=len(expected_bytes),
+        )
+        _require_matching_reservation_marker_identity(opened, after_read)
+        _require_attested_reservation_marker_identity(after_read, expected_marker)
+        visible = _require_reservation_marker_details(
+            _stat_reservation_marker(parent_fd),
+            expected_size=len(expected_bytes),
+        )
+        _require_matching_reservation_marker_identity(after_read, visible)
+        _require_attested_reservation_marker_identity(visible, expected_marker)
+        if contents != expected_bytes:
+            raise PathValidationError("publication reservation marker contents do not match")
+    finally:
+        os.close(descriptor)
+
+
+def _require_attested_reservation_marker_identity(
+    details: os.stat_result,
+    expected_marker: PublicationReservationMarker,
+) -> None:
+    if _reservation_marker_identity(details) != (
+        expected_marker.st_dev,
+        expected_marker.st_ino,
+    ):
+        raise UnsafePathError("publication reservation marker changed during attestation")
+
+
+def _require_absent_final_name(parent_fd: int, name: str) -> None:
+    try:
+        details = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise PathValidationError("final destination is inaccessible") from error
+    try:
+        mode = details.st_mode
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("final destination metadata is invalid") from error
+    if type(mode) is not int:
+        raise PathValidationError("final destination metadata is invalid")
+    if stat.S_ISLNK(mode):
+        raise UnsafePathError("final destination is a symlink")
+    raise FinalPathCollisionError("final destination is already occupied")
+
+
+def _stat_staged_partial_payload(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, int, int, int, int, int, int]:
+    try:
+        details = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise PathValidationError("partial payload is missing") from error
+    except OSError as error:
+        raise PathValidationError("partial payload is inaccessible") from error
+    return _staged_partial_payload_details(details)
+
+
+def _open_staged_partial_payload(parent_fd: int, name: str) -> int:
+    try:
+        return os.open(name, _STAGED_PARTIAL_READ_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise UnsafePathError("partial payload cannot be opened safely") from error
+
+
+def _fstat_staged_partial_payload(
+    descriptor: int,
+) -> tuple[int, int, int, int, int, int, int]:
+    try:
+        details = os.fstat(descriptor)
+    except OSError as error:
+        raise PathValidationError("partial payload is inaccessible") from error
+    try:
+        return _staged_partial_payload_details(details)
+    except UnsafePathError:
+        raise
+    except PathValidationError as error:
+        raise UnsafePathError("partial payload changed during attestation") from error
+
+
+def _staged_partial_payload_details(
+    details: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    details = _require_regular_single_link_file(details)
+    try:
+        st_dev = details.st_dev
+        st_ino = details.st_ino
+        st_size = details.st_size
+        st_mode = details.st_mode
+        st_nlink = details.st_nlink
+        st_mtime_ns = details.st_mtime_ns
+        st_ctime_ns = details.st_ctime_ns
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("partial payload metadata is invalid") from error
+    if (
+        type(st_dev) is not int
+        or st_dev < 0
+        or type(st_ino) is not int
+        or st_ino < 0
+        or type(st_size) is not int
+        or st_size < 0
+        or type(st_mode) is not int
+        or type(st_nlink) is not int
+        or st_nlink != 1
+        or type(st_mtime_ns) is not int
+        or type(st_ctime_ns) is not int
+    ):
+        raise PathValidationError("partial payload metadata is invalid")
+    return st_dev, st_ino, st_size, st_mode, st_nlink, st_mtime_ns, st_ctime_ns
+
+
+def _require_matching_staged_partial_details(
+    first: tuple[int, int, int, int, int, int, int],
+    second: tuple[int, int, int, int, int, int, int],
+) -> None:
+    if first != second:
+        raise UnsafePathError("partial payload changed during attestation")
+
+
+def _fsync_staged_partial_payload(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise PathValidationError("partial payload cannot be synced") from error
+
+
+def _fsync_staged_partial_directory(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise PathValidationError("incomplete job directory cannot be synced") from error
 
 
 def _require_expected_output_logical_bytes(value: object) -> int | None:

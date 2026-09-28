@@ -1043,3 +1043,415 @@ def test_prepare_persisted_workspace_preflights_cross_filesystem_final_before_cr
     assert not os.path.lexists(destination.final_path)
     assert not os.path.lexists(destination.partial_path)
     assert not os.path.lexists(_marker_path(destination))
+
+
+def _prepare_staged_partial(paths, payload: bytes = b"complete payload bytes"):
+    destination = _resolve(paths, _root())
+    reservation = _reservation(destination)
+    paths.attest_publication_reservation_marker(destination, reservation)
+    destination.partial_path.write_bytes(payload)
+    return destination, reservation
+
+
+def test_attests_staged_partial_payload_descriptor_relatively_without_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    payload = b"complete payload bytes"
+    destination, reservation = _prepare_staged_partial(paths, payload)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    partial_before = _entry_signature(destination.partial_path)
+    partial_identity = partial_before[:2]
+    sidecar_before = _entry_signature(sidecar)
+    job_details = os.lstat(destination.incomplete_dir)
+    opens: list[tuple[int, int, int | None]] = []
+    fsync_targets: list[tuple[int, int, int]] = []
+    original_open = paths.os.open
+    original_read = paths.os.read
+    original_fsync = paths.os.fsync
+
+    def record_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if path == destination.partial_path.name:
+            opens.append((flags, mode, dir_fd))
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def reject_partial_read(descriptor: int, count: int) -> bytes:
+        details = os.fstat(descriptor)
+        assert (details.st_dev, details.st_ino) != partial_identity
+        return original_read(descriptor, count)
+
+    def record_fsync(descriptor: int) -> None:
+        details = os.fstat(descriptor)
+        fsync_targets.append((stat.S_IFMT(details.st_mode), details.st_dev, details.st_ino))
+        original_fsync(descriptor)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("staged payload attestation must not resolve a destination")
+
+    monkeypatch.setattr(paths.os, "open", record_open)
+    monkeypatch.setattr(paths.os, "read", reject_partial_read)
+    monkeypatch.setattr(paths.os, "fsync", record_fsync)
+    monkeypatch.setattr(paths, "resolve_destination", forbidden)
+
+    attested = paths.attest_staged_partial_payload(destination, reservation)
+
+    assert "StagedPartialPayload" in paths.__all__
+    assert "attest_staged_partial_payload" in paths.__all__
+    assert tuple(paths.StagedPartialPayload.__dataclass_fields__) == (
+        "path",
+        "st_dev",
+        "st_ino",
+        "logical_size",
+    )
+    assert attested == paths.StagedPartialPayload(
+        path=destination.partial_path,
+        st_dev=partial_before[0],
+        st_ino=partial_before[1],
+        logical_size=len(payload),
+    )
+    assert reservation.claim_token not in repr(attested)
+    assert len(opens) == 1
+    flags, _mode, parent_fd = opens[0]
+    assert flags == os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    assert parent_fd is not None
+    assert fsync_targets == [
+        (stat.S_IFREG, marker_before[0], marker_before[1]),
+        (stat.S_IFREG, partial_before[0], partial_before[1]),
+        (stat.S_IFDIR, job_details.st_dev, job_details.st_ino),
+    ]
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert destination.partial_path.read_bytes() == payload
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    assert not os.path.lexists(destination.final_path)
+
+
+def test_staged_partial_attestation_requires_a_preexisting_matching_marker(
+    tmp_path: Path,
+) -> None:
+    paths = _paths()
+    destination = _resolve(paths, _root())
+    reservation = _reservation(destination)
+    destination.partial_path.write_bytes(b"complete payload bytes")
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    partial_before = _entry_signature(destination.partial_path)
+    sidecar_before = _entry_signature(sidecar)
+
+    with pytest.raises(paths.PathValidationError, match="marker is missing"):
+        paths.attest_staged_partial_payload(destination, reservation)
+
+    assert not os.path.lexists(_marker_path(destination))
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    assert not os.path.lexists(destination.final_path)
+
+
+@pytest.mark.parametrize("shape", ("symlink", "hardlink", "directory", "fifo"))
+def test_staged_partial_attestation_rejects_unsafe_partial_shapes_without_mutation(
+    tmp_path: Path, shape: str
+) -> None:
+    paths = _paths()
+    destination = _resolve(paths, _root())
+    reservation = _reservation(destination)
+    paths.attest_publication_reservation_marker(destination, reservation)
+    marker = _marker_path(destination)
+    partial = destination.partial_path
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    outside = tmp_path / f"outside-partial-{shape}"
+
+    if shape == "symlink":
+        outside.write_bytes(b"outside payload bytes")
+        partial.symlink_to(outside)
+    elif shape == "hardlink":
+        outside.write_bytes(b"outside payload bytes")
+        os.link(outside, partial)
+    elif shape == "directory":
+        partial.mkdir(mode=0o700)
+    else:
+        os.mkfifo(partial, 0o600)
+
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    partial_before = _entry_signature(partial)
+    sidecar_before = _entry_signature(sidecar)
+    outside_before = _entry_signature(outside) if outside.exists() else None
+
+    with pytest.raises(paths.PathValidationError):
+        paths.attest_staged_partial_payload(destination, reservation)
+
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+    assert _entry_signature(partial) == partial_before
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    if outside_before is not None:
+        assert _entry_signature(outside) == outside_before
+        assert outside.read_bytes() == b"outside payload bytes"
+    assert not os.path.lexists(destination.final_path)
+
+
+def test_staged_partial_attestation_rejects_partial_replacement_during_file_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination, reservation = _prepare_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    partial_before = _entry_signature(destination.partial_path)
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    sidecar_before = _entry_signature(sidecar)
+    replacement = destination.incomplete_dir / "attacker-replacement"
+    replacement.write_bytes(b"attacker replacement bytes")
+    original_fsync = paths.os.fsync
+    replaced = False
+
+    def replace_partial_during_sync(descriptor: int) -> None:
+        nonlocal replaced
+        details = os.fstat(descriptor)
+        if (details.st_dev, details.st_ino) == partial_before[:2]:
+            os.replace(replacement, destination.partial_path)
+            replaced = True
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(paths.os, "fsync", replace_partial_during_sync)
+
+    with pytest.raises(paths.UnsafePathError, match="partial payload changed"):
+        paths.attest_staged_partial_payload(destination, reservation)
+
+    assert replaced
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+    assert _entry_signature(destination.partial_path) != partial_before
+    assert destination.partial_path.read_bytes() == b"attacker replacement bytes"
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    assert not os.path.lexists(destination.final_path)
+
+
+def test_staged_partial_attestation_rejects_in_place_metadata_change_during_file_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    payload = b"complete payload bytes"
+    destination, reservation = _prepare_staged_partial(paths, payload)
+    marker = _marker_path(destination)
+    partial_before = os.lstat(destination.partial_path)
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    original_fsync = paths.os.fsync
+    changed = False
+
+    def change_metadata_during_sync(descriptor: int) -> None:
+        nonlocal changed
+        details = os.fstat(descriptor)
+        if (details.st_dev, details.st_ino) == (
+            partial_before.st_dev,
+            partial_before.st_ino,
+        ):
+            os.utime(
+                destination.partial_path,
+                ns=(partial_before.st_atime_ns, partial_before.st_mtime_ns + 1_000_000_000),
+            )
+            changed = True
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(paths.os, "fsync", change_metadata_during_sync)
+
+    with pytest.raises(paths.UnsafePathError, match="partial payload changed"):
+        paths.attest_staged_partial_payload(destination, reservation)
+
+    assert changed
+    assert destination.partial_path.read_bytes() == payload
+    assert os.lstat(destination.partial_path).st_mtime_ns != partial_before.st_mtime_ns
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+    assert not os.path.lexists(destination.final_path)
+
+
+def test_staged_partial_attestation_rejects_existing_final_without_mutation(
+    tmp_path: Path,
+) -> None:
+    paths = _paths()
+    destination, reservation = _prepare_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    destination.final_path.write_bytes(b"ordinary preexisting final")
+    final_before = _entry_signature(destination.final_path)
+    partial_before = _entry_signature(destination.partial_path)
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    sidecar_before = _entry_signature(sidecar)
+
+    with pytest.raises(paths.FinalPathCollisionError):
+        paths.attest_staged_partial_payload(destination, reservation)
+
+    assert _entry_signature(destination.final_path) == final_before
+    assert destination.final_path.read_bytes() == b"ordinary preexisting final"
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+
+
+def test_staged_partial_attestation_rejects_final_created_during_file_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination, reservation = _prepare_staged_partial(paths)
+    marker = _marker_path(destination)
+    partial_before = _entry_signature(destination.partial_path)
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    original_fsync = paths.os.fsync
+    created = False
+
+    def create_final_during_sync(descriptor: int) -> None:
+        nonlocal created
+        details = os.fstat(descriptor)
+        if (details.st_dev, details.st_ino) == partial_before[:2]:
+            destination.final_path.write_bytes(b"racing final bytes")
+            created = True
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(paths.os, "fsync", create_final_during_sync)
+
+    with pytest.raises(paths.FinalPathCollisionError):
+        paths.attest_staged_partial_payload(destination, reservation)
+
+    assert created
+    assert destination.final_path.read_bytes() == b"racing final bytes"
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+
+
+def test_staged_partial_attestation_rejects_partial_replacement_after_marker_reattest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination, reservation = _prepare_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    partial_before = _entry_signature(destination.partial_path)
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    sidecar_before = _entry_signature(sidecar)
+    replacement = destination.incomplete_dir / "attacker-replacement"
+    replacement.write_bytes(b"attacker replacement bytes")
+    original_verify = paths._verify_attested_reservation_marker
+    replaced = False
+
+    def replace_partial_after_marker_verification(*args, **kwargs) -> None:
+        nonlocal replaced
+        original_verify(*args, **kwargs)
+        os.replace(replacement, destination.partial_path)
+        replaced = True
+
+    monkeypatch.setattr(
+        paths,
+        "_verify_attested_reservation_marker",
+        replace_partial_after_marker_verification,
+    )
+
+    with pytest.raises(paths.UnsafePathError, match="partial payload changed"):
+        paths.attest_staged_partial_payload(destination, reservation)
+
+    assert replaced
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+    assert _entry_signature(destination.partial_path) != partial_before
+    assert destination.partial_path.read_bytes() == b"attacker replacement bytes"
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    assert not os.path.lexists(destination.final_path)
+
+
+def test_staged_partial_attestation_rejects_marker_mismatch_without_touching_payload(
+    tmp_path: Path,
+) -> None:
+    paths = _paths()
+    destination, reservation = _prepare_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    partial_before = _entry_signature(destination.partial_path)
+    sidecar_before = _entry_signature(sidecar)
+
+    with pytest.raises(paths.PathValidationError, match="marker contents do not match"):
+        paths.attest_staged_partial_payload(
+            destination,
+            _reservation(destination, claim_token="b" * 64),
+        )
+
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    assert not os.path.lexists(destination.final_path)
+
+
+@pytest.mark.parametrize("failure_target", ("partial", "job-directory"))
+def test_staged_partial_attestation_fsync_failure_preserves_all_entries(
+    monkeypatch: pytest.MonkeyPatch, failure_target: str
+) -> None:
+    paths = _paths()
+    destination, reservation = _prepare_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    marker_bytes = marker.read_bytes()
+    partial_before = _entry_signature(destination.partial_path)
+    sidecar_before = _entry_signature(sidecar)
+    job_identity = _entry_signature(destination.incomplete_dir)[:2]
+    original_fsync = paths.os.fsync
+    injected = 0
+
+    def fail_selected_sync(descriptor: int) -> None:
+        nonlocal injected
+        details = os.fstat(descriptor)
+        identity = (details.st_dev, details.st_ino)
+        should_fail = (
+            failure_target == "partial" and identity == partial_before[:2]
+        ) or (failure_target == "job-directory" and identity == job_identity)
+        if should_fail:
+            injected += 1
+            raise OSError("injected staged payload sync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(paths.os, "fsync", fail_selected_sync)
+
+    with pytest.raises(paths.PathValidationError):
+        paths.attest_staged_partial_payload(destination, reservation)
+
+    assert injected == 1
+    assert _entry_signature(marker) == marker_before
+    assert marker.read_bytes() == marker_bytes
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    assert not os.path.lexists(destination.final_path)
