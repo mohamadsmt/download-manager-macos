@@ -40,6 +40,7 @@ from hermes_downloads.store import (
     SQLiteStore,
     _DirectDispatchPlan,
     _DirectEngineRecoveryCapability,
+    _DirectPublicationReconciliationPlan,
 )
 
 if TYPE_CHECKING:
@@ -185,6 +186,40 @@ def _validate_ipc_socket_path(state_root: Path, socket_path: str | Path) -> Path
     if path != state_root / _IPC_SOCKET_FILE_NAME:
         raise WorkerStateError
     return path
+
+
+def _require_reconciliation_chain(
+    destination: DestinationIntent,
+    plan: _DirectPublicationReconciliationPlan,
+) -> None:
+    """Require exact pre-existing marker, staged, and final inode identities."""
+
+    try:
+        marker = os.lstat(destination.incomplete_dir / ".hermes-reservation")
+        staged = os.lstat(destination.partial_path)
+        final = os.lstat(destination.final_path)
+    except OSError as error:
+        raise ValueError("published finalization chain is absent") from error
+    if (
+        not stat.S_ISREG(marker.st_mode)
+        or (marker.st_dev, marker.st_ino)
+        != (plan.marker.marker_device, plan.marker.marker_inode)
+        or not stat.S_ISREG(staged.st_mode)
+        or (staged.st_dev, staged.st_ino, staged.st_size)
+        != (
+            plan.staged.partial_device,
+            plan.staged.partial_inode,
+            plan.staged.logical_size,
+        )
+        or not stat.S_ISREG(final.st_mode)
+        or (final.st_dev, final.st_ino, final.st_size)
+        != (
+            plan.staged.partial_device,
+            plan.staged.partial_inode,
+            plan.staged.logical_size,
+        )
+    ):
+        raise ValueError("published finalization chain does not match durable bindings")
 
 
 def _health_from_store(store: SQLiteStore) -> WorkerHealth:
@@ -664,6 +699,61 @@ def run_worker(
                     generation=prepared.generation,
                     revision=prepared.revision,
                     state=prepared.state,
+                )
+            if type(prepared) is _DirectPublicationReconciliationPlan:
+                reconciliation = prepared
+                try:
+                    from hermes_downloads.paths import (
+                        StagedPartialPayload,
+                        publish_staged_partial_payload,
+                        rehydrate_destination,
+                    )
+
+                    destination = rehydrate_destination(
+                        category=reconciliation.job.category,
+                        collection=reconciliation.job.destination_collection,
+                        partial_filename=reconciliation.job.partial_filename,
+                        selected_final_filename=reconciliation.job.selected_final_filename,
+                        job_id=reconciliation.job.job_id,
+                    )
+                    _require_reconciliation_chain(destination, reconciliation)
+                    published = publish_staged_partial_payload(
+                        destination,
+                        reconciliation.reservation,
+                        StagedPartialPayload(
+                            path=destination.partial_path,
+                            st_dev=reconciliation.staged.partial_device,
+                            st_ino=reconciliation.staged.partial_inode,
+                            logical_size=reconciliation.staged.logical_size,
+                        ),
+                    )
+                    _require_reconciliation_chain(destination, reconciliation)
+                    result = store.complete_direct_publication_reconciliation(
+                        reconciliation,
+                        final_device=published.st_dev,
+                        final_inode=published.st_ino,
+                        logical_size=published.logical_size,
+                    )
+                except BaseException:
+                    try:
+                        aborted = store.abort_direct_publication_reconciliation(
+                            reconciliation
+                        )
+                    except BaseException:
+                        raise IPCError("direct_dispatch_blocked") from None
+                    return DirectJobDispatchResult(
+                        status=aborted.status,
+                        job=aborted.job,
+                        generation=aborted.generation,
+                        revision=aborted.revision,
+                        state=aborted.state,
+                    )
+                return DirectJobDispatchResult(
+                    status=result.status,
+                    job=result.job,
+                    generation=result.generation,
+                    revision=result.revision,
+                    state=result.state,
                 )
             if type(prepared) is not _DirectDispatchPlan or controller is None:
                 raise IPCError("direct_dispatch_blocked")

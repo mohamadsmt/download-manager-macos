@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
 from pathlib import Path
 import stat
+import tempfile
 import threading
 
 import pytest
 
-from hermes_downloads import worker
+from hermes_downloads import direct, ipc, paths, worker
+from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
 from hermes_downloads.store import SQLiteStore
 
 
@@ -33,6 +37,14 @@ def test_worker_entrypoint_persists_paused_gate_in_configured_state_root(
 
 
 _WATCHDOG_SECONDS = 5.0
+
+
+@pytest.fixture
+def short_state_root() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-t15g-") as temporary_root:
+        state_root = Path(temporary_root) / "state"
+        state_root.mkdir(mode=0o700)
+        yield state_root
 
 
 def test_run_worker_sets_ready_only_after_recovery_and_stops_on_shutdown(
@@ -297,3 +309,228 @@ def test_run_worker_creates_a_private_regular_lease_file(
 
     assert not thread.is_alive()
     assert errors == []
+
+
+def _seed_published_finalization(
+    state_root: Path,
+    *,
+    final_bound: bool,
+    mismatched_final: bool,
+    missing_final: bool,
+) -> tuple[paths.DestinationIntent, str]:
+    intent = DownloadIntent(
+        job_id="reconcile-job",
+        request_id="reconcile-add",
+        payload_digest="a" * 64,
+        source_url=b"https://example.test/reconciliation-must-not-transfer",
+    )
+    materialized = MaterializedJob(
+        job_id=intent.job_id,
+        intent=intent,
+        source_kind=SourceKind.DIRECT,
+        queue_collection_id=None,
+        priority=0,
+        order_key=0,
+        scheduled_for=None,
+        authorized=False,
+        manual_hold=False,
+        start_now_requested=False,
+        category="Other",
+        destination_collection=None,
+        partial_filename="payload.bin",
+        selected_final_filename="payload.bin",
+    )
+    store = SQLiteStore(state_root / "state.db")
+    try:
+        assert store.apply_add(intent, materialized=materialized).applied
+        reservation = store.get_publication_reservation(intent.job_id)
+        assert reservation is not None
+        root = Path.home() / "Downloads" / "Hermes"
+        root.mkdir(parents=True, mode=0o700)
+        root.chmod(0o700)
+        destination = paths.rehydrate_destination(
+            category=materialized.category,
+            collection=materialized.destination_collection,
+            partial_filename=materialized.partial_filename,
+            selected_final_filename=materialized.selected_final_filename,
+            job_id=intent.job_id,
+        )
+        paths.prepare_persisted_destination_workspace(destination)
+        marker = paths.attest_publication_reservation_marker(destination, reservation)
+        store.bind_publication_marker(
+            intent.job_id,
+            claim_token=reservation.claim_token,
+            marker_device=marker.st_dev,
+            marker_inode=marker.st_ino,
+        )
+        destination.partial_path.write_bytes(b"durably published payload")
+        staged = paths.attest_staged_partial_payload(destination, reservation)
+        store._bind_staged_payload(
+            intent.job_id,
+            claim_token=reservation.claim_token,
+            partial_device=staged.st_dev,
+            partial_inode=staged.st_ino,
+            logical_size=staged.logical_size,
+        )
+        published = paths.publish_staged_partial_payload(destination, reservation, staged)
+        if final_bound:
+            store._bind_final_publication(
+                intent.job_id,
+                claim_token=reservation.claim_token,
+                final_device=published.st_dev,
+                final_inode=published.st_ino,
+                logical_size=published.logical_size,
+            )
+        if mismatched_final:
+            destination.final_path.unlink()
+            destination.final_path.write_bytes(b"different payload")
+        if missing_final:
+            destination.final_path.unlink()
+        store._connection.execute(
+            "UPDATE jobs SET revision = 1, state = 'finalizing' WHERE job_id = ?",
+            (intent.job_id,),
+        )
+        store._connection.execute(
+            """
+            INSERT INTO events (kind, job_id, generation, revision)
+            VALUES ('job_finalizing', ?, 0, 1)
+            """,
+            (intent.job_id,),
+        )
+        return destination, reservation.claim_token
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("final_bound", "mismatched_final", "missing_final"),
+    (
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (True, True, False),
+        (False, False, True),
+    ),
+    ids=(
+        "pre-bind",
+        "final-bound",
+        "mismatch",
+        "final-bound-mismatch",
+        "missing-final",
+    ),
+)
+def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
+    short_state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    final_bound: bool,
+    mismatched_final: bool,
+    missing_final: bool,
+) -> None:
+    state_root = short_state_root
+    destination, claim_token = _seed_published_finalization(
+        state_root,
+        final_bound=final_bound,
+        mismatched_final=mismatched_final,
+        missing_final=missing_final,
+    )
+    transfer_calls: list[str] = []
+    results: list[ipc.DirectJobDispatchResult] = []
+    shutdown = threading.Event()
+    stopped = threading.Event()
+    errors: list[BaseException] = []
+
+    def forbidden_transfer(*_args: object, **_kwargs: object) -> object:
+        transfer_calls.append("attempted")
+        raise AssertionError("published-final reconciliation must not transfer")
+
+    monkeypatch.setattr(worker, "validate_source_url", forbidden_transfer)
+    monkeypatch.setattr(direct.DirectAria2Controller, "add_paused", forbidden_transfer)
+    monkeypatch.setattr(direct.DirectAria2Controller, "resume", forbidden_transfer)
+
+    class DispatchServer:
+        def __init__(self, _path: Path, **handlers: object) -> None:
+            self._queue = handlers["queue_gate"]
+            self._job = handlers["job_control"]
+            self._dispatch = handlers["direct_job_dispatch"]
+            self._served = False
+
+        def serve_once(self) -> None:
+            if self._served:
+                return
+            self._served = True
+            command = ipc.DirectJobDispatchCommand(
+                job="reconcile-job",
+                expected_worker_epoch=1,
+                expected_generation=0,
+                expected_revision=1,
+                request_id="reconcile-dispatch",
+            )
+            first = self._dispatch(command)
+            replay = self._dispatch(command)
+            assert isinstance(first, ipc.DirectJobDispatchResult)
+            assert isinstance(replay, ipc.DirectJobDispatchResult)
+            results.extend((first, replay))
+            shutdown.set()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker, "HealthServer", DispatchServer)
+
+    def run() -> None:
+        try:
+            worker.run_worker(
+                state_root,
+                socket_path=state_root / "worker.sock",
+                ready_event=threading.Event(),
+                shutdown_event=shutdown,
+                stopped_event=stopped,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert stopped.wait(_WATCHDOG_SECONDS)
+    finally:
+        shutdown.set()
+        thread.join(_WATCHDOG_SECONDS)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert transfer_calls == []
+    store = SQLiteStore(state_root / "state.db")
+    try:
+        job = store.get_job("reconcile-job")
+        assert job is not None
+        if mismatched_final or missing_final:
+            expected = ipc.DirectJobDispatchResult("blocked", "reconcile-job", 0, 1, "finalizing")
+            assert results == [expected, expected]
+            assert job.state == "finalizing"
+            if final_bound:
+                assert store._get_final_publication_binding("reconcile-job") is not None
+            else:
+                assert store._get_final_publication_binding("reconcile-job") is None
+            if mismatched_final:
+                assert destination.final_path.read_bytes() == b"different payload"
+            else:
+                assert not destination.final_path.exists()
+        else:
+            expected = ipc.DirectJobDispatchResult("started", "reconcile-job", 0, 2, "completed")
+            assert results == [expected, expected]
+            assert job.state == "completed"
+            final = os.lstat(destination.final_path)
+            partial = os.lstat(destination.partial_path)
+            assert (final.st_dev, final.st_ino, final.st_size) == (
+                partial.st_dev,
+                partial.st_ino,
+                partial.st_size,
+            )
+            assert store._get_final_publication_binding("reconcile-job") is not None
+            assert [event.kind for event in store.list_events()].count("job_completed") == 1
+        assert claim_token not in repr(results)
+        assert claim_token not in repr(store.list_job_page())
+        assert claim_token not in repr(store.list_events())
+    finally:
+        store.close()

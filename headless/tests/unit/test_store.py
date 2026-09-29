@@ -5360,6 +5360,217 @@ def _admit_direct_dispatch_target(store: SQLiteStore, *, job_id: str = "job-1") 
     ).status == "applied"
 
 
+def _seed_finalizing_direct_publication(
+    store: SQLiteStore, *, final_bound: bool
+) -> models_module.PublicationReservation:
+    """Build one durable finalization chain without starting a transfer."""
+
+    _admit_direct_dispatch_target(store)
+    store._connection.execute(
+        "UPDATE jobs SET revision = 3, state = 'finalizing' WHERE job_id = 'job-1'"
+    )
+    store._connection.execute(
+        """
+        INSERT INTO events (kind, job_id, generation, revision)
+        VALUES ('job_finalizing', 'job-1', 1, 3)
+        """
+    )
+    reservation = store.get_publication_reservation("job-1")
+    assert reservation is not None
+    store.bind_publication_marker(
+        "job-1",
+        claim_token=reservation.claim_token,
+        marker_device=901,
+        marker_inode=902,
+    )
+    store._bind_staged_payload(
+        "job-1",
+        claim_token=reservation.claim_token,
+        partial_device=903,
+        partial_inode=904,
+        logical_size=905,
+    )
+    if final_bound:
+        store._bind_final_publication(
+            "job-1",
+            claim_token=reservation.claim_token,
+            final_device=903,
+            final_inode=904,
+            logical_size=905,
+        )
+    return reservation
+
+
+@pytest.mark.parametrize("final_bound", (False, True))
+def test_direct_dispatch_reconciles_a_durable_final_publication_and_replays_exactly(
+    tmp_path: Path, final_bound: bool
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        reservation = _seed_finalizing_direct_publication(store, final_bound=final_bound)
+        prepared = store.prepare_direct_dispatch(
+            job_id="job-1",
+            expected_worker_epoch=1,
+            expected_generation=1,
+            expected_revision=3,
+            request_id="reconcile-final-publication",
+            payload_digest="6" * 64,
+            controller_ready=False,
+            now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+
+        assert type(prepared) is store_module._DirectPublicationReconciliationPlan
+        assert (
+            store.prepare_direct_dispatch(
+                job_id="job-1",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=3,
+                request_id="reconcile-final-publication",
+                payload_digest="6" * 64,
+                controller_ready=False,
+                now=datetime(2032, 1, 2, tzinfo=UTC),
+            )
+            == prepared
+        )
+        completed = store.complete_direct_publication_reconciliation(
+            prepared,
+            final_device=903,
+            final_inode=904,
+            logical_size=905,
+        )
+
+        assert completed == store_module.DirectDispatchResult(
+            status="started",
+            job="job-1",
+            generation=1,
+            revision=4,
+            state="completed",
+        )
+        assert store.get_job("job-1") == store_module.JobRecord(
+            job="job-1",
+            source_url=bytes(_intent().source_url),
+            generation=1,
+            revision=4,
+            state="completed",
+        )
+        assert store._get_final_publication_binding("job-1") == (
+            store_module._FinalPublicationBinding(
+                job_id="job-1",
+                final_device=903,
+                final_inode=904,
+                logical_size=905,
+            )
+        )
+        assert [event.kind for event in store.list_events()][-2:] == [
+            "job_finalizing",
+            "job_completed",
+        ]
+        assert reservation.claim_token not in repr(store.list_job_page())
+        assert reservation.claim_token not in repr(store.list_events())
+        assert reservation.claim_token not in repr(completed)
+
+        assert (
+            store.prepare_direct_dispatch(
+                job_id="job-1",
+                expected_worker_epoch=1,
+                expected_generation=1,
+                expected_revision=3,
+                request_id="reconcile-final-publication",
+                payload_digest="6" * 64,
+                controller_ready=False,
+                now=datetime(2032, 1, 2, tzinfo=UTC),
+            )
+            == completed
+        )
+        assert [event.kind for event in store.list_events()].count("job_completed") == 1
+    finally:
+        store.close()
+
+
+def test_direct_dispatch_blocks_a_finalizing_chain_without_its_terminal_audit(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _seed_finalizing_direct_publication(store, final_bound=False)
+        store._connection.execute(
+            "DELETE FROM events WHERE kind = 'job_finalizing' AND job_id = 'job-1'"
+        )
+
+        assert store.prepare_direct_dispatch(
+            job_id="job-1",
+            expected_worker_epoch=1,
+            expected_generation=1,
+            expected_revision=3,
+            request_id="reconcile-missing-finalizing-audit",
+            payload_digest="e" * 64,
+            controller_ready=False,
+            now=datetime(2032, 1, 2, tzinfo=UTC),
+        ) == store_module.DirectDispatchResult(
+            status="blocked",
+            job="job-1",
+            generation=1,
+            revision=3,
+            state="finalizing",
+        )
+        assert store._get_final_publication_binding("job-1") is None
+        assert "job_completed" not in [event.kind for event in store.list_events()]
+    finally:
+        store.close()
+
+
+def test_direct_publication_reconciliation_rolls_back_mismatch_and_audit_failure(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _seed_finalizing_direct_publication(store, final_bound=False)
+        prepared = store.prepare_direct_dispatch(
+            job_id="job-1",
+            expected_worker_epoch=1,
+            expected_generation=1,
+            expected_revision=3,
+            request_id="reconcile-rejects-mismatch",
+            payload_digest="7" * 64,
+            controller_ready=False,
+            now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+        assert type(prepared) is store_module._DirectPublicationReconciliationPlan
+
+        with pytest.raises(ValueError, match="final publication"):
+            store.complete_direct_publication_reconciliation(
+                prepared,
+                final_device=903,
+                final_inode=999,
+                logical_size=905,
+            )
+        assert store.get_job("job-1").state == "finalizing"  # type: ignore[union-attr]
+        assert store._get_final_publication_binding("job-1") is None
+        assert "job_completed" not in [event.kind for event in store.list_events()]
+
+        store._connection.execute(
+            """
+            CREATE TRIGGER fail_completed_audit
+            BEFORE INSERT ON events
+            WHEN NEW.kind = 'job_completed'
+            BEGIN SELECT RAISE(ABORT, 'injected completed audit failure'); END
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="injected completed audit failure"):
+            store.complete_direct_publication_reconciliation(
+                prepared,
+                final_device=903,
+                final_inode=904,
+                logical_size=905,
+            )
+        assert store.get_job("job-1").state == "finalizing"  # type: ignore[union-attr]
+        assert store._get_final_publication_binding("job-1") is None
+        assert "job_completed" not in [event.kind for event in store.list_events()]
+    finally:
+        store.close()
+
+
 def test_direct_dispatch_is_fenced_idempotent_and_allows_only_one_active_body(
     tmp_path: Path,
 ) -> None:

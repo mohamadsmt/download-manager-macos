@@ -871,6 +871,20 @@ class _DirectDispatchPlan:
     payload_digest: str
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectPublicationReconciliationPlan:
+    """Private evidence required to finish an already-published final payload."""
+
+    job: MaterializedJob
+    reservation: PublicationReservation
+    marker: PublicationMarkerBinding
+    staged: _StagedPayloadBinding
+    generation: int
+    revision: int
+    request_id: str
+    payload_digest: str
+
+
 @dataclass(frozen=True, slots=True)
 class _DirectDispatchCommand:
     """Internal direct-dispatch idempotency receipt."""
@@ -2280,14 +2294,13 @@ class SQLiteStore:
         payload_digest: str,
         controller_ready: bool,
         now: datetime,
-    ) -> _DirectDispatchPlan | DirectDispatchResult:
+    ) -> _DirectDispatchPlan | _DirectPublicationReconciliationPlan | DirectDispatchResult:
         """Fence and durably enter ``resolving`` before any engine admission.
 
         The returned plan contains only immutable persisted job data and the
-        already-computed durable admission gates.  A pending receipt is
-        deliberately fail-closed after a crash: cold recovery pauses the job,
-        and replay resolves to a bounded ``blocked`` result instead of retrying
-        an uncertain engine side effect.
+        already-computed durable admission gates.  Pending engine receipts remain
+        fail-closed after a crash; a terminal-publication receipt may only replay
+        its no-transfer inode reconciliation.
         """
 
         job_id = _require_identifier(job_id, "job_id")
@@ -2319,6 +2332,28 @@ class SQLiteStore:
                     )
                 if replay.status == "pending":
                     current = self._read_job_control_projection(connection, job_id)
+                    materialized = self.get_materialized_job(job_id)
+                    reconciliation = (
+                        None
+                        if (
+                            materialized is None
+                            or materialized.source_kind is not SourceKind.DIRECT
+                            or replay.generation != current.generation
+                            or replay.revision != current.revision
+                            or replay.state != current.state
+                        )
+                        else self._prepare_direct_publication_reconciliation(
+                            connection,
+                            current=current,
+                            materialized=materialized,
+                            request_id=request_id,
+                            payload_digest=payload_digest,
+                            persist_receipt=False,
+                        )
+                    )
+                    if reconciliation is not None:
+                        connection.commit()
+                        return reconciliation
                     result = DirectDispatchResult(
                         status="blocked",
                         job=current.job,
@@ -2349,6 +2384,18 @@ class SQLiteStore:
             ):
                 result = self._direct_dispatch_result_from_current(current, "stale")
             elif materialized.source_kind is not SourceKind.DIRECT:
+                result = self._direct_dispatch_result_from_current(current, "blocked")
+            elif current.state == JobState.FINALIZING.value:
+                reconciliation = self._prepare_direct_publication_reconciliation(
+                    connection,
+                    current=current,
+                    materialized=materialized,
+                    request_id=request_id,
+                    payload_digest=payload_digest,
+                )
+                if reconciliation is not None:
+                    connection.commit()
+                    return reconciliation
                 result = self._direct_dispatch_result_from_current(current, "blocked")
             elif self._has_other_active_direct_dispatch(connection, job_id):
                 result = self._direct_dispatch_result_from_current(current, "blocked")
@@ -2527,6 +2574,95 @@ class SQLiteStore:
             connection.rollback()
             raise
 
+    def complete_direct_publication_reconciliation(
+        self,
+        plan: _DirectPublicationReconciliationPlan,
+        *,
+        final_device: object,
+        final_inode: object,
+        logical_size: object,
+    ) -> DirectDispatchResult:
+        """Bind an already-published final payload and complete it atomically."""
+
+        if type(plan) is not _DirectPublicationReconciliationPlan:
+            raise TypeError("plan must be a direct-publication reconciliation plan")
+        requested = _FinalPublicationBinding(
+            job_id=plan.job.job_id,
+            final_device=_require_counter(final_device, "final_device"),
+            final_inode=_require_counter(final_inode, "final_inode"),
+            logical_size=_require_counter(logical_size, "logical_size"),
+        )
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            command = self._require_pending_direct_dispatch_command(connection, plan)
+            current = self._read_job_control_projection(connection, plan.job.job_id)
+            if (
+                current.generation != plan.generation
+                or current.revision != plan.revision
+                or current.state != JobState.FINALIZING.value
+                or command.generation != plan.generation
+                or command.revision != plan.revision
+                or command.state != JobState.FINALIZING.value
+                or self._read_publication_reservation(connection, current.job)
+                != plan.reservation
+                or self._read_publication_marker_binding(connection, current.job)
+                != plan.marker
+                or self._read_staged_payload_binding(connection, current.job) != plan.staged
+            ):
+                raise ValueError("direct publication reconciliation state is stale")
+            self._bind_final_publication_in_transaction(
+                connection,
+                requested=requested,
+                claim_token=plan.reservation.claim_token,
+            )
+            completed = self._persist_direct_dispatch_lifecycle(
+                connection,
+                current=current,
+                state=JobState.COMPLETED.value,
+                event_kind="job_completed",
+            )
+            result = self._direct_dispatch_result_from_current(completed, "started")
+            self._update_direct_dispatch_command(
+                connection, request_id=plan.request_id, result=result
+            )
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def abort_direct_publication_reconciliation(
+        self, plan: _DirectPublicationReconciliationPlan
+    ) -> DirectDispatchResult:
+        """Close a failed final-publication receipt without retrying its transfer."""
+
+        if type(plan) is not _DirectPublicationReconciliationPlan:
+            raise TypeError("plan must be a direct-publication reconciliation plan")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            command = self._require_pending_direct_dispatch_command(connection, plan)
+            current = self._read_job_control_projection(connection, plan.job.job_id)
+            if (
+                current.generation != plan.generation
+                or current.revision != plan.revision
+                or current.state != JobState.FINALIZING.value
+                or command.generation != plan.generation
+                or command.revision != plan.revision
+                or command.state != JobState.FINALIZING.value
+            ):
+                raise ValueError("direct publication reconciliation state is stale")
+            result = self._direct_dispatch_result_from_current(current, "blocked")
+            self._update_direct_dispatch_command(
+                connection, request_id=plan.request_id, result=result
+            )
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+
     def pause_active_direct_job(
         self, *, job_id: str, generation: int, revision: int
     ) -> JobControlResult:
@@ -2567,6 +2703,73 @@ class SQLiteStore:
             generation=current.generation,
             revision=current.revision,
             state=current.state,
+        )
+
+    def _prepare_direct_publication_reconciliation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        current: _JobControlProjection,
+        materialized: MaterializedJob,
+        request_id: str,
+        payload_digest: str,
+        persist_receipt: bool = True,
+    ) -> _DirectPublicationReconciliationPlan | None:
+        """Return a plan only for a durable finalization cutpoint."""
+
+        if current.state != JobState.FINALIZING.value:
+            return None
+        try:
+            reservation = self._read_publication_reservation(connection, current.job)
+            marker = self._read_publication_marker_binding(connection, current.job)
+            staged = self._read_staged_payload_binding(connection, current.job)
+            finalizing_event = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE kind = 'job_finalizing'
+                  AND job_id = ?
+                  AND generation = ?
+                  AND revision = ?
+                LIMIT 1
+                """,
+                (current.job, current.generation, current.revision),
+            ).fetchone()
+            if (
+                reservation is None
+                or marker is None
+                or staged is None
+                or finalizing_event is None
+            ):
+                return None
+            # Reject a corrupt pre-existing final binding before filesystem work.
+            self._read_final_publication_binding(connection, current.job)
+        except (TypeError, ValueError):
+            return None
+        if persist_receipt:
+            self._insert_direct_dispatch_command(
+                connection,
+                request_id=request_id,
+                payload_digest=payload_digest,
+                job=current.job,
+                status="pending",
+                generation=current.generation,
+                revision=current.revision,
+                state=current.state,
+            )
+        updated_intent = replace(
+            materialized.intent,
+            generation=current.generation,
+            revision=current.revision,
+        )
+        return _DirectPublicationReconciliationPlan(
+            job=replace(materialized, intent=updated_intent),
+            reservation=reservation,
+            marker=marker,
+            staged=staged,
+            generation=current.generation,
+            revision=current.revision,
+            request_id=request_id,
+            payload_digest=payload_digest,
         )
 
     @staticmethod
@@ -2752,7 +2955,8 @@ class SQLiteStore:
 
     @staticmethod
     def _require_pending_direct_dispatch_command(
-        connection: sqlite3.Connection, plan: _DirectDispatchPlan
+        connection: sqlite3.Connection,
+        plan: _DirectDispatchPlan | _DirectPublicationReconciliationPlan,
     ) -> _DirectDispatchCommand:
         command = SQLiteStore._read_direct_dispatch_command(connection, plan.request_id)
         if (
@@ -2763,6 +2967,37 @@ class SQLiteStore:
         ):
             raise ValueError("direct dispatch receipt is not pending")
         return command
+
+    @staticmethod
+    def _has_durable_finalization_bindings(
+        connection: sqlite3.Connection, job_id: str, generation: int, revision: int
+    ) -> bool:
+        """Retain only a complete terminal binding chain for explicit inspection."""
+
+        try:
+            reservation = SQLiteStore._read_publication_reservation(connection, job_id)
+            marker = SQLiteStore._read_publication_marker_binding(connection, job_id)
+            staged = SQLiteStore._read_staged_payload_binding(connection, job_id)
+            SQLiteStore._read_final_publication_binding(connection, job_id)
+            finalizing_event = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE kind = 'job_finalizing'
+                  AND job_id = ?
+                  AND generation = ?
+                  AND revision = ?
+                LIMIT 1
+                """,
+                (job_id, generation, revision),
+            ).fetchone()
+        except (TypeError, ValueError):
+            return False
+        return (
+            reservation is not None
+            and marker is not None
+            and staged is not None
+            and finalizing_event is not None
+        )
 
     def recover_cold_start(self) -> int:
         """Atomically fence a cold worker epoch and pause incomplete jobs."""
@@ -2814,7 +3049,7 @@ class SQLiteStore:
 
             jobs = connection.execute(
                 """
-                SELECT job_id, generation, revision
+                SELECT job_id, generation, revision, state
                 FROM jobs
                 WHERE state IN (?, ?, ?, ?, ?, ?, ?)
                 ORDER BY job_id
@@ -2823,6 +3058,17 @@ class SQLiteStore:
             ).fetchall()
             for job in jobs:
                 job_id = _require_sqlite_text(job["job_id"], "job_id")
+                if (
+                    _require_public_job_state(job["state"], "cold-start job state")
+                    == JobState.FINALIZING.value
+                    and self._has_durable_finalization_bindings(
+                        connection,
+                        job_id,
+                        _require_sqlite_integer(job["generation"], "generation"),
+                        _require_sqlite_integer(job["revision"], "revision"),
+                    )
+                ):
+                    continue
                 generation = _require_sqlite_integer(job["generation"], "generation") + 1
                 revision = _require_sqlite_integer(job["revision"], "revision") + 1
                 retry_budget = self._read_retry_budget(connection, job_id)
@@ -4372,7 +4618,6 @@ class SQLiteStore:
         """Persist or exactly replay a verified same-inode final publication."""
 
         job_id = _require_identifier(job_id, "job_id")
-        claim_token = _require_reservation_token(claim_token)
         requested = _FinalPublicationBinding(
             job_id=job_id,
             final_device=_require_counter(final_device, "final_device"),
@@ -4382,59 +4627,70 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
-            reservation = self._read_publication_reservation(connection, job_id)
-            if reservation is None:
-                raise ValueError(
-                    "final publication binding requires a current publication reservation"
-                )
-            if reservation.claim_token != claim_token:
-                raise ValueError("final publication claim token does not match")
-            marker = self._read_publication_marker_binding(connection, job_id)
-            if marker is None:
-                raise ValueError(
-                    "final publication binding requires a current publication marker"
-                )
-            if marker.job_id != reservation.job_id:
-                raise ValueError("publication marker binding does not match its owner")
-            staged = self._read_staged_payload_binding(connection, job_id)
-            if staged is None:
-                raise ValueError(
-                    "final publication binding requires a current staged payload"
-                )
-            if staged.job_id != marker.job_id:
-                raise ValueError("staged payload binding does not match its owner")
-            if (
-                requested.final_device != staged.partial_device
-                or requested.final_inode != staged.partial_inode
-                or requested.logical_size != staged.logical_size
-            ):
-                raise ValueError("final publication binding does not match staged payload")
-            existing = self._read_final_publication_binding(connection, job_id)
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO final_publication_bindings (
-                        job_id, final_device, final_inode, logical_size
-                    )
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        requested.job_id,
-                        requested.final_device,
-                        requested.final_inode,
-                        requested.logical_size,
-                    ),
-                )
-                result = requested
-            else:
-                if existing != requested:
-                    raise ValueError("final publication binding does not match")
-                result = existing
+            result = self._bind_final_publication_in_transaction(
+                connection,
+                requested=requested,
+                claim_token=claim_token,
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         return result
+
+    def _bind_final_publication_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        requested: _FinalPublicationBinding,
+        claim_token: str,
+    ) -> _FinalPublicationBinding:
+        """Bind final identity using an already-open atomic lifecycle transaction."""
+
+        if type(requested) is not _FinalPublicationBinding:
+            raise TypeError("requested must be a final publication binding")
+        claim_token = _require_reservation_token(claim_token)
+        reservation = self._read_publication_reservation(connection, requested.job_id)
+        if reservation is None:
+            raise ValueError("final publication binding requires a current publication reservation")
+        if reservation.claim_token != claim_token:
+            raise ValueError("final publication claim token does not match")
+        marker = self._read_publication_marker_binding(connection, requested.job_id)
+        if marker is None:
+            raise ValueError("final publication binding requires a current publication marker")
+        if marker.job_id != reservation.job_id:
+            raise ValueError("publication marker binding does not match its owner")
+        staged = self._read_staged_payload_binding(connection, requested.job_id)
+        if staged is None:
+            raise ValueError("final publication binding requires a current staged payload")
+        if staged.job_id != marker.job_id:
+            raise ValueError("staged payload binding does not match its owner")
+        if (
+            requested.final_device != staged.partial_device
+            or requested.final_inode != staged.partial_inode
+            or requested.logical_size != staged.logical_size
+        ):
+            raise ValueError("final publication binding does not match staged payload")
+        existing = self._read_final_publication_binding(connection, requested.job_id)
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO final_publication_bindings (
+                    job_id, final_device, final_inode, logical_size
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    requested.job_id,
+                    requested.final_device,
+                    requested.final_inode,
+                    requested.logical_size,
+                ),
+            )
+            return requested
+        if existing != requested:
+            raise ValueError("final publication binding does not match")
+        return existing
 
     @staticmethod
     def _materialized_job_from_row(row: sqlite3.Row) -> MaterializedJob:
