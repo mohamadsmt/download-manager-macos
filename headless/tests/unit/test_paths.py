@@ -340,6 +340,11 @@ def _entry_signature(path: Path) -> tuple[int, int, int, int, int]:
     )
 
 
+def _payload_identity(path: Path) -> tuple[int, int, int]:
+    details = os.lstat(path)
+    return details.st_dev, details.st_ino, details.st_size
+
+
 def _directory_identity_inventory(path: Path):
     return (
         _entry_signature(path),
@@ -1455,3 +1460,765 @@ def test_staged_partial_attestation_fsync_failure_preserves_all_entries(
     assert _entry_signature(sidecar) == sidecar_before
     assert sidecar.read_bytes() == b"preserve this sidecar"
     assert not os.path.lexists(destination.final_path)
+
+
+def _attest_prepared_staged_partial(
+    paths, payload: bytes = b"complete payload bytes"
+):
+    destination, reservation = _prepare_staged_partial(paths, payload)
+    return (
+        destination,
+        reservation,
+        paths.attest_staged_partial_payload(destination, reservation),
+    )
+
+
+def test_publishes_attested_staged_payload_with_a_descriptor_relative_hard_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    payload = b"complete payload bytes"
+    destination, reservation, staged = _attest_prepared_staged_partial(paths, payload)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    partial_before = _entry_signature(destination.partial_path)
+    sidecar_before = _entry_signature(sidecar)
+    final_directory_identity = _entry_signature(destination.final_path.parent)[:2]
+    events: list[tuple[object, ...]] = []
+    original_link = paths.os.link
+    original_fsync = paths.os.fsync
+
+    def record_link(
+        source: object,
+        target: object,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        events.append(
+            (
+                "link",
+                source,
+                target,
+                src_dir_fd,
+                dst_dir_fd,
+                follow_symlinks,
+            )
+        )
+        original_link(
+            source,
+            target,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    def record_fsync(descriptor: int) -> None:
+        details = os.fstat(descriptor)
+        events.append(("fsync", details.st_dev, details.st_ino, stat.S_IFMT(details.st_mode)))
+        original_fsync(descriptor)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("publication must not resolve, rename, or delete a payload")
+
+    monkeypatch.setattr(paths.os, "link", record_link)
+    monkeypatch.setattr(paths.os, "fsync", record_fsync)
+    monkeypatch.setattr(paths, "resolve_destination", forbidden)
+    monkeypatch.setattr(paths, "_select_available_name", forbidden)
+    monkeypatch.setattr(paths, "claim_final_path", forbidden)
+    monkeypatch.setattr(paths.os, "replace", forbidden)
+    monkeypatch.setattr(paths.os, "rename", forbidden)
+    monkeypatch.setattr(paths.os, "unlink", forbidden)
+    monkeypatch.setattr(paths.os, "remove", forbidden)
+    monkeypatch.setattr(paths.os, "truncate", forbidden)
+
+    published = paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    final_details = os.lstat(destination.final_path)
+    partial_details = os.lstat(destination.partial_path)
+    assert "PublishedFinalPayload" in paths.__all__
+    assert "publish_staged_partial_payload" in paths.__all__
+    assert tuple(paths.PublishedFinalPayload.__dataclass_fields__) == (
+        "path",
+        "st_dev",
+        "st_ino",
+        "logical_size",
+    )
+    assert published == paths.PublishedFinalPayload(
+        path=destination.final_path,
+        st_dev=staged.st_dev,
+        st_ino=staged.st_ino,
+        logical_size=len(payload),
+    )
+    assert reservation.claim_token not in repr(published)
+    assert stat.S_ISREG(final_details.st_mode)
+    assert (final_details.st_dev, final_details.st_ino, final_details.st_size) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert (partial_details.st_dev, partial_details.st_ino, partial_details.st_size) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert final_details.st_nlink == partial_details.st_nlink == 2
+    assert destination.final_path.read_bytes() == payload
+    assert destination.partial_path.read_bytes() == payload
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    assert partial_before[:3] == _entry_signature(destination.partial_path)[:3]
+
+    link_event = next(event for event in events if event[0] == "link")
+    assert link_event[1] == destination.partial_path.name
+    assert link_event[2] == destination.final_path.name
+    assert link_event[3] is not None
+    assert link_event[4] is not None
+    assert link_event[5] is False
+    link_index = events.index(link_event)
+    marker_sync_index = next(
+        index
+        for index, event in enumerate(events)
+        if event[:3] == ("fsync", marker_before[0], marker_before[1])
+    )
+    final_directory_sync_index = next(
+        index
+        for index, event in enumerate(events)
+        if event[:3] == ("fsync", *final_directory_identity)
+    )
+    assert marker_sync_index < link_index < final_directory_sync_index
+
+
+@pytest.mark.parametrize(
+    "shape",
+    (
+        "same-bytes-new-inode",
+        "symlink",
+        "directory",
+        "fifo",
+        "hardlink-to-unrelated",
+    ),
+)
+def test_publication_never_overwrites_or_accepts_an_unrelated_existing_final(
+    tmp_path: Path, shape: str
+) -> None:
+    paths = _paths()
+    payload = b"complete payload bytes"
+    destination, reservation, staged = _attest_prepared_staged_partial(paths, payload)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    outside = tmp_path / f"outside-final-{shape}"
+
+    if shape == "same-bytes-new-inode":
+        destination.final_path.write_bytes(payload)
+    elif shape == "symlink":
+        outside.write_bytes(payload)
+        destination.final_path.symlink_to(outside)
+    elif shape == "directory":
+        destination.final_path.mkdir(mode=0o700)
+    elif shape == "fifo":
+        os.mkfifo(destination.final_path, 0o600)
+    else:
+        outside.write_bytes(payload)
+        os.link(outside, destination.final_path)
+
+    final_before = _entry_signature(destination.final_path)
+    marker_before = _entry_signature(marker)
+    partial_before = _entry_signature(destination.partial_path)
+    sidecar_before = _entry_signature(sidecar)
+    outside_before = _entry_signature(outside) if os.path.lexists(outside) else None
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert reservation.claim_token not in str(raised.value)
+    assert _entry_signature(destination.final_path) == final_before
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert _entry_signature(sidecar) == sidecar_before
+    assert destination.partial_path.read_bytes() == payload
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    if outside_before is not None:
+        assert _entry_signature(outside) == outside_before
+        assert outside.read_bytes() == payload
+
+
+def test_publication_retries_an_exact_link_after_final_directory_sync_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    payload = b"complete payload bytes"
+    destination, reservation, staged = _attest_prepared_staged_partial(paths, payload)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    sidecar_before = _entry_signature(sidecar)
+    final_directory_identity = _entry_signature(destination.final_path.parent)[:2]
+    original_fsync = paths.os.fsync
+    marker_syncs = 0
+    final_syncs = 0
+
+    def fail_first_final_directory_sync(descriptor: int) -> None:
+        nonlocal marker_syncs, final_syncs
+        details = os.fstat(descriptor)
+        identity = (details.st_dev, details.st_ino)
+        if identity == marker_before[:2]:
+            marker_syncs += 1
+        if identity == final_directory_identity:
+            final_syncs += 1
+            if final_syncs == 1:
+                raise OSError("injected final directory sync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(paths.os, "fsync", fail_first_final_directory_sync)
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert reservation.claim_token not in str(raised.value)
+    assert final_syncs == 1
+    assert marker_syncs == 1
+    assert os.path.lexists(destination.final_path)
+    assert _payload_identity(destination.final_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _payload_identity(destination.partial_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert os.lstat(destination.final_path).st_nlink == 2
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(sidecar) == sidecar_before
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+
+    retried = paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert retried.st_dev == staged.st_dev
+    assert retried.st_ino == staged.st_ino
+    assert retried.logical_size == staged.logical_size
+    assert retried.path == destination.final_path
+    assert marker_syncs == 2
+    assert final_syncs == 2
+    assert _payload_identity(destination.final_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _payload_identity(destination.partial_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(sidecar) == sidecar_before
+
+
+def test_publication_does_not_link_when_marker_reattest_sync_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    partial_before = _entry_signature(destination.partial_path)
+    sidecar_before = _entry_signature(sidecar)
+    original_fsync = paths.os.fsync
+    marker_syncs = 0
+
+    def fail_marker_sync(descriptor: int) -> None:
+        nonlocal marker_syncs
+        details = os.fstat(descriptor)
+        if (details.st_dev, details.st_ino) == marker_before[:2]:
+            marker_syncs += 1
+            raise OSError("injected marker sync failure")
+        original_fsync(descriptor)
+
+    def forbidden_link(*_args, **_kwargs) -> None:
+        pytest.fail("publication must not link after a marker reattestation failure")
+
+    monkeypatch.setattr(paths.os, "fsync", fail_marker_sync)
+    monkeypatch.setattr(paths.os, "link", forbidden_link)
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert reservation.claim_token not in str(raised.value)
+    assert marker_syncs == 1
+    assert not os.path.lexists(destination.final_path)
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert _entry_signature(sidecar) == sidecar_before
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+
+
+def test_publication_requires_a_matching_marker_and_exact_staged_identity() -> None:
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    partial_before = _entry_signature(destination.partial_path)
+    sidecar_before = _entry_signature(sidecar)
+    mismatched_reservation = _reservation(destination, claim_token="b" * 64)
+    mismatched_staged = replace(staged, logical_size=staged.logical_size + 1)
+
+    with pytest.raises(paths.PathValidationError) as marker_raised:
+        paths.publish_staged_partial_payload(
+            destination,
+            mismatched_reservation,
+            staged,
+        )
+    with pytest.raises(paths.PathValidationError) as staged_raised:
+        paths.publish_staged_partial_payload(destination, reservation, mismatched_staged)
+
+    assert reservation.claim_token not in str(marker_raised.value)
+    assert mismatched_reservation.claim_token not in str(marker_raised.value)
+    assert reservation.claim_token not in str(staged_raised.value)
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert _entry_signature(sidecar) == sidecar_before
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert sidecar.read_bytes() == b"preserve this sidecar"
+    assert not os.path.lexists(destination.final_path)
+
+
+def test_publication_retains_the_link_when_post_link_final_verification_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    sidecar_before = _entry_signature(sidecar)
+    final_directory_identity = _entry_signature(destination.final_path.parent)[:2]
+    original_link = paths.os.link
+    original_stat = paths.os.stat
+    linked = False
+
+    def record_link(*args, **kwargs) -> None:
+        nonlocal linked
+        original_link(*args, **kwargs)
+        linked = True
+
+    def fail_post_link_final_stat(path, *args, **kwargs):
+        if linked and path == destination.final_path.name:
+            descriptor = kwargs.get("dir_fd")
+            if descriptor is not None:
+                details = os.fstat(descriptor)
+                if (details.st_dev, details.st_ino) == final_directory_identity:
+                    raise OSError("injected final verification failure")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(paths.os, "link", record_link)
+    monkeypatch.setattr(paths.os, "stat", fail_post_link_final_stat)
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert linked
+    assert reservation.claim_token not in str(raised.value)
+    assert _payload_identity(destination.final_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _payload_identity(destination.partial_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert os.lstat(destination.final_path).st_nlink == 2
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(sidecar) == sidecar_before
+
+    monkeypatch.setattr(paths.os, "link", original_link)
+    monkeypatch.setattr(paths.os, "stat", original_stat)
+    retried = paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert retried == paths.PublishedFinalPayload(
+        path=destination.final_path,
+        st_dev=staged.st_dev,
+        st_ino=staged.st_ino,
+        logical_size=staged.logical_size,
+    )
+    assert _payload_identity(destination.final_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _payload_identity(destination.partial_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+
+
+def test_publication_rejects_a_final_replaced_after_link_without_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    payload = b"complete payload bytes"
+    destination, reservation, staged = _attest_prepared_staged_partial(paths, payload)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    sidecar_before = _entry_signature(sidecar)
+    replacement = destination.final_path.parent / "attacker-replacement"
+    replacement.write_bytes(b"attacker replacement bytes")
+    original_link = paths.os.link
+    replaced = False
+
+    def link_then_replace_final(*args, **kwargs) -> None:
+        nonlocal replaced
+        original_link(*args, **kwargs)
+        os.replace(replacement, destination.final_path)
+        replaced = True
+
+    monkeypatch.setattr(paths.os, "link", link_then_replace_final)
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert replaced
+    assert reservation.claim_token not in str(raised.value)
+    assert destination.final_path.read_bytes() == b"attacker replacement bytes"
+    assert _payload_identity(destination.final_path)[:2] != (staged.st_dev, staged.st_ino)
+    assert destination.partial_path.read_bytes() == payload
+    assert _payload_identity(destination.partial_path)[:2] == (staged.st_dev, staged.st_ino)
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(sidecar) == sidecar_before
+
+
+def test_publication_rejects_a_final_replaced_during_post_sync_source_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    payload = b"complete payload bytes"
+    destination, reservation, staged = _attest_prepared_staged_partial(paths, payload)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    sidecar_before = _entry_signature(sidecar)
+    final_directory_identity = _entry_signature(destination.final_path.parent)[:2]
+    job_directory_identity = _entry_signature(destination.incomplete_dir)[:2]
+    replacement = destination.final_path.parent / "attacker-replacement"
+    replacement.write_bytes(b"attacker replacement bytes")
+    original_fsync = paths.os.fsync
+    original_verify = paths._verify_visible_publication_payload
+    final_directory_synced = False
+    replaced = False
+
+    def record_final_directory_sync(descriptor: int) -> None:
+        nonlocal final_directory_synced
+        original_fsync(descriptor)
+        details = os.fstat(descriptor)
+        if (details.st_dev, details.st_ino) == final_directory_identity:
+            final_directory_synced = True
+
+    def replace_final_after_source_verification(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, int, int],
+        *,
+        minimum_links: int,
+    ) -> None:
+        nonlocal replaced
+        original_verify(parent_fd, name, expected, minimum_links=minimum_links)
+        details = os.fstat(parent_fd)
+        if (
+            final_directory_synced
+            and not replaced
+            and (details.st_dev, details.st_ino) == job_directory_identity
+        ):
+            os.replace(replacement, destination.final_path)
+            replaced = True
+
+    monkeypatch.setattr(paths.os, "fsync", record_final_directory_sync)
+    monkeypatch.setattr(
+        paths,
+        "_verify_visible_publication_payload",
+        replace_final_after_source_verification,
+    )
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert replaced
+    assert reservation.claim_token not in str(raised.value)
+    assert destination.final_path.read_bytes() == b"attacker replacement bytes"
+    assert _payload_identity(destination.final_path)[:2] != (staged.st_dev, staged.st_ino)
+    assert _payload_identity(destination.partial_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(sidecar) == sidecar_before
+
+
+def test_publication_rejects_a_final_parent_replaced_during_post_sync_source_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    sidecar_before = _entry_signature(sidecar)
+    final_directory = destination.final_path.parent
+    final_directory_identity = _entry_signature(final_directory)[:2]
+    job_directory_identity = _entry_signature(destination.incomplete_dir)[:2]
+    detached_directory = destination.root / "detached-final-directory"
+    original_fsync = paths.os.fsync
+    original_verify = paths._verify_visible_publication_payload
+    final_directory_synced = False
+    replaced = False
+
+    def record_final_directory_sync(descriptor: int) -> None:
+        nonlocal final_directory_synced
+        original_fsync(descriptor)
+        details = os.fstat(descriptor)
+        if (details.st_dev, details.st_ino) == final_directory_identity:
+            final_directory_synced = True
+
+    def replace_final_parent_after_source_verification(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, int, int],
+        *,
+        minimum_links: int,
+    ) -> None:
+        nonlocal replaced
+        original_verify(parent_fd, name, expected, minimum_links=minimum_links)
+        details = os.fstat(parent_fd)
+        if (
+            final_directory_synced
+            and not replaced
+            and (details.st_dev, details.st_ino) == job_directory_identity
+        ):
+            os.rename(final_directory, detached_directory)
+            final_directory.mkdir(mode=0o700)
+            replaced = True
+
+    monkeypatch.setattr(paths.os, "fsync", record_final_directory_sync)
+    monkeypatch.setattr(
+        paths,
+        "_verify_visible_publication_payload",
+        replace_final_parent_after_source_verification,
+    )
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert replaced
+    assert reservation.claim_token not in str(raised.value)
+    assert _payload_identity(detached_directory / destination.final_path.name) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert not os.path.lexists(destination.final_path)
+    assert _payload_identity(destination.partial_path) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(sidecar) == sidecar_before
+
+
+def test_publication_rejects_a_partial_replaced_between_validation_and_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    sidecar_before = _entry_signature(sidecar)
+    replacement = destination.incomplete_dir / "attacker-replacement"
+    replacement.write_bytes(b"attacker replacement bytes")
+    original_link = paths.os.link
+    replaced = False
+
+    def replace_partial_then_link(*args, **kwargs) -> None:
+        nonlocal replaced
+        os.replace(replacement, destination.partial_path)
+        replaced = True
+        original_link(*args, **kwargs)
+
+    monkeypatch.setattr(paths.os, "link", replace_partial_then_link)
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert replaced
+    assert reservation.claim_token not in str(raised.value)
+    assert destination.partial_path.read_bytes() == b"attacker replacement bytes"
+    assert destination.final_path.read_bytes() == b"attacker replacement bytes"
+    assert _payload_identity(destination.partial_path)[:2] == _payload_identity(
+        destination.final_path
+    )[:2]
+    assert _payload_identity(destination.partial_path)[:2] != (staged.st_dev, staged.st_ino)
+    assert _entry_signature(marker) == marker_before
+    assert _entry_signature(sidecar) == sidecar_before
+
+
+@pytest.mark.parametrize("replaced_chain", ("final", "job"))
+def test_publication_rejects_a_replaced_parent_before_accepting_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+    replaced_chain: str,
+) -> None:
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    sidecar_before = _entry_signature(sidecar)
+    if replaced_chain == "final":
+        original_directory = destination.final_path.parent
+        detached_directory = destination.root / "detached-final-directory"
+    else:
+        original_directory = destination.incomplete_dir
+        detached_directory = destination.incomplete_dir.parent / "detached-job-directory"
+    original_link = paths.os.link
+    replaced = False
+
+    def link_then_replace_parent(*args, **kwargs) -> None:
+        nonlocal replaced
+        original_link(*args, **kwargs)
+        os.rename(original_directory, detached_directory)
+        original_directory.mkdir(mode=0o700)
+        replaced = True
+
+    monkeypatch.setattr(paths.os, "link", link_then_replace_parent)
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert replaced
+    assert reservation.claim_token not in str(raised.value)
+    detached_final = (
+        detached_directory / destination.final_path.name
+        if replaced_chain == "final"
+        else destination.final_path
+    )
+    assert _payload_identity(detached_final) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    if replaced_chain == "final":
+        assert not os.path.lexists(destination.final_path)
+        assert _payload_identity(destination.partial_path) == (
+            staged.st_dev,
+            staged.st_ino,
+            staged.logical_size,
+        )
+        assert _entry_signature(marker) == marker_before
+        assert _entry_signature(sidecar) == sidecar_before
+    else:
+        detached_marker = detached_directory / marker.name
+        detached_sidecar = detached_directory / sidecar.name
+        detached_partial = detached_directory / destination.partial_path.name
+        assert _entry_signature(detached_marker) == marker_before
+        assert _entry_signature(detached_sidecar) == sidecar_before
+        assert _payload_identity(detached_partial) == (
+            staged.st_dev,
+            staged.st_ino,
+            staged.logical_size,
+        )
+        assert not os.path.lexists(destination.partial_path)
+
+
+@pytest.mark.parametrize("replaced_chain", ("root", "incomplete"))
+def test_publication_rejects_a_replaced_root_or_incomplete_ancestor_before_accepting_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+    replaced_chain: str,
+) -> None:
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+    marker = _marker_path(destination)
+    sidecar = destination.incomplete_dir / "owned.sidecar"
+    sidecar.write_bytes(b"preserve this sidecar")
+    marker_before = _entry_signature(marker)
+    sidecar_before = _entry_signature(sidecar)
+    if replaced_chain == "root":
+        original_directory = destination.root
+        detached_directory = destination.root.parent / "detached-root"
+        detached_final = (
+            detached_directory
+            / destination.final_path.parent.name
+            / destination.final_path.name
+        )
+        detached_partial = (
+            detached_directory
+            / ".incomplete"
+            / destination.job_id
+            / destination.partial_path.name
+        )
+    else:
+        original_directory = destination.incomplete_dir.parent
+        detached_directory = destination.root / "detached-incomplete-directory"
+        detached_final = destination.final_path
+        detached_partial = detached_directory / destination.job_id / destination.partial_path.name
+    detached_marker = detached_partial.parent / marker.name
+    detached_sidecar = detached_partial.parent / sidecar.name
+    original_link = paths.os.link
+    replaced = False
+
+    def link_then_replace_ancestor(*args, **kwargs) -> None:
+        nonlocal replaced
+        original_link(*args, **kwargs)
+        os.rename(original_directory, detached_directory)
+        original_directory.mkdir(mode=0o700)
+        replaced = True
+
+    monkeypatch.setattr(paths.os, "link", link_then_replace_ancestor)
+
+    with pytest.raises(paths.PathValidationError) as raised:
+        paths.publish_staged_partial_payload(destination, reservation, staged)
+
+    assert replaced
+    assert reservation.claim_token not in str(raised.value)
+    assert _payload_identity(detached_final) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _payload_identity(detached_partial) == (
+        staged.st_dev,
+        staged.st_ino,
+        staged.logical_size,
+    )
+    assert _entry_signature(detached_marker) == marker_before
+    assert _entry_signature(detached_sidecar) == sidecar_before
+    assert not os.path.lexists(destination.partial_path)
+    if replaced_chain == "root":
+        assert not os.path.lexists(destination.final_path)
+    else:
+        assert _payload_identity(destination.final_path) == (
+            staged.st_dev,
+            staged.st_ino,
+            staged.logical_size,
+        )

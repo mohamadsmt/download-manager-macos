@@ -1,8 +1,8 @@
 """Safe, deterministic destination intent for Hermes downloads.
 
-This module owns pathname validation, final-name reservation, and durable
-publication-reservation markers. It does not write payload bytes, publish
-completed files, or clean partials.
+This module owns pathname validation, reservation markers, and no-clobber
+publication of an already-attested staged payload. It does not write payload
+bytes or clean partials.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ __all__ = [
     "FinalPathCollisionError",
     "JobSpace",
     "PathValidationError",
+    "PublishedFinalPayload",
     "PublicationReservationMarker",
     "StagedPartialPayload",
     "StorageUsage",
@@ -30,6 +31,7 @@ __all__ = [
     "attest_staged_partial_payload",
     "claim_final_path",
     "observe_job_space",
+    "publish_staged_partial_payload",
     "prepare_persisted_destination_workspace",
     "rehydrate_destination",
     "resolve_destination",
@@ -37,7 +39,9 @@ __all__ = [
 
 CATEGORIES: Final = frozenset({"Videos", "Audio", "Documents", "Software", "Other"})
 _INCOMPLETE: Final = ".incomplete"
-_DIRECTORY_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_DIRECTORY_FLAGS: Final = (
+    os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
 _CLAIM_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _RESERVATION_MARKER: Final = ".hermes-reservation"
 _RESERVATION_MARKER_VERSION: Final = "v1"
@@ -110,6 +114,16 @@ class PublicationReservationMarker:
 @dataclass(frozen=True, slots=True)
 class StagedPartialPayload:
     """The visible completed partial payload identity retained for publication."""
+
+    path: Path
+    st_dev: int
+    st_ino: int
+    logical_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedFinalPayload:
+    """The final namespace identity returned after a no-clobber publication."""
 
     path: Path
     st_dev: int
@@ -460,6 +474,142 @@ def attest_staged_partial_payload(
                             st_ino=preflight[1],
                             logical_size=preflight[2],
                         )
+                    finally:
+                        os.close(payload_fd)
+                finally:
+                    os.close(job_fd)
+            finally:
+                os.close(incomplete_fd)
+        finally:
+            os.close(final_fd)
+    finally:
+        os.close(root_fd)
+
+
+def publish_staged_partial_payload(
+    destination: DestinationIntent,
+    reservation: PublicationReservation,
+    staged_payload: StagedPartialPayload,
+) -> PublishedFinalPayload:
+    """Publish one previously attested partial via a no-clobber hard link.
+
+    The partial and receipt remain in place.  A visible final is accepted only
+    when it is the exact staged inode from a prior interrupted publication.
+    """
+
+    root, final_component = _validate_destination_intent(destination)
+    reservation = _validate_publication_reservation(
+        destination,
+        final_component,
+        reservation,
+    )
+    expected_marker_bytes = _reservation_marker_bytes(reservation)
+    expected_payload = _validate_staged_partial_payload_identity(
+        destination,
+        staged_payload,
+    )
+    result = PublishedFinalPayload(
+        path=destination.final_path,
+        st_dev=expected_payload[0],
+        st_ino=expected_payload[1],
+        logical_size=expected_payload[2],
+    )
+    _require_safe_writable_root(root)
+
+    root_fd = _open_root(root)
+    try:
+        final_fd = _open_existing_directory(root_fd, final_component)
+        try:
+            incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)
+            try:
+                job_fd = _open_existing_directory(incomplete_fd, destination.job_id)
+                try:
+                    _require_same_filesystem(final_fd, job_fd)
+                    expected_chain = _publication_chain_identities(
+                        root_fd,
+                        final_fd,
+                        incomplete_fd,
+                        job_fd,
+                    )
+                    marker = _attest_existing_reservation_marker(
+                        job_fd,
+                        destination.incomplete_dir / _RESERVATION_MARKER,
+                        expected_marker_bytes,
+                    )
+                    _verify_visible_publication_payload(
+                        job_fd,
+                        destination.partial_path.name,
+                        expected_payload,
+                        minimum_links=1,
+                    )
+                    payload_fd = _open_staged_partial_payload(
+                        job_fd,
+                        destination.partial_path.name,
+                    )
+                    try:
+                        _verify_publication_payload_descriptor(
+                            payload_fd,
+                            expected_payload,
+                            minimum_links=1,
+                        )
+                        _verify_visible_publication_payload(
+                            job_fd,
+                            destination.partial_path.name,
+                            expected_payload,
+                            minimum_links=1,
+                        )
+                        _verify_attested_reservation_marker(
+                            job_fd,
+                            expected_marker_bytes,
+                            marker,
+                        )
+                        _link_staged_partial_payload(
+                            job_fd,
+                            final_fd,
+                            destination.partial_path.name,
+                            destination.final_path.name,
+                            expected_payload,
+                        )
+                        _verify_publication_payload_descriptor(
+                            payload_fd,
+                            expected_payload,
+                            minimum_links=2,
+                        )
+                        _verify_attested_reservation_marker(
+                            job_fd,
+                            expected_marker_bytes,
+                            marker,
+                        )
+                        _verify_visible_published_payloads(
+                            root,
+                            final_component,
+                            destination.job_id,
+                            expected_chain,
+                            destination.final_path.name,
+                            destination.partial_path.name,
+                            expected_payload,
+                        )
+                        _fsync_published_final_directory(final_fd)
+                        _verify_publication_payload_descriptor(
+                            payload_fd,
+                            expected_payload,
+                            minimum_links=2,
+                        )
+                        _verify_attested_reservation_marker(
+                            job_fd,
+                            expected_marker_bytes,
+                            marker,
+                        )
+                        _verify_visible_published_payloads(
+                            root,
+                            final_component,
+                            destination.job_id,
+                            expected_chain,
+                            destination.final_path.name,
+                            destination.partial_path.name,
+                            expected_payload,
+                        )
+                        return result
                     finally:
                         os.close(payload_fd)
                 finally:
@@ -961,6 +1111,341 @@ def _fsync_staged_partial_directory(descriptor: int) -> None:
         os.fsync(descriptor)
     except OSError as error:
         raise PathValidationError("incomplete job directory cannot be synced") from error
+
+
+def _validate_staged_partial_payload_identity(
+    destination: DestinationIntent,
+    staged_payload: StagedPartialPayload,
+) -> tuple[int, int, int]:
+    if type(staged_payload) is not StagedPartialPayload:
+        raise TypeError("staged_payload must be a StagedPartialPayload")
+    try:
+        path = staged_payload.path
+        st_dev = staged_payload.st_dev
+        st_ino = staged_payload.st_ino
+        logical_size = staged_payload.logical_size
+    except AttributeError as error:
+        raise PathValidationError("staged payload identity is invalid") from error
+    if not isinstance(path, Path) or path != destination.partial_path:
+        raise PathValidationError("staged payload path does not match destination")
+    if (
+        type(st_dev) is not int
+        or st_dev < 0
+        or type(st_ino) is not int
+        or st_ino < 0
+        or type(logical_size) is not int
+        or logical_size < 0
+    ):
+        raise PathValidationError("staged payload identity is invalid")
+    return st_dev, st_ino, logical_size
+
+
+def _publication_chain_identities(
+    root_fd: int,
+    final_fd: int,
+    incomplete_fd: int,
+    job_fd: int,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]:
+    return (
+        _publication_directory_identity(root_fd),
+        _publication_directory_identity(final_fd),
+        _publication_directory_identity(incomplete_fd),
+        _publication_directory_identity(job_fd),
+    )
+
+
+def _publication_directory_identity(descriptor: int) -> tuple[int, int]:
+    try:
+        details = os.fstat(descriptor)
+    except OSError as error:
+        raise PathValidationError("managed publication directory is inaccessible") from error
+    try:
+        mode = details.st_mode
+        st_dev = details.st_dev
+        st_ino = details.st_ino
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("managed publication directory metadata is invalid") from error
+    if (
+        type(mode) is not int
+        or not stat.S_ISDIR(mode)
+        or type(st_dev) is not int
+        or st_dev < 0
+        or type(st_ino) is not int
+        or st_ino < 0
+    ):
+        raise PathValidationError("managed publication directory metadata is invalid")
+    return st_dev, st_ino
+
+
+def _require_publication_directory_identity(
+    descriptor: int,
+    expected: tuple[int, int],
+) -> None:
+    if _publication_directory_identity(descriptor) != expected:
+        raise UnsafePathError("managed publication directory changed during publication")
+
+
+def _publication_payload_details(
+    details: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    try:
+        st_dev = details.st_dev
+        st_ino = details.st_ino
+        st_size = details.st_size
+        st_mode = details.st_mode
+        st_nlink = details.st_nlink
+        st_mtime_ns = details.st_mtime_ns
+        st_ctime_ns = details.st_ctime_ns
+    except (AttributeError, TypeError, ValueError) as error:
+        raise PathValidationError("published payload metadata is invalid") from error
+    if type(st_mode) is not int:
+        raise PathValidationError("published payload metadata is invalid")
+    if stat.S_ISLNK(st_mode):
+        raise UnsafePathError("published payload is a symlink")
+    if (
+        not stat.S_ISREG(st_mode)
+        or type(st_dev) is not int
+        or st_dev < 0
+        or type(st_ino) is not int
+        or st_ino < 0
+        or type(st_size) is not int
+        or st_size < 0
+        or type(st_nlink) is not int
+        or st_nlink < 1
+        or type(st_mtime_ns) is not int
+        or type(st_ctime_ns) is not int
+    ):
+        raise PathValidationError("published payload metadata is invalid")
+    return st_dev, st_ino, st_size, st_mode, st_nlink, st_mtime_ns, st_ctime_ns
+
+
+def _stat_visible_publication_payload(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, int, int, int, int, int, int]:
+    try:
+        details = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise PathValidationError("published payload is missing") from error
+    except OSError as error:
+        raise PathValidationError("published payload is inaccessible") from error
+    return _publication_payload_details(details)
+
+
+def _open_publication_payload(parent_fd: int, name: str) -> int:
+    try:
+        return os.open(name, _STAGED_PARTIAL_READ_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise UnsafePathError("published payload cannot be opened safely") from error
+
+
+def _fstat_publication_payload(
+    descriptor: int,
+) -> tuple[int, int, int, int, int, int, int]:
+    try:
+        details = os.fstat(descriptor)
+    except OSError as error:
+        raise PathValidationError("published payload is inaccessible") from error
+    try:
+        return _publication_payload_details(details)
+    except UnsafePathError:
+        raise
+    except PathValidationError as error:
+        raise UnsafePathError("published payload changed during verification") from error
+
+
+def _require_publication_payload_identity(
+    details: tuple[int, int, int, int, int, int, int],
+    expected: tuple[int, int, int],
+    *,
+    minimum_links: int,
+) -> None:
+    if details[:3] != expected or details[4] < minimum_links:
+        raise UnsafePathError("published payload identity does not match staged payload")
+
+
+def _verify_publication_payload_descriptor(
+    descriptor: int,
+    expected: tuple[int, int, int],
+    *,
+    minimum_links: int,
+) -> None:
+    details = _fstat_publication_payload(descriptor)
+    _require_publication_payload_identity(
+        details,
+        expected,
+        minimum_links=minimum_links,
+    )
+
+
+def _verify_visible_publication_payload(
+    parent_fd: int,
+    name: str,
+    expected: tuple[int, int, int],
+    *,
+    minimum_links: int,
+) -> None:
+    preflight = _stat_visible_publication_payload(parent_fd, name)
+    _require_publication_payload_identity(
+        preflight,
+        expected,
+        minimum_links=minimum_links,
+    )
+    descriptor = _open_publication_payload(parent_fd, name)
+    try:
+        opened = _fstat_publication_payload(descriptor)
+        _require_publication_payload_identity(
+            opened,
+            expected,
+            minimum_links=minimum_links,
+        )
+        if opened != preflight:
+            raise UnsafePathError("published payload changed during verification")
+        visible = _stat_visible_publication_payload(parent_fd, name)
+        _require_publication_payload_identity(
+            visible,
+            expected,
+            minimum_links=minimum_links,
+        )
+        if visible != opened:
+            raise UnsafePathError("published payload changed during verification")
+    finally:
+        os.close(descriptor)
+
+
+def _require_existing_final_payload(
+    parent_fd: int,
+    name: str,
+    expected: tuple[int, int, int],
+) -> None:
+    try:
+        preflight = _stat_visible_publication_payload(parent_fd, name)
+    except UnsafePathError:
+        raise
+    except PathValidationError as error:
+        raise FinalPathCollisionError("final destination is already occupied") from error
+    if preflight[:3] != expected or preflight[4] < 2:
+        raise FinalPathCollisionError("final destination is already occupied")
+    descriptor = _open_publication_payload(parent_fd, name)
+    try:
+        opened = _fstat_publication_payload(descriptor)
+        if opened != preflight:
+            raise UnsafePathError("final destination changed during publication")
+        if opened[:3] != expected or opened[4] < 2:
+            raise UnsafePathError("final destination changed during publication")
+        visible = _stat_visible_publication_payload(parent_fd, name)
+        if visible != opened:
+            raise UnsafePathError("final destination changed during publication")
+    finally:
+        os.close(descriptor)
+
+
+def _link_staged_partial_payload(
+    source_parent_fd: int,
+    final_parent_fd: int,
+    source_name: str,
+    final_name: str,
+    expected: tuple[int, int, int],
+) -> None:
+    try:
+        os.link(
+            source_name,
+            final_name,
+            src_dir_fd=source_parent_fd,
+            dst_dir_fd=final_parent_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError:
+        _require_existing_final_payload(final_parent_fd, final_name, expected)
+    except OSError as error:
+        raise PathValidationError("staged payload cannot be linked to final destination") from error
+
+
+def _open_visible_publication_chain(
+    root: Path,
+    final_component: str,
+    job_id: str,
+    expected_chain: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]],
+) -> tuple[int, int, int, int]:
+    root_fd = _open_root(root)
+    final_fd: int | None = None
+    incomplete_fd: int | None = None
+    job_fd: int | None = None
+    try:
+        _require_publication_directory_identity(root_fd, expected_chain[0])
+        final_fd = _open_existing_directory(root_fd, final_component)
+        _require_publication_directory_identity(final_fd, expected_chain[1])
+        incomplete_fd = _open_existing_directory(root_fd, _INCOMPLETE)
+        _require_publication_directory_identity(incomplete_fd, expected_chain[2])
+        job_fd = _open_existing_directory(incomplete_fd, job_id)
+        _require_publication_directory_identity(job_fd, expected_chain[3])
+        return root_fd, final_fd, incomplete_fd, job_fd
+    except BaseException:
+        if job_fd is not None:
+            os.close(job_fd)
+        if incomplete_fd is not None:
+            os.close(incomplete_fd)
+        if final_fd is not None:
+            os.close(final_fd)
+        os.close(root_fd)
+        raise
+
+
+def _verify_visible_published_payloads(
+    root: Path,
+    final_component: str,
+    job_id: str,
+    expected_chain: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]],
+    final_name: str,
+    partial_name: str,
+    expected: tuple[int, int, int],
+) -> None:
+    root_fd, final_fd, incomplete_fd, job_fd = _open_visible_publication_chain(
+        root,
+        final_component,
+        job_id,
+        expected_chain,
+    )
+    try:
+        _verify_visible_publication_payload(
+            job_fd,
+            partial_name,
+            expected,
+            minimum_links=2,
+        )
+    finally:
+        os.close(job_fd)
+        os.close(incomplete_fd)
+        os.close(final_fd)
+        os.close(root_fd)
+
+    # Rebind the lexical chain after source verification, then check the final
+    # entry last so a source-check race cannot return a stale final namespace.
+    root_fd, final_fd, incomplete_fd, job_fd = _open_visible_publication_chain(
+        root,
+        final_component,
+        job_id,
+        expected_chain,
+    )
+    try:
+        _verify_visible_publication_payload(
+            final_fd,
+            final_name,
+            expected,
+            minimum_links=2,
+        )
+    finally:
+        os.close(job_fd)
+        os.close(incomplete_fd)
+        os.close(final_fd)
+        os.close(root_fd)
+
+
+def _fsync_published_final_directory(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise PathValidationError("final destination directory cannot be synced") from error
 
 
 def _require_expected_output_logical_bytes(value: object) -> int | None:
