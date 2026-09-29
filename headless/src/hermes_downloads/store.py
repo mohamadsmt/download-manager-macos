@@ -184,6 +184,32 @@ CREATE TABLE staged_payload_bindings (
 );
 """
 
+_FINAL_PUBLICATION_BINDINGS_SCHEMA: Final = """
+CREATE TABLE final_publication_bindings (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES staged_payload_bindings(job_id) ON DELETE CASCADE CHECK (
+        typeof(job_id) = 'text'
+        AND length(job_id) BETWEEN 1 AND 128
+        AND substr(job_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND job_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+    ),
+    final_device INTEGER NOT NULL CHECK (
+        typeof(final_device) = 'integer'
+        AND final_device >= 0
+        AND final_device <= 9223372036854775807
+    ),
+    final_inode INTEGER NOT NULL CHECK (
+        typeof(final_inode) = 'integer'
+        AND final_inode >= 0
+        AND final_inode <= 9223372036854775807
+    ),
+    logical_size INTEGER NOT NULL CHECK (
+        typeof(logical_size) = 'integer'
+        AND logical_size >= 0
+        AND logical_size <= 9223372036854775807
+    )
+);
+"""
+
 _COLLECTION_HOLDS_SCHEMA: Final = """
 CREATE TABLE collection_holds (
     collection_id TEXT PRIMARY KEY
@@ -399,7 +425,7 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 14
+_SUPPORTED_SCHEMA_VERSION: Final = 15
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -541,6 +567,24 @@ _V14_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _PUBLICATION_RESERVATIONS_SCHEMA,
     _PUBLICATION_MARKER_BINDINGS_SCHEMA,
     _STAGED_PAYLOAD_BINDINGS_SCHEMA,
+    _COLLECTION_HOLDS_SCHEMA,
+    _JOB_RETRY_SCHEMA,
+    _JOB_RETRY_AUDIT_SCHEMA,
+    _QUEUE_COMMANDS_SCHEMA,
+    _ENGINE_INSTANCES_SCHEMA,
+    _DIRECT_ENGINE_ACTIVATION_FENCES_SCHEMA,
+    _DIRECT_ENGINE_RECOVERY_CAPABILITIES_SCHEMA,
+    _DIRECT_DISPATCH_COMMANDS_SCHEMA,
+    _JOB_CONTROL_COMMANDS_SCHEMA,
+    _COMMAND_RECEIPTS_SCHEMA,
+)
+_V15_TABLE_SCHEMAS: Final = _expected_table_schemas(
+    _SCHEMA,
+    _MATERIALIZED_JOBS_SCHEMA,
+    _PUBLICATION_RESERVATIONS_SCHEMA,
+    _PUBLICATION_MARKER_BINDINGS_SCHEMA,
+    _STAGED_PAYLOAD_BINDINGS_SCHEMA,
+    _FINAL_PUBLICATION_BINDINGS_SCHEMA,
     _COLLECTION_HOLDS_SCHEMA,
     _JOB_RETRY_SCHEMA,
     _JOB_RETRY_AUDIT_SCHEMA,
@@ -936,6 +980,34 @@ class _StagedPayloadBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class _FinalPublicationBinding:
+    """Private durable identity of a verified same-inode final publication."""
+
+    job_id: str
+    final_device: int
+    final_inode: int
+    logical_size: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "job_id", _require_identifier(self.job_id, "job_id"))
+        object.__setattr__(
+            self,
+            "final_device",
+            _require_counter(self.final_device, "final_device"),
+        )
+        object.__setattr__(
+            self,
+            "final_inode",
+            _require_counter(self.final_inode, "final_inode"),
+        )
+        object.__setattr__(
+            self,
+            "logical_size",
+            _require_counter(self.logical_size, "logical_size"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class JobPageRecord:
     """Lifecycle fields needed to render one bounded job page."""
 
@@ -1032,7 +1104,7 @@ class SQLiteStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             self._reject_newer_schema_version(connection)
-            self._migrate_schema_v14(connection)
+            self._migrate_schema_v15(connection)
         except BaseException:
             try:
                 connection.rollback()
@@ -1070,6 +1142,7 @@ class SQLiteStore:
             12: _V12_TABLE_SCHEMAS,
             13: _V13_TABLE_SCHEMAS,
             14: _V14_TABLE_SCHEMAS,
+            15: _V15_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -1100,8 +1173,8 @@ class SQLiteStore:
         return actual_schemas == expected_schemas
 
     @staticmethod
-    def _migrate_schema_v14(connection: sqlite3.Connection) -> None:
-        """Bootstrap v1 then apply additive v2 through v14 migrations atomically."""
+    def _migrate_schema_v15(connection: sqlite3.Connection) -> None:
+        """Bootstrap v1 then apply additive v2 through v15 migrations atomically."""
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1236,8 +1309,14 @@ class SQLiteStore:
                 connection.execute(_STAGED_PAYLOAD_BINDINGS_SCHEMA)
                 connection.execute("PRAGMA user_version = 14")
                 version = 14
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 14:
                 if not SQLiteStore._has_table_schemas(connection, _V14_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_FINAL_PUBLICATION_BINDINGS_SCHEMA)
+                connection.execute("PRAGMA user_version = 15")
+                version = 15
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V15_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -3874,6 +3953,14 @@ class SQLiteStore:
         job_id = _require_identifier(job_id, "job_id")
         return self._read_staged_payload_binding(self._connection, job_id)
 
+    def _get_final_publication_binding(
+        self, job_id: str
+    ) -> _FinalPublicationBinding | None:
+        """Read one private final identity through its verified owner chain."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        return self._read_final_publication_binding(self._connection, job_id)
+
     @staticmethod
     def _read_publication_reservation(
         connection: sqlite3.Connection, job_id: str
@@ -4095,6 +4182,66 @@ class SQLiteStore:
                 requested = binding
         return requested
 
+    @staticmethod
+    def _read_final_publication_binding(
+        connection: sqlite3.Connection, job_id: str
+    ) -> _FinalPublicationBinding | None:
+        """Read final identity only when it exactly matches a staged owner chain."""
+
+        requested: _FinalPublicationBinding | None = None
+        rows = connection.execute(
+            """
+            SELECT job_id, final_device, final_inode, logical_size
+            FROM final_publication_bindings
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                binding = _FinalPublicationBinding(
+                    job_id=_require_sqlite_text(
+                        row["job_id"], "final publication binding job_id"
+                    ),
+                    final_device=_require_counter(
+                        _require_sqlite_integer(
+                            row["final_device"],
+                            "final publication binding final_device",
+                        ),
+                        "final publication binding final_device",
+                    ),
+                    final_inode=_require_counter(
+                        _require_sqlite_integer(
+                            row["final_inode"],
+                            "final publication binding final_inode",
+                        ),
+                        "final publication binding final_inode",
+                    ),
+                    logical_size=_require_counter(
+                        _require_sqlite_integer(
+                            row["logical_size"],
+                            "final publication binding logical_size",
+                        ),
+                        "final publication binding logical_size",
+                    ),
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError("persisted final publication binding is invalid") from error
+            staged = SQLiteStore._read_staged_payload_binding(connection, binding.job_id)
+            if staged is None:
+                raise ValueError("final publication binding is missing its staged payload")
+            if staged.job_id != binding.job_id:
+                raise ValueError("final publication binding job_id does not match its owner")
+            if (
+                binding.final_device != staged.partial_device
+                or binding.final_inode != staged.partial_inode
+                or binding.logical_size != staged.logical_size
+            ):
+                raise ValueError("final publication binding does not match staged payload")
+            if binding.job_id == job_id:
+                if requested is not None:
+                    raise ValueError("materialized job has multiple final publication bindings")
+                requested = binding
+        return requested
+
     def bind_publication_marker(
         self,
         job_id: str,
@@ -4206,6 +4353,82 @@ class SQLiteStore:
             else:
                 if existing != requested:
                     raise ValueError("staged payload binding does not match")
+                result = existing
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return result
+
+    def _bind_final_publication(
+        self,
+        job_id: str,
+        *,
+        claim_token: str,
+        final_device: object,
+        final_inode: object,
+        logical_size: object,
+    ) -> _FinalPublicationBinding:
+        """Persist or exactly replay a verified same-inode final publication."""
+
+        job_id = _require_identifier(job_id, "job_id")
+        claim_token = _require_reservation_token(claim_token)
+        requested = _FinalPublicationBinding(
+            job_id=job_id,
+            final_device=_require_counter(final_device, "final_device"),
+            final_inode=_require_counter(final_inode, "final_inode"),
+            logical_size=_require_counter(logical_size, "logical_size"),
+        )
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            reservation = self._read_publication_reservation(connection, job_id)
+            if reservation is None:
+                raise ValueError(
+                    "final publication binding requires a current publication reservation"
+                )
+            if reservation.claim_token != claim_token:
+                raise ValueError("final publication claim token does not match")
+            marker = self._read_publication_marker_binding(connection, job_id)
+            if marker is None:
+                raise ValueError(
+                    "final publication binding requires a current publication marker"
+                )
+            if marker.job_id != reservation.job_id:
+                raise ValueError("publication marker binding does not match its owner")
+            staged = self._read_staged_payload_binding(connection, job_id)
+            if staged is None:
+                raise ValueError(
+                    "final publication binding requires a current staged payload"
+                )
+            if staged.job_id != marker.job_id:
+                raise ValueError("staged payload binding does not match its owner")
+            if (
+                requested.final_device != staged.partial_device
+                or requested.final_inode != staged.partial_inode
+                or requested.logical_size != staged.logical_size
+            ):
+                raise ValueError("final publication binding does not match staged payload")
+            existing = self._read_final_publication_binding(connection, job_id)
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO final_publication_bindings (
+                        job_id, final_device, final_inode, logical_size
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        requested.job_id,
+                        requested.final_device,
+                        requested.final_inode,
+                        requested.logical_size,
+                    ),
+                )
+                result = requested
+            else:
+                if existing != requested:
+                    raise ValueError("final publication binding does not match")
                 result = existing
             connection.commit()
         except BaseException:
