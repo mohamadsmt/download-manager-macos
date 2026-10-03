@@ -2,19 +2,29 @@
 
 ## Status and scope
 
-**No benchmark result exists yet.** T22a adds only local evidence allocation, strict
-trial validation, and deterministic summary mechanics. It does not generate the
-fixture, start curl or aria2, transfer a payload, open a network connection, or
-make a numerical performance, recovery, A08, A09, or A11 claim.
+T22a's version-1 allocation, strict metadata validation, and pure summary remain
+available. Version-1 summaries retain `pending_real_execution`; synthetic unit
+records are contract tests, never runtime evidence.
 
-`headless/scripts/benchmark.py` is standard-library-only. Its `allocate` command
-creates a pending evidence directory; it is not a benchmark runner. Any generated
-summary has the literal status `pending_real_execution`, never a passing acceptance
-status.
+T22b adds an explicit `run` command for **local engine baselines**. It generates a
+real deterministic 64 MiB payload and serves only `127.0.0.1` using Python's
+standard library. It invokes the existing curl/aria2 engines with argv and no
+shell. It accepts neither user URLs nor additional engine arguments. No DNS, WAN,
+worker, Swift application, user queue/store, profile, or Hermes settings are used.
+
+A full run requests 18 measured completion trials: three balanced rotations of
+`curl-single`, `aria2-single`, and `aria2-multi` under both unrestricted and
+per-connection origins. Single configurations use one connection; multi uses 16.
+The throttled origin allows 4 MiB/s per connection, including an initial 64 KiB
+chunk. This models an origin constraint; it does not certify a worker/global cap.
+
+Native Swift is excluded because its controller depends on AppKit, Combine, and
+the real store, and there is no isolated comparable engine harness. The runner
+never launches the old application against user state.
 
 ## Artifact location and allocation
 
-Canonical future evidence is kept outside Git at:
+Evidence must be owner-only and outside Git (or beneath this narrowly ignored root):
 
 ```text
 .artifacts/download-manager/<run-id>/
@@ -24,17 +34,21 @@ The reserved run layout is:
 
 ```text
 <run-id>/
-  trials/<trial-id>.json   # canonical diagnostic record per future trial
-  summary.json             # derived pending_real_execution report
+  trials/<trial-id>.json   # immutable diagnostic record per requested trial
+  manifest.json            # source hashes, sequence, budgets, setup
+  <trial-id>/completion/   # real output, process accounting, origin ledger
+  <trial-id>/pause/        # separate containment-probe output/accounting/ledger
+  summary.json             # only when the requested evidence is complete
+  report.json              # success or failure; never filters failed trials
 ```
 
 T22a allocates only `<run-id>` and does not fabricate either trial or summary
-artifact. A later controlled runner may populate the reserved paths only after it
-has observed real measurements.
+artifact. The explicit T22b `run` command populates these paths from observed
+measurements and retains failed records for diagnosis.
 
 The repository ignores only `.artifacts/download-manager/`; it does not blanket
-ignore `.artifacts/`. Callers must explicitly supply the absolute
-`.artifacts/download-manager` root to `allocate_run_directory` or to the CLI:
+ignore `.artifacts/`. Callers explicitly supply an absolute private root to
+`allocate_run_directory` or to the CLI, for example:
 
 ```text
 headless/scripts/benchmark.py allocate \
@@ -50,7 +64,7 @@ Allocation uses an exclusive directory creation for `<run-id>`. A pre-existing
 file, directory, dangling symlink, or directory symlink with that name is rejected;
 the allocator never merges with or overwrites it. New managed directories are mode
 `0700` on POSIX, and the supplied root chain must contain real directories rather
-than symlinks. A future runner writes its immutable trial JSON records and derived
+than symlinks. The runner writes immutable trial JSON records and its derived
 summary below that freshly allocated run directory.
 
 ## Trial JSON contract
@@ -79,7 +93,7 @@ pause_latency_seconds
 completion_sha256
 ```
 
-`schema_version` is currently `1`. `outcome` is exactly `passed` or `failed`.
+The frozen T22a contract below uses `schema_version: 1`. `outcome` is exactly `passed` or `failed`.
 Passed records have precisely the base fields and all measurement fields are finite,
 nonnegative numbers; payload bytes and elapsed time must be positive. Their
 completion SHA-256 is lowercase hexadecimal and must equal the fixture SHA-256.
@@ -138,9 +152,103 @@ retransmitted bytes, client payload, allocated disk bytes, and pause latency. Th
 report remains `pending_real_execution` even when synthetic unit-test records are
 complete.
 
-## Deferred controlled matrix and acceptance thresholds
+## Running the local baseline
 
-The later controlled local matrix must use a deterministic **64 MiB** synthetic
+First install the isolated, noneditable Python 3.12 package and verify installed
+source parity before collecting evidence:
+
+```sh
+env -u PYTHONPATH -u PYTHONHOME uv sync --locked --project headless \
+  --python 3.12 --no-editable --all-groups --reinstall-package hermes-downloads
+headless/scripts/run-tests tests/unit/test_benchmark.py
+```
+
+Invoke the explicit interpreter from a fresh scratch working directory, with an
+absolute private artifact root and a new run ID. For the complete local matrix:
+
+```sh
+env -u PYTHONPATH -u PYTHONHOME /absolute/repo/headless/.venv/bin/python -I \
+  /absolute/repo/headless/scripts/benchmark.py run \
+  --artifact-root /absolute/private/benchmark-evidence --run-id reviewed-matrix \
+  --mode full --wall-seconds 1200 --trial-seconds 60 --byte-budget 2147483648
+```
+
+For one unrestricted curl completion and its containment probe, use `--mode smoke
+--wall-seconds 120 --trial-seconds 60 --byte-budget 134217728`. A smoke is never a
+complete matrix. No transfer occurs with the retained `allocate` command.
+
+Setup has a 30-second monotonic budget within the aggregate run budget. Completion
+children have at most 60 seconds each, probes at most 10 seconds, and termination
+reserves up to 10 seconds inside the aggregate deadline (half the remaining budget
+for short injected fault tests). SIGTERM has at most five seconds of grace, then
+SIGKILL and group-containment verification. Forced cleanup fails a pause probe.
+The CLI rejects aggregate deadlines over 1800 seconds (120 for smoke), and byte
+budgets over 3 GiB (128 MiB for smoke). Each completion origin is additionally
+bounded to 128 MiB, and each probe to 4 MiB. Setup, child waits, hashes, transfers,
+and the trial sequence all check monotonic budgets. Exhaustion retains failed
+records for all requested slots, rather than skipping them for a clean summary.
+
+New run directories are `0700`; evidence files are exclusively created `0600`.
+Engine outputs live in fresh private trial directories; curl disables config and
+netrc, aria2 disables config/netrc and explicitly sets `file-allocation=none`,
+no overwrite, and no automatic renaming. The minimal child environment omits
+ambient proxy/config/credential variables. TLS verification remains enabled;
+the synthetic origin itself uses HTTP on numeric loopback, without redirects.
+Engine version stdout and executable hashes are retained privately.
+
+## Version-2 measurement contract
+
+Version 2 adds the closed fields `purpose: local_engine_baseline`, `runner_sha256`
+(the exact runner file), `source_sha256` (fixture-generator source), and
+`pause_probe`. It keeps the original strict metadata redaction and all completion
+accounting requirements. Exact settings, versions, deterministic fixture hash,
+client size/hash, and actual `st_blocks * 512` allocations are recorded.
+
+CPU seconds and normalized maximum RSS come from `wait4` for the actual engine
+leader: macOS RSS is bytes; Linux RSS is KiB converted to bytes. This is engine
+process accounting, not whole-run CPU, server CPU, or a sampled machine metric.
+Completion elapsed time spans launch through observed child exit/containment;
+hash verification and the separate probe are excluded from completion throughput.
+
+The server ledger counts bytes successfully accepted by socket sends, stores the
+actual sent length of each requested range, and computes their union.
+`retransmitted_bytes` means repeated HTTP payload ranges, not inferred TCP
+retransmission. Headers and HEAD requests are excluded. Completion requires full
+range coverage and the verified 64 MiB client output; the ledger identity must
+hold. Failed partial sends remain diagnostic.
+
+Every passed completion also needs a **separate graceful engine-process
+containment probe**. The probe uses the same fixture with a 1 MiB/s per-connection
+origin, waits for at least 64 KiB of actual server payload, then measures SIGTERM
+to verified process-group disappearance. Its closed fields are:
+
+```text
+scope, elapsed_seconds, cpu_seconds, max_rss_bytes,
+server_payload_bytes, server_unique_payload_bytes, retransmitted_bytes,
+client_logical_bytes, allocated_disk_bytes, latency_seconds, forced, contained
+```
+
+The scope is exactly `separate_graceful_engine_containment`. Probe bytes and CPU
+have separate summary totals and are included in the aggregate run budget, never
+silently folded into completion throughput. `client_logical_bytes` is observed
+file length: segmented output may be sparse, so it is not treated as received
+payload. Probe ledger retransmission is separate. Missing/unobserved failure
+metrics remain null; zeros are never fabricated to obtain a passing record.
+
+`summarize_baseline_trials` requires exactly the six expected configurations and
+three repetitions, validates every version-2 record, and reuses the version-1
+fail-closed summarizer. It rejects missing/extra/failed/duplicate records and
+mismatched fixture, run, source/runner hash, scope, settings, cross-configuration
+version inventory, trial identity, and accounting.
+A complete computed version-2 report is `measured_local_baseline`; an actual
+single CLI smoke is `measured_local_smoke`. Those labels describe this narrow
+local baseline, not project acceptance. Unit-generated records still are not
+measured evidence. Failed runs return nonzero, retain their diagnostics, and do
+not write a passing `summary.json`.
+
+## Deferred worker and live acceptance thresholds
+
+The controlled local matrix uses a deterministic **64 MiB** synthetic
 payload and three balanced repetitions for each of:
 
 1. `curl-single`
@@ -151,10 +259,11 @@ All configurations use the same fixture and record versions, settings, hash, CPU
 RSS, server payload ledger, client accounting, actual allocated disk blocks, pause
 latency, and completion hash. The fixture must separately model unrestricted and
 per-connection throttling. This local matrix consumes no WAN budget. Native Swift
-may be compared only using a disposable independent harness; an unsafe or
-non-comparable comparison must be explicitly excluded rather than silently omitted.
+is explicitly excluded for the concrete reason above.
 
-Approved future acceptance criteria include:
+Worker cap, recovery, and live acceptance remain separate work. The baseline and
+its process-containment probe make no A08, mixed-worker, recovery, full-A09, or A11
+delivery claim. Approved future worker acceptance criteria include:
 
 - Use at least 30-second steady measurement windows after 10 seconds of settling;
   server-ledger payload accounting is authoritative and retransmitted bytes are

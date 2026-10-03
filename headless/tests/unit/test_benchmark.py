@@ -508,3 +508,286 @@ def test_summarizer_calculates_p50_and_inclusive_ranges_with_pending_status() ->
     }
     assert report["fixture"]["payload_bytes"] == PAYLOAD_BYTES
     assert report["repetitions"] == 3
+
+
+# T22b: injected records below test contracts, never measured benchmark evidence.
+def _baseline_record(model: str, config_id: str, repetition: int) -> dict[str, Any]:
+    benchmark = _benchmark()
+    record = _passed_record(config_id, repetition)
+    record.update(schema_version=2, purpose="local_engine_baseline",
+                  runner_sha256="b" * 64, source_sha256="c" * 64)
+    record["configuration"]["id"] = f"{model}-{config_id}"
+    record["trial_id"] = f"{model}-{config_id}-{repetition}"
+    record["configuration"]["settings"] = benchmark.baseline_settings(model, config_id)
+    record["pause_probe"] = {
+        "scope": "separate_graceful_engine_containment",
+        "elapsed_seconds": 0.5, "cpu_seconds": 0.02, "max_rss_bytes": 4096,
+        "server_payload_bytes": 65536, "client_logical_bytes": 65536,
+        "server_unique_payload_bytes": 65536, "retransmitted_bytes": 0,
+        "allocated_disk_bytes": 65536, "latency_seconds": record["pause_latency_seconds"],
+        "forced": False, "contained": True,
+    }
+    return record
+
+
+def test_real_baseline_sequence_is_three_balanced_rotations_under_two_models() -> None:
+    benchmark = _benchmark()
+    sequence = benchmark.baseline_sequence()
+    assert len(sequence) == 18
+    for model in ("unrestricted", "per-connection"):
+        rows = [(config, rep) for origin, config, rep in sequence if origin == model]
+        assert {row for row in rows} == {(config, rep) for config in EXPECTED_CONFIGURATIONS
+                                           for rep in (1, 2, 3)}
+        for rep in (1, 2, 3):
+            assert [config for config, repetition in rows if repetition == rep] == (
+                ["curl-single", "aria2-single", "aria2-multi"][rep-1:]
+                + ["curl-single", "aria2-single", "aria2-multi"][:rep-1]
+            )
+
+
+def test_engine_argv_is_closed_loopback_no_configuration_or_credentials(tmp_path: Path) -> None:
+    benchmark = _benchmark()
+    curl = benchmark.engine_argv("curl-single", "/usr/bin/curl", 12345, tmp_path, 10)
+    aria = benchmark.engine_argv("aria2-multi", "/opt/homebrew/bin/aria2c", 12345, tmp_path, 10)
+    assert curl[1] == "-q"
+    assert "--no-netrc" in curl and "--proxy" in curl and "--noproxy" in curl
+    assert "--file-allocation=none" in aria and "--no-conf=true" in aria
+    assert "--no-netrc=true" in aria and "--check-certificate=true" in aria
+    assert "--allow-overwrite=false" in aria and "--auto-file-renaming=false" in aria
+    assert "--split=16" in aria and "--max-connection-per-server=16" in aria
+    assert curl[-1] == aria[-1] == "http://127.0.0.1:12345/payload"
+    with pytest.raises(benchmark.BenchmarkValidationError):
+        benchmark.engine_argv("curl-single --insecure", "/usr/bin/curl", 12345, tmp_path, 10)
+    clean = benchmark.engine_environment(tmp_path)
+    assert set(clean) == {"PATH", "HOME", "LC_ALL", "TMPDIR"}
+    assert not any("proxy" in key.lower() for key in clean)
+
+
+def test_monotonic_aggregate_budget_rejects_excess_before_transfer() -> None:
+    benchmark = _benchmark()
+    now = [1.0]
+    budget = benchmark.RunBudget(10, 100, clock=lambda: now[0])
+    budget.consume(70)
+    with pytest.raises(benchmark.BudgetExceeded):
+        budget.consume(31)
+    assert budget.transferred == 70
+    now[0] = 12
+    with pytest.raises(benchmark.BudgetExceeded):
+        budget.check()
+
+
+def test_fixture_is_generated_deterministically_exclusive_and_budgeted(tmp_path: Path) -> None:
+    benchmark = _benchmark()
+    budget = benchmark.RunBudget(10, PAYLOAD_BYTES)
+    first = tmp_path / "fixture"
+    digest = benchmark.generate_fixture(first, budget)
+    import hashlib
+    assert first.stat().st_size == PAYLOAD_BYTES
+    assert hashlib.sha256(first.read_bytes()).hexdigest() == digest
+    assert first.read_bytes()[:512] == bytes(range(256)) * 2
+    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+    with pytest.raises(FileExistsError):
+        benchmark.generate_fixture(first, budget)
+    assert budget.transferred == 0  # generation is setup, never network ledger
+    expired = benchmark.RunBudget(1, 100, clock=lambda: 0)
+    expired.clock = lambda: 2
+    with pytest.raises(benchmark.BudgetExceeded):
+        benchmark.generate_fixture(tmp_path / "expired", expired)
+
+
+def test_actual_wait4_metrics_and_timeout_group_containment(tmp_path: Path) -> None:
+    benchmark = _benchmark()
+    # Fault control only: no engine evidence or extra public runner CLI arguments.
+    result = benchmark.run_child(
+        [sys.executable, "-c", "sum(i*i for i in range(100000))"], tmp_path,
+        benchmark.RunBudget(5, 100), timeout=2, log_name="accounting")
+    assert result["exit_code"] == 0 and result["contained"] is True
+    assert result["cpu_seconds"] > 0 and result["max_rss_bytes"] > 0
+    timed = benchmark.run_child(
+        [sys.executable, "-c", "import time; time.sleep(10)"], tmp_path,
+        benchmark.RunBudget(5, 100), timeout=0.05, log_name="timeout")
+    assert timed["failure_classification"] == "timeout" and timed["contained"] is True
+    with pytest.raises(ProcessLookupError):
+        os.killpg(timed["pid"], 0)
+    assert benchmark.normalize_rss(10, "darwin") == 10
+    assert benchmark.normalize_rss(10, "linux") == 10240
+
+
+def test_pause_probe_signals_active_child_and_accounts_separately(tmp_path: Path) -> None:
+    benchmark = _benchmark()
+    signals = []
+    result = benchmark.run_child(
+        [sys.executable, "-c", "import time; time.sleep(10)"], tmp_path,
+        benchmark.RunBudget(5, 100), timeout=2, log_name="pause",
+        pause_ready=lambda: True, signal_observer=signals.append)
+    assert signals[0] == benchmark.signal.SIGTERM
+    assert result["pause_latency_seconds"] > 0
+    assert result["forced"] is False and result["contained"] is True
+
+
+def test_v2_complete_summary_rejects_missing_extra_failed_scope_and_hash_mismatch() -> None:
+    benchmark = _benchmark()
+    records = [_baseline_record(model, config, rep)
+               for model, config, rep in benchmark.baseline_sequence()]
+    summary = benchmark.summarize_baseline_trials(records)
+    assert summary["status"] == "measured_local_baseline"
+    assert summary["trial_count"] == 18 and summary["schema_version"] == 2
+    assert summary["pause_scope"] == "separate_graceful_engine_containment"
+    assert summary["probe_totals"]["server_payload_bytes"] == 18 * 65536
+    variants = [records[:-1], records + [records[0]]]
+    for mutate in (lambda r: r.update(outcome="failed", failure_classification="timeout",
+                                      completion_sha256=None, pause_latency_seconds=None,
+                                      pause_probe=None),
+                   lambda r: r.update(runner_sha256="d" * 64),
+                   lambda r: r["pause_probe"].update(scope="worker_pause"),
+                   lambda r: r["pause_probe"].update(server_payload_bytes=0),
+                   lambda r: r["configuration"]["settings"].update(connections=3)):
+        variant = deepcopy(records)
+        mutate(variant[0])
+        variants.append(variant)
+    for variant in variants:
+        with pytest.raises(benchmark.SummaryValidationError):
+            benchmark.summarize_baseline_trials(variant)
+    assert json.loads(benchmark.canonical_json(records[0])) == records[0]
+
+
+def test_run_preserves_every_failed_trial_without_manufacturing_summary(tmp_path: Path,
+                                                                      monkeypatch) -> None:
+    benchmark = _benchmark()
+    monkeypatch.setattr(benchmark, "inventory_engines", lambda *a: {"curl": ("/usr/bin/curl", "8.0"),
+                                                                  "aria2": ("/missing/aria2", "1.0")})
+    def fail(*args, **kwargs):
+        raise benchmark.BudgetExceeded("bounded fault")
+    monkeypatch.setattr(benchmark, "execute_baseline_trial", fail)
+    report = benchmark.run_baselines(tmp_path, "failures", mode="full", wall_seconds=10,
+                                     byte_budget=2 * 1024**3, trial_seconds=1)
+    records = [json.loads(path.read_text()) for path in (tmp_path / "failures" / "trials").glob("*.json")]
+    assert len(records) == 18 and all(r["outcome"] == "failed" for r in records)
+    assert report["status"] == "failed_local_baseline" and not (tmp_path / "failures" / "summary.json").exists()
+    for path in (tmp_path / "failures").rglob("*"):
+        assert stat.S_IMODE(path.stat().st_mode) == (0o700 if path.is_dir() else 0o600)
+
+
+def test_local_ledger_counts_partial_sends_and_repeated_ranges(tmp_path: Path) -> None:
+    benchmark = _benchmark()
+    origin = benchmark.LocalOrigin(tmp_path / "fixture", benchmark.RunBudget(5, 100), 0, 100)
+    try:
+        origin.transferred = 25
+        origin.requests = [{"start": 0, "end": 19, "sent": 20},
+                           {"start": 10, "end": 19, "sent": 5}]
+        ledger = origin.ledger()
+        assert ledger["server_payload_bytes"] == 25
+        assert ledger["unique_payload_bytes"] == 20
+        assert ledger["retransmitted_bytes"] == 5
+        assert origin.server.server_address[0] == "127.0.0.1"
+    finally:
+        origin.server.server_close()
+    class Socket:
+        def send(self, data):
+            return 3
+    budget = benchmark.RunBudget(5, 10)
+    assert budget.send(Socket(), b"abcdefgh") == 3
+    assert budget.transferred == 3
+
+
+def test_v2_probe_records_sparse_logical_size_and_its_own_retransmission() -> None:
+    benchmark = _benchmark()
+    record = _baseline_record("per-connection", "aria2-multi", 1)
+    record["pause_probe"]["client_logical_bytes"] = PAYLOAD_BYTES
+    record["pause_probe"]["server_unique_payload_bytes"] = 60000
+    record["pause_probe"]["retransmitted_bytes"] = 5536
+    assert benchmark.validate_trial_record(record) == record
+    broken = deepcopy(record)
+    broken["pause_probe"]["retransmitted_bytes"] += 1
+    with pytest.raises(benchmark.BenchmarkValidationError):
+        benchmark.validate_trial_record(broken)
+
+
+def test_cli_rejects_user_sources_and_arbitrary_engine_arguments() -> None:
+    benchmark = _benchmark()
+    for extra in (['--url', 'http://127.0.0.1/private'], ['--engine-args', '--insecure']):
+        with pytest.raises(SystemExit) as error:
+            benchmark.main(['run', '--artifact-root', '/tmp/evidence', '--run-id', 'unused', *extra])
+        assert error.value.code == 2
+
+
+def test_ignored_term_is_forced_contained_and_never_a_successful_pause(tmp_path: Path) -> None:
+    benchmark = _benchmark()
+    result = benchmark.run_child(
+        [sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)"],
+        tmp_path, benchmark.RunBudget(2, 100), timeout=0.3, log_name="forced")
+    assert result["forced"] is True and result["contained"] is True
+    assert result["failure_classification"] == "timeout"
+    assert result["elapsed_seconds"] < 2
+    with pytest.raises(ProcessLookupError):
+        os.killpg(result["pid"], 0)
+
+
+def test_completion_file_is_verified_and_allocated_blocks_are_measured(tmp_path: Path) -> None:
+    benchmark = _benchmark()
+    payload = tmp_path / "payload"
+    with payload.open("wb") as stream:
+        stream.seek(1024 * 1024 - 1)
+        stream.write(b"x")
+    measured = benchmark._measure_file(payload, benchmark.RunBudget(5, 100), verify=True)
+    import hashlib
+    assert measured["client_payload_bytes"] == 1024 * 1024
+    assert measured["allocated_disk_bytes"] == payload.stat().st_blocks * 512
+    assert measured["completion_sha256"] == hashlib.sha256(payload.read_bytes()).hexdigest()
+    absent = benchmark._measure_file(tmp_path / "absent", benchmark.RunBudget(5, 100), verify=False)
+    assert absent == {"client_payload_bytes": None, "allocated_disk_bytes": None, "completion_sha256": None}
+
+
+def test_failed_setup_still_retains_the_entire_requested_matrix(tmp_path: Path, monkeypatch) -> None:
+    benchmark = _benchmark()
+    def missing(*args):
+        raise benchmark.BenchmarkValidationError("local engine missing")
+    monkeypatch.setattr(benchmark, "inventory_engines", missing)
+    report = benchmark.run_baselines(tmp_path, "setup-failed", mode="full", wall_seconds=10,
+                                     byte_budget=2 * 1024**3, trial_seconds=1)
+    records = [json.loads(path.read_text()) for path in (tmp_path / "setup-failed" / "trials").glob("*.json")]
+    assert len(records) == 18
+    assert all(r["failure_classification"] == "setup_error" for r in records)
+    assert all(r["cpu_seconds"] is None and r["server_payload_bytes"] is None for r in records)
+    assert report["status"] == "failed_local_baseline"
+    assert not (tmp_path / "setup-failed" / "summary.json").exists()
+
+
+def test_origin_setup_bounds_idle_headers_and_closes_on_expired_entry(tmp_path: Path,
+                                                                    monkeypatch) -> None:
+    benchmark = _benchmark()
+    budget = benchmark.RunBudget(1, 100, clock=lambda: 0)
+    origin = benchmark.LocalOrigin(tmp_path / "fixture", budget, 0, 100)
+    calls = []
+    class Socket:
+        def settimeout(self, seconds):
+            calls.append(seconds)
+    monkeypatch.setattr(benchmark.http.server.BaseHTTPRequestHandler, "setup",
+                        lambda self: calls.append("base"))
+    handler = object.__new__(origin.server.RequestHandlerClass)
+    handler.request = Socket()
+    handler.setup()
+    assert calls == [0.25, "base"]
+    budget.clock = lambda: 2
+    with pytest.raises(benchmark.BudgetExceeded):
+        origin.__enter__()
+    assert origin.server.fileno() == -1
+
+
+def test_v2_summary_rejects_cross_configuration_version_inventory_mismatch() -> None:
+    benchmark = _benchmark()
+    records = [_baseline_record(model, config, rep)
+               for model, config, rep in benchmark.baseline_sequence()]
+    for record in records:
+        if record["configuration"]["id"] == "unrestricted-curl-single":
+            record["configuration"]["versions"]["python"] = "3.12.99"
+    with pytest.raises(benchmark.SummaryValidationError, match="versions"):
+        benchmark.summarize_baseline_trials(records)
+
+
+def test_v2_trial_identity_must_correspond_to_configuration_and_repetition() -> None:
+    benchmark = _benchmark()
+    record = _baseline_record("unrestricted", "curl-single", 1)
+    record["trial_id"] = "unrestricted-aria2-single-1"
+    with pytest.raises(benchmark.BenchmarkValidationError, match="identity"):
+        benchmark.validate_trial_record(record)
