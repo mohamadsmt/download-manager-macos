@@ -133,6 +133,8 @@ are retained for diagnosis but cannot become canonical acceptance evidence.
 `summarize_trials(trials, expected_configurations, repetitions=...)` is pure: it
 makes no filesystem, network, or engine calls. The caller must provide a nonempty
 explicit set of expected configuration IDs and an exact positive repetition count.
+This public version-1 entry point requires exact integer `schema_version: 1` on
+every record; mixed versions and all-version-2 inputs are rejected.
 For every expected configuration, the summarizer requires every repetition number
 from `1` through that count, with identical configuration settings apart from the
 repetition number.
@@ -188,6 +190,26 @@ bounded to 128 MiB, and each probe to 4 MiB. Setup, child waits, hashes, transfe
 and the trial sequence all check monotonic budgets. Exhaustion retains failed
 records for all requested slots, rather than skipping them for a clean summary.
 
+Unverified engine-group or origin shutdown raises a typed `ContainmentFailure`,
+with fixed redacted messages and the nonpassing `containment_error` classification.
+Setup, inventory and trial boundaries retain the current failed slot and every
+remaining requested slot, write `report.json`, and omit `summary.json`. Admission
+stops immediately: no later inventory engine, completion or probe is launched,
+including after a verified completion whose separate probe fails containment.
+Unrelated `RuntimeError` exceptions are not converted into containment failures.
+
+Private `containment-failure.json` evidence and the report retain only known owned
+PID/process-group/session authority and observed shutdown/accounting facts. Missing
+authority stays null; group absence is false when observed present and null when
+unverifiable. This does not claim successful cleanup or authorize signaling an
+unknown system group. A concurrent origin failure preserves prior engine authority.
+Already observed process/ledger accounting is retained; unobserved metrics in the
+current and unlaunched slots stay null. Mutable output size/hash is unavailable
+until engine and origin shutdown are both verified. A previously verified
+completion keeps its measured metrics if its probe fails, but the failed trial's
+completion hash and pause latency remain null. Unknown engine versions are omitted,
+never replaced with placeholder metadata.
+
 New run directories are `0700`; evidence files are exclusively created `0600`.
 Engine outputs live in fresh private trial directories; curl disables config and
 netrc, aria2 disables config/netrc and explicitly sets `file-allocation=none`,
@@ -234,10 +256,16 @@ silently folded into completion throughput. `client_logical_bytes` is observed
 file length: segmented output may be sparse, so it is not treated as received
 payload. Probe ledger retransmission is separate. Missing/unobserved failure
 metrics remain null; zeros are never fabricated to obtain a passing record.
+For an uncertain failed probe, `contained` is false (phase containment was not
+verified), `forced` is null if no signal accounting was observed, and the measured
+containment latency is null. A passed probe still requires explicit boolean flags
+and every strict measurement. Private process evidence preserves any independently
+verified engine shutdown when the origin is the uncertain component.
 
 `summarize_baseline_trials` requires exactly the six expected configurations and
 three repetitions, validates every version-2 record, and reuses the version-1
-fail-closed summarizer. It rejects missing/extra/failed/duplicate records and
+fail-closed summarizer only after explicit conversion to version 1, removing the
+version-2-only fields without mutating the input. It rejects missing/extra/failed/duplicate records and
 mismatched fixture, run, source/runner hash, scope, settings, cross-configuration
 version inventory, trial identity, and accounting.
 A complete computed version-2 report is `measured_local_baseline`; an actual
@@ -245,6 +273,12 @@ single CLI smoke is `measured_local_smoke`. Those labels describe this narrow
 local baseline, not project acceptance. Unit-generated records still are not
 measured evidence. Failed runs return nonzero, retain their diagnostics, and do
 not write a passing `summary.json`.
+
+Fault-injection tests verify these diagnostic contracts without orphaning a real
+engine or targeting an unknown process group. They are not live failure acceptance.
+The source revision invalidates previous exact smoke evidence; a fresh committed
+candidate 64 MiB completion plus separate probe smoke remains a parent verification
+step, as do independent specification and quality/security review.
 
 ## Deferred worker and live acceptance thresholds
 

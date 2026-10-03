@@ -122,6 +122,7 @@ FAILURE_CLASSIFICATIONS: Final = frozenset(
     {
         "accounting_error",
         "allocation_error",
+        "containment_error",
         "engine_error",
         "environment_error",
         "integrity_error",
@@ -526,6 +527,9 @@ def summarize_trials(
 
     validated_trials: list[dict[str, Any]] = []
     for trial in trials:
+        if (type(trial) is not dict or type(trial.get("schema_version")) is not int or
+                trial["schema_version"] != SCHEMA_VERSION):
+            raise SummaryValidationError("version-1 summary requires schema version 1")
         try:
             validated = validate_trial_record(trial)
         except BenchmarkValidationError as error:
@@ -634,6 +638,20 @@ PROBE_FIELDS: Final = frozenset({
 
 class BudgetExceeded(RuntimeError):
     """A finite aggregate transfer or monotonic wall budget was exhausted."""
+
+
+class ContainmentFailure(RuntimeError):
+    """Admission must stop when owned engine/origin shutdown is unverified."""
+
+    def __init__(self, component: str, *, authority: dict[str, int] | None,
+                 observations: dict[str, Any], accounting: dict[str, Any] | None = None):
+        message = {"engine": "engine group containment could not be verified",
+                   "origin": "origin containment could not be verified"}[component]
+        super().__init__(message)
+        self.accounting = accounting or {}
+        self.evidence = {"status": "uncertain", "component": component, "message": message,
+                         "authority": authority, "observations": observations,
+                         "process_accounting": self.accounting}
 
 
 class RunBudget:
@@ -785,6 +803,28 @@ def run_child(argv: list[str], directory: Path, budget: RunBudget, *, timeout: f
     classification = None
     pause_started = None
     forced = False
+    group_absent = None
+
+    def group_exists() -> bool:
+        nonlocal group_absent
+        exists = _group_exists(process.pid)
+        group_absent = not exists
+        return exists
+
+    def uncertain() -> ContainmentFailure:
+        # Popen's successful start_new_session owns this PID, PGID and session.
+        accounting = {"pid": process.pid, "contained": False, "forced": forced,
+                      "exit_code": os.waitstatus_to_exitcode(status) if status is not None else None,
+                      "elapsed_seconds": time.monotonic() - started,
+                      "cpu_seconds": usage.ru_utime + usage.ru_stime if usage is not None else None,
+                      "max_rss_bytes": normalize_rss(usage.ru_maxrss) if usage is not None else None,
+                      "pause_latency_seconds": None}
+        return ContainmentFailure("engine", authority={"pid": process.pid,
+                                  "process_group_id": process.pid, "session_id": process.pid},
+                                  observations={"group_absent": group_absent,
+                                                "leader_reaped": status is not None,
+                                                "forced": forced}, accounting=accounting)
+
     try:
         with os.fdopen(descriptor, "wb") as log:
             process = subprocess.Popen(argv, cwd=directory, env=engine_environment(directory),
@@ -810,39 +850,54 @@ def run_child(argv: list[str], directory: Path, budget: RunBudget, *, timeout: f
                 time.sleep(0.01)
     finally:
         if process is not None:
-            if status is None or _group_exists(process.pid):
-                signaled = time.monotonic()
-                os.killpg(process.pid, signal.SIGTERM) if _group_exists(process.pid) else None
-                if signal_observer is not None:
-                    signal_observer(signal.SIGTERM)
-                grace_deadline = min(signaled + 5, budget.deadline - 1)
-                while time.monotonic() < grace_deadline:
-                    if status is None:
-                        waited, observed_status, observed_usage = os.wait4(process.pid, os.WNOHANG)
-                        if waited:
-                            status, usage = observed_status, observed_usage
-                    if status is not None and not _group_exists(process.pid):
-                        break
-                    time.sleep(0.01)
-                if _group_exists(process.pid):
-                    forced = True
-                    os.killpg(process.pid, signal.SIGKILL)
+            try:
+                if status is None or group_exists():
+                    signaled = time.monotonic()
+                    if group_exists():
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass  # Only a subsequent absence probe proves containment.
                     if signal_observer is not None:
-                        signal_observer(signal.SIGKILL)
-                if status is None:
-                    _, status, usage = os.wait4(process.pid, 0)
-                while _group_exists(process.pid) and time.monotonic() < budget.deadline:
-                    time.sleep(0.01)
-                if _group_exists(process.pid):
-                    raise RuntimeError("engine group containment could not be verified")
-            process.returncode = os.waitstatus_to_exitcode(status)
+                        signal_observer(signal.SIGTERM)
+                    grace_deadline = min(signaled + 5, budget.deadline - 1)
+                    while time.monotonic() < grace_deadline:
+                        if status is None:
+                            waited, observed_status, observed_usage = os.wait4(process.pid, os.WNOHANG)
+                            if waited:
+                                status, usage = observed_status, observed_usage
+                        if status is not None and not group_exists():
+                            break
+                        time.sleep(0.01)
+                    if group_exists():
+                        forced = True
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        if signal_observer is not None:
+                            signal_observer(signal.SIGKILL)
+                    while time.monotonic() < budget.deadline:
+                        if status is None:
+                            waited, observed_status, observed_usage = os.wait4(process.pid, os.WNOHANG)
+                            if waited:
+                                status, usage = observed_status, observed_usage
+                        if not group_exists() and status is not None:
+                            break
+                        time.sleep(0.01)
+                if group_exists() or status is None:
+                    raise uncertain()
+                process.returncode = os.waitstatus_to_exitcode(status)
+            except OSError:
+                group_absent = None
+                raise uncertain() from None
     assert process is not None and usage is not None
     elapsed = time.monotonic() - started
     result = {"pid": process.pid, "exit_code": process.returncode,
               "elapsed_seconds": elapsed,
               "cpu_seconds": usage.ru_utime + usage.ru_stime,
               "max_rss_bytes": normalize_rss(usage.ru_maxrss),
-              "contained": not _group_exists(process.pid), "forced": forced,
+              "contained": True, "forced": forced,
               "pause_latency_seconds": time.monotonic() - pause_started if pause_started else None}
     if classification:
         result["failure_classification"] = classification
@@ -962,11 +1017,23 @@ class LocalOrigin:
 
     def __exit__(self, *args):
         self.stop.set()
-        self.server.shutdown()
-        self.server.server_close()  # joins request threads, bounded socket timeout
-        self.thread.join(timeout=1)
-        if self.thread.is_alive():
-            raise RuntimeError("origin containment failed")
+        failure = None
+        try:
+            self.server.shutdown()
+            self.server.server_close()  # joins request threads, bounded socket timeout
+            self.thread.join(timeout=1)
+        except OSError:
+            failure = ContainmentFailure("origin", authority=None,
+                                         observations={"thread_stopped": None})
+        if failure is None and self.thread.is_alive():
+            failure = ContainmentFailure("origin", authority=None,
+                                         observations={"thread_stopped": False})
+        if failure is not None:
+            if len(args) > 1 and isinstance(args[1], ContainmentFailure):
+                # Origin cleanup must not discard the owned engine authority.
+                args[1].evidence["origin_failure"] = failure.evidence
+                raise args[1]
+            raise failure from None
 
     def ledger(self) -> dict[str, Any]:
         intervals = sorted((r["start"], r["start"] + r["sent"])
@@ -1021,6 +1088,47 @@ def _measure_file(path: Path, budget: RunBudget, *, verify: bool) -> dict[str, A
             "completion_sha256": digest.hexdigest() if verify else None}
 
 
+def _run_trial_phase(record: dict[str, Any], directory: Path, fixture: Path,
+                     budget: RunBudget, rate: int, byte_limit: int, argv_engine: str,
+                     executable: str, timeout: float, *, probe: bool = False):
+    origin = result = None
+    try:
+        with LocalOrigin(fixture, budget, rate, byte_limit) as origin:
+            result = run_child(engine_argv(argv_engine, executable, origin.port, directory, timeout),
+                               directory, budget, timeout=timeout, log_name="engine",
+                               pause_ready=(lambda: origin.transferred >= 65536) if probe else None)
+    except ContainmentFailure as failure:
+        result = result if result is not None else failure.accounting
+        ledger = origin.ledger() if origin is not None else None
+        _json_write(directory / "containment-failure.json", failure.evidence)
+        if result:
+            _json_write(directory / "process.json", result)
+        if ledger is not None:
+            _json_write(directory / "ledger.json", ledger)
+        if probe:
+            pause = {key: None for key in PROBE_FIELDS}
+            pause.update(scope=PAUSE_SCOPE, contained=False)
+            for metric in ("elapsed_seconds", "cpu_seconds", "max_rss_bytes", "forced"):
+                pause[metric] = result.get(metric)
+            if ledger is not None:
+                pause.update(server_payload_bytes=ledger["server_payload_bytes"],
+                             server_unique_payload_bytes=ledger["unique_payload_bytes"],
+                             retransmitted_bytes=ledger["retransmitted_bytes"])
+            record["pause_probe"] = pause
+        else:
+            for metric in ("elapsed_seconds", "cpu_seconds", "max_rss_bytes"):
+                record[metric] = result.get(metric)
+            if ledger is not None:
+                record.update(server_payload_bytes=ledger["server_payload_bytes"],
+                              retransmitted_bytes=ledger["retransmitted_bytes"])
+        # Mutable files have no measurement authority before verified shutdown.
+        raise
+    ledger = origin.ledger()
+    _json_write(directory / "ledger.json", ledger)
+    _json_write(directory / "process.json", result)
+    return result, ledger, origin.error
+
+
 def execute_baseline_trial(record: dict[str, Any], directory: Path, fixture: Path,
                            budget: RunBudget, inventory: dict[str, tuple[str, str]],
                            trial_seconds: float) -> dict[str, Any]:
@@ -1031,20 +1139,16 @@ def execute_baseline_trial(record: dict[str, Any], directory: Path, fixture: Pat
     executable = inventory[record["configuration"]["engine"]][0]
     completion = directory / "completion"
     completion.mkdir(mode=0o700)
-    with LocalOrigin(fixture, budget, settings["origin_bytes_per_connection_second"],
-                     2 * FIXTURE_PAYLOAD_BYTES) as origin:
-        result = run_child(engine_argv(engine, executable, origin.port, completion, trial_seconds),
-                           completion, budget, timeout=trial_seconds, log_name="engine")
-    ledger = origin.ledger()
-    _json_write(completion / "ledger.json", ledger)
-    _json_write(completion / "process.json", result)
+    result, ledger, origin_error = _run_trial_phase(
+        record, completion, fixture, budget, settings["origin_bytes_per_connection_second"],
+        2 * FIXTURE_PAYLOAD_BYTES, engine, executable, trial_seconds)
     for metric in ("elapsed_seconds", "cpu_seconds", "max_rss_bytes"):
         record[metric] = result[metric]
     record["server_payload_bytes"] = ledger["server_payload_bytes"]
     record["retransmitted_bytes"] = ledger["retransmitted_bytes"]
     measured = _measure_file(completion / "payload.bin", budget, verify=True)
     record.update(measured)
-    failure = result.get("failure_classification") or origin.error
+    failure = result.get("failure_classification") or origin_error
     if not failure and (measured["client_payload_bytes"] != FIXTURE_PAYLOAD_BYTES or
                         measured["completion_sha256"] != record["fixture_sha256"]):
         failure = "integrity_error"
@@ -1056,13 +1160,9 @@ def execute_baseline_trial(record: dict[str, Any], directory: Path, fixture: Pat
 
     probe = directory / "pause"
     probe.mkdir(mode=0o700)
-    with LocalOrigin(fixture, budget, PROBE_RATE, PROBE_BYTE_LIMIT) as origin:
-        result = run_child(engine_argv(engine, executable, origin.port, probe, 10), probe,
-                           budget, timeout=10, log_name="engine",
-                           pause_ready=lambda: origin.transferred >= 65536)
-    ledger = origin.ledger()
-    _json_write(probe / "ledger.json", ledger)
-    _json_write(probe / "process.json", result)
+    result, ledger, origin_error = _run_trial_phase(
+        record, probe, fixture, budget, PROBE_RATE, PROBE_BYTE_LIMIT,
+        engine, executable, 10, probe=True)
     measured = _measure_file(probe / "payload.bin", budget, verify=False)
     pause = {"scope": PAUSE_SCOPE,
              **{metric: result[metric] for metric in ("elapsed_seconds", "cpu_seconds", "max_rss_bytes")},
@@ -1074,7 +1174,7 @@ def execute_baseline_trial(record: dict[str, Any], directory: Path, fixture: Pat
              "latency_seconds": result["pause_latency_seconds"],
              "forced": result["forced"], "contained": result["contained"]}
     record["pause_probe"] = pause
-    failure = result.get("failure_classification") or origin.error
+    failure = result.get("failure_classification") or origin_error
     if not failure and (pause["latency_seconds"] is None or pause["latency_seconds"] > 5):
         failure = "pause_error"
     if not failure and (not pause["server_payload_bytes"] or pause["client_logical_bytes"] is None):
@@ -1124,7 +1224,9 @@ def _validate_baseline_trial(record: dict[str, Any]) -> dict[str, Any]:
             _require_nonnegative_integer(probe[metric], "probe." + metric)
         else:
             _require_nonnegative_number(probe[metric], "probe." + metric)
-    if type(probe["forced"]) is not bool or type(probe["contained"]) is not bool:
+    if (type(probe["contained"]) is not bool or
+            (type(probe["forced"]) is not bool and
+             not (record["outcome"] == "failed" and probe["forced"] is None))):
         raise BenchmarkValidationError("pause containment must be explicit booleans")
     if record["outcome"] == "passed":
         if (not probe["contained"] or probe["forced"] or not 0 < probe["latency_seconds"] <= 5 or
@@ -1187,6 +1289,7 @@ def run_baselines(artifact_root: Path, run_id: str, *, mode: str = "full",
     fixture_hash = None
     inventory = {}
     setup_failure = None
+    containment_failure = None
     started = time.monotonic()
     setup_budget = RunBudget(min(30, wall_seconds), byte_budget)
     try:
@@ -1194,6 +1297,10 @@ def run_baselines(artifact_root: Path, run_id: str, *, mode: str = "full",
         inventory = inventory_engines(directory, setup_budget)
         setup_budget.check()
         budget.check()
+    except ContainmentFailure as failure:
+        containment_failure = failure.evidence
+        setup_failure = "containment_error"
+        _json_write(directory / "containment-failure.json", containment_failure)
     except (OSError, BenchmarkValidationError, BudgetExceeded):
         setup_failure = "setup_error"
     if fixture_hash is None:
@@ -1218,7 +1325,8 @@ def run_baselines(artifact_root: Path, run_id: str, *, mode: str = "full",
         record = {metric: None for metric in MEASURED_METRICS}
         record.update(schema_version=2, purpose=BASELINE_PURPOSE, run_id=run_id,
                       trial_id=trial_id, runner_sha256=runner_hash, source_sha256=source_hash,
-                      outcome="failed", failure_classification=setup_failure or "timeout",
+                      outcome="failed", failure_classification=("containment_error" if containment_failure
+                                                               else setup_failure or "timeout"),
                       fixture_sha256=fixture_hash, payload_bytes=FIXTURE_PAYLOAD_BYTES,
                       observed_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                       completion_sha256=None, pause_probe=None,
@@ -1228,13 +1336,18 @@ def run_baselines(artifact_root: Path, run_id: str, *, mode: str = "full",
                                      "versions": {"python": sys.version.split()[0],
                                                   **{key: item[1] for key, item in inventory.items()}},
                                      "settings": baseline_settings(model, engine)})
-        if not setup_failure:
+        if not setup_failure and containment_failure is None:
             try:
                 budget.check()
                 trial_directory = directory / trial_id
                 trial_directory.mkdir(mode=0o700)
                 record = execute_baseline_trial(record, trial_directory, directory / "fixture.bin",
                                                 budget, inventory, trial_seconds)
+            except ContainmentFailure as failure:
+                containment_failure = failure.evidence
+                _json_write(directory / "containment-failure.json", containment_failure)
+                record.update(outcome="failed", failure_classification="containment_error",
+                              completion_sha256=None, pause_latency_seconds=None)
             except BudgetExceeded:
                 record.update(outcome="failed", failure_classification="timeout",
                               completion_sha256=None, pause_latency_seconds=None)
@@ -1260,6 +1373,8 @@ def run_baselines(artifact_root: Path, run_id: str, *, mode: str = "full",
               "aggregate_server_payload_bytes": budget.transferred,
               "elapsed_seconds": time.monotonic() - started,
               "wall_seconds": wall_seconds, "byte_budget": byte_budget}
+    if containment_failure is not None:
+        report["containment_failure"] = containment_failure
     if summary:
         _json_write(directory / "summary.json", summary)
     _json_write(directory / "report.json", report)

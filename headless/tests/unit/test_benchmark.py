@@ -791,3 +791,236 @@ def test_v2_trial_identity_must_correspond_to_configuration_and_repetition() -> 
     record["trial_id"] = "unrestricted-aria2-single-1"
     with pytest.raises(benchmark.BenchmarkValidationError, match="identity"):
         benchmark.validate_trial_record(record)
+
+
+@pytest.mark.parametrize("versions", [(1, 2, 1), (2, 2, 2)])
+def test_public_v1_summary_rejects_mixed_and_all_v2_records(versions) -> None:
+    benchmark = _benchmark()
+    records = [_baseline_record("unrestricted", "curl-single", rep) for rep in (1, 2, 3)]
+    for record, version in zip(records, versions):
+        if version == 1:
+            for key in benchmark.BASELINE_FIELDS:
+                record.pop(key)
+            record["schema_version"] = 1
+    with pytest.raises(benchmark.SummaryValidationError, match="schema"):
+        benchmark.summarize_trials(records, {"unrestricted-curl-single"}, repetitions=3)
+
+
+def test_v2_summary_validates_then_explicitly_converts_for_v1_reuse(monkeypatch) -> None:
+    benchmark = _benchmark()
+    records = [_baseline_record(model, config, rep)
+               for model, config, rep in benchmark.baseline_sequence()]
+    original = deepcopy(records)
+    legacy_summary = benchmark.summarize_trials
+    converted = []
+    def capture(trials, expected, *, repetitions):
+        converted.extend(deepcopy(trials))
+        return legacy_summary(trials, expected, repetitions=repetitions)
+    monkeypatch.setattr(benchmark, "summarize_trials", capture)
+    summary = benchmark.summarize_baseline_trials(records)
+    assert len(converted) == 18 and all(r["schema_version"] == 1 for r in converted)
+    assert all(not (set(r) & benchmark.BASELINE_FIELDS) for r in converted)
+    assert records == original
+    assert summary["schema_version"] == 2 and summary["status"] == "measured_local_baseline"
+    assert legacy_summary(converted, {r["configuration"]["id"] for r in converted},
+                          repetitions=3)["status"] == "pending_real_execution"
+    converted.clear()
+    records[0]["pause_probe"]["contained"] = False
+    with pytest.raises(benchmark.SummaryValidationError):
+        benchmark.summarize_baseline_trials(records)
+    assert converted == []
+
+
+def _injected_containment_failure(benchmark, component="engine"):
+    # No real process authority is invented by these boundary injections.
+    failure_type = getattr(benchmark, "ContainmentFailure", None)
+    if failure_type is None:
+        return RuntimeError("engine group containment could not be verified")
+    return failure_type(component, authority=None,
+                        observations={"group_absent": None} if component == "engine"
+                        else {"thread_stopped": False})
+
+
+@pytest.mark.parametrize("boundary", ["setup", "inventory", "trial"])
+def test_uncertain_containment_retains_matrix_and_stops_engine_admission(
+        tmp_path: Path, monkeypatch, boundary) -> None:
+    benchmark = _benchmark()
+    launches = []
+    def fixture(path, budget):
+        if boundary == "setup":
+            raise _injected_containment_failure(benchmark, "origin")
+        path.write_bytes(b"test-only-fixture")
+        return FIXTURE_SHA256
+    monkeypatch.setattr(benchmark, "generate_fixture", fixture)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda *a, **k: "/usr/bin/true")
+    def child(*args, **kwargs):
+        launches.append(kwargs["log_name"])
+        raise _injected_containment_failure(benchmark)
+    monkeypatch.setattr(benchmark, "run_child", child)
+    if boundary == "trial":
+        monkeypatch.setattr(benchmark, "inventory_engines", lambda *a: {
+            "curl": ("/usr/bin/true", "8.0"), "aria2": ("/usr/bin/true", "1.0")})
+    report = benchmark.run_baselines(tmp_path, boundary, wall_seconds=10, trial_seconds=1)
+    directory = tmp_path / boundary
+    records = [json.loads((directory / "trials" / f"{m}-{e}-{r}.json").read_text())
+               for m, e, r in benchmark.baseline_sequence()]
+    assert len(records) == report["trial_count"] == 18
+    assert launches == ([] if boundary == "setup" else
+                        ["curl-version"] if boundary == "inventory" else ["engine"])
+    assert all(r["outcome"] == "failed" and r["failure_classification"] == "containment_error"
+               for r in records)
+    assert all(all(r[m] is None for m in benchmark.MEASURED_METRICS) for r in records[1:])
+    assert all(r["completion_sha256"] is None and r["pause_probe"] is None for r in records)
+    if boundary != "trial":
+        assert all(r["configuration"]["versions"] == {"python": sys.version.split()[0]}
+                   for r in records)
+    evidence = json.loads((directory / "containment-failure.json").read_text())
+    assert evidence["authority"] is None
+    assert evidence["component"] == ("origin" if boundary == "setup" else "engine")
+    assert evidence["status"] == "uncertain" and evidence["message"]
+    assert report["status"] == "failed_local_baseline" and report["containment_failure"] == evidence
+    assert json.loads((directory / "report.json").read_text()) == report
+    assert not (directory / "summary.json").exists()
+    for record in records:
+        benchmark.validate_trial_record(record)
+    for path in directory.rglob("*"):
+        assert stat.S_IMODE(path.stat().st_mode) == (0o700 if path.is_dir() else 0o600)
+
+
+@pytest.mark.parametrize("component", ["engine", "origin"])
+def test_probe_containment_failure_preserves_completion_and_partial_accounting(
+        tmp_path: Path, monkeypatch, component) -> None:
+    benchmark = _benchmark()
+    launches = []
+    monkeypatch.setattr(benchmark, "generate_fixture", lambda *a: FIXTURE_SHA256)
+    monkeypatch.setattr(benchmark, "inventory_engines", lambda *a: {
+        "curl": ("/usr/bin/true", "8.0"), "aria2": ("/usr/bin/true", "1.0")})
+    class Origin:
+        def __init__(self, fixture, budget, rate, byte_limit):
+            self.probe = byte_limit == 4 * 1024**2
+            self.port, self.error, self.transferred = 12345, None, 65536
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            if self.probe and component == "origin":
+                raise _injected_containment_failure(benchmark, "origin")
+        def ledger(self):
+            size = 65536 if self.probe else PAYLOAD_BYTES
+            return {"server_payload_bytes": size, "unique_payload_bytes": size,
+                    "retransmitted_bytes": 0, "requests": []}
+    monkeypatch.setattr(benchmark, "LocalOrigin", Origin)
+    def child(argv, directory, budget, **kwargs):
+        launches.append(directory.name)
+        if directory.name == "pause" and component == "engine":
+            raise _injected_containment_failure(benchmark)
+        return {"pid": 123, "exit_code": 0, "elapsed_seconds": 0.5, "cpu_seconds": 0.1,
+                "max_rss_bytes": 4096, "contained": True, "forced": False,
+                "pause_latency_seconds": 0.1 if directory.name == "pause" else None}
+    monkeypatch.setattr(benchmark, "run_child", child)
+    monkeypatch.setattr(benchmark, "_measure_file", lambda *a, **k: {
+        "client_payload_bytes": PAYLOAD_BYTES, "allocated_disk_bytes": PAYLOAD_BYTES,
+        "completion_sha256": FIXTURE_SHA256})
+    report = benchmark.run_baselines(tmp_path, component, wall_seconds=10, trial_seconds=1)
+    directory = tmp_path / component
+    records = [json.loads((directory / "trials" / f"{m}-{e}-{r}.json").read_text())
+               for m, e, r in benchmark.baseline_sequence()]
+    assert launches == ["completion", "pause"]
+    assert len(records) == 18 and len(report["failed_trials"]) == 18
+    first = records[0]
+    assert first["elapsed_seconds"] == 0.5 and first["cpu_seconds"] == 0.1
+    assert first["server_payload_bytes"] == first["client_payload_bytes"] == PAYLOAD_BYTES
+    assert first["pause_latency_seconds"] is None and first["completion_sha256"] is None
+    assert first["pause_probe"]["server_payload_bytes"] == 65536
+    assert first["pause_probe"]["client_logical_bytes"] is None
+    assert first["pause_probe"]["contained"] is False
+    assert first["pause_probe"]["latency_seconds"] is None
+    assert first["pause_probe"]["cpu_seconds"] == (None if component == "engine" else 0.1)
+    assert all(all(r[m] is None for m in benchmark.MEASURED_METRICS) for r in records[1:])
+    assert report["status"] == "failed_local_baseline" and not (directory / "summary.json").exists()
+    for record in records:
+        benchmark.validate_trial_record(record)
+
+
+def test_run_child_uncertain_group_raises_typed_failure_with_owned_authority(
+        tmp_path: Path, monkeypatch) -> None:
+    benchmark = _benchmark()
+    from types import SimpleNamespace
+    now = [0.0]
+    def clock():
+        now[0] += 0.2
+        return now[0]
+    monkeypatch.setattr(benchmark.time, "monotonic", clock)
+    monkeypatch.setattr(benchmark.time, "sleep", lambda *a: None)
+    process = SimpleNamespace(pid=123456, returncode=None)
+    monkeypatch.setattr(benchmark.subprocess, "Popen", lambda *a, **k: process)
+    monkeypatch.setattr(benchmark.os, "wait4", lambda pid, flags: (
+        pid, 0, SimpleNamespace(ru_utime=0.1, ru_stime=0.2, ru_maxrss=4096)))
+    monkeypatch.setattr(benchmark, "_group_exists", lambda pid: True)
+    signals = []
+    monkeypatch.setattr(benchmark.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    with pytest.raises(RuntimeError) as caught:
+        benchmark.run_child(["test-only"], tmp_path, benchmark.RunBudget(4, 100, clock=clock),
+                            timeout=1, log_name="uncertain")
+    error = caught.value
+    assert type(error).__name__ == "ContainmentFailure"
+    assert error.evidence["authority"] == {
+        "pid": 123456, "process_group_id": 123456, "session_id": 123456}
+    assert error.evidence["observations"]["group_absent"] is False
+    assert error.evidence["observations"]["leader_reaped"] is True
+    assert error.accounting["contained"] is False and error.accounting["cpu_seconds"] > 0
+    assert signals == [(123456, benchmark.signal.SIGTERM), (123456, benchmark.signal.SIGKILL)]
+
+
+def test_origin_cleanup_uncertainty_is_typed_after_real_threads_are_joined(
+        tmp_path: Path, monkeypatch) -> None:
+    benchmark = _benchmark()
+    origin = benchmark.LocalOrigin(tmp_path / "fixture", benchmark.RunBudget(5, 100), 0, 100)
+    origin.__enter__()
+    thread = origin.thread
+    # Join the actual thread; inject only the final observation, never an orphan.
+    class Observation:
+        def join(self, timeout):
+            thread.join(timeout=timeout)
+        def is_alive(self):
+            return True
+    origin.thread = Observation()
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            origin.__exit__()
+        assert type(caught.value).__name__ == "ContainmentFailure"
+        assert caught.value.evidence["component"] == "origin"
+        assert caught.value.evidence["authority"] is None
+        assert caught.value.evidence["observations"]["thread_stopped"] is False
+    finally:
+        thread.join(timeout=1)
+        origin.server.server_close()
+    assert not thread.is_alive() and origin.server.fileno() == -1
+
+
+def test_unrelated_runtime_error_is_not_classified_as_containment(tmp_path: Path, monkeypatch) -> None:
+    benchmark = _benchmark()
+    def unrelated(*args):
+        raise RuntimeError("unrelated programming fault")
+    monkeypatch.setattr(benchmark, "generate_fixture", unrelated)
+    with pytest.raises(RuntimeError, match="unrelated programming fault"):
+        benchmark.run_baselines(tmp_path, "unrelated", wall_seconds=10)
+
+
+def test_origin_cleanup_error_preserves_prior_owned_engine_authority(tmp_path: Path, monkeypatch) -> None:
+    benchmark = _benchmark()
+    failure = benchmark.ContainmentFailure("engine", authority={
+        "pid": 123456, "process_group_id": 123456, "session_id": 123456},
+        observations={"group_absent": None, "leader_reaped": False})
+    origin = benchmark.LocalOrigin(tmp_path / "fixture", benchmark.RunBudget(5, 100), 0, 100)
+    def denied():
+        raise OSError("test-only-sensitive-detail")
+    monkeypatch.setattr(origin.server, "shutdown", denied)
+    try:
+        with pytest.raises(benchmark.ContainmentFailure) as caught:
+            origin.__exit__(type(failure), failure, None)
+        assert caught.value is failure
+        assert caught.value.evidence["authority"]["pid"] == 123456
+        assert caught.value.evidence["origin_failure"]["component"] == "origin"
+        assert "test-only-sensitive-detail" not in json.dumps(caught.value.evidence)
+    finally:
+        origin.server.server_close()
