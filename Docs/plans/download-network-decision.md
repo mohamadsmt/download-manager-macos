@@ -6,9 +6,9 @@ Status: accepted user scope amendment; G0 closed.
 
 ## Decision
 
-The user stated that they vet links before submitting them and do not require special handling of malicious links. Use stock aria2/yt-dlp networking for trusted, user-provided sources. Do not add an egress proxy, custom downloader transport, root network rules, VPN changes, or a separate network service.
+The user stated that they vet links before submitting them and do not require special handling of malicious links. Use stock aria2 networking for trusted, user-provided direct HTTP(S) file sources. The 2026-10-03 direct-only scope amendment retires web-video extraction; media file extensions remain supported. Do not add an egress proxy, custom downloader transport, root network rules, VPN changes, or a separate network service.
 
-This supersedes the original design's universal rejection of private/internal destinations across DNS/redirect/extractor chains. Do not re-open that requirement in implementation or review without a new user request or materially changed use case.
+This supersedes the original design's universal rejection of private/internal destinations across DNS/redirect chains. Do not re-open that requirement in implementation or review without a new user request or materially changed use case.
 
 ## Retained boundaries
 
@@ -22,7 +22,7 @@ This supersedes the original design's universal rejection of private/internal de
 
 ## Explicit residual risk
 
-A source initially considered valid can be compromised, redirect to an unexpected address, or lead an extractor to a different host. The engines resolve and connect independently. This delivery does not guarantee that the entire chain avoids private/internal destinations or hostile content. No passing fixture or URL preflight should be described as full SSRF or malware protection.
+A source initially considered valid can be compromised, redirect to an unexpected address, or resolve to a different host. The engines resolve and connect independently. This delivery does not guarantee that the entire chain avoids private/internal destinations or hostile content. No passing fixture or URL preflight should be described as full SSRF or malware protection.
 
 ## Implementation consequence
 

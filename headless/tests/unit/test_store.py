@@ -103,7 +103,7 @@ def _materialized_job(**overrides: Any) -> MaterializedJob:
     values: dict[str, Any] = {
         "job_id": "job-1",
         "intent": _intent(expected_revision=3),
-        "source_kind": SourceKind.VIDEO,
+        "source_kind": SourceKind.DIRECT,
         "queue_collection_id": "queue-1",
         "priority": -12,
         "order_key": 42,
@@ -4035,7 +4035,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
             generation=23,
             revision=41,
         ),
-        source_kind=SourceKind.VIDEO,
+        source_kind=SourceKind("video"),
         queue_collection_id="legacy-queue",
         priority=9,
         order_key=17,
@@ -4132,7 +4132,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
             ),
         )
 
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(ValueError, match="unsupported source kind"):
             store.apply_add(conflicting.intent, materialized=conflicting)
 
         assert (
@@ -4814,7 +4814,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
             generation=23,
             revision=41,
         ),
-        source_kind=SourceKind.VIDEO,
+        source_kind=SourceKind("video"),
         queue_collection_id="legacy-queue",
         priority=9,
         order_key=17,

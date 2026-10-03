@@ -1539,6 +1539,34 @@ class SQLiteStore:
             (request_id, payload_digest, scope, action),
         )
 
+    @staticmethod
+    def _read_source_kind(
+        connection: sqlite3.Connection, job_id: str
+    ) -> SourceKind | None:
+        """Decode persisted compatibility without treating it as work authority."""
+
+        row = connection.execute(
+            "SELECT source_kind FROM materialized_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return SourceKind(_require_sqlite_text(row["source_kind"], "source_kind"))
+        except ValueError as error:
+            raise ValueError("persisted source_kind is invalid") from error
+
+    @staticmethod
+    def _require_mutable_source(
+        connection: sqlite3.Connection, job_id: str, *, direct_only: bool = False
+    ) -> None:
+        """Keep legacy targets inert, including private lifecycle/binding seams."""
+
+        kind = SQLiteStore._read_source_kind(connection, job_id)
+        if kind is SourceKind.LEGACY_VIDEO or (
+            direct_only and kind is not SourceKind.DIRECT
+        ):
+            raise ValueError("unsupported source kind")
+
     def apply_add(
         self, intent: DownloadIntent, *, materialized: MaterializedJob | None = None
     ) -> CommandResult:
@@ -1607,6 +1635,8 @@ class SQLiteStore:
                 if existing is not None:
                     raise RuntimeError("command receipt registry is incomplete")
                 if materialized is not None:
+                    if materialized.source_kind is not SourceKind.DIRECT:
+                        raise ValueError("unsupported source kind")
                     self._ensure_publication_target_is_available(connection, materialized)
                 connection.execute(
                     """
@@ -2052,6 +2082,9 @@ class SQLiteStore:
                 if receipt is not None:
                     raise RuntimeError("command receipt registry is incomplete")
                 current = self._read_job_control_projection(connection, job_id)
+                if self._read_source_kind(connection, job_id) is SourceKind.LEGACY_VIDEO:
+                    connection.commit()
+                    return current.to_result("blocked")
                 if current.revision != expected_revision:
                     result = current.to_result("stale")
                 elif current.state in _TERMINAL_JOB_CONTROL_STATES:
@@ -2205,8 +2238,9 @@ class SQLiteStore:
         action: str,
         updated: _JobControlProjection,
     ) -> None:
-        """Persist exactly one lifecycle/domain transition and its audit event."""
+        """Persist exactly one supported lifecycle/domain transition and audit."""
 
+        SQLiteStore._require_mutable_source(connection, updated.job, direct_only=True)
         connection.execute(
             """
             UPDATE jobs
@@ -2363,6 +2397,12 @@ class SQLiteStore:
                 if replay.status == "pending":
                     current = self._read_job_control_projection(connection, job_id)
                     materialized = self.get_materialized_job(job_id)
+                    if (
+                        materialized is not None
+                        and materialized.source_kind is SourceKind.LEGACY_VIDEO
+                    ):
+                        connection.commit()
+                        return self._direct_dispatch_result_from_current(current, "blocked")
                     reconciliation = (
                         None
                         if (
@@ -2405,6 +2445,9 @@ class SQLiteStore:
             materialized = self.get_materialized_job(job_id)
             if materialized is None:
                 raise ValueError("direct dispatch target is not materialized")
+            if materialized.source_kind is SourceKind.LEGACY_VIDEO:
+                connection.commit()
+                return self._direct_dispatch_result_from_current(current, "blocked")
 
             if expected_worker_epoch != current_epoch:
                 result = self._direct_dispatch_result_from_current(current, "stale")
@@ -2580,6 +2623,13 @@ class SQLiteStore:
         The engine import is confined to this explicitly dispatched terminal path.
         """
 
+        if (
+            type(terminal) is _DirectTerminalPlan
+            and type(terminal.dispatch) is _DirectDispatchPlan
+        ):
+            self._require_mutable_source(
+                self._connection, terminal.dispatch.job.job_id, direct_only=True
+            )
         from hermes_downloads.direct import DirectTransfer
 
         if type(terminal) is not _DirectTerminalPlan:
@@ -2686,6 +2736,14 @@ class SQLiteStore:
     def _require_direct_stage_authority(
         self, connection: sqlite3.Connection, stage: _DirectStagePlan
     ) -> None:
+        if (
+            type(stage) is _DirectStagePlan
+            and type(stage.terminal) is _DirectTerminalPlan
+            and type(stage.terminal.dispatch) is _DirectDispatchPlan
+        ):
+            self._require_mutable_source(
+                connection, stage.terminal.dispatch.job.job_id, direct_only=True
+            )
         from hermes_downloads.direct import DirectTransfer, _VerifiedPayloadIdentity
 
         if type(stage) is not _DirectStagePlan:
@@ -2984,8 +3042,11 @@ class SQLiteStore:
         payload_digest: str,
         persist_receipt: bool = True,
     ) -> _DirectPublicationReconciliationPlan | None:
-        """Return a plan only for a durable finalization cutpoint."""
+        """Return a plan only for a supported durable finalization cutpoint."""
 
+        self._require_mutable_source(connection, current.job, direct_only=True)
+        if materialized.source_kind is not SourceKind.DIRECT:
+            raise ValueError("unsupported source kind")
         if not self._has_audited_finalization_cutpoint(connection, current):
             return None
         try:
@@ -3058,6 +3119,11 @@ class SQLiteStore:
         materialized: MaterializedJob,
         now: datetime,
     ) -> Admission:
+        SQLiteStore._require_mutable_source(
+            connection, materialized.job_id, direct_only=True
+        )
+        if materialized.source_kind is not SourceKind.DIRECT:
+            raise ValueError("unsupported source kind")
         collection_held = (
             materialized.queue_collection_id is not None
             and connection.execute(
@@ -3085,6 +3151,7 @@ class SQLiteStore:
         state: str,
         event_kind: str,
     ) -> _JobControlProjection:
+        SQLiteStore._require_mutable_source(connection, current.job, direct_only=True)
         if current.revision == _MAX_COUNTER:
             raise OverflowError("job revision exceeds persisted counter range")
         next_state = _require_public_job_state(state, "direct dispatch state")
@@ -3215,6 +3282,7 @@ class SQLiteStore:
         connection: sqlite3.Connection,
         plan: _DirectDispatchPlan | _DirectPublicationReconciliationPlan,
     ) -> _DirectDispatchCommand:
+        SQLiteStore._require_mutable_source(connection, plan.job.job_id, direct_only=True)
         command = SQLiteStore._read_direct_dispatch_command(connection, plan.request_id)
         if (
             command is None
@@ -3316,6 +3384,10 @@ class SQLiteStore:
                 SELECT job_id, generation, revision, state
                 FROM jobs
                 WHERE state IN (?, ?, ?, ?, ?, ?, ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM materialized_jobs AS domain
+                      WHERE domain.job_id = jobs.job_id AND domain.source_kind != 'direct'
+                  )
                 ORDER BY job_id
                 """,
                 _RECOVERABLE_COLD_START_STATES,
@@ -3583,6 +3655,7 @@ class SQLiteStore:
         """Replace one authoritative snapshot and its bounded normalized history."""
 
         budget = RetryAuthority.restore(policy=RetryPolicy(), budget=budget).budget
+        SQLiteStore._require_mutable_source(connection, budget.job_id)
         connection.execute(
             """
             INSERT INTO job_retry (
@@ -4771,7 +4844,9 @@ class SQLiteStore:
             if reservation.claim_token != claim_token:
                 raise ValueError("publication marker claim token does not match")
             existing = self._read_publication_marker_binding(connection, job_id)
+            self._read_source_kind(connection, job_id)
             if existing is None:
+                self._require_mutable_source(connection, job_id)
                 connection.execute(
                     """
                     INSERT INTO publication_marker_bindings (
@@ -4846,7 +4921,9 @@ class SQLiteStore:
         if marker.job_id != reservation.job_id:
             raise ValueError("publication marker binding does not match its owner")
         existing = self._read_staged_payload_binding(connection, requested.job_id)
+        self._read_source_kind(connection, requested.job_id)
         if existing is None:
+            self._require_mutable_source(connection, requested.job_id)
             connection.execute(
                 """
                 INSERT INTO staged_payload_bindings (
@@ -4934,7 +5011,9 @@ class SQLiteStore:
         ):
             raise ValueError("final publication binding does not match staged payload")
         existing = self._read_final_publication_binding(connection, requested.job_id)
+        self._read_source_kind(connection, requested.job_id)
         if existing is None:
+            self._require_mutable_source(connection, requested.job_id)
             connection.execute(
                 """
                 INSERT INTO final_publication_bindings (

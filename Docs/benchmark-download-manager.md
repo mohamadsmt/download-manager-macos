@@ -323,4 +323,8 @@ delivery claim. Approved future worker acceptance criteria include:
   failed artifact as diagnostic evidence and never drop it to make a report clean.
 
 The local fixture does not substitute for an authorized live-source test. Actual
-YouTube output/hash/`ffprobe` acceptance remains deferred and is required for A11.
+authorized direct real-file acceptance with an expected checksum remains required
+for A11. YouTube/`ffprobe`, extracted quality/audio/subtitles and playlist acceptance
+were retired by the user on 2026-10-03, not passed. A12 retains direct duplicate and
+source-identity checks. Local synthetic media bytes do not satisfy real-source A11.
+See `.hermes/handoffs/2026-10-03-download-manager-direct-only-scope.md`.

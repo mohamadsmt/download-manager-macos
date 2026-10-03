@@ -33,7 +33,6 @@ EXPECTED_WHEEL_MODULES = {
     "hermes_downloads/queue.py",
     "hermes_downloads/retry.py",
     "hermes_downloads/store.py",
-    "hermes_downloads/video.py",
     "hermes_downloads/worker.py",
     "hermes_downloads/service.py",
     "hermes_downloads/endpoint_ownership.py",
@@ -112,7 +111,6 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     project = tomllib.loads((HEADLESS_ROOT / "pyproject.toml").read_text("utf-8"))
     assert project["project"]["requires-python"] == ">=3.12,<3.13"
     assert project["project"]["dependencies"] == [
-        "yt-dlp==2026.6.9",
         "mcp[cli]==1.29.1",
     ]
     assert project["project"]["scripts"] == {
@@ -442,7 +440,8 @@ def test_materialized_job_binds_intent_and_normalizes_its_projections() -> None:
     materialized = _materialized_job(intent=intent)
     ordinary = _materialized_job(selected_final_filename="selected.webm")
 
-    assert {kind.value for kind in models.SourceKind} == {"direct", "video"}
+    assert models.SourceKind("video").name == "LEGACY_VIDEO"
+    assert not hasattr(models.SourceKind, "VIDEO")
     assert {"MaterializedJob", "SourceKind"} <= set(models.__all__)
     assert materialized.job_id == intent.job_id
     assert materialized.intent is intent

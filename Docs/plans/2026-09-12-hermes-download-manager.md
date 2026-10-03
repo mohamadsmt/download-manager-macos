@@ -1,18 +1,20 @@
 # Hermes Download Manager Implementation Plan
 
-> **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
+> **For Hermes:** Follow the binding execution contract and ordered independent reviews. The 2026-10-03 bounded removal child uses no agents, integration, push, installation or self-approval; the parent owns later delivery gates.
 
-**Goal:** Deliver a persistent local download service controlled exclusively through Hermes, covering direct files and supported video pages, with explicit-start queue semantics and predictable Downloads output.
+**Goal:** Deliver a persistent local download service controlled exclusively through Hermes, covering direct HTTP(S) files only, including MP4/WEBM/MP3 and signed/extensionless bytes, with explicit-start queue semantics and predictable Downloads output.
 
-**Architecture:** A small Python controller owns durable intent, scheduling, engine process groups, SQLite state, and events. A stdio MCP adapter and a notification-only Desktop plugin are thin clients of the same worker over a private Unix socket. Reuse aria2, yt-dlp, FFmpeg, and the official Hermes plugin SDK; do not write another downloader or a separate application UI.
+**Architecture:** A small Python controller owns durable intent, scheduling, engine process groups, SQLite state, and events. A stdio MCP adapter and a notification-only Desktop plugin are thin clients of the same worker over a private Unix socket. Reuse aria2 and the official Hermes plugin SDK; do not write another downloader or a separate application UI.
 
-**Tech Stack:** Python 3.12; stdlib asyncio/sqlite3/pathlib; official MCP SDK; pinned yt-dlp + local EJS; aria2 1.37.0 candidate; FFmpeg/ffprobe; Deno; macOS launchd; plain ESM Desktop plugin; pytest and Node's test runner.
+**Tech Stack:** Python 3.12; stdlib asyncio/sqlite3/pathlib; official MCP SDK; locked dependencies; aria2 1.37.0 candidate; macOS launchd; plain ESM Desktop plugin; pytest and Node's test runner.
 
 **Canonical root:** `/Users/mohamadsmt/Documents/Download Manager`
 
 **Approved design:** `Docs/superpowers/specs/2026-09-12-hermes-download-manager-design.md` (initial design commit `93cd18b`; subsequent user approval is recorded in that file).
 
-**Date:** 2026-09-12 / 1405-06-21.
+**Date:** 2026-09-12 / 1405-06-21; direct-only amendment 2026-10-03.
+
+**Current scope:** `.hermes/handoffs/2026-10-03-download-manager-direct-only-scope.md` supersedes web-video tasks and old live gates. Historical planning/discovery below is not current execution evidence. Legacy literal `video` rows remain readable, read-only and inert with unchanged history/bindings/files; only `direct` may be added or dispatched. No synthetic conversion or state migration.
 
 **Status:** Ready to execute after the user resolved G0 by selecting trusted, user-vetted links. No additional egress proxy/guard is required. The service and benchmarks are NOT implemented; all execution acceptance gates remain.
 
@@ -32,7 +34,7 @@ Why this is less code than extracting the old application:
 - `JSONDownloadStore` is atomic file replacement, not a transaction across queue intent, command idempotency, workers, and event delivery.
 - `DownloadQueue.nextEligibleID` sorts priority/createdAt, so its `move` array order does not determine subsequent dispatch. Do not port this hidden priority/reorder mismatch.
 - `FilenameResolver.sanitize` replaces separators but is not path containment: e.g. dot names and filesystem aliases need real validation. Port only the intended naming/category behavior, not a trust-boundary guarantee.
-- Keeping the Swift state model would still need new persistent gates, worker identity, retry budgets, outbox, video control, process cancellation, and MCP packaging. A bridge would add another runtime interface without reusing the hard parts.
+- Keeping the Swift state model would still need new persistent gates, worker identity, retry budgets, outbox, process cancellation, and MCP packaging. A bridge would add another runtime interface without reusing the hard parts.
 - Reuse the existing smoke test scenarios as characterization inputs: filename precedence, range fallback, coverage, FIFO in equal priority, monotonic progress. Add corrected tests for reorder/manual pause/start behavior. Keep original Swift tests as regression evidence.
 
 Proven local packaging pattern: `/Users/mohamadsmt/Documents/google-docs-mcp/scripts/run-mcp` unsets `PYTHONPATH` and `PYTHONHOME` and executes a canonical non-editable venv entry point. Reuse the pattern; never import that project's private modules.
@@ -42,13 +44,9 @@ Proven local packaging pattern: `/Users/mohamadsmt/Documents/google-docs-mcp/scr
 Use finite integer shares `b_i` so each running job has `b_i <= item_cap_i` and `sum(b_i) <= global_cap`. Equal-share capped allocation is enough; no adaptive bandwidth optimizer.
 
 - Direct: one private aria2 daemon, per-GID `max-download-limit`, plus `max-overall-download-limit` equal to the total direct allocation.
-- Video: yt-dlp uses aria2 for certified payload paths. The installed `Aria2cFD._make_cmd` maps `ratelimit` to aria2 `--max-overall-download-limit`; appended `-j/-x/-s` override its hardcoded 16-connection defaults. This mapping was independently exercised by the parent **without launching a child or network request**, and passed.
-- A video job may invoke multiple payload contexts. Budget each simultaneous child, or serialize audio/video payload phases; never give several simultaneous children the entire job budget.
 - Zero allocated budget means WAIT, not `0` passed to aria2 (where zero means unlimited).
 - Reconfiguration closes admission, reduces/quiesces old transfers, confirms process-group termination when necessary, applies reductions before increases, then reopens admission. No old-cap process may survive the acknowledgement.
-- yt-dlp can fall back to native or networked FFmpeg despite `--downloader aria2c`. Certified dispatch must reject unbudgeted paths before media payload transfer. VOD HTTP(S), tested DASH and tested HLS paths are included incrementally; unsupported live/byte-range/DRM cases return a bounded unsupported reason rather than disable a limit.
-- Native fragment throttling is not a job-global cap. Do not implement `rate/F` and assume it covers multiple audio/video pools.
-- Proposed acceptance semantics: media/file payload bytes, not total machine traffic or instantaneous wire rate; each 30-second steady measurement window after 10-second settling must be <=105% of cap. Measure short-window bursts separately. These are test thresholds, not already-proven engine guarantees. If stock engines fail, stop and revise rather than waive A08.
+- Proposed acceptance semantics: direct-file payload bytes, not total machine traffic or instantaneous wire rate; each 30-second steady measurement window after 10-second settling must be <=105% of cap. Measure short-window bursts separately. These are test thresholds, not already-proven engine guarantees. If stock engines fail, stop and revise rather than waive A08.
 
 ### D3 — Official notification-only plugin
 
@@ -69,17 +67,17 @@ Parent checked live official SDK documentation and local source: `host.notify`, 
 
 ### D4 — Version readiness is not acceptance
 
-Parent verified aria2 1.37.0 earlier, installed yt-dlp `2026.3.17`, EJS `0.8.0`, and existence of ffmpeg/ffprobe/Deno. Child reports additional version inventory, but capture all versions/digests again in the actual acceptance environment.
+Capture current aria2 versions/digests in the actual acceptance environment. Binary presence is not direct-file acceptance.
 
-Candidate Python dependencies: `mcp[cli]==1.29.1` (proven local MCP packaging precedent), `yt-dlp[default]==2026.3.17`, with exact transitive hashes from `uv.lock`. EJS must resolve to 0.8.0 for that selected release. These are reproducibility candidates, not a claim the older installed yt-dlp still works against today's YouTube. Select a newer exact release only if a live test demonstrates need; record the change and rerun all relevant acceptance from fresh output.
+The active locked Python dependency is `mcp[cli]==1.29.1`, retaining its locked transitive dependencies and official MCP/CLI/worker entrypoints. The direct-only amendment removes yt-dlp without unrelated upgrades. FFmpeg/ffprobe/EJS/Deno are not product runtime requirements; do not uninstall globally shared tools. Use explicit aria2 arguments/private configuration, no ambient netrc/proxies/cookies, verified TLS and bounded process controls.
 
-Use explicit executable paths, `--ignore-config`, `--no-plugin-dirs`, `--no-update`, `--no-remote-components`, local EJS, `--no-js-runtimes --js-runtimes deno:<path>`, and explicit FFmpeg location. Disable implicit cookies, netrc, environment proxies and arbitrary extra CLI arguments. Never self-update a Homebrew installation behind the user's back.
+Historical media discovery remains in the original handoffs and references below; it imposes no current web-video gate.
 
 ## 2. G0 — Resolved: trusted user-provided links, no extra network guard
 
 The user explicitly stated that they vet submitted links and do not require special protection against malicious links. This supersedes the previous all-hop private-network rejection requirement. The decision is recorded in `Docs/plans/download-network-decision.md` and the approved spec has been amended consistently.
 
-Use stock engine networking with initial bounded HTTP/HTTPS URL validation. Reject malformed URLs, control characters, embedded credentials and unsupported schemes; preserve valid signed URL bytes. Basic initial-host screening may reject literal loopback/private targets by default, with explicit local-fixture grants in tests, but it must not be presented as a guarantee about later DNS resolution, redirects or extractor-discovered destinations. Do not build/install an egress proxy, add root/VPN/system-routing changes, or block implementation on full SSRF protection.
+Use stock engine networking with initial bounded HTTP/HTTPS URL validation. Reject malformed URLs, control characters, embedded credentials and unsupported schemes; preserve valid signed URL bytes. Basic initial-host screening may reject literal loopback/private targets by default, with explicit local-fixture grants in tests, but it must not be presented as a guarantee about later DNS resolution, redirects. Do not build/install an egress proxy, add root/VPN/system-routing changes, or block implementation on full SSRF protection.
 
 Residual risk is explicit: a trusted source can be compromised or redirect unexpectedly; subprocess engines can resolve/connect independently. The application does not guarantee prevention of private/internal connections across that chain. Normal TLS certificate verification stays enabled. Essential filesystem containment, no-clobber publication, subprocess argument validation, secret redaction, cookie consent and no automatic execution remain mandatory.
 
@@ -94,13 +92,13 @@ headless/
   pyproject.toml, uv.lock, .python-version
   src/hermes_downloads/
     __init__.py, cli.py, models.py, store.py, queue.py
-    paths.py, processes.py, direct.py, video.py
+    paths.py, processes.py, direct.py
     bandwidth.py, retry.py, worker.py, ipc.py, mcp_server.py
   tests/
     conftest.py
     unit/test_models.py, test_store.py, test_queue.py, test_paths.py
-    unit/test_bandwidth.py, test_retry.py, test_video_policy.py
-    integration/test_processes.py, test_direct.py, test_video.py
+    unit/test_bandwidth.py, test_retry.py
+    integration/test_processes.py, test_direct.py, test_legacy_direct_only.py
     integration/test_recovery.py, test_ipc.py, test_mcp.py
     integration/test_network_policy.py, test_space.py, test_events.py
     acceptance/test_live.py
@@ -115,7 +113,7 @@ Docs/download-manager-operations.md
 Docs/benchmark-download-manager.md
 ```
 
-Do not create empty production modules just to match the tree. Create each when its test first needs it. Keep adapters thin and avoid a plugin registry/factory abstraction for two fixed engines.
+Do not create empty production modules just to match the tree. Create each when its test first needs it. Keep adapters thin and avoid a plugin registry/factory abstraction for the fixed direct-file engine.
 
 Runtime ownership:
 
@@ -128,7 +126,7 @@ Runtime ownership:
 
 Model contract:
 
-- `job_id`, `collection_id`, immutable original source, source kind, chosen formats, stable content identity, destination intent/final path, priority/order key, schedule, retry budget, generation, effective engine state, manual hold and authorization.
+- `job_id`, `collection_id`, immutable original source, source kind, direct source identity/validators, destination intent/final path, priority/order key, schedule, retry budget, generation, effective engine state, manual hold and authorization.
 - Separate queue gate (`paused`, `pausing`, `running`), collection hold and per-item manual hold. Eligibility is conjunction, not a single overloaded status.
 - Public states: `queued`, `resolving`, `downloading`, `pausing`, `paused`, `retry_wait`, `needs_link`, `needs_auth`, `blocked`, `finalizing`, `completed`, `cancelled`, `removed`, `failed`.
 - Changes use request ID plus payload digest and optional expected revision. Same request/digest is idempotent; same request/different digest conflicts. Stale engine callbacks with a different generation cannot complete or restart a job.
@@ -141,7 +139,7 @@ Minimum callable surface (official typed schemas, no raw RPC/shell):
 1. `downloads_add(items, collection?, start=false, request_id)`
 2. `downloads_query(scope, ids?, cursor?, limit=100)` — status, list, detail, events, health.
 3. `downloads_control(action, scope, ids?, request_id, expected_revision?)` — pause/resume/start-now/remove/retry.
-4. `downloads_edit(ids, patch, request_id, expected_revision?)` — priority/order/destination/quality/schedule; active changes quiesce first.
+4. `downloads_edit(ids, patch, request_id, expected_revision?)` — priority/order/destination/schedule; active changes quiesce first.
 5. `downloads_replace_source(id, url, request_id, expected_revision?)` — never unsafe append.
 6. `downloads_configure(global_limit_bps?, concurrency?, connections?, request_id)`
 7. `downloads_files(action, ids, confirmation?)` — reveal or explicit purge, never execution.
@@ -236,7 +234,7 @@ Commit: `feat: persist queue commands and events atomically`.
 
 **Test:** `headless/scripts/run-tests tests/unit/test_paths.py`.
 
-Test exact destination contract, Persian names, collection precedence, reserved `.incomplete`, dot names, traversal, absolute names, collisions and symlinks. A renamed final extension follows selected codec/container; listing cannot promise an unselected MP4. Refuse inaccessible destination without fallback. Use job-owned directories and no-clobber publication within the same filesystem.
+Test exact destination contract, Persian names, collection precedence, reserved `.incomplete`, dot names, traversal, absolute names, collisions and symlinks. Media-named direct files remain ordinary bytes; preserve explicit filenames and no-clobber publication without codec inference. Refuse inaccessible destination without fallback. Use job-owned directories and no-clobber publication within the same filesystem.
 
 Commit: `feat: enforce predictable Downloads paths and no-clobber naming`.
 
@@ -306,37 +304,19 @@ Test 403 ambiguity, transient 5xx, disk-full not network-retried, pause during r
 
 Commit: `feat: add bounded retries and safe source replacement`.
 
-### T12 — Video metadata policy before body download
+### T12 — Retired web-video metadata scope
 
-**Create:** `video.py`, `tests/unit/test_video_policy.py`, `tests/integration/test_video.py`.
+Retired by the user's 2026-10-03 direct-only amendment, not PASSED. No page extraction, quality/playlist policy, module, dedicated suite or runtime dependency remains. Preserve historical results in prior handoffs.
 
-**Test:** `headless/scripts/run-tests tests/unit/test_video_policy.py` then `headless/scripts/run-tests tests/integration/test_video.py -k metadata`.
+### T13 — Retired web-video payload/media-processing scope
 
-Use pinned yt-dlp APIs/CLI without custom extractors. Metadata response bounded, no autoplay/payload download, original page retained, cookies opt-in. Format default equivalent to `bv*[height<=1080]+ba/b[height<=1080]`, verified for actual available formats; if none fit, report unavailable. Mixed audio/video IDs and extension must be explicit.
-
-No playlist expansion by ambiguous video URL; pure playlist bounded selection required. Distinguish unsupported, DRM, auth-needed and transient failure. Final filename is established before body transfer; provisional path has an explicit marker.
-
-Commit: `feat: resolve video pages and quality without starting payloads`.
-
-### T13 — Certified video payload and local merge
-
-**Modify:** `video.py`; extend `tests/integration/test_video.py`, `test_processes.py`.
-
-**Test:** `headless/scripts/run-tests tests/integration/test_video.py tests/integration/test_processes.py`.
-
-Use aria2 external payload path with explicit concurrency and allocation. Test selected downloader class and real protocol fixture behavior, including native/FFmpeg fallback rejection before body bytes. Serialize audio/video payload phases or subdivide the job budget across every simultaneously spawned context.
-
-External progress hooks are incomplete in the inspected release; report measured job bytes/phase from bounded file/engine observations. Do not use logical sparse file length as downloaded bytes. Mark speed/ETA unavailable when not reliably measurable, never invent zero/precise ETA. No private upstream `if False` RPC patch without an explicit redesign.
-
-FFmpeg only opens verified local input paths for merging; forbid network protocols during local processing. Validate output with ffprobe and known metadata/stream presence; do not transcode by default. Strict fragment behavior cannot silently skip missing fragments and still complete. Test stop/resume before/during merge and incompatible refresh. Audio-only and available subtitles follow the same output ownership rules.
-
-Commit: `feat: download supported videos with budgeted engines and verified merge`.
+Retired by the same user amendment, not PASSED. No yt-dlp payload, FFmpeg merge, ffprobe, extracted audio or subtitle acceptance. Generic direct byte-range/segment merge remains in T10/T15.
 
 ### T14 — Whole-queue bandwidth allocation and transitions
 
-**Create:** `bandwidth.py`, `tests/unit/test_bandwidth.py`; extend direct/video integration tests.
+**Create:** `bandwidth.py`, `tests/unit/test_bandwidth.py`; extend direct integration tests.
 
-**Test:** `headless/scripts/run-tests tests/unit/test_bandwidth.py tests/integration/test_direct.py tests/integration/test_video.py`.
+**Test:** `headless/scripts/run-tests tests/unit/test_bandwidth.py tests/integration/test_direct.py`.
 
 Implement capped equal-share allocation; priority affects admission, not implicit bandwidth stealing. Example test contract:
 
@@ -353,7 +333,7 @@ def test_zero_share_is_not_unlimited():
     assert shares == [1, 0]
 ```
 
-Check shares across job arrivals/departures, tiny caps, unlimited distinction, active engine contexts, child failure and pending reconfiguration. Apply direct RPC reductions before increases; video quiesces process group before new-cap restart. A failed stop blocks reallocation acknowledgement.
+Check shares across job arrivals/departures, tiny caps, unlimited distinction, active engine contexts, child failure and pending reconfiguration. Apply direct RPC reductions before increases; quiesce contained direct processes when a restart is required. A failed stop blocks reallocation acknowledgement.
 
 Commit: `feat: enforce aggregate payload budgets across engines`.
 
@@ -363,7 +343,7 @@ Commit: `feat: enforce aggregate payload budgets across engines`.
 
 **Test:** `headless/scripts/run-tests tests/integration/test_space.py tests/unit/test_paths.py`.
 
-Track actual allocated bytes (`st_blocks` where supported), logical size separately, expected merge peak and free space. Unknown size is unknown, not zero reservation. Measure during writes; catch ENOSPC, retain partial, no deleting other files. Use fsync/close/verify and no-overwrite publication; on crash, reconcile publish-vs-DB state idempotently. Clear only job-owned intermediates after successful verified publication, preserving subtitles/requested sidecars. No auto-purge history/failed partials in v1.
+Track actual allocated bytes (`st_blocks` where supported), logical size separately, expected merge peak and free space. Unknown size is unknown, not zero reservation. Measure during writes; catch ENOSPC, retain partial, no deleting other files. Use fsync/close/verify and no-overwrite publication; on crash, reconcile publish-vs-DB state idempotently. Clear only job-owned intermediates after successful verified publication, preserving unrelated existing files/history. No auto-purge history/failed partials in v1.
 
 Commit: `feat: finalize downloads safely and account for real disk use`.
 
@@ -373,7 +353,7 @@ Commit: `feat: finalize downloads safely and account for real disk use`.
 
 **Test:** `headless/scripts/run-tests tests/integration/test_recovery.py`.
 
-One writer/worker, admission generation, pause-before-schedule on cold start, in-scope orphan containment, atomic transition/event publication. Recovery maps incomplete jobs to paused, preserves per-item holds and paths, and does not spawn old aria2 sessions. Test killing worker while direct/video/merge/retry is active, two simultaneous clients, duplicate worker start and Desktop/MCP exit while worker remains alive. Use event handshakes, not arbitrary sleeps.
+One writer/worker, admission generation, pause-before-schedule on cold start, in-scope orphan containment, atomic transition/event publication. Recovery maps supported direct incomplete jobs to paused and leaves legacy video jobs/history/bindings/files unchanged, preserves per-item holds and paths, and does not spawn old aria2 sessions. Test killing worker while direct transfer/segment merge/retry is active, two simultaneous clients, duplicate worker start and Desktop/MCP exit while worker remains alive. Use event handshakes, not arbitrary sleeps.
 
 Commit: `feat: run a durable single-owner download worker`.
 
@@ -453,9 +433,9 @@ Commit: `test: add reproducible downloader performance and recovery benchmark`.
 
 **Test:** `headless/scripts/run-tests tests/acceptance/test_live.py` must SKIP live by default with explicit reason; this skip is not A11 PASS.
 
-After obtaining an explicit public test URL from the user or an approved small upstream test video with clear public test provenance, run opt-in acceptance with a 256 MiB total external-body budget and 15-minute wall deadline. Record original source privately, public redacted handle, version/format metadata, file hash and ffprobe output with real video/audio streams. Do not auto-download a playlist, use cookies or ask for passwords in chat. Test lower-quality selection and one real quality within 1080p, as available. If cap/source unavailable, report blocked and request a suitable URL, never synthesize the output.
+Use a bounded authorized direct real-file source with an expected digest. Run opt-in acceptance with a 256 MiB total external-body budget and 15-minute wall deadline; record the source privately, public redacted handle, engine versions/settings, exact bytes and checksum. If source/budget is unavailable, report that direct acceptance gap. Local fixtures never substitute for real-file A11.
 
-Direct live file likewise requires a bounded approved source and expected digest when available. Local fixture success never substitutes for blocked YouTube access.
+The 2026-10-03 removal child performs only synthetic private fixtures and does not run this live task. YouTube, ffprobe and quality/audio/subtitle/playlist assertions are retired scope, not PASS or a reopened gate.
 
 Commit: `test: add opt-in live download acceptance`.
 
@@ -496,22 +476,24 @@ Commit documentation/evidence summaries: `docs: record canonical Hermes download
 | A04 | T04,T06,T17,T18 | actual order + request id/revision reconciliation |
 | A05 | T08,T10,T16,T24 | crash/MCP-exit/worker survival evidence |
 | A06 | T07,T09,T10,T11 | real origin fault matrix |
-| A07 | T11,T12,T13 | direct/media identity replacement matrix |
-| A08 | T10,T13,T14,T22 | mixed-engine server-observed numerical windows |
-| A09 | T05,T13,T15,T22 | physical blocks and merge peak/cleanup |
+| A07 | T10,T11 | direct source identity replacement matrix |
+| A08 | T10,T14,T22 | direct-engine global/per-job caps with server-observed numerical windows |
+| A09 | T05,T10,T15,T22 | ordinary file physical blocks and segment merge peak/cleanup |
 | A10 | T05,T07,T15,T24 | safe path/collision/permission tests + Finder |
-| A11 | T10,T13,T22,T23 | expected hash + actual YouTube output/ffprobe |
-| A12 | T04,T12,T13,T23 | duplicate/quality/audio/subtitle/playlist tests |
+| A11 | T10,T22,T23 | actual authorized direct real-file + expected hash; video portion retired, not PASS |
+| A12 | T04,T10,T11,T23 | direct duplicate/source identity; quality/audio/subtitle/playlist retired, not PASS |
 | A13 | T19,T20,T24 | actual toast plus failure/dedup/replay receipts |
 | A14 | T17,T18,T21,T24 | fresh SDK calls and actual Hermes operation |
 
 ## 7. Planning verification and remaining decisions
 
-Completed planning evidence: approved spec read, prior Swift controllers/models/store/naming/tests inspected, existing local MCP launcher precedent read, official notification SDK/source verified, installed yt-dlp command builder tested without network. The user resolved G0 in favor of trusted sources and no extra guard. Neither the service, plugin nor benchmark harness has been created or run.
+Historical planning evidence (not active runtime requirements): approved spec read, prior Swift controllers/models/store/naming/tests inspected, existing local MCP launcher precedent read, official notification SDK/source verified, installed yt-dlp command builder tested without network. The user resolved G0 in favor of trusted sources and no extra guard. Neither the service, plugin nor benchmark harness has been created or run.
 
 No remaining G0 choice blocks implementation. Continue at T02 with fresh execution context. Do not re-ask about malicious links or add a proxy. The actual live-source/credential and disruptive app-restart gates still apply when reached; Python, schema, file names and task order are implementation decisions.
 
 ## Sources and exact discovery references
+
+The yt-dlp links below are historical research for the retired source family, not current dependencies or acceptance requirements.
 
 - Approved source: `Docs/superpowers/specs/2026-09-12-hermes-download-manager-design.md`.
 - Previous implementation: `Sources/DownloadManagerApp/App/DownloadController.swift`; `Sources/DownloadManagerCore/{Models/DownloadQueue.swift,Stores/JSONDownloadStore.swift,Services/FilenameResolver.swift,Services/Aria2DownloadEngine.swift}`.

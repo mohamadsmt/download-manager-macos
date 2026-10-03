@@ -46,10 +46,10 @@ class JobState(str, Enum):
 
 
 class SourceKind(str, Enum):
-    """The immutable source family selected while materializing a job."""
+    """Direct is supported; literal video is read-only historical compatibility."""
 
     DIRECT = "direct"
-    VIDEO = "video"
+    LEGACY_VIDEO = "video"
 
 
 def _require_identifier(value: object, name: str) -> str:
