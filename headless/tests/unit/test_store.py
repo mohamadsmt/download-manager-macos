@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+import os
 import secrets
 import sqlite3
 from typing import Any
@@ -7467,3 +7469,146 @@ def test_direct_terminal_audit_failure_rolls_back_revision_and_receipt(tmp_path)
         assert tuple(store._connection.iterdump()) == snapshot
     finally:
         store.close()
+
+
+def _stage_producer_fixture(store):
+    from hermes_downloads import direct, paths
+    assert hasattr(store, "prepare_direct_stage"), "missing fenced stage plan producer"
+    terminal, observed, started = _started_terminal_fixture(store)
+    job = terminal.dispatch.job
+    root = Path.home() / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    destination = paths.rehydrate_destination(category=job.category,
+        collection=job.destination_collection, partial_filename=job.partial_filename,
+        selected_final_filename=job.selected_final_filename, job_id=job.job_id)
+    paths.prepare_persisted_destination_workspace(destination)
+    marker = paths.attest_publication_reservation_marker(destination, terminal.dispatch.reservation)
+    store._connection.execute("UPDATE publication_marker_bindings SET marker_device = ?, marker_inode = ?",
+        (marker.st_dev, marker.st_ino))
+    terminal = replace(terminal, marker=store.get_publication_marker_binding(job.job_id), partial_path=destination.partial_path,
+        capability=store._get_direct_engine_recovery_capability(terminal.record))
+    destination.partial_path.write_bytes(b"body")
+    details = destination.partial_path.stat()
+    observed = replace(observed, partial_path=destination.partial_path,
+        verified_identity=direct._VerifiedPayloadIdentity(details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns))
+    store.finalize_direct_terminal(terminal, observed)
+    plan = store.prepare_direct_stage(terminal, observed)
+    staged = paths.attest_staged_partial_payload(destination, terminal.dispatch.reservation)
+    return plan, staged, destination, started
+
+
+def test_stage_producer_binding_exact_replay_preserves_lifecycle_and_receipt(tmp_path):
+    with closing(SQLiteStore(tmp_path / "state.db")) as store:
+        plan, staged, destination, started = _stage_producer_fixture(store)
+        receipt = tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands").fetchone())
+        events = store.list_events()
+        binding = store.bind_direct_staged_payload(plan, staged)
+        assert (binding.partial_device, binding.partial_inode, binding.logical_size) == (staged.st_dev, staged.st_ino, 4)
+        snapshot = tuple(store._connection.iterdump())
+        assert store.bind_direct_staged_payload(plan, staged) == binding
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert store.list_events() == events
+        assert store.get_job("job-1").state == "finalizing"
+        assert tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands").fetchone()) == receipt
+        assert not destination.final_path.exists()
+        assert store._get_final_publication_binding("job-1") is None
+        assert store.prepare_direct_dispatch(job_id="job-1", expected_worker_epoch=1,
+            expected_generation=1, expected_revision=2, request_id="terminal-start",
+            payload_digest="1" * 64, controller_ready=False, now=datetime(2032, 1, 2, tzinfo=UTC)) == started
+
+
+@pytest.mark.parametrize("damage", ("epoch", "revision", "generation", "receipt", "record", "capability", "capability-change", "missing-receipt", "marker-content", "malformed-identity", "owner", "reservation", "marker", "audit", "missing-audit", "paused", "removed", "inode", "mtime", "size", "symlink", "parent", "final", "evidence-inode", "evidence-mtime", "missing-identity", "wrong-plan"))
+def test_stage_producer_binding_rejects_stale_evidence_atomically(tmp_path, damage):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / "state.db")) as store:
+        plan, staged, destination, _ = _stage_producer_fixture(store)
+        sql = {
+            "epoch": "UPDATE settings SET value = '2' WHERE key = 'worker_epoch'",
+            "revision": "UPDATE jobs SET revision = 9",
+            "generation": "UPDATE jobs SET generation = 2",
+            "receipt": "UPDATE direct_dispatch_commands SET revision = 9",
+            "record": "UPDATE engine_instances SET started_unix_us = started_unix_us + 1",
+            "capability": "DELETE FROM direct_engine_recovery_capabilities",
+            "capability-change": "UPDATE direct_engine_recovery_capabilities SET rpc_port = rpc_port + 1",
+            "missing-receipt": "DELETE FROM direct_dispatch_commands",
+            "owner": "UPDATE materialized_jobs SET partial_filename = 'changed.bin'",
+            "reservation": "UPDATE publication_reservations SET final_filename = 'changed.bin'",
+            "marker": "DELETE FROM publication_marker_bindings",
+            "audit": "INSERT INTO events (kind, job_id, generation, revision) VALUES ('job_finalizing', 'job-1', 1, 5)",
+            "missing-audit": "DELETE FROM events WHERE kind = 'job_finalizing'",
+            "paused": "UPDATE jobs SET state = 'paused'",
+            "removed": "UPDATE jobs SET state = 'removed'",
+        }
+        if damage in sql:
+            store._connection.execute(sql[damage])
+        elif damage in {"inode", "symlink"}:
+            retained = destination.partial_path.with_name("retained")
+            destination.partial_path.rename(retained)
+            if damage == "inode":
+                destination.partial_path.write_bytes(b"body")
+            else:
+                destination.partial_path.symlink_to(retained)
+        elif damage == "marker-content":
+            marker = destination.incomplete_dir / ".hermes-reservation"
+            payload = marker.read_bytes()
+            marker.write_bytes(b"x" + payload[1:])
+        elif damage == "malformed-identity":
+            plan = replace(plan, observed=replace(plan.observed, verified_identity=object()))
+        elif damage == "mtime":
+            details = destination.partial_path.stat()
+            os.utime(destination.partial_path, ns=(details.st_atime_ns, details.st_mtime_ns + 1000000))
+        elif damage == "size":
+            destination.partial_path.write_bytes(b"wrong-size")
+        elif damage == "parent":
+            retained = destination.incomplete_dir.with_name("retained-dir")
+            destination.incomplete_dir.rename(retained)
+            destination.incomplete_dir.symlink_to(retained, target_is_directory=True)
+        elif damage == "final":
+            destination.final_path.write_bytes(b"unrelated")
+        elif damage == "evidence-inode":
+            staged = replace(staged, st_ino=staged.st_ino + 1)
+        elif damage == "evidence-mtime":
+            staged = replace(staged, mtime_ns=staged.mtime_ns + 1)
+        elif damage == "missing-identity":
+            plan = replace(plan, observed=replace(plan.observed, verified_identity=None))
+        elif damage == "wrong-plan":
+            plan = replace(plan, terminal=replace(plan.terminal, gid="ffffffffffffffff"))
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises((TypeError, ValueError, paths.PathValidationError)):
+            store.bind_direct_staged_payload(plan, staged)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert store._connection.execute("SELECT COUNT(*) FROM staged_payload_bindings").fetchone()[0] == 0
+        assert destination.partial_path.exists()
+
+
+def test_stage_producer_bind_insert_failure_rolls_back_and_retains_files(tmp_path):
+    with closing(SQLiteStore(tmp_path / "state.db")) as store:
+        plan, staged, destination, _ = _stage_producer_fixture(store)
+        store._connection.execute("CREATE TRIGGER fail_stage BEFORE INSERT ON staged_payload_bindings BEGIN SELECT RAISE(ABORT, 'stage failure'); END")
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(sqlite3.IntegrityError, match="stage failure"):
+            store.bind_direct_staged_payload(plan, staged)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert destination.partial_path.read_bytes() == b"body"
+        assert (destination.incomplete_dir / ".hermes-reservation").exists()
+
+
+def test_stage_producer_failure_can_pause_contained_finalizing_revision(tmp_path):
+    with closing(SQLiteStore(tmp_path / "state.db")) as store:
+        plan, staged, destination, _ = _stage_producer_fixture(store)
+        paused = store.pause_active_direct_job(job_id="job-1", generation=1, revision=5)
+        assert (paused.state, paused.revision) == ("paused", 6)
+        assert store._get_staged_payload_binding("job-1") is None
+        with pytest.raises(ValueError):
+            store.bind_direct_staged_payload(plan, staged)
+        assert destination.partial_path.read_bytes() == b"body"
+
+
+def test_stage_producer_prepare_rejects_intervening_same_cutpoint_audit(tmp_path):
+    with closing(SQLiteStore(tmp_path / "state.db")) as store:
+        plan, _, _, _ = _stage_producer_fixture(store)
+        store._connection.execute("INSERT INTO events (kind, job_id, generation, revision) VALUES ('job_finalizing', 'job-1', 1, 5)")
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):
+            store.prepare_direct_stage(plan.terminal, plan.observed)
+        assert tuple(store._connection.iterdump()) == snapshot

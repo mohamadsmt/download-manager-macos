@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from hermes_downloads.models import (
     Admission,
@@ -27,6 +27,10 @@ from hermes_downloads.retry import (
     RetryBudget,
     RetryPolicy,
 )
+
+if TYPE_CHECKING:
+    from hermes_downloads.direct import DirectTransfer
+    from hermes_downloads.paths import StagedPartialPayload
 
 __all__ = [
     "CommandRecord",
@@ -881,6 +885,20 @@ class _DirectTerminalPlan:
     marker: PublicationMarkerBinding
     gid: str
     partial_path: Path
+    capability: _DirectEngineRecoveryCapability | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectStagePlan:
+    """One live finalizing cutpoint, retaining its originating STARTED receipt."""
+
+    terminal: _DirectTerminalPlan
+    observed: DirectTransfer
+    job: MaterializedJob
+    revision: int
+    audit_id: int
+    receipt: _DirectDispatchCommand
+    capability: _DirectEngineRecoveryCapability
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -2602,6 +2620,8 @@ class SQLiteStore:
                 or self.get_direct_engine_record() != terminal.record
                 or self.get_direct_engine_activation_fence() is not None
                 or self._get_direct_engine_recovery_capability(terminal.record) is None
+                or (terminal.capability is not None and
+                    self._get_direct_engine_recovery_capability(terminal.record) != terminal.capability)
                 or current.generation != plan.generation
                 or current.revision != plan.revision
                 or current.state != JobState.DOWNLOADING.value
@@ -2628,6 +2648,161 @@ class SQLiteStore:
             )
             connection.commit()
             return self._direct_dispatch_result_from_current(finalizing, "started")
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def prepare_direct_stage(
+        self, terminal: _DirectTerminalPlan, observed: DirectTransfer
+    ) -> _DirectStagePlan:
+        """Capture live authority after the real terminal producer commits."""
+
+        if type(terminal) is not _DirectTerminalPlan:
+            raise TypeError("terminal must be a direct-terminal plan")
+        dispatch = terminal.dispatch
+        if type(dispatch) is not _DirectDispatchPlan:
+            raise TypeError("stage dispatch is invalid")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            job = self.get_materialized_job(dispatch.job.job_id)
+            receipt = self._read_direct_dispatch_command(connection, dispatch.request_id)
+            capability = self._get_direct_engine_recovery_capability(terminal.record)
+            latest = connection.execute(
+                "SELECT event_id FROM events WHERE job_id = ? ORDER BY event_id DESC LIMIT 1",
+                (dispatch.job.job_id,),
+            ).fetchone()
+            if job is None or receipt is None or capability is None or latest is None:
+                raise ValueError("direct stage authority is absent")
+            stage = _DirectStagePlan(terminal, observed, job, dispatch.revision + 1,
+                                     latest["event_id"], receipt, capability)
+            self._require_direct_stage_authority(connection, stage)
+            connection.commit()
+            return stage
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def _require_direct_stage_authority(
+        self, connection: sqlite3.Connection, stage: _DirectStagePlan
+    ) -> None:
+        from hermes_downloads.direct import DirectTransfer, _VerifiedPayloadIdentity
+
+        if type(stage) is not _DirectStagePlan:
+            raise TypeError("stage must be a direct-stage plan")
+        terminal, observed = stage.terminal, stage.observed
+        if (type(terminal) is not _DirectTerminalPlan
+                or type(terminal.dispatch) is not _DirectDispatchPlan
+                or type(terminal.record) is not DirectEngineRecord
+                or type(terminal.marker) is not PublicationMarkerBinding
+                or type(stage.capability) is not _DirectEngineRecoveryCapability
+                or type(stage.receipt) is not _DirectDispatchCommand
+                or not isinstance(terminal.partial_path, Path)
+                or type(observed) is not DirectTransfer
+                or type(observed.verified_identity) is not _VerifiedPayloadIdentity):
+            raise TypeError("direct stage evidence is invalid")
+        dispatch = terminal.dispatch
+        identity = observed.verified_identity
+        # Reconstruct to reject malformed evidence even at this private seam.
+        _VerifiedPayloadIdentity(identity.st_dev, identity.st_ino,
+                                 identity.logical_size, identity.mtime_ns)
+        current = self._read_job_control_projection(connection, dispatch.job.job_id)
+        latest = connection.execute(
+            "SELECT event_id, kind, generation, revision FROM events "
+            "WHERE job_id = ? ORDER BY event_id DESC LIMIT 1", (current.job,),
+        ).fetchone()
+        audited_count = connection.execute(
+            "SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = 'job_finalizing' "
+            "AND generation = ? AND revision = ?",
+            (current.job, dispatch.generation, stage.revision),
+        ).fetchone()[0]
+        _require_counter(dispatch.generation, "stage generation")
+        _require_counter(dispatch.revision, "stage revision")
+        expected_job = replace(dispatch.job, intent=replace(dispatch.job.intent,
+                                                           revision=dispatch.revision + 1))
+        expected_receipt = _DirectDispatchCommand(
+            dispatch.request_id, dispatch.payload_digest, dispatch.job.job_id,
+            "started", dispatch.generation, dispatch.revision, JobState.DOWNLOADING.value,
+        )
+        if (
+            type(stage.revision) is not int or stage.revision != dispatch.revision + 1
+            or type(stage.audit_id) is not int or stage.audit_id < 1
+            or current.generation != dispatch.generation
+            or current.revision != stage.revision or current.state != JobState.FINALIZING.value
+            or latest is None or audited_count != 1
+            or tuple(latest) != (stage.audit_id, "job_finalizing", dispatch.generation, stage.revision)
+            or stage.job != expected_job or self.get_materialized_job(current.job) != stage.job
+            or dispatch.job.source_kind is not SourceKind.DIRECT
+            or stage.receipt != expected_receipt
+            or self._read_direct_dispatch_command(connection, dispatch.request_id) != stage.receipt
+            or self._current_worker_epoch(connection) != terminal.record.worker_epoch
+            or self.get_direct_engine_record() != terminal.record
+            or self.get_direct_engine_activation_fence() is not None
+            or terminal.capability != stage.capability
+            or self._get_direct_engine_recovery_capability(terminal.record) != stage.capability
+            or self._read_publication_reservation(connection, current.job) != dispatch.reservation
+            or self._read_publication_marker_binding(connection, current.job) != terminal.marker
+            or observed.job_id != current.job or observed.generation != dispatch.generation
+            or type(terminal.gid) is not str or re.fullmatch(r"[0-9a-fA-F]{16}", terminal.gid) is None
+            or observed.gid != terminal.gid or observed.partial_path != terminal.partial_path
+            or terminal.partial_path.name != dispatch.job.partial_filename
+            or terminal.partial_path.parent.name != current.job
+            or observed.status != "complete"
+            or type(observed.verification) is not CompletionVerification
+            or type(observed.hash_verified) is not bool
+            or observed.hash_verified != (observed.verification is CompletionVerification.CHECKSUM_VERIFIED)
+            or _require_counter(observed.total_length, "total_length") != identity.logical_size
+            or _require_counter(observed.completed_length, "completed_length") != identity.logical_size
+        ):
+            raise ValueError("direct stage authority is stale")
+
+    def bind_direct_staged_payload(
+        self, stage: _DirectStagePlan, staged: StagedPartialPayload
+    ) -> _StagedPayloadBinding:
+        """Fence all live authority and bind atomically, retaining finalizing."""
+
+        from hermes_downloads.paths import (
+            PublicationReservationMarker, StagedPartialPayload,
+            _require_current_staged_payload, rehydrate_destination,
+        )
+
+        if type(stage) is not _DirectStagePlan or type(staged) is not StagedPartialPayload:
+            raise TypeError("direct stage binding evidence is invalid")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_direct_stage_authority(connection, stage)
+            identity = stage.observed.verified_identity
+            if (staged.st_dev, staged.st_ino, staged.logical_size, staged.mtime_ns) != (
+                identity.st_dev, identity.st_ino, identity.logical_size, identity.mtime_ns
+            ):
+                raise ValueError("attested payload differs from original verification")
+            job = stage.job
+            destination = rehydrate_destination(
+                category=job.category, collection=job.destination_collection,
+                partial_filename=job.partial_filename,
+                selected_final_filename=job.selected_final_filename, job_id=job.job_id,
+            )
+            if destination.partial_path != stage.terminal.partial_path:
+                raise ValueError("stage path differs from original verification")
+            marker = PublicationReservationMarker(
+                destination.incomplete_dir / ".hermes-reservation",
+                stage.terminal.marker.marker_device, stage.terminal.marker.marker_inode,
+            )
+            _require_current_staged_payload(destination, stage.terminal.dispatch.reservation,
+                                            marker, staged)
+            requested = _StagedPayloadBinding(job.job_id, staged.st_dev, staged.st_ino,
+                                              staged.logical_size)
+            result = self._bind_staged_payload_in_transaction(
+                connection, requested=requested,
+                claim_token=stage.terminal.dispatch.reservation.claim_token,
+            )
+            # Recheck before commit; an insert failure or namespace change rolls
+            # back without altering receipt, lifecycle, files or marker.
+            _require_current_staged_payload(destination, stage.terminal.dispatch.reservation,
+                                            marker, staged)
+            connection.commit()
+            return result
         except BaseException:
             connection.rollback()
             raise
@@ -2769,7 +2944,7 @@ class SQLiteStore:
             if (
                 current.generation != generation
                 or current.revision != revision
-                or current.state != JobState.DOWNLOADING.value
+                or current.state not in {JobState.DOWNLOADING.value, JobState.FINALIZING.value}
             ):
                 raise ValueError("active direct job is stale")
             paused = self._persist_direct_dispatch_lifecycle(
@@ -4640,45 +4815,54 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
-            reservation = self._read_publication_reservation(connection, job_id)
-            if reservation is None:
-                raise ValueError(
-                    "staged payload binding requires a current publication reservation"
-                )
-            if reservation.claim_token != claim_token:
-                raise ValueError("staged payload claim token does not match")
-            marker = self._read_publication_marker_binding(connection, job_id)
-            if marker is None:
-                raise ValueError(
-                    "staged payload binding requires a current publication marker"
-                )
-            if marker.job_id != reservation.job_id:
-                raise ValueError("publication marker binding does not match its owner")
-            existing = self._read_staged_payload_binding(connection, job_id)
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO staged_payload_bindings (
-                        job_id, partial_device, partial_inode, logical_size
-                    )
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        requested.job_id,
-                        requested.partial_device,
-                        requested.partial_inode,
-                        requested.logical_size,
-                    ),
-                )
-                result = requested
-            else:
-                if existing != requested:
-                    raise ValueError("staged payload binding does not match")
-                result = existing
+            result = self._bind_staged_payload_in_transaction(
+                connection, requested=requested, claim_token=claim_token
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
+        return result
+
+    def _bind_staged_payload_in_transaction(
+        self, connection: sqlite3.Connection, *, requested: _StagedPayloadBinding,
+        claim_token: str,
+    ) -> _StagedPayloadBinding:
+        reservation = self._read_publication_reservation(connection, requested.job_id)
+        if reservation is None:
+            raise ValueError(
+                "staged payload binding requires a current publication reservation"
+            )
+        if reservation.claim_token != claim_token:
+            raise ValueError("staged payload claim token does not match")
+        marker = self._read_publication_marker_binding(connection, requested.job_id)
+        if marker is None:
+            raise ValueError(
+                "staged payload binding requires a current publication marker"
+            )
+        if marker.job_id != reservation.job_id:
+            raise ValueError("publication marker binding does not match its owner")
+        existing = self._read_staged_payload_binding(connection, requested.job_id)
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO staged_payload_bindings (
+                    job_id, partial_device, partial_inode, logical_size
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    requested.job_id,
+                    requested.partial_device,
+                    requested.partial_inode,
+                    requested.logical_size,
+                ),
+            )
+            result = requested
+        else:
+            if existing != requested:
+                raise ValueError("staged payload binding does not match")
+            result = existing
         return result
 
     def _bind_final_publication(

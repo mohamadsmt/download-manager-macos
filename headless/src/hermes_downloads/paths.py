@@ -119,6 +119,7 @@ class StagedPartialPayload:
     st_dev: int
     st_ino: int
     logical_size: int
+    mtime_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +474,7 @@ def attest_staged_partial_payload(
                             st_dev=preflight[0],
                             st_ino=preflight[1],
                             logical_size=preflight[2],
+                            mtime_ns=preflight[5],
                         )
                     finally:
                         os.close(payload_fd)
@@ -484,6 +486,56 @@ def attest_staged_partial_payload(
             os.close(final_fd)
     finally:
         os.close(root_fd)
+
+
+def _require_current_staged_payload(
+    destination: DestinationIntent,
+    reservation: PublicationReservation,
+    marker: PublicationReservationMarker,
+    staged: StagedPartialPayload,
+) -> None:
+    """Fresh descriptor/namespace evidence for a bind; no hash, writes or fsync."""
+
+    root, component = _validate_destination_intent(destination)
+    reservation = _validate_publication_reservation(destination, component, reservation)
+    identity = _validate_staged_partial_payload_identity(destination, staged)
+    if type(staged.mtime_ns) is not int:
+        raise PathValidationError("staged payload mtime evidence is absent")
+    directories = (root, destination.final_path.parent, root / _INCOMPLETE,
+                   destination.incomplete_dir)
+    chain = tuple((details.st_dev, details.st_ino)
+                  for details in map(_require_real_directory, directories))
+    descriptors = _open_visible_publication_chain(root, component, destination.job_id, chain)
+    try:
+        _verify_attested_reservation_marker(
+            descriptors[3], _reservation_marker_bytes(reservation), marker
+        )
+        before = _stat_staged_partial_payload(descriptors[3], destination.partial_path.name)
+        payload_fd = _open_staged_partial_payload(descriptors[3], destination.partial_path.name)
+        try:
+            opened = _fstat_staged_partial_payload(payload_fd)
+            _require_matching_staged_partial_details(before, opened)
+            if opened[:3] != identity or opened[5] != staged.mtime_ns:
+                raise UnsafePathError("staged payload no longer matches verified evidence")
+            # Reopen the visible directories after descriptor checks; detached
+            # old directory descriptors must not confer namespace authority.
+            fresh = _open_visible_publication_chain(root, component, destination.job_id, chain)
+            try:
+                _verify_attested_reservation_marker(
+                    fresh[3], _reservation_marker_bytes(reservation), marker
+                )
+                visible = _stat_staged_partial_payload(fresh[3], destination.partial_path.name)
+                _require_matching_staged_partial_details(opened, visible)
+                _require_matching_staged_partial_details(opened, _fstat_staged_partial_payload(payload_fd))
+                _require_absent_final_name(fresh[1], destination.final_path.name)
+            finally:
+                for descriptor in reversed(fresh):
+                    os.close(descriptor)
+        finally:
+            os.close(payload_fd)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def publish_staged_partial_payload(

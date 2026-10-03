@@ -576,13 +576,15 @@ def test_worker_without_dispatch_never_observes_or_verifies_terminal(private_roo
         raise AssertionError("bootstrap cannot observe a transfer")
     assert hasattr(direct.DirectAria2Controller, "observe_terminal"), "missing one-shot API"
     monkeypatch.setattr(direct.DirectAria2Controller, "observe_terminal", forbidden)
+    monkeypatch.setattr(paths, "attest_staged_partial_payload", forbidden)
     monkeypatch.setattr(direct.DirectAria2Controller, "_verify_completed_output", forbidden)
     assert worker.main() == 0
     assert calls == []
 
 
 
-def test_held_observation_cannot_overlap_controller_after_same_process_worker_restart(short_state_root, monkeypatch):
+@pytest.mark.parametrize("operation", ("terminal", "stage"))
+def test_held_observation_cannot_overlap_controller_after_same_process_worker_restart(short_state_root, monkeypatch, operation):
     from types import SimpleNamespace
     from hermes_downloads.processes import ProcessBirthIdentity
     from hermes_downloads.store import _DirectEngineRecoveryCapability
@@ -613,16 +615,36 @@ def test_held_observation_cannot_overlap_controller_after_same_process_worker_re
         def _recovery_capability(self):
             return _DirectEngineRecoveryCapability(rpc_port=43123, rpc_secret="a" * 43)
         def add_paused(self, **kwargs):
+            self.destination = kwargs["destination"]
+            if operation == "stage":
+                self.destination.partial_path.write_bytes(b"body")
             return SimpleNamespace(status="paused", gid="0123456789abcdef")
         def resume(self, **kwargs):
             return None
         def observe_terminal(self, **kwargs):
+            if operation == "stage":
+                details = self.destination.partial_path.stat()
+                return direct.DirectTransfer(job_id="observer-job", generation=1,
+                    gid="0123456789abcdef", status="complete", total_length=4,
+                    completed_length=4, partial_path=self.destination.partial_path,
+                    hash_verified=False, verification=direct.CompletionVerification.TRANSPORT_VERIFIED,
+                    verified_identity=direct._VerifiedPayloadIdentity(
+                        details.st_dev, details.st_ino, 4, details.st_mtime_ns))
             entered.set()
             assert release.wait(10)
             returned.set()
             return None
         def close(self):
             return None
+    if operation == "stage":
+        from hermes_downloads import paths
+        original_sync = paths._fsync_staged_partial_payload
+        def held_sync(fd):
+            entered.set()
+            assert release.wait(10)
+            original_sync(fd)
+            returned.set()
+        monkeypatch.setattr(paths, "_fsync_staged_partial_payload", held_sync)
     monkeypatch.setattr(direct, "DirectAria2Controller", Controller)
     monkeypatch.setattr("hermes_downloads.processes.reconcile_process_birth", lambda _: "current")
     monkeypatch.setattr(worker, "reconcile_process_birth", lambda _: "current")

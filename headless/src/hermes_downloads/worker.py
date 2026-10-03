@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import fcntl
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 from queue import Queue
@@ -44,11 +44,12 @@ from hermes_downloads.store import (
     _DirectEngineRecoveryCapability,
     _DirectPublicationReconciliationPlan,
     _DirectTerminalPlan,
+    _DirectStagePlan,
 )
 
 if TYPE_CHECKING:
     from hermes_downloads.direct import DirectTransfer
-    from hermes_downloads.paths import DestinationIntent
+    from hermes_downloads.paths import DestinationIntent, StagedPartialPayload
 
 __all__ = ["WorkerStateError", "main", "run_worker", "worker_busy"]
 
@@ -74,6 +75,15 @@ class _DirectObservation:
 
     plan: _DirectTerminalPlan
     result: DirectTransfer | None
+    failed: bool
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectStageObservation:
+    """Only attestation evidence crosses back to the live SQLite owner."""
+
+    plan: _DirectStagePlan
+    result: StagedPartialPayload | None
     failed: bool
 
 
@@ -415,8 +425,9 @@ def run_worker(
     direct_controller_absent_local_cleanup_complete = False
     active_direct_plan: _DirectDispatchPlan | None = None
     active_terminal_plan: _DirectTerminalPlan | None = None
+    active_stage_plan: _DirectStagePlan | None = None
     observation_thread: threading.Thread | None = None
-    observation_results: Queue[_DirectObservation] = Queue(maxsize=1)
+    observation_results: Queue[_DirectObservation | _DirectStageObservation] = Queue(maxsize=1)
     try:
         root = _validate_state_root(state_root)
         requested_socket_path: Path | None = None
@@ -468,7 +479,7 @@ def run_worker(
             nonlocal direct_controller_ready
             nonlocal direct_controller_absent_discard_failed
             nonlocal direct_controller_absent_local_cleanup_complete
-            nonlocal active_terminal_plan
+            nonlocal active_terminal_plan, active_stage_plan
 
             direct_controller = None
             direct_fence = None
@@ -481,11 +492,12 @@ def run_worker(
             direct_controller_absent_local_cleanup_complete = False
             active_direct_plan = None
             active_terminal_plan = None
+            active_stage_plan = None
 
         def close_owned_direct_controller(
             persist_contained: Callable[[], object] | None = None,
         ) -> object:
-            nonlocal active_terminal_plan, direct_controller_ready, direct_recovery_blocked
+            nonlocal active_terminal_plan, active_stage_plan, direct_controller_ready, direct_recovery_blocked
 
             controller = direct_controller
             if controller is None:
@@ -493,6 +505,7 @@ def run_worker(
             # Invalidate callbacks before containment. Keep durable authority
             # until both containment and any paused/removed transaction succeed.
             active_terminal_plan = None
+            active_stage_plan = None
             direct_controller_ready = False
             try:
                 controller.close()
@@ -876,6 +889,7 @@ def run_worker(
                     marker=binding,
                     gid=paused_transfer.gid,
                     partial_path=destination.partial_path,
+                    capability=direct_recovery_capability,
                 )
                 result = store.finish_direct_dispatch(plan)
             except BaseException:
@@ -957,9 +971,10 @@ def run_worker(
             return _queue_gate_from_store(store, command)
 
         def poll_direct_terminal() -> None:
-            """Reap/launch one readback; all persistence stays on this thread."""
+            """Reap/launch one terminal or stage observation; persist on this thread."""
 
             nonlocal observation_thread, active_direct_plan, active_terminal_plan
+            nonlocal active_stage_plan
 
             if observation_thread is not None:
                 if observation_thread.is_alive():
@@ -967,14 +982,35 @@ def run_worker(
                 observation_thread.join()
                 observation_thread = None
                 observation = observation_results.get_nowait()
-                if observation.plan is active_terminal_plan:
+                if type(observation) is _DirectStageObservation:
+                    if observation.plan is active_stage_plan:
+                        stage = observation.plan
+                        failed = observation.failed
+                        if not failed and observation.result is not None:
+                            try:
+                                store.bind_direct_staged_payload(stage, observation.result)
+                            except Exception:
+                                failed = True
+                            else:
+                                active_stage_plan = None
+                        if failed:
+                            current = store.get_job(stage.job.job_id)
+                            if current is not None and (
+                                current.generation, current.revision, current.state
+                            ) == (stage.terminal.dispatch.generation, stage.revision, "finalizing"):
+                                close_owned_direct_controller(lambda: store.pause_active_direct_job(
+                                    job_id=stage.job.job_id,
+                                    generation=stage.terminal.dispatch.generation,
+                                    revision=stage.revision,
+                                ))
+                            else:
+                                close_owned_direct_controller()
+                elif observation.plan is active_terminal_plan:
                     plan = observation.plan.dispatch
                     current = store.get_job(plan.job.job_id)
                     if current is None or (
                         current.generation, current.revision, current.state
                     ) != (plan.generation, plan.revision, "downloading"):
-                        # No late result may revive a changed job. Contain the
-                        # old owner without writing a lifecycle for the new one.
                         close_owned_direct_controller()
                     else:
                         failed = observation.failed
@@ -990,60 +1026,96 @@ def run_worker(
                                     )
                                 ):
                                     raise ValueError("direct terminal marker is stale")
-                                store.finalize_direct_terminal(
+                                finalizing = store.finalize_direct_terminal(
+                                    observation.plan, observation.result
+                                )
+                                # Keep containment tracked at the new revision
+                                # even if preparing the stage plan fails.
+                                active_direct_plan = replace(
+                                    plan, revision=finalizing.revision,
+                                    job=replace(plan.job, intent=replace(
+                                        plan.job.intent, revision=finalizing.revision)),
+                                )
+                                active_stage_plan = store.prepare_direct_stage(
                                     observation.plan, observation.result
                                 )
                             except Exception:
                                 failed = True
                             else:
-                                active_direct_plan = None
                                 active_terminal_plan = None
                         if failed:
+                            tracked = active_direct_plan
                             close_owned_direct_controller(lambda: store.pause_active_direct_job(
                                 job_id=plan.job.job_id,
                                 generation=plan.generation,
-                                revision=plan.revision,
+                                revision=tracked.revision if tracked is not None else plan.revision,
                             ))
 
-            controller, terminal = direct_controller, active_terminal_plan
-            if controller is None or terminal is None or not direct_controller_ready:
+            controller, terminal, stage = direct_controller, active_terminal_plan, active_stage_plan
+            if controller is None or (terminal is None and stage is None) or not direct_controller_ready:
                 return
             if not _DIRECT_OBSERVATION_LOCK.acquire(blocking=False):
                 return
 
             def observe() -> None:
                 try:
-                    try:
-                        from hermes_downloads.direct import DirectTransfer
+                    if stage is not None:
+                        try:
+                            from hermes_downloads.paths import (
+                                StagedPartialPayload, attest_staged_partial_payload,
+                                rehydrate_destination,
+                            )
+                            job = stage.job
+                            destination = rehydrate_destination(
+                                category=job.category, collection=job.destination_collection,
+                                partial_filename=job.partial_filename,
+                                selected_final_filename=job.selected_final_filename,
+                                job_id=job.job_id,
+                            )
+                            staged = attest_staged_partial_payload(
+                                destination, stage.terminal.dispatch.reservation
+                            )
+                            identity = stage.observed.verified_identity
+                            if type(staged) is not StagedPartialPayload or identity is None or (
+                                staged.path, staged.st_dev, staged.st_ino, staged.logical_size, staged.mtime_ns
+                            ) != (stage.terminal.partial_path, identity.st_dev, identity.st_ino,
+                                  identity.logical_size, identity.mtime_ns):
+                                raise ValueError("staged payload differs from verified output")
+                            outcome = _DirectStageObservation(stage, staged, False)
+                        except BaseException:
+                            outcome = _DirectStageObservation(stage, None, True)
+                    else:
+                        try:
+                            from hermes_downloads.direct import DirectTransfer
 
-                        result = controller.observe_terminal(
-                            job_id=terminal.dispatch.job.job_id,
-                            generation=terminal.dispatch.generation,
-                            gid=terminal.gid,
-                        )
-                        if result is not None and type(result) is not DirectTransfer:
-                            raise TypeError("direct observation result is invalid")
-                        outcome = _DirectObservation(terminal, result, False)
-                    except BaseException:
-                        # Never retain exception diagnostics, traceback, URL or
-                        # secret in the channel back to the owning worker thread.
-                        outcome = _DirectObservation(terminal, None, True)
+                            result = controller.observe_terminal(
+                                job_id=terminal.dispatch.job.job_id,
+                                generation=terminal.dispatch.generation,
+                                gid=terminal.gid,
+                            )
+                            if result is not None and type(result) is not DirectTransfer:
+                                raise TypeError("direct observation result is invalid")
+                            outcome = _DirectObservation(terminal, result, False)
+                        except BaseException:
+                            outcome = _DirectObservation(terminal, None, True)
                     observation_results.put_nowait(outcome)
                 finally:
                     _DIRECT_OBSERVATION_LOCK.release()
 
             observation_thread = threading.Thread(
-                target=observe, name="direct-terminal-observation", daemon=True
+                target=observe, name="direct-stage-observation" if stage is not None else
+                "direct-terminal-observation", daemon=True,
             )
             try:
                 observation_thread.start()
             except BaseException:
                 observation_thread = None
                 _DIRECT_OBSERVATION_LOCK.release()
+                tracked = active_direct_plan
                 close_owned_direct_controller(lambda: store.pause_active_direct_job(
-                    job_id=terminal.dispatch.job.job_id,
-                    generation=terminal.dispatch.generation,
-                    revision=terminal.dispatch.revision,
+                    job_id=tracked.job.job_id,
+                    generation=tracked.generation,
+                    revision=tracked.revision,
                 ))
 
         if requested_socket_path is not None:

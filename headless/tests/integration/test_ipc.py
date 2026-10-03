@@ -5133,7 +5133,7 @@ def test_worker_direct_dispatch_attests_before_body_and_pause_stops_running_byte
             if process.is_alive():
                 _join(process)
 
-def test_worker_direct_dispatch_defers_completed_body_terminalization(
+def test_worker_direct_dispatch_stage_producer_retains_finalizing(
     short_socket_root: Path,
 ) -> None:
     state_root = short_socket_root / "state"
@@ -5254,7 +5254,14 @@ def test_worker_direct_dispatch_defers_completed_body_terminalization(
                     "job_downloading",
                     "job_finalizing",
                 ]
-                assert observer._get_staged_payload_binding("dispatch-job") is None
+                deadline = time.monotonic() + _WATCHDOG_SECONDS
+                while observer._get_staged_payload_binding("dispatch-job") is None and time.monotonic() < deadline:
+                    request_health(socket_path)
+                    time.sleep(0.005)
+                staged = observer._get_staged_payload_binding("dispatch-job")
+                details = partial_path.stat()
+                assert staged is not None, "actual completed controller did not produce staged binding"
+                assert (staged.partial_device, staged.partial_inode, staged.logical_size) == (details.st_dev, details.st_ino, 1024)
                 assert observer._get_final_publication_binding("dispatch-job") is None
                 assert ipc.dispatch_direct_job(
                     socket_path, job="dispatch-job", expected_worker_epoch=1,
@@ -5471,7 +5478,14 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                     assert kinds.count("job_finalizing") == (1 if expected == "finalizing" else 0)
                     assert "job_completed" not in kinds
                     assert observer._get_final_publication_binding("dispatch-job") is None
-                    assert observer._get_staged_payload_binding("dispatch-job") is None
+                    if expected == "finalizing":
+                        deadline = time.monotonic() + _WATCHDOG_SECONDS
+                        while observer._get_staged_payload_binding("dispatch-job") is None and time.monotonic() < deadline:
+                            request_health(socket_path)
+                            time.sleep(0.005)
+                        assert observer._get_staged_payload_binding("dispatch-job") is not None
+                    else:
+                        assert observer._get_staged_payload_binding("dispatch-job") is None
                     if mode in {"rpc", "error"}:
                         assert observer.get_direct_engine_record() is None
                 finally:
@@ -5490,3 +5504,211 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
             shutdown.set()
             if process.is_alive():
                 _join(process)
+
+
+def _run_stage_gated_worker(state_root, socket_path, ready, shutdown, stopped, results,
+        origin_url, mode, entered, release, returned):
+    from hermes_downloads import direct, paths, network
+    owner = threading.get_ident()
+    grant = network.LocalOriginGrant.for_url(origin_url)
+    original_validate = worker.validate_source_url
+    worker.validate_source_url = lambda value: original_validate(value, local_origin_grant=grant)
+    original_sync = paths._fsync_staged_partial_payload
+    original_attest = paths.attest_staged_partial_payload
+    original_pause = worker.SQLiteStore.pause_active_direct_job
+    original_close = direct.DirectAria2Controller.close
+    original_bind = getattr(worker.SQLiteStore, "bind_direct_staged_payload", None)
+    assert original_bind is not None, "missing actual stage producer bind"
+    def held():
+        entered.set()
+        assert release.wait(_WATCHDOG_SECONDS)
+    def sync(fd):
+        assert threading.get_ident() != owner, "stage fsync blocked IPC owner"
+        if mode not in {"post-inode", "post-mtime", "crash-after"}:
+            held()
+            if mode in {"error", "late-error", "persist-uncertain", "contain-uncertain"}:
+                returned.set()
+                raise OSError("private fixture diagnostics")
+        return original_sync(fd)
+    def attest(*args, **kwargs):
+        result = original_attest(*args, **kwargs)
+        if mode in {"post-inode", "post-mtime"}:
+            held()
+        returned.set()
+        return result
+    def bind(store, *args):
+        assert threading.get_ident() == owner, "stage SQLite left owner thread"
+        if mode == "bind-error":
+            raise sqlite3.OperationalError("private fixture failure")
+        result = original_bind(store, *args)
+        if mode == "bind-after-error":
+            raise sqlite3.OperationalError("fixture failure after durable bind")
+        if mode == "crash-after":
+            held()
+        return result
+    def pause(store, **kwargs):
+        assert threading.get_ident() == owner
+        if mode == "persist-uncertain":
+            raise sqlite3.OperationalError("fixture pause failure")
+        return original_pause(store, **kwargs)
+    def close(controller):
+        if mode == "contain-uncertain":
+            raise RuntimeError("fixture containment failure")
+        return original_close(controller)
+    worker.SQLiteStore.pause_active_direct_job = pause
+    direct.DirectAria2Controller.close = close
+    paths._fsync_staged_partial_payload = sync
+    paths.attest_staged_partial_payload = attest
+    worker.SQLiteStore.bind_direct_staged_payload = bind
+    try:
+        _run_worker_process(state_root, socket_path, ready, shutdown, stopped, results)
+    finally:
+        paths._fsync_staged_partial_payload = original_sync
+        paths.attest_staged_partial_payload = original_attest
+        worker.SQLiteStore.bind_direct_staged_payload = original_bind
+        worker.SQLiteStore.pause_active_direct_job = original_pause
+        direct.DirectAria2Controller.close = original_close
+        worker.validate_source_url = original_validate
+
+
+@pytest.mark.parametrize("mode,action", (
+    ("success", None), ("error", None), ("bind-error", None), ("bind-after-error", None),
+    ("persist-uncertain", None), ("contain-uncertain", None),
+    ("success", "pause"), ("success", "remove"), ("success", "queue"), ("success", "close"),
+    ("late-error", "pause"), ("late-error", "remove"), ("late-error", "queue"), ("late-error", "close"),
+    ("post-inode", None), ("post-mtime", None), ("success", "marker"),
+    ("success", "crash-before"), ("crash-after", "crash-after"),
+))
+def test_stage_producer_real_completion_races_and_crash_retention(short_socket_root, mode, action):
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    root = Path.home() / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    context = multiprocessing.get_context("spawn")
+    ready, shutdown, stopped = context.Event(), context.Event(), context.Event()
+    entered, release, returned = context.Event(), context.Event(), context.Event()
+    results = context.Queue()
+    with _origin_type()(payload_size=1024) as origin:
+        _seed_local_direct_dispatch_job(state_root, origin.url("/range"))
+        process = context.Process(target=_run_stage_gated_worker, args=(str(state_root), str(socket_path),
+            ready, shutdown, stopped, results, origin.url(), mode, entered, release, returned))
+        process.start()
+        owned = None
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS), _result(results)
+            assert set_queue_gate(socket_path, gate="running", request_id="stage-open", expected_revision=1).applied
+            assert ipc.control_job(socket_path, job="dispatch-job", action="start_now", request_id="stage-authorize", expected_revision=1).status == "applied"
+            assert activate_direct_engine(socket_path, expected_worker_epoch=1).status == "active"
+            started = ipc.dispatch_direct_job(socket_path, job="dispatch-job", expected_worker_epoch=1,
+                expected_generation=1, expected_revision=2, request_id="stage-start")
+            assert entered.wait(_WATCHDOG_SECONDS), "real finalizing never reached stage operation"
+            partial = root / ".incomplete" / "dispatch-job" / "dispatch.bin"
+            marker = partial.parent / ".hermes-reservation"
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                owned = observer.get_direct_engine_record()
+                assert owned is not None
+                assert observer.get_job("dispatch-job").state == "finalizing"
+                assert [e.kind for e in observer.list_events()].count("job_finalizing") == 1
+                assert (observer._get_staged_payload_binding("dispatch-job") is not None) == (action == "crash-after")
+            finally:
+                observer.close()
+            if action != "crash-after":
+                before = time.monotonic()
+                assert request_health(socket_path).worker_epoch == 1
+                assert request_jobs_page(socket_path).jobs[0].state == "finalizing"
+                assert time.monotonic() - before < 2
+                assert ipc.dispatch_direct_job(socket_path, job="dispatch-job", expected_worker_epoch=1,
+                    expected_generation=1, expected_revision=2, request_id="stage-start") == started
+            if action in {"pause", "remove"}:
+                controlled = ipc.control_job(socket_path, job="dispatch-job", action=action,
+                    request_id="stage-control", expected_revision=5)
+                assert (controlled.status, controlled.state, controlled.revision) == ("applied", "paused" if action == "pause" else "removed", 6)
+                assert _group_is_gone(owned.identity.process_group_id)
+                assert activate_direct_engine(socket_path, expected_worker_epoch=1).status == "blocked"
+            elif action == "queue":
+                assert set_queue_gate(socket_path, gate="paused", request_id="stage-queue", expected_revision=2).applied
+                assert _group_is_gone(owned.identity.process_group_id)
+            elif action == "marker":
+                marker.rename(marker.with_name("retained-marker"))
+                marker.write_bytes(b"changed fixture marker")
+            elif action in {"crash-before", "crash-after"}:
+                process.kill()
+                process.join(_WATCHDOG_SECONDS)
+                assert not process.is_alive()
+                assert process.exitcode < 0
+            elif action == "close":
+                shutdown.set()
+                assert stopped.wait(_WATCHDOG_SECONDS)
+                _join(process)
+                assert _result(results) == ("result", None)
+                assert _group_is_gone(owned.identity.process_group_id)
+            if mode == "post-inode":
+                partial.rename(partial.with_name("retained-payload"))
+                partial.write_bytes(origin.payload)  # Same size, different allocated inode.
+            elif mode == "post-mtime":
+                details = partial.stat()
+                os.utime(partial, ns=(details.st_atime_ns, details.st_mtime_ns + 1000000))
+            if process.is_alive():
+                release.set()
+            if mode in {"persist-uncertain", "contain-uncertain"}:
+                assert stopped.wait(_WATCHDOG_SECONDS)
+                _join(process)
+                assert _result(results) == ("error", "IPCStateError", "direct_dispatch_blocked")
+                observer = SQLiteStore(state_root / "state.db")
+                try:
+                    retained = observer.get_direct_engine_record()
+                    assert retained == owned
+                    assert observer._get_direct_engine_recovery_capability(retained) is not None
+                    assert (observer.get_job("dispatch-job").state, observer.get_job("dispatch-job").revision) == ("finalizing", 5)
+                    assert [e.kind for e in observer.list_events()].count("job_paused") == 1
+                    assert observer._get_staged_payload_binding("dispatch-job") is None
+                finally:
+                    observer.close()
+                assert partial.read_bytes() == origin.payload
+                assert marker.exists()
+                assert not (root / "Other" / "dispatch.bin").exists()
+                return
+            if action not in {"close", "crash-before", "crash-after"}:
+                deadline = time.monotonic() + _WATCHDOG_SECONDS
+                expected = "removed" if action == "remove" else "paused" if (action in {"pause", "queue", "marker"} or mode != "success") else "finalizing"
+                while time.monotonic() < deadline:
+                    observer = SQLiteStore(state_root / "state.db")
+                    try:
+                        settled = observer.get_job("dispatch-job").state == expected and (expected != "finalizing" or observer._get_staged_payload_binding("dispatch-job") is not None)
+                    finally:
+                        observer.close()
+                    if settled:
+                        break
+                    request_health(socket_path)
+                    time.sleep(0.005)
+                assert settled
+                shutdown.set()
+                assert stopped.wait(_WATCHDOG_SECONDS)
+                _join(process)
+                assert _result(results) == ("result", None)
+            observer = SQLiteStore(state_root / "state.db")
+            try:
+                assert (observer._get_staged_payload_binding("dispatch-job") is not None) == (action == "crash-after" or (mode in {"success", "bind-after-error"} and action is None))
+                assert observer._get_final_publication_binding("dispatch-job") is None
+                assert [e.kind for e in observer.list_events()].count("job_finalizing") == 1
+                assert "job_completed" not in [e.kind for e in observer.list_events()]
+                if action in {"crash-before", "crash-after"}:
+                    observer.recover_cold_start()
+                    assert observer.get_job("dispatch-job").state == "paused"
+                    assert (observer._get_staged_payload_binding("dispatch-job") is not None) == (action == "crash-after")
+            finally:
+                observer.close()
+            assert partial.read_bytes() == origin.payload
+            assert marker.exists()
+            assert not (root / "Other" / "dispatch.bin").exists()
+        finally:
+            # A killed process may hold a multiprocessing Event's semaphore.
+            # Never acquire shared event locks after a crash or process exit.
+            if process.is_alive():
+                release.set()
+                shutdown.set()
+                _join(process)
+            if owned is not None and not _group_is_gone(owned.identity.process_group_id):
+                os.killpg(owned.identity.process_group_id, signal.SIGKILL)

@@ -81,6 +81,21 @@ class StaleGenerationError(DirectTransferError):
     """A callback did not match the exact currently-owned GID and generation."""
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _VerifiedPayloadIdentity:
+    """Immutable descriptor evidence from the original terminal verification."""
+
+    st_dev: int
+    st_ino: int
+    logical_size: int
+    mtime_ns: int
+
+    def __post_init__(self) -> None:
+        if any(type(value) is not int or value < 0 for value in
+               (self.st_dev, self.st_ino, self.logical_size)) or type(self.mtime_ns) is not int:
+            raise ValueError("verified payload identity is invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class DirectTransfer:
     """A readback of one aria2 direct transfer, never authorization itself."""
@@ -94,6 +109,7 @@ class DirectTransfer:
     partial_path: Path
     hash_verified: bool
     verification: CompletionVerification | None
+    verified_identity: _VerifiedPayloadIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,14 +571,19 @@ class DirectAria2Controller:
                     raise OSError
         except OSError:
             raise DirectTransferError("aria2 output is unavailable") from None
+        identity = _VerifiedPayloadIdentity(
+            details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns
+        )
         if transfer.expected_sha256 is None:
-            return replace(state, verification=CompletionVerification.TRANSPORT_VERIFIED)
+            return replace(state, verification=CompletionVerification.TRANSPORT_VERIFIED,
+                           verified_identity=identity)
         if digest.hexdigest() != transfer.expected_sha256:
             raise DirectTransferError("aria2 hash verification failed")
         return replace(
             state,
             hash_verified=True,
             verification=CompletionVerification.CHECKSUM_VERIFIED,
+            verified_identity=identity,
         )
 
     def _create_private_config(self) -> tuple[Path, Path, str]:

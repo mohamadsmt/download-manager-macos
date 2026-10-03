@@ -1113,12 +1113,14 @@ def test_attests_staged_partial_payload_descriptor_relatively_without_publicatio
         "st_dev",
         "st_ino",
         "logical_size",
+        "mtime_ns",
     )
     assert attested == paths.StagedPartialPayload(
         path=destination.partial_path,
         st_dev=partial_before[0],
         st_ino=partial_before[1],
         logical_size=len(payload),
+        mtime_ns=destination.partial_path.stat().st_mtime_ns,
     )
     assert reservation.claim_token not in repr(attested)
     assert len(opens) == 1

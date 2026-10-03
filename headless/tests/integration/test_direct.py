@@ -2754,3 +2754,17 @@ def test_direct_one_shot_observation_requires_exact_mapping(tmp_path, monkeypatc
         controller.observe_terminal(job_id="other" if change == "job" else transfer.job_id,
             generation=5 if change == "generation" else 6,
             gid="ffffffffffffffff" if change == "gid" else transfer.gid)
+
+
+def test_stage_producer_verification_retains_descriptor_identity(tmp_path, monkeypatch):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    transfer.destination.partial_path.write_bytes(b"body")
+    details = transfer.destination.partial_path.stat()
+    monkeypatch.setattr(controller, "_rpc", lambda *_: {"status": "complete", "totalLength": "4", "completedLength": "4"})
+    result = controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid)
+    assert result.verified_identity == direct._VerifiedPayloadIdentity(
+        details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
+    from dataclasses import FrozenInstanceError
+    with pytest.raises(FrozenInstanceError):
+        result.verified_identity.logical_size = 99
