@@ -2385,7 +2385,7 @@ class SQLiteStore:
                 result = self._direct_dispatch_result_from_current(current, "stale")
             elif materialized.source_kind is not SourceKind.DIRECT:
                 result = self._direct_dispatch_result_from_current(current, "blocked")
-            elif current.state == JobState.FINALIZING.value:
+            elif current.state in (JobState.FINALIZING.value, JobState.PAUSED.value):
                 reconciliation = self._prepare_direct_publication_reconciliation(
                     connection,
                     current=current,
@@ -2600,10 +2600,10 @@ class SQLiteStore:
             if (
                 current.generation != plan.generation
                 or current.revision != plan.revision
-                or current.state != JobState.FINALIZING.value
+                or not self._has_audited_finalization_cutpoint(connection, current)
                 or command.generation != plan.generation
                 or command.revision != plan.revision
-                or command.state != JobState.FINALIZING.value
+                or command.state != current.state
                 or self._read_publication_reservation(connection, current.job)
                 != plan.reservation
                 or self._read_publication_marker_binding(connection, current.job)
@@ -2647,10 +2647,10 @@ class SQLiteStore:
             if (
                 current.generation != plan.generation
                 or current.revision != plan.revision
-                or current.state != JobState.FINALIZING.value
+                or not self._has_audited_finalization_cutpoint(connection, current)
                 or command.generation != plan.generation
                 or command.revision != plan.revision
-                or command.state != JobState.FINALIZING.value
+                or command.state != current.state
             ):
                 raise ValueError("direct publication reconciliation state is stale")
             result = self._direct_dispatch_result_from_current(current, "blocked")
@@ -2717,28 +2717,16 @@ class SQLiteStore:
     ) -> _DirectPublicationReconciliationPlan | None:
         """Return a plan only for a durable finalization cutpoint."""
 
-        if current.state != JobState.FINALIZING.value:
+        if not self._has_audited_finalization_cutpoint(connection, current):
             return None
         try:
             reservation = self._read_publication_reservation(connection, current.job)
             marker = self._read_publication_marker_binding(connection, current.job)
             staged = self._read_staged_payload_binding(connection, current.job)
-            finalizing_event = connection.execute(
-                """
-                SELECT 1 FROM events
-                WHERE kind = 'job_finalizing'
-                  AND job_id = ?
-                  AND generation = ?
-                  AND revision = ?
-                LIMIT 1
-                """,
-                (current.job, current.generation, current.revision),
-            ).fetchone()
             if (
                 reservation is None
                 or marker is None
                 or staged is None
-                or finalizing_event is None
             ):
                 return None
             # Reject a corrupt pre-existing final binding before filesystem work.
@@ -2969,34 +2957,41 @@ class SQLiteStore:
         return command
 
     @staticmethod
-    def _has_durable_finalization_bindings(
-        connection: sqlite3.Connection, job_id: str, generation: int, revision: int
+    def _has_audited_finalization_cutpoint(
+        connection: sqlite3.Connection, current: _JobControlProjection
     ) -> bool:
-        """Retain only a complete terminal binding chain for explicit inspection."""
+        """Prove the current cutpoint, or its immediate cold-paused successor.
 
-        try:
-            reservation = SQLiteStore._read_publication_reservation(connection, job_id)
-            marker = SQLiteStore._read_publication_marker_binding(connection, job_id)
-            staged = SQLiteStore._read_staged_payload_binding(connection, job_id)
-            SQLiteStore._read_final_publication_binding(connection, job_id)
-            finalizing_event = connection.execute(
-                """
-                SELECT 1 FROM events
-                WHERE kind = 'job_finalizing'
-                  AND job_id = ?
-                  AND generation = ?
-                  AND revision = ?
-                LIMIT 1
-                """,
-                (job_id, generation, revision),
-            ).fetchone()
-        except (TypeError, ValueError):
+        Cold recovery advances both fences exactly once. Ordinary pause only
+        advances revision; repeated recovery and intervening job audits cannot
+        inherit an earlier finalization authority.
+        """
+
+        events = connection.execute(
+            """
+            SELECT kind, generation, revision FROM events
+            WHERE job_id = ? ORDER BY event_id DESC LIMIT 2
+            """,
+            (current.job,),
+        ).fetchall()
+        if not events:
             return False
+        latest = events[0]
+        if current.state == JobState.FINALIZING.value:
+            return (
+                latest["kind"] == "job_finalizing"
+                and latest["generation"] == current.generation
+                and latest["revision"] == current.revision
+            )
         return (
-            reservation is not None
-            and marker is not None
-            and staged is not None
-            and finalizing_event is not None
+            current.state == JobState.PAUSED.value
+            and len(events) == 2
+            and latest["kind"] == "job_paused"
+            and latest["generation"] == current.generation
+            and latest["revision"] == current.revision
+            and events[1]["kind"] == "job_finalizing"
+            and events[1]["generation"] == current.generation - 1
+            and events[1]["revision"] == current.revision - 1
         )
 
     def recover_cold_start(self) -> int:
@@ -3058,17 +3053,6 @@ class SQLiteStore:
             ).fetchall()
             for job in jobs:
                 job_id = _require_sqlite_text(job["job_id"], "job_id")
-                if (
-                    _require_public_job_state(job["state"], "cold-start job state")
-                    == JobState.FINALIZING.value
-                    and self._has_durable_finalization_bindings(
-                        connection,
-                        job_id,
-                        _require_sqlite_integer(job["generation"], "generation"),
-                        _require_sqlite_integer(job["revision"], "revision"),
-                    )
-                ):
-                    continue
                 generation = _require_sqlite_integer(job["generation"], "generation") + 1
                 revision = _require_sqlite_integer(job["revision"], "revision") + 1
                 retry_budget = self._read_retry_budget(connection, job_id)

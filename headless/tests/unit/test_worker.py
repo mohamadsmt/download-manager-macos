@@ -410,6 +410,7 @@ def _seed_published_finalization(
         (False, True, False),
         (True, True, False),
         (False, False, True),
+        (True, False, True),
     ),
     ids=(
         "pre-bind",
@@ -417,6 +418,7 @@ def _seed_published_finalization(
         "mismatch",
         "final-bound-mismatch",
         "missing-final",
+        "final-bound-missing-final",
     ),
 )
 def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
@@ -458,11 +460,22 @@ def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
             if self._served:
                 return
             self._served = True
+            startup = SQLiteStore(state_root / "state.db")
+            try:
+                job = startup.get_job("reconcile-job")
+                assert job is not None
+                assert (job.state, job.generation, job.revision) == ("paused", 1, 2)
+                assert startup.queue_gate() == "paused"
+                assert "job_completed" not in [e.kind for e in startup.list_events()]
+                assert destination.final_path.exists() is (not missing_final)
+                assert transfer_calls == []
+            finally:
+                startup.close()
             command = ipc.DirectJobDispatchCommand(
                 job="reconcile-job",
                 expected_worker_epoch=1,
-                expected_generation=0,
-                expected_revision=1,
+                expected_generation=1,
+                expected_revision=2,
                 request_id="reconcile-dispatch",
             )
             first = self._dispatch(command)
@@ -505,9 +518,9 @@ def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
         job = store.get_job("reconcile-job")
         assert job is not None
         if mismatched_final or missing_final:
-            expected = ipc.DirectJobDispatchResult("blocked", "reconcile-job", 0, 1, "finalizing")
+            expected = ipc.DirectJobDispatchResult("blocked", "reconcile-job", 1, 2, "paused")
             assert results == [expected, expected]
-            assert job.state == "finalizing"
+            assert job.state == "paused"
             if final_bound:
                 assert store._get_final_publication_binding("reconcile-job") is not None
             else:
@@ -517,7 +530,7 @@ def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
             else:
                 assert not destination.final_path.exists()
         else:
-            expected = ipc.DirectJobDispatchResult("started", "reconcile-job", 0, 2, "completed")
+            expected = ipc.DirectJobDispatchResult("started", "reconcile-job", 1, 3, "completed")
             assert results == [expected, expected]
             assert job.state == "completed"
             final = os.lstat(destination.final_path)

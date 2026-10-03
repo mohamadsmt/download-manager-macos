@@ -5402,6 +5402,113 @@ def _seed_finalizing_direct_publication(
 
 
 @pytest.mark.parametrize("final_bound", (False, True))
+def test_cold_finalization_pauses_and_fences_before_explicit_reconciliation(
+    tmp_path: Path, final_bound: bool
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _seed_finalizing_direct_publication(store, final_bound=final_bound)
+        store._connection.execute(
+            "UPDATE materialized_jobs SET manual_hold = 1 WHERE job_id = 'job-1'"
+        )
+        pending = store.prepare_direct_dispatch(
+            job_id="job-1", expected_worker_epoch=1, expected_generation=1,
+            expected_revision=3, request_id="old-pending", payload_digest="9" * 64,
+            controller_ready=False, now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+        assert type(pending) is store_module._DirectPublicationReconciliationPlan
+        before = store.get_materialized_job("job-1")
+        reservation = store.get_publication_reservation("job-1")
+        marker = store._read_publication_marker_binding(store._connection, "job-1")
+        staged = store._read_staged_payload_binding(store._connection, "job-1")
+        assert store.recover_cold_start() == 2
+        job = store.get_job("job-1")
+        assert job is not None
+        assert (job.state, job.generation, job.revision) == ("paused", 2, 4)
+        after = store.get_materialized_job("job-1")
+        assert before is not None and after is not None
+        assert after == replace(before, intent=replace(before.intent, generation=2, revision=4))
+        assert store.get_publication_reservation("job-1") == reservation
+        assert store._read_publication_marker_binding(store._connection, "job-1") == marker
+        assert store._read_staged_payload_binding(store._connection, "job-1") == staged
+        assert store.queue_gate() == "paused"
+        assert [e.kind for e in store.list_events()][-1] == "job_paused"
+        old = store.prepare_direct_dispatch(
+            job_id="job-1", expected_worker_epoch=1, expected_generation=1,
+            expected_revision=3, request_id="old-pending", payload_digest="9" * 64,
+            controller_ready=False, now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+        assert old.status == "blocked"
+        with pytest.raises(ValueError, match="pending"):
+            store.complete_direct_publication_reconciliation(
+                pending, final_device=903, final_inode=904, logical_size=905,
+            )
+        for epoch, generation, revision in ((1, 2, 4), (2, 1, 4), (2, 2, 3)):
+            stale = store.prepare_direct_dispatch(
+                job_id="job-1", expected_worker_epoch=epoch,
+                expected_generation=generation, expected_revision=revision,
+                request_id=f"stale-{epoch}-{generation}-{revision}",
+                payload_digest="a" * 64, controller_ready=False,
+                now=datetime(2032, 1, 2, tzinfo=UTC),
+            )
+            assert stale.status == "stale"
+        prepared = store.prepare_direct_dispatch(
+            job_id="job-1", expected_worker_epoch=2, expected_generation=2,
+            expected_revision=4, request_id="cold-reconcile", payload_digest="8" * 64,
+            controller_ready=False, now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+        assert type(prepared) is store_module._DirectPublicationReconciliationPlan
+        result = store.complete_direct_publication_reconciliation(
+            prepared, final_device=903, final_inode=904, logical_size=905,
+        )
+        assert (result.state, result.generation, result.revision) == ("completed", 2, 5)
+        replay = store.prepare_direct_dispatch(
+            job_id="job-1", expected_worker_epoch=2, expected_generation=2,
+            expected_revision=4, request_id="cold-reconcile", payload_digest="8" * 64,
+            controller_ready=False, now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+        assert replay == result
+        assert [e.kind for e in store.list_events()].count("job_completed") == 1
+        assert store.get_materialized_job("job-1").manual_hold is True
+        assert store.queue_gate() == "paused"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("damage", ("missing", "irrelevant", "intervening", "repeat-cold"))
+def test_cold_reconciliation_requires_immediate_exact_finalizing_audit(
+    tmp_path: Path, damage: str
+) -> None:
+    store = SQLiteStore(tmp_path / "queue.sqlite3")
+    try:
+        _seed_finalizing_direct_publication(store, final_bound=False)
+        store.recover_cold_start()
+        if damage == "missing":
+            store._connection.execute("DELETE FROM events WHERE kind = 'job_finalizing'")
+        elif damage == "irrelevant":
+            store._connection.execute("UPDATE events SET generation = 0 WHERE kind = 'job_finalizing'")
+        elif damage == "intervening":
+            store._connection.execute(
+                "INSERT INTO events (kind, job_id, generation, revision) VALUES ('job_paused', 'job-1', 2, 4)"
+            )
+        else:
+            store.recover_cold_start()
+        job = store.get_job("job-1")
+        assert job is not None
+        result = store.prepare_direct_dispatch(
+            job_id="job-1", expected_worker_epoch=store.worker_epoch(),
+            expected_generation=job.generation, expected_revision=job.revision,
+            request_id="unproven-cutpoint", payload_digest="b" * 64,
+            controller_ready=False, now=datetime(2032, 1, 2, tzinfo=UTC),
+        )
+        assert result.status == "blocked"
+        assert store._get_final_publication_binding("job-1") is None
+        assert "job_completed" not in [e.kind for e in store.list_events()]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("final_bound", (False, True))
 def test_direct_dispatch_reconciles_a_durable_final_publication_and_replays_exactly(
     tmp_path: Path, final_bound: bool
 ) -> None:
@@ -5520,17 +5627,20 @@ def test_direct_dispatch_blocks_a_finalizing_chain_without_its_terminal_audit(
         store.close()
 
 
+@pytest.mark.parametrize("cold", (False, True))
 def test_direct_publication_reconciliation_rolls_back_mismatch_and_audit_failure(
-    tmp_path: Path,
+    tmp_path: Path, cold: bool,
 ) -> None:
     store = SQLiteStore(tmp_path / "queue.sqlite3")
     try:
         _seed_finalizing_direct_publication(store, final_bound=False)
+        if cold:
+            store.recover_cold_start()
         prepared = store.prepare_direct_dispatch(
             job_id="job-1",
-            expected_worker_epoch=1,
-            expected_generation=1,
-            expected_revision=3,
+            expected_worker_epoch=2 if cold else 1,
+            expected_generation=2 if cold else 1,
+            expected_revision=4 if cold else 3,
             request_id="reconcile-rejects-mismatch",
             payload_digest="7" * 64,
             controller_ready=False,
@@ -5545,7 +5655,7 @@ def test_direct_publication_reconciliation_rolls_back_mismatch_and_audit_failure
                 final_inode=999,
                 logical_size=905,
             )
-        assert store.get_job("job-1").state == "finalizing"  # type: ignore[union-attr]
+        assert store.get_job("job-1").state == ("paused" if cold else "finalizing")  # type: ignore[union-attr]
         assert store._get_final_publication_binding("job-1") is None
         assert "job_completed" not in [event.kind for event in store.list_events()]
 
@@ -5564,7 +5674,7 @@ def test_direct_publication_reconciliation_rolls_back_mismatch_and_audit_failure
                 final_inode=904,
                 logical_size=905,
             )
-        assert store.get_job("job-1").state == "finalizing"  # type: ignore[union-attr]
+        assert store.get_job("job-1").state == ("paused" if cold else "finalizing")  # type: ignore[union-attr]
         assert store._get_final_publication_binding("job-1") is None
         assert "job_completed" not in [event.kind for event in store.list_events()]
     finally:
