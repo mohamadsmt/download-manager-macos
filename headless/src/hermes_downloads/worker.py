@@ -726,6 +726,7 @@ def run_worker(
                             st_ino=reconciliation.staged.partial_inode,
                             logical_size=reconciliation.staged.logical_size,
                         ),
+                        existing_only=True,
                     )
                     _require_reconciliation_chain(destination, reconciliation)
                     result = store.complete_direct_publication_reconciliation(

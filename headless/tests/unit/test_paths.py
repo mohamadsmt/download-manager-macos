@@ -2222,3 +2222,49 @@ def test_publication_rejects_a_replaced_root_or_incomplete_ancestor_before_accep
             staged.st_ino,
             staged.logical_size,
         )
+
+
+@pytest.mark.parametrize("final_state", ("existing", "absent", "replacement"))
+def test_existing_only_publication_never_attempts_a_link(monkeypatch, final_state):
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+    paths.publish_staged_partial_payload(destination, reservation, staged)
+    if final_state != "existing":
+        destination.final_path.unlink()
+    if final_state == "replacement":
+        destination.final_path.write_bytes(b"replacement")
+    partial_before = _entry_signature(destination.partial_path)
+    marker_before = _entry_signature(_marker_path(destination))
+    link_calls = []
+
+    def forbidden_link(*args, **kwargs):
+        link_calls.append("attempted")
+        raise AssertionError("existing-only verification must not link")
+
+    monkeypatch.setattr(paths.os, "link", forbidden_link)
+    if final_state == "existing":
+        result = paths.publish_staged_partial_payload(destination, reservation, staged, existing_only=True)
+        assert (result.st_dev, result.st_ino) == (staged.st_dev, staged.st_ino)
+    else:
+        with pytest.raises(paths.PathValidationError):
+            paths.publish_staged_partial_payload(destination, reservation, staged, existing_only=True)
+        if final_state == "absent":
+            assert not destination.final_path.exists()
+        else:
+            assert destination.final_path.read_bytes() == b"replacement"
+    assert link_calls == []
+    assert _entry_signature(destination.partial_path) == partial_before
+    assert _entry_signature(_marker_path(destination)) == marker_before
+
+
+@pytest.mark.parametrize("invalid", (None, 0, 1, "true"))
+def test_existing_only_option_is_validated_before_namespace_operations(monkeypatch, invalid):
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths)
+
+    def forbidden_open(*args, **kwargs):
+        raise AssertionError("invalid option must fail before opening paths")
+
+    monkeypatch.setattr(paths, "_open_root", forbidden_open)
+    with pytest.raises(paths.PathValidationError):
+        paths.publish_staged_partial_payload(destination, reservation, staged, existing_only=invalid)

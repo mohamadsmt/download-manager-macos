@@ -490,12 +490,18 @@ def publish_staged_partial_payload(
     destination: DestinationIntent,
     reservation: PublicationReservation,
     staged_payload: StagedPartialPayload,
+    *,
+    existing_only: bool = False,
 ) -> PublishedFinalPayload:
     """Publish one previously attested partial via a no-clobber hard link.
 
     The partial and receipt remain in place.  A visible final is accepted only
     when it is the exact staged inode from a prior interrupted publication.
+    With existing_only=True, verify an existing final without creating a link.
     """
+
+    if type(existing_only) is not bool:
+        raise PathValidationError("existing_only must be a boolean")
 
     root, final_component = _validate_destination_intent(destination)
     reservation = _validate_publication_reservation(
@@ -563,13 +569,20 @@ def publish_staged_partial_payload(
                             expected_marker_bytes,
                             marker,
                         )
-                        _link_staged_partial_payload(
-                            job_fd,
-                            final_fd,
-                            destination.partial_path.name,
-                            destination.final_path.name,
-                            expected_payload,
-                        )
+                        if existing_only:
+                            _require_existing_final_payload(
+                                final_fd,
+                                destination.final_path.name,
+                                expected_payload,
+                            )
+                        else:
+                            _link_staged_partial_payload(
+                                job_fd,
+                                final_fd,
+                                destination.partial_path.name,
+                                destination.final_path.name,
+                                expected_payload,
+                            )
                         _verify_publication_payload_descriptor(
                             payload_fd,
                             expected_payload,

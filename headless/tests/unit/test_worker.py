@@ -421,12 +421,14 @@ def _seed_published_finalization(
         "final-bound-missing-final",
     ),
 )
+@pytest.mark.parametrize("late_change", (None, "remove", "replace"))
 def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
     short_state_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     final_bound: bool,
     mismatched_final: bool,
     missing_final: bool,
+    late_change: str | None,
 ) -> None:
     state_root = short_state_root
     destination, claim_token = _seed_published_finalization(
@@ -435,6 +437,19 @@ def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
         mismatched_final=mismatched_final,
         missing_final=missing_final,
     )
+    seam_calls: list[str] = []
+    original_publish = paths.publish_staged_partial_payload
+    retained_entries = {p.name: p.read_bytes() for p in destination.incomplete_dir.iterdir() if p.is_file()}
+
+    def change_final_then_publish(*args: object, **kwargs: object) -> object:
+        seam_calls.append("called")
+        destination.final_path.unlink()
+        if late_change == "replace":
+            destination.final_path.write_bytes(b"different payload")
+        return original_publish(*args, **kwargs)
+
+    if late_change is not None:
+        monkeypatch.setattr(paths, "publish_staged_partial_payload", change_final_then_publish)
     transfer_calls: list[str] = []
     results: list[ipc.DirectJobDispatchResult] = []
     shutdown = threading.Event()
@@ -517,7 +532,7 @@ def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
     try:
         job = store.get_job("reconcile-job")
         assert job is not None
-        if mismatched_final or missing_final:
+        if mismatched_final or missing_final or late_change is not None:
             expected = ipc.DirectJobDispatchResult("blocked", "reconcile-job", 1, 2, "paused")
             assert results == [expected, expected]
             assert job.state == "paused"
@@ -525,7 +540,7 @@ def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
                 assert store._get_final_publication_binding("reconcile-job") is not None
             else:
                 assert store._get_final_publication_binding("reconcile-job") is None
-            if mismatched_final:
+            if mismatched_final or (late_change == "replace" and not missing_final):
                 assert destination.final_path.read_bytes() == b"different payload"
             else:
                 assert not destination.final_path.exists()
@@ -542,6 +557,10 @@ def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
             )
             assert store._get_final_publication_binding("reconcile-job") is not None
             assert [event.kind for event in store.list_events()].count("job_completed") == 1
+        if late_change is not None and not mismatched_final and not missing_final:
+            assert seam_calls == ["called"]
+            assert {p.name: p.read_bytes() for p in destination.incomplete_dir.iterdir() if p.is_file()} == retained_entries
+            assert "job_completed" not in [e.kind for e in store.list_events()]
         assert claim_token not in repr(results)
         assert claim_token not in repr(store.list_job_page())
         assert claim_token not in repr(store.list_events())
