@@ -330,11 +330,38 @@ test('validated reveal is explicit only and captured action is inert after activ
   h.state.profile.set('work'); h.state.profile.set('default'); await action.onClick();
   assert.equal(h.reveals.length, 1); h.dispose(); await action.onClick(); assert.equal(h.reveals.length, 1);
 });
+for (const [name, path] of [
+  ['named Persian collection', '/Users/test/Downloads/Hermes/مجموعه شخصی/گزارش.pdf'],
+  ['ordinary arbitrary safe collection', '/home/test/Downloads/Hermes/Secrets/report.pdf'],
+  ['nested category folders', '/Users/test/Downloads/Hermes/Videos/Training/جلسه یک/clip.mp4'],
+]) test(`${name} completion offers an explicit SDK reveal action`, async () => {
+  const e = event({ collection_id: 'collection-1', reveal_path: path });
+  const h = await harness({ rest: route => route.startsWith('/events?') ? pending(e) : route === '/events/claim' ? claims(e) : { status: 'presented' } });
+  try {
+    await flush();
+    assert.equal(h.notifications.length, 1, 'valid collection completion must produce a notification');
+    assert.deepEqual(h.reveals, [], 'notification insertion must not reveal automatically');
+    const action = h.notifications[0].action;
+    assert.equal(typeof action?.onClick, 'function', 'valid collection must have an explicit reveal action');
+    assert.equal(of(h, '/events/presented').length, 1);
+    await action.onClick();
+    assert.deepEqual(h.reveals, [path]);
+    h.state.connectionId.set('remote');
+    await action.onClick();
+    assert.deepEqual(h.reveals, [path], 'wrong scope must prevent another reveal');
+    h.state.connectionId.set('local');
+    await action.onClick();
+    assert.deepEqual(h.reveals, [path], 'returning scope must not restore the captured action');
+    h.dispose();
+    await action.onClick();
+    assert.deepEqual(h.reveals, [path], 'disposal must prevent another reveal');
+  } finally { h.dispose(); }
+});
 for (const path of [
   '/tmp/movie.mp4', '/Users/test/Downloads/Hermes/Videos/../secret',
   '/Users/test/Downloads/Hermes//Videos/movie.mp4', '/Users/test/Downloads/Hermes/Videos/',
   '/Users/test/Downloads/Hermes/Videos/./movie.mp4', '/Users/test/Downloads/Hermes/Videos/movie\u0000.mp4',
-  '/Users/test/Downloads/Hermes/Videos/movie\n.mp4', '/Users/test/Downloads/Hermes/Secrets/movie.mp4',
+  '/Users/test/Downloads/Hermes/Videos/movie\n.mp4',
   '/Users/test/Downloads/Hermes/Videos/a\\b.mp4', 'Users/test/Downloads/Hermes/Videos/movie.mp4',
 ]) test(`unsafe reveal path ${JSON.stringify(path)} never contributes an action or notification`, async () => {
   const e = event({ reveal_path: path });

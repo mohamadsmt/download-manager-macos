@@ -27,8 +27,7 @@ function validPath(path) {
   // No home-directory API is exposed by the SDK. This is lexical validation;
   // the future backend must certify the actual user's canonical owned path.
   return parts.length >= 6 && (parts[0] === 'Users' || parts[0] === 'home') &&
-    parts[2] === 'Downloads' && parts[3] === 'Hermes' &&
-    ['Videos', 'Audio', 'Documents', 'Software', 'Other'].includes(parts[4]);
+    parts[2] === 'Downloads' && parts[3] === 'Hermes';
 }
 function dto(value) {
   requireValid(exact(value, EVENT_FIELDS));

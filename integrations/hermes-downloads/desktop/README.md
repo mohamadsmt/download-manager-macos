@@ -8,9 +8,13 @@ UI. It is active only for profile `default`, connection `null` or `local`, and
 gateway `open`, independently of chat/session state.
 
 This slice does **not** implement or install the future backend bridge or
-durable notification outbox. No live notification, YouTube, A13 or A14
+durable notification outbox. No live notification, A13 or A14
 acceptance is claimed. No worker/downloader, core/profile/configuration or
 Swift application is changed.
+
+Current delivery scope is direct-file downloads. `Videos` and `Audio` are
+destination categories for direct files; this adapter adds no extraction or
+video-page capability.
 
 ## Closed future bridge
 
@@ -85,9 +89,13 @@ persistent (`durationMs: 0`). No native notification channel is used.
 
 Only completion DTOs may carry a non-null reveal path. Paths must be absolute
 and lexically canonical under `/Users/<home>/Downloads/Hermes/` or
-`/home/<home>/Downloads/Hermes/`, then one of `Videos`, `Audio`, `Documents`,
-`Software`, `Other`, then at least one nonempty component. Paths are bounded
-to 4096 characters and components to 255; control/NUL characters, backslashes,
+`/home/<home>/Downloads/Hermes/`, followed by at least a collection/category
+component and a file component. Safe Unicode named collections, including
+Persian names, override category organization; ordinary nested folders are
+allowed between collection/category and file. Without a named collection,
+direct files use `Videos`, `Audio`, `Documents`, `Software` or `Other`; those
+category names are not a renderer allowlist. Paths are bounded to 4096
+characters and components to 255; control/NUL characters, backslashes,
 unpaired surrogates, empty/whitespace components and `.`/`..` are rejected.
 The optional Persian action calls only `ctx.os.revealPath` on an explicit
 click while its captured activation remains valid, with no auto-open or
