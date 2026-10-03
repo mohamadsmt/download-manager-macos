@@ -407,9 +407,12 @@ def run_worker(
     ready_event: _LifecycleEvent,
     shutdown_event: _LifecycleEvent,
     stopped_event: _LifecycleEvent,
+    recover_socket: bool = False,
 ) -> str | None:
     """Recover one exclusively owned paused worker until shutdown is requested."""
 
+    endpoint_certificate = None
+    owned_endpoint_certificate = None
     lease_descriptor: int | None = None
     store: SQLiteStore | None = None
     health_server: HealthServer | None = None
@@ -430,18 +433,26 @@ def run_worker(
     observation_results: Queue[_DirectObservation | _DirectStageObservation] = Queue(maxsize=1)
     try:
         root = _validate_state_root(state_root)
+        if recover_socket:
+            from hermes_downloads import endpoint_ownership
+            root = endpoint_ownership.validate_root(state_root)
+            if socket_path is None:
+                raise WorkerStateError
+            endpoint_certificate = endpoint_ownership.preflight(root)
         requested_socket_path: Path | None = None
         if socket_path is not None:
             try:
-                requested_socket_path = validate_available_socket_path(
-                    _validate_ipc_socket_path(root, socket_path)
-                )
+                requested_socket_path = _validate_ipc_socket_path(root, socket_path)
+                if not recover_socket:
+                    requested_socket_path = validate_available_socket_path(requested_socket_path)
             except IPCStateError:
                 raise WorkerStateError from None
         lease_descriptor = _acquire_worker_lease(root)
         if lease_descriptor is None:
             return worker_busy
 
+        if recover_socket:
+            endpoint_ownership.reclaim(root, endpoint_certificate)
         store = SQLiteStore(root / _STATE_DATABASE_NAME)
         store.recover_cold_start()
         direct_recovery_blocked = _recover_cold_direct_engine(store)
@@ -1134,7 +1145,12 @@ def run_worker(
                 )
             except IPCStateError:
                 raise WorkerStateError from None
-        ready_event.set()
+        if recover_socket:
+            owned_endpoint_certificate = endpoint_ownership.publish(
+                root, endpoint_certificate, store.worker_epoch(), health_server._identity
+            )
+        if not recover_socket or not shutdown_event.wait(0):
+            ready_event.set()
         if health_server is None:
             shutdown_event.wait()
         else:
@@ -1154,6 +1170,8 @@ def run_worker(
                         observation_thread.join(_OBSERVATION_JOIN_SECONDS)
                     if health_server is not None:
                         health_server.close()
+                        if owned_endpoint_certificate is not None:
+                            endpoint_ownership.clear(root, owned_endpoint_certificate)
                 finally:
                     if store is not None:
                         store.close()

@@ -15,7 +15,7 @@ dependencies = [
 [project.scripts]
 hermes-downloads = "hermes_downloads.cli:main"
 hermes-downloads-mcp = "hermes_downloads.mcp_server:main"
-hermes-downloads-worker = "hermes_downloads.worker:main"
+hermes-downloads-worker = "hermes_downloads.service:worker_main"
 
 [dependency-groups]
 dev = [

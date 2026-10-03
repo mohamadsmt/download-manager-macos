@@ -35,6 +35,8 @@ EXPECTED_WHEEL_MODULES = {
     "hermes_downloads/store.py",
     "hermes_downloads/video.py",
     "hermes_downloads/worker.py",
+    "hermes_downloads/service.py",
+    "hermes_downloads/endpoint_ownership.py",
 }
 ENTRYPOINTS = (
     "hermes-downloads",
@@ -116,7 +118,7 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     assert project["project"]["scripts"] == {
         "hermes-downloads": "hermes_downloads.cli:main",
         "hermes-downloads-mcp": "hermes_downloads.mcp_server:main",
-        "hermes-downloads-worker": "hermes_downloads.worker:main",
+        "hermes-downloads-worker": "hermes_downloads.service:worker_main",
     }
 
     uv = shutil.which("uv")
