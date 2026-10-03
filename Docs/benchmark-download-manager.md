@@ -198,6 +198,15 @@ stops immediately: no later inventory engine, completion or probe is launched,
 including after a verified completion whose separate probe fails containment.
 Unrelated `RuntimeError` exceptions are not converted into containment failures.
 
+After the existing SIGKILL, an owned-group zero probe returning EPERM leaves
+group absence unknown. The runner continues only read-only owned-leader `wait4`
+and zero-probe observations within the original aggregate deadline, sends no
+further signals, and requires both positive leader reaping and positive group
+absence (ProcessLookupError) before declaring containment. Persistent uncertainty
+exhausts that same deadline and raises `ContainmentFailure`; other signal, probe,
+and wait errors still fail closed immediately. Known reaped process accounting is
+retained, while unobserved accounting remains null.
+
 Private `containment-failure.json` evidence and the report retain only known owned
 PID/process-group/session authority and observed shutdown/accounting facts. Missing
 authority stays null; group absence is false when observed present and null when

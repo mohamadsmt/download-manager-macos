@@ -1024,3 +1024,217 @@ def test_origin_cleanup_error_preserves_prior_owned_engine_authority(tmp_path: P
         assert "test-only-sensitive-detail" not in json.dumps(caught.value.evidence)
     finally:
         origin.server.server_close()
+
+# Revision 2 lifecycle injections never start a process or address a real group.
+def _post_kill_lifecycle(benchmark, monkeypatch, *, persistent=False,
+                         reap=True, error=None):
+    import errno
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(now=0.0, calls=[], launches=[], denied=0,
+                            killed=False, reaped=False, wait_error=False)
+    process = SimpleNamespace(pid=123456, returncode=None)
+    usage = SimpleNamespace(ru_utime=0.1, ru_stime=0.2, ru_maxrss=4096)
+
+    def clock():
+        return state.now
+
+    def sleep(seconds):
+        state.now = round(state.now + seconds, 8)
+
+    def launch(argv, **kwargs):
+        assert kwargs["start_new_session"] is True and kwargs["shell"] is False
+        state.launches.append(argv)
+        return process
+
+    def wait(pid, flags):
+        assert pid == process.pid and flags == benchmark.os.WNOHANG
+        if state.denied and error == "wait4":
+            state.wait_error = True
+            raise PermissionError(errno.EPERM, "injected wait failure")
+        if state.denied and reap:
+            assert not state.reaped
+            state.reaped = True
+            return pid, benchmark.signal.SIGKILL, usage
+        return 0, 0, None
+
+    def killpg(pid, sig):
+        assert pid == process.pid
+        state.calls.append((pid, sig, state.now))
+        if sig == benchmark.signal.SIGTERM and error == "sigterm":
+            raise PermissionError(errno.EPERM, "injected signal failure")
+        if sig == benchmark.signal.SIGKILL:
+            if error == "sigkill":
+                raise PermissionError(errno.EPERM, "injected signal failure")
+            state.killed = True
+        if sig == 0 and state.killed:
+            if error == "zero-eacces":
+                raise PermissionError(errno.EACCES, "injected different probe failure")
+            if not state.denied or persistent:
+                state.denied += 1
+                raise PermissionError(errno.EPERM, "injected zero-probe uncertainty")
+            raise ProcessLookupError(errno.ESRCH, "injected positive group absence")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("PID/global process control is outside owned group authority")
+
+    monkeypatch.setattr(benchmark.time, "monotonic", clock)
+    monkeypatch.setattr(benchmark.time, "sleep", sleep)
+    monkeypatch.setattr(benchmark.subprocess, "Popen", launch)
+    monkeypatch.setattr(benchmark.os, "wait4", wait)
+    monkeypatch.setattr(benchmark.os, "killpg", killpg)
+    monkeypatch.setattr(benchmark.os, "kill", forbidden)
+    state.clock, state.process = clock, process
+    return state
+
+
+def _assert_only_initial_owned_signals(benchmark, state):
+    signals = [(pid, sig) for pid, sig, _ in state.calls if sig]
+    assert signals == [(123456, benchmark.signal.SIGTERM),
+                       (123456, benchmark.signal.SIGKILL)]
+    kill_index = next(i for i, (_, sig, _) in enumerate(state.calls)
+                      if sig == benchmark.signal.SIGKILL)
+    assert all(sig == 0 for _, sig, _ in state.calls[kill_index + 1:])
+
+
+def test_post_kill_zero_probe_eperm_reaps_and_proves_absence_within_original_budget(
+        tmp_path: Path, monkeypatch) -> None:
+    benchmark = _benchmark()
+    state = _post_kill_lifecycle(benchmark, monkeypatch)
+    budget = benchmark.RunBudget(2, 100, clock=state.clock)
+    deadline = budget.deadline
+    result = benchmark.run_child(["test-only-owned"], tmp_path, budget,
+                                 timeout=0.3, log_name="post-kill")
+    assert state.denied == 1 and state.reaped is True
+    assert result["contained"] is True and result["forced"] is True
+    assert result["exit_code"] == -benchmark.signal.SIGKILL
+    assert result["failure_classification"] == "timeout"
+    assert result["cpu_seconds"] == pytest.approx(0.3)
+    assert result["max_rss_bytes"] == benchmark.normalize_rss(4096)
+    assert budget.deadline == deadline == 2 and state.now < deadline
+    assert [sig for _, sig, _ in state.calls] == [
+        0, benchmark.signal.SIGTERM, 0, benchmark.signal.SIGKILL, 0, 0]
+    _assert_only_initial_owned_signals(benchmark, state)
+
+
+@pytest.mark.parametrize("reap", [False, True])
+def test_persistent_post_kill_zero_probe_eperm_exhausts_original_budget_truthfully(
+        tmp_path: Path, monkeypatch, reap) -> None:
+    benchmark = _benchmark()
+    state = _post_kill_lifecycle(benchmark, monkeypatch, persistent=True, reap=reap)
+    budget = benchmark.RunBudget(2, 100, clock=state.clock)
+    deadline = budget.deadline
+    with pytest.raises(benchmark.ContainmentFailure) as caught:
+        benchmark.run_child(["test-only-owned"], tmp_path, budget,
+                            timeout=0.3, log_name="persistent")
+    failure = caught.value
+    assert state.denied > 1 and state.now == deadline == budget.deadline == 2
+    assert failure.evidence["status"] == "uncertain"
+    assert failure.evidence["authority"] == {
+        "pid": 123456, "process_group_id": 123456, "session_id": 123456}
+    assert failure.evidence["observations"] == {
+        "group_absent": None, "leader_reaped": reap, "forced": True}
+    assert failure.accounting["contained"] is False
+    assert failure.accounting["exit_code"] == (-benchmark.signal.SIGKILL if reap else None)
+    assert failure.accounting["cpu_seconds"] == (pytest.approx(0.3) if reap else None)
+    assert failure.accounting["max_rss_bytes"] == (benchmark.normalize_rss(4096) if reap else None)
+    assert failure.accounting["pause_latency_seconds"] is None
+    _assert_only_initial_owned_signals(benchmark, state)
+
+
+def test_post_kill_positive_group_absence_without_owned_reap_is_not_containment(
+        tmp_path: Path, monkeypatch) -> None:
+    benchmark = _benchmark()
+    state = _post_kill_lifecycle(benchmark, monkeypatch, reap=False)
+    budget = benchmark.RunBudget(2, 100, clock=state.clock)
+    with pytest.raises(benchmark.ContainmentFailure) as caught:
+        benchmark.run_child(["test-only-owned"], tmp_path, budget,
+                            timeout=0.3, log_name="unreaped")
+    assert state.now == budget.deadline == 2
+    assert caught.value.evidence["observations"] == {
+        "group_absent": True, "leader_reaped": False, "forced": True}
+    assert caught.value.accounting["cpu_seconds"] is None
+    assert caught.value.accounting["contained"] is False
+    _assert_only_initial_owned_signals(benchmark, state)
+
+
+@pytest.mark.parametrize("error", ["sigterm", "sigkill", "wait4", "zero-eacces"])
+def test_post_kill_probe_uncertainty_does_not_defer_other_errors(
+        tmp_path: Path, monkeypatch, error) -> None:
+    benchmark = _benchmark()
+    state = _post_kill_lifecycle(benchmark, monkeypatch, error=error)
+    budget = benchmark.RunBudget(2, 100, clock=state.clock)
+    with pytest.raises(benchmark.ContainmentFailure) as caught:
+        benchmark.run_child(["test-only-owned"], tmp_path, budget,
+                            timeout=0.3, log_name="other-error")
+    assert state.now < budget.deadline == 2
+    assert caught.value.evidence["observations"]["group_absent"] is None
+    assert caught.value.evidence["observations"]["leader_reaped"] is False
+    assert caught.value.accounting["cpu_seconds"] is None
+    assert "injected" not in json.dumps(caught.value.evidence)
+    if error == "wait4":
+        assert state.denied == 1 and state.wait_error is True
+        _assert_only_initial_owned_signals(benchmark, state)
+    else:
+        assert state.denied == 0
+
+
+@pytest.mark.parametrize("reap", [False, True])
+def test_persistent_post_kill_eperm_retains_current_and_remaining_baseline_slots(
+        tmp_path: Path, monkeypatch, reap) -> None:
+    benchmark = _benchmark()
+    state = _post_kill_lifecycle(benchmark, monkeypatch, persistent=True, reap=reap)
+    from functools import partial
+    monkeypatch.setattr(benchmark, "RunBudget", partial(benchmark.RunBudget, clock=state.clock))
+    monkeypatch.setattr(benchmark, "generate_fixture", lambda *args: FIXTURE_SHA256)
+    # No version observation took place; do not invent engine versions.
+    monkeypatch.setattr(benchmark, "inventory_engines", lambda *args: {})
+
+    class Origin:
+        def __init__(self, *args):
+            self.port, self.error = 12345, None
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def ledger(self):
+            return {"server_payload_bytes": 65536, "unique_payload_bytes": 65536,
+                    "retransmitted_bytes": 0, "requests": []}
+
+    monkeypatch.setattr(benchmark, "LocalOrigin", Origin)
+    admissions = []
+    def trial(record, directory, fixture, budget, inventory, trial_seconds):
+        admissions.append(record["trial_id"])
+        benchmark._run_trial_phase(record, directory, fixture, budget, 0, PAYLOAD_BYTES,
+                                   "curl-single", "test-only-owned", trial_seconds)
+        pytest.fail("uncertain containment cannot return a trial success")
+    monkeypatch.setattr(benchmark, "execute_baseline_trial", trial)
+    report = benchmark.run_baselines(tmp_path, "persistent-slots", wall_seconds=2,
+                                     trial_seconds=0.3)
+    directory = tmp_path / "persistent-slots"
+    records = [json.loads((directory / "trials" / f"{m}-{e}-{r}.json").read_text())
+               for m, e, r in benchmark.baseline_sequence()]
+    assert state.now == 2 and state.denied > 1
+    assert admissions == ["unrestricted-curl-single-1"] and len(state.launches) == 1
+    assert len(records) == report["trial_count"] == len(report["failed_trials"]) == 18
+    assert report["status"] == "failed_local_baseline"
+    assert json.loads((directory / "report.json").read_text()) == report
+    assert not (directory / "summary.json").exists()
+    evidence = json.loads((directory / "containment-failure.json").read_text())
+    assert report["containment_failure"] == evidence
+    assert evidence["authority"]["pid"] == 123456
+    assert evidence["observations"] == {
+        "group_absent": None, "leader_reaped": reap, "forced": True}
+    assert records[0]["elapsed_seconds"] == 2
+    assert records[0]["cpu_seconds"] == (pytest.approx(0.3) if reap else None)
+    assert records[0]["max_rss_bytes"] == (benchmark.normalize_rss(4096) if reap else None)
+    assert records[0]["server_payload_bytes"] == 65536
+    assert records[0]["client_payload_bytes"] is None
+    for record in records:
+        assert record["outcome"] == "failed"
+        assert record["failure_classification"] == "containment_error"
+        assert record["completion_sha256"] is None and record["pause_probe"] is None
+        assert record["configuration"]["versions"] == {"python": sys.version.split()[0]}
+        benchmark.validate_trial_record(record)
+    assert all(all(r[m] is None for m in benchmark.MEASURED_METRICS) for r in records[1:])
+    _assert_only_initial_owned_signals(benchmark, state)

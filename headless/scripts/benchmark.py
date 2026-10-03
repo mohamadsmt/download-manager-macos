@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
+import errno
 import hashlib
 import http.server
 import inspect
@@ -805,9 +806,17 @@ def run_child(argv: list[str], directory: Path, budget: RunBudget, *, timeout: f
     forced = False
     group_absent = None
 
-    def group_exists() -> bool:
+    def group_exists(*, post_kill: bool = False) -> bool | None:
         nonlocal group_absent
-        exists = _group_exists(process.pid)
+        try:
+            exists = _group_exists(process.pid)
+        except PermissionError as error:
+            if not (post_kill and forced and error.errno == errno.EPERM):
+                raise
+            # Only this read-only post-SIGKILL probe may be reobserved. EPERM
+            # establishes neither presence nor absence and authorizes no signal.
+            group_absent = None
+            return None
         group_absent = not exists
         return exists
 
@@ -882,10 +891,10 @@ def run_child(argv: list[str], directory: Path, budget: RunBudget, *, timeout: f
                             waited, observed_status, observed_usage = os.wait4(process.pid, os.WNOHANG)
                             if waited:
                                 status, usage = observed_status, observed_usage
-                        if not group_exists() and status is not None:
+                        if group_exists(post_kill=True) is False and status is not None:
                             break
-                        time.sleep(0.01)
-                if group_exists() or status is None:
+                        time.sleep(min(0.01, max(0, budget.deadline - time.monotonic())))
+                if group_absent is not True or status is None:
                     raise uncertain()
                 process.returncode = os.waitstatus_to_exitcode(status)
             except OSError:
