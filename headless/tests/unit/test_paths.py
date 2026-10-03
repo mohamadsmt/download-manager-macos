@@ -1571,10 +1571,8 @@ def test_publishes_attested_staged_payload_with_a_descriptor_relative_hard_link(
     assert "PublishedFinalPayload" in paths.__all__
     assert "publish_staged_partial_payload" in paths.__all__
     assert tuple(paths.PublishedFinalPayload.__dataclass_fields__) == (
-        "path",
-        "st_dev",
-        "st_ino",
-        "logical_size",
+        "path", "st_dev", "st_ino", "logical_size", "st_mode", "st_nlink",
+        "mtime_ns", "ctime_ns", "sha256", "marker", "directory_identities",
     )
     assert published == paths.PublishedFinalPayload(
         path=destination.final_path,
@@ -2297,3 +2295,504 @@ def test_existing_only_option_is_validated_before_namespace_operations(monkeypat
     monkeypatch.setattr(paths, "_open_root", forbidden_open)
     with pytest.raises(paths.PathValidationError):
         paths.publish_staged_partial_payload(destination, reservation, staged, existing_only=invalid)
+
+
+# Strict evidence is a foundation for an owner-issued live publication attempt.
+# These fixtures attest real descriptor metadata; they do not simulate worker completion.
+def _strict_fixture(payload=b"complete payload bytes"):
+    paths = _paths()
+    destination, reservation, staged = _attest_prepared_staged_partial(paths, payload)
+    marker = paths.attest_publication_reservation_marker(destination, reservation)
+    return paths, destination, reservation, staged, marker
+
+
+def _strict_prepare(fixture):
+    paths, destination, reservation, staged, marker = fixture
+    return paths.prepare_publication_payload(destination, reservation, marker, staged)
+
+
+def _strict_publish(fixture, prepared, permit=None):
+    paths, destination, reservation, staged, _ = fixture
+    return paths.publish_staged_partial_payload(
+        destination, reservation, staged, prepared=prepared,
+        creation_permit=permit if permit is not None else paths.PublicationCreationPermit(),
+    )
+
+
+def _strict_metadata(path):
+    details = path.stat()
+    return (details.st_dev, details.st_ino, details.st_size, details.st_mode,
+            details.st_nlink, details.st_mtime_ns, details.st_ctime_ns)
+
+
+def _strict_rewrite(path):
+    before = path.stat()
+    payload = path.read_bytes()
+    path.write_bytes(bytes(value ^ 1 for value in payload))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    assert after.st_ctime_ns != before.st_ctime_ns
+
+
+def test_strict_preparation_and_publication_return_frozen_full_byte_evidence():
+    import hashlib
+    from dataclasses import FrozenInstanceError
+    fixture = _strict_fixture()
+    paths, destination, reservation, staged, marker = fixture
+    original = _strict_metadata(destination.partial_path)
+    prepared = _strict_prepare(fixture)
+    assert prepared.destination == destination
+    assert prepared.reservation == reservation
+    assert prepared.marker == marker
+    assert prepared.staged_payload == staged
+    assert prepared.sha256 == hashlib.sha256(b"complete payload bytes").hexdigest()
+    assert not destination.final_path.exists()
+    assert _strict_metadata(destination.partial_path) == original
+    with pytest.raises(FrozenInstanceError):
+        prepared.sha256 = "0" * 64
+    result = _strict_publish(fixture, prepared)
+    actual = _strict_metadata(destination.final_path)
+    assert actual == _strict_metadata(destination.partial_path)
+    assert actual[:4] == original[:4] and actual[5] == original[5]
+    assert actual[4] == 2 and actual[6] != original[6]
+    assert (result.st_dev, result.st_ino, result.logical_size, result.st_mode,
+            result.st_nlink, result.mtime_ns, result.ctime_ns) == actual
+    assert result.sha256 == prepared.sha256
+    assert result.directory_identities == prepared.directory_identities
+    assert result.marker == marker
+    assert result.path == destination.final_path
+    assert _marker_path(destination).read_bytes()
+    with pytest.raises(FrozenInstanceError):
+        result.ctime_ns = 0
+
+
+@pytest.mark.parametrize("field", ("st_mode", "st_nlink", "mtime_ns", "ctime_ns"))
+def test_strict_preparation_rejects_absent_original_metadata(field):
+    fixture = _strict_fixture()
+    paths, destination, reservation, staged, marker = fixture
+    bad = replace(staged, **{field: None})
+    with pytest.raises(paths.PathValidationError):
+        paths.prepare_publication_payload(destination, reservation, marker, bad)
+    assert not destination.final_path.exists()
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert _marker_path(destination).exists()
+
+
+@pytest.mark.parametrize("mutation", ("rewrite", "mode", "extra-link", "marker"))
+@pytest.mark.parametrize("boundary", ("before-prepare", "before-link"))
+def test_strict_original_authority_drift_rejects_without_creation(mutation, boundary, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, reservation, staged, marker = fixture
+    prepared = _strict_prepare(fixture) if boundary == "before-link" else None
+    if mutation == "rewrite":
+        _strict_rewrite(destination.partial_path)
+    elif mutation == "mode":
+        destination.partial_path.chmod(0o400)
+    elif mutation == "extra-link":
+        os.link(destination.partial_path, destination.incomplete_dir / "extra")
+    else:
+        marker.path.rename(marker.path.with_name("retained-marker"))
+        marker.path.write_bytes(marker.path.with_name("retained-marker").read_bytes())
+        marker.path.chmod(0o600)
+        assert marker.path.stat().st_ino != marker.st_ino
+    calls = []
+    monkeypatch.setattr(paths.os, "link", lambda *a, **k: calls.append(1))
+    with pytest.raises(paths.PathValidationError):
+        if prepared is None:
+            _strict_prepare(fixture)
+        else:
+            _strict_publish(fixture, prepared)
+    assert calls == [] and not destination.final_path.exists()
+    assert destination.partial_path.exists() and marker.path.exists()
+
+
+def test_strict_rewrite_during_preparation_hash_is_rejected(monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, staged, _ = fixture
+    real_pread = paths.os.pread
+    mutated = False
+    def rewrite_after_read(fd, count, offset):
+        nonlocal mutated
+        result = real_pread(fd, count, offset)
+        if os.fstat(fd).st_ino == staged.st_ino and result and not mutated:
+            mutated = True
+            _strict_rewrite(destination.partial_path)
+        return result
+    monkeypatch.setattr(paths.os, "pread", rewrite_after_read)
+    with pytest.raises(paths.PathValidationError):
+        _strict_prepare(fixture)
+    assert mutated and not destination.final_path.exists()
+    assert destination.partial_path.exists() and _marker_path(destination).exists()
+
+
+@pytest.mark.parametrize("mutation", ("rewrite", "mode", "extra-link", "marker"))
+@pytest.mark.parametrize("boundary", ("after-link", "after-hash", "before-fsync-return"))
+def test_strict_postlink_drift_rejects_and_retains_uncertain_final(mutation, boundary, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, _, marker = fixture
+    prepared = _strict_prepare(fixture)
+    injected = False
+    def mutate():
+        nonlocal injected
+        assert not injected
+        injected = True
+        if mutation == "rewrite":
+            _strict_rewrite(destination.partial_path)
+        elif mutation == "mode":
+            destination.partial_path.chmod(0o400)
+        elif mutation == "extra-link":
+            os.link(destination.partial_path, destination.incomplete_dir / "extra")
+        else:
+            marker.path.rename(marker.path.with_name("retained-marker"))
+            marker.path.write_bytes(marker.path.with_name("retained-marker").read_bytes())
+            marker.path.chmod(0o600)
+    if boundary == "after-link":
+        real_link = paths.os.link
+        def link_then_mutate(*args, **kwargs):
+            real_link(*args, **kwargs)
+            # Extra link uses the unpatched primitive to avoid recursive injection.
+            if mutation == "extra-link":
+                nonlocal injected
+                injected = True
+                real_link(destination.partial_path, destination.incomplete_dir / "extra")
+            else:
+                mutate()
+        monkeypatch.setattr(paths.os, "link", link_then_mutate)
+    elif boundary == "after-hash":
+        real_hash = paths._hash_publication_payload
+        def hash_then_mutate(*args, **kwargs):
+            digest = real_hash(*args, **kwargs)
+            mutate()
+            return digest
+        monkeypatch.setattr(paths, "_hash_publication_payload", hash_then_mutate)
+    else:
+        real_sync = paths._fsync_published_final_directory
+        def sync_then_mutate(fd):
+            real_sync(fd)
+            mutate()
+        monkeypatch.setattr(paths, "_fsync_published_final_directory", sync_then_mutate)
+    permit = paths.PublicationCreationPermit()
+    with pytest.raises(paths.PathValidationError):
+        _strict_publish(fixture, prepared, permit)
+    assert injected and destination.final_path.exists()
+    assert destination.partial_path.exists() and marker.path.exists()
+    assert permit.snapshot().creation_attempted and not permit.snapshot().in_flight
+
+
+@pytest.mark.parametrize("target", ("root", "final", "incomplete", "job"))
+@pytest.mark.parametrize("boundary", ("prepare", "link", "fsync"))
+def test_strict_directory_swap_fails_closed_and_retains_entries(target, boundary, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = _strict_prepare(fixture) if boundary != "prepare" else None
+    directories = dict(root=destination.root, final=destination.final_path.parent,
+                       incomplete=destination.incomplete_dir.parent, job=destination.incomplete_dir)
+    selected = directories[target]
+    detached = selected.with_name(selected.name + "-retained")
+    marker_path = _marker_path(destination)
+    marker_before = _entry_signature(marker_path)
+    marker_bytes = marker_path.read_bytes()
+    partial_before = _entry_signature(destination.partial_path)[:2]
+    injected = False
+    def swap():
+        nonlocal injected
+        assert not injected
+        injected = True
+        selected.rename(detached)
+        selected.mkdir()
+    if boundary == "prepare":
+        real_pread = paths.os.pread
+        def read_then_swap(*args):
+            result = real_pread(*args)
+            if not injected:
+                swap()
+            return result
+        monkeypatch.setattr(paths.os, "pread", read_then_swap)
+    elif boundary == "link":
+        real_link = paths.os.link
+        def link_then_swap(*args, **kwargs):
+            real_link(*args, **kwargs)
+            swap()
+        monkeypatch.setattr(paths.os, "link", link_then_swap)
+    else:
+        real_sync = paths._fsync_published_final_directory
+        def sync_then_swap(fd):
+            real_sync(fd)
+            swap()
+        monkeypatch.setattr(paths, "_fsync_published_final_directory", sync_then_swap)
+    with pytest.raises(paths.PathValidationError):
+        if prepared is None:
+            _strict_prepare(fixture)
+        else:
+            _strict_publish(fixture, prepared)
+    assert injected and detached.is_dir() and selected.is_dir()
+    def retained(path):
+        return detached / path.relative_to(selected) if path.is_relative_to(selected) else path
+    retained_partial, retained_marker = retained(destination.partial_path), retained(marker_path)
+    assert _entry_signature(retained_partial)[:2] == partial_before
+    assert retained_partial.read_bytes() == b"complete payload bytes"
+    assert _entry_signature(retained_marker) == marker_before
+    assert retained_marker.read_bytes() == marker_bytes
+    if boundary != "prepare":
+        retained_final = retained(destination.final_path)
+        assert _entry_signature(retained_final)[:2] == partial_before
+        assert retained_final.read_bytes() == b"complete payload bytes"
+
+
+@pytest.mark.parametrize("target", ("partial", "final"))
+@pytest.mark.parametrize("kind", ("symlink", "fifo", "directory", "regular"))
+def test_strict_unsafe_entries_and_collisions_never_link_or_delete(target, kind, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = _strict_prepare(fixture)
+    selected = destination.partial_path if target == "partial" else destination.final_path
+    if target == "partial":
+        selected.rename(selected.with_name("retained-payload"))
+    if kind == "symlink":
+        selected.symlink_to(destination.incomplete_dir / "nonexistent")
+    elif kind == "fifo":
+        os.mkfifo(selected)
+    elif kind == "directory":
+        selected.mkdir()
+    else:
+        selected.write_bytes(b"other payload")
+    before = os.lstat(selected)
+    calls = []
+    monkeypatch.setattr(paths.os, "link", lambda *a, **k: calls.append(1))
+    with pytest.raises(paths.PathValidationError):
+        _strict_publish(fixture, prepared)
+    after = os.lstat(selected)
+    assert (after.st_dev, after.st_ino, after.st_mode) == (before.st_dev, before.st_ino, before.st_mode)
+    assert calls == [] and _marker_path(destination).exists()
+
+
+@pytest.mark.parametrize("barrier", ("before-enter", "in-link", "post-link"))
+def test_strict_creation_permit_revocation_is_truthful_and_nonblocking(barrier, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from dataclasses import FrozenInstanceError
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = _strict_prepare(fixture)
+    permit = paths.PublicationCreationPermit()
+    entered, release = Event(), Event()
+    real_link = paths.os.link
+    calls = []
+    def held_link(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(3)
+        return real_link(*args, **kwargs)
+    real_sync = paths._fsync_published_final_directory
+    def held_sync(fd):
+        entered.set()
+        assert release.wait(3)
+        real_sync(fd)
+    if barrier == "before-enter":
+        snapshot = permit.revoke()
+        assert snapshot.revoked and not snapshot.creation_attempted and not snapshot.in_flight
+        with pytest.raises(paths.PathValidationError):
+            _strict_publish(fixture, prepared, permit)
+        assert not destination.final_path.exists()
+    else:
+        monkeypatch.setattr(paths.os, "link", held_link if barrier == "in-link" else lambda *a, **k: (calls.append(1), real_link(*a, **k))[1])
+        if barrier == "post-link":
+            monkeypatch.setattr(paths, "_fsync_published_final_directory", held_sync)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            publication = pool.submit(_strict_publish, fixture, prepared, permit)
+            try:
+                assert entered.wait(3)
+                # A separate thread must revoke while the syscall is held; a mutex
+                # held across os.link would make this bounded result time out.
+                snapshot = pool.submit(permit.revoke).result(timeout=1)
+                assert snapshot.revoked and snapshot.creation_attempted
+                assert snapshot.in_flight == (barrier == "in-link")
+                with pytest.raises(FrozenInstanceError):
+                    snapshot.revoked = False
+            finally:
+                release.set()
+            publication.result(timeout=3)
+        assert calls == [1] and destination.final_path.exists()
+    final_snapshot = permit.snapshot()
+    assert final_snapshot.revoked and not final_snapshot.in_flight
+    with pytest.raises(paths.PathValidationError):
+        permit._enter_creation()
+    assert permit.snapshot() == final_snapshot
+
+
+def test_strict_creation_permit_is_one_attempt_even_after_exception(monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = _strict_prepare(fixture)
+    permit = paths.PublicationCreationPermit()
+    calls = []
+    def failed_link(*args, **kwargs):
+        calls.append(1)
+        raise OSError("injected link failure")
+    monkeypatch.setattr(paths.os, "link", failed_link)
+    for _ in range(2):
+        with pytest.raises(paths.PathValidationError):
+            _strict_publish(fixture, prepared, permit)
+    assert calls == [1]
+    assert permit.snapshot().creation_attempted and not permit.snapshot().in_flight
+    assert not destination.final_path.exists()
+    assert destination.partial_path.exists() and _marker_path(destination).exists()
+
+
+@pytest.mark.parametrize("fault", ("hash", "fsync"))
+def test_strict_publication_faults_retain_names_and_quiesce_permit(fault, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = _strict_prepare(fixture)
+    permit = paths.PublicationCreationPermit()
+    def fail(*args, **kwargs):
+        raise paths.PathValidationError("injected evidence fault")
+    monkeypatch.setattr(paths, "_hash_publication_payload" if fault == "hash" else "_fsync_published_final_directory", fail)
+    with pytest.raises(paths.PathValidationError):
+        _strict_publish(fixture, prepared, permit)
+    assert destination.final_path.exists() and destination.partial_path.exists()
+    assert _marker_path(destination).exists()
+    assert permit.snapshot().creation_attempted and not permit.snapshot().in_flight
+
+
+@pytest.mark.parametrize("field,value", (("sha256", None), ("sha256", "bad"),
+    ("directory_identities", ()), ("marker", None), ("staged_payload", None)))
+def test_strict_prepared_evidence_type_damage_rejects_before_link(field, value, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = replace(_strict_prepare(fixture), **{field: value})
+    calls = []
+    monkeypatch.setattr(paths.os, "link", lambda *a, **k: calls.append(1))
+    with pytest.raises(paths.PathValidationError):
+        _strict_publish(fixture, prepared)
+    assert calls == [] and not destination.final_path.exists()
+    assert destination.partial_path.exists() and _marker_path(destination).exists()
+
+
+@pytest.mark.parametrize("exception", (OSError, RuntimeError, KeyboardInterrupt))
+def test_strict_every_link_exception_clears_inflight_without_rearming(exception, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = _strict_prepare(fixture)
+    permit = paths.PublicationCreationPermit()
+    def fail(*args, **kwargs):
+        assert permit.snapshot().in_flight
+        raise exception("injected syscall failure")
+    monkeypatch.setattr(paths.os, "link", fail)
+    expected_error = paths.PathValidationError if exception is OSError else exception
+    with pytest.raises(expected_error):
+        _strict_publish(fixture, prepared, permit)
+    assert permit.snapshot().creation_attempted and not permit.snapshot().in_flight
+    with pytest.raises(paths.PathValidationError):
+        permit._enter_creation()
+    assert not destination.final_path.exists()
+    assert destination.partial_path.exists() and _marker_path(destination).exists()
+
+
+def test_strict_concurrent_publishers_cannot_share_creation_permit(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = _strict_prepare(fixture)
+    permit = paths.PublicationCreationPermit()
+    entered, release = Event(), Event()
+    calls = []
+    real_link = paths.os.link
+    def held_link(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(3)
+        return real_link(*args, **kwargs)
+    monkeypatch.setattr(paths.os, "link", held_link)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(_strict_publish, fixture, prepared, permit)
+        try:
+            assert entered.wait(3)
+            second = pool.submit(_strict_publish, fixture, prepared, permit)
+            with pytest.raises(paths.PathValidationError):
+                second.result(timeout=1)
+            assert permit.snapshot().in_flight
+        finally:
+            release.set()
+        first.result(timeout=3)
+    assert calls == [1]
+    assert destination.final_path.read_bytes() == b"complete payload bytes"
+    assert permit.snapshot().creation_attempted and not permit.snapshot().in_flight
+
+
+def test_strict_collision_during_link_is_not_accepted_or_deleted(monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, _, _, _ = fixture
+    prepared = _strict_prepare(fixture)
+    permit = paths.PublicationCreationPermit()
+    real_link = paths.os.link
+    def collide(*args, **kwargs):
+        destination.final_path.write_bytes(b"preexisting collision")
+        return real_link(*args, **kwargs)
+    monkeypatch.setattr(paths.os, "link", collide)
+    with pytest.raises(paths.FinalPathCollisionError):
+        _strict_publish(fixture, prepared, permit)
+    assert destination.final_path.read_bytes() == b"preexisting collision"
+    assert destination.partial_path.read_bytes() == b"complete payload bytes"
+    assert _marker_path(destination).exists()
+    assert permit.snapshot().creation_attempted and not permit.snapshot().in_flight
+
+
+@pytest.mark.parametrize("boundary", ("prepare", "publish"))
+def test_strict_byte_read_faults_are_redacted_and_preserve_all_names(boundary, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, reservation, staged, _ = fixture
+    prepared = _strict_prepare(fixture) if boundary == "publish" else None
+    real_pread = paths.os.pread
+    def fail_payload_read(fd, count, offset):
+        if os.fstat(fd).st_ino == staged.st_ino:
+            raise OSError(reservation.claim_token)
+        return real_pread(fd, count, offset)
+    monkeypatch.setattr(paths.os, "pread", fail_payload_read)
+    with pytest.raises(paths.PathValidationError) as raised:
+        if prepared is None:
+            _strict_prepare(fixture)
+        else:
+            _strict_publish(fixture, prepared)
+    assert reservation.claim_token not in str(raised.value)
+    assert destination.partial_path.exists() and _marker_path(destination).exists()
+    assert destination.final_path.exists() == (boundary == "publish")
+
+
+@pytest.mark.parametrize("missing", ("prepared", "permit"))
+def test_strict_creation_requires_both_evidence_and_permit(missing, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, reservation, staged, _ = fixture
+    prepared = _strict_prepare(fixture)
+    permit = paths.PublicationCreationPermit()
+    calls = []
+    monkeypatch.setattr(paths.os, "link", lambda *a, **k: calls.append(1))
+    with pytest.raises(paths.PathValidationError):
+        paths.publish_staged_partial_payload(destination, reservation, staged,
+            prepared=None if missing == "prepared" else prepared,
+            creation_permit=None if missing == "permit" else permit)
+    assert calls == [] and not destination.final_path.exists()
+    assert destination.partial_path.exists() and _marker_path(destination).exists()
+
+
+@pytest.mark.parametrize("final_state", ("missing", "occupied", "owned"))
+def test_strict_existing_only_is_deferred_and_never_enters_creation(final_state, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, reservation, staged, _ = fixture
+    prepared = _strict_prepare(fixture)
+    permit = paths.PublicationCreationPermit()
+    if final_state == "occupied":
+        destination.final_path.write_bytes(b"occupied")
+    elif final_state == "owned":
+        os.link(destination.partial_path, destination.final_path)
+    calls = []
+    monkeypatch.setattr(paths.os, "link", lambda *a, **k: calls.append(1))
+    with pytest.raises(paths.PathValidationError):
+        paths.publish_staged_partial_payload(destination, reservation, staged,
+            prepared=prepared, creation_permit=permit, existing_only=True)
+    assert calls == [] and not permit.snapshot().creation_attempted
+    assert destination.final_path.exists() == (final_state != "missing")
+    assert destination.partial_path.exists() and _marker_path(destination).exists()
