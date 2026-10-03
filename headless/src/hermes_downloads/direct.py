@@ -21,6 +21,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Final, cast
 
@@ -144,6 +145,7 @@ class DirectAria2Controller:
         self._launch_argv: tuple[str, ...] = ()
         self._by_job_id: dict[str, _TrackedTransfer] = {}
         self._by_gid: dict[str, _TrackedTransfer] = {}
+        self._observation_cancelled = threading.Event()
 
     def __enter__(self) -> DirectAria2Controller:
         self.start()
@@ -203,6 +205,7 @@ class DirectAria2Controller:
             raise DirectEngineError("aria2 is already running")
         if self._private_runtime_path is not None or self._private_config_path is not None:
             raise DirectEngineError("aria2 private runtime cleanup is pending")
+        self._observation_cancelled.clear()
         runtime_path: Path | None = None
         process: subprocess.Popen[bytes] | None = None
         process_group_id: int | None = None
@@ -262,6 +265,7 @@ class DirectAria2Controller:
     def close(self) -> None:
         """Stop the owned daemon and erase its secret-bearing temporary config."""
 
+        self._observation_cancelled.set()
         stopped, interruption = self._stop_owned_process()
         if stopped:
             self._clear_mappings()
@@ -277,6 +281,7 @@ class DirectAria2Controller:
     def discard_absent(self) -> None:
         """Discard a worker-reconciled absent owner without signaling its old PGID."""
 
+        self._observation_cancelled.set()
         process, identity = self._process, self._identity
         if (
             process is None
@@ -419,6 +424,36 @@ class DirectAria2Controller:
 
         return self.readback(job_id=job_id, generation=generation, gid=gid)
 
+    def observe_terminal(
+        self, *, job_id: str, generation: int, gid: str
+    ) -> DirectTransfer | None:
+        """Read exactly once; verify only a complete, still-owned payload.
+
+        This operation makes no queue or mapping changes. The worker runs it
+        outside its IPC/SQLite thread and fences its immutable result again.
+        """
+
+        try:
+            transfer = self._callback_transfer(job_id, generation, gid)
+            if self._observation_cancelled.is_set():
+                raise StaleGenerationError("stale direct observation")
+            state = self._readback(transfer)
+            if state.status in {"active", "waiting", "paused"}:
+                return None
+            if state.status != "complete" or state.total_length != state.completed_length:
+                raise DirectTransferError("aria2 terminal observation failed")
+            verified = self._verify_completed_output(state, transfer)
+            if (
+                self._observation_cancelled.is_set()
+                or self._callback_transfer(job_id, generation, gid) is not transfer
+            ):
+                raise StaleGenerationError("stale direct observation")
+            return verified
+        except StaleGenerationError:
+            raise
+        except Exception:
+            raise DirectTransferError("aria2 terminal verification failed") from None
+
     def wait_for_terminal(
         self, *, job_id: str, generation: int, timeout: float
     ) -> DirectTransfer:
@@ -485,20 +520,44 @@ class DirectAria2Controller:
     def _verify_completed_output(
         self, state: DirectTransfer, transfer: _TrackedTransfer
     ) -> DirectTransfer:
-        if transfer.expected_sha256 is None:
-            return replace(
-                state,
-                verification=CompletionVerification.TRANSPORT_VERIFIED,
-            )
+        _require_destination(transfer.destination, transfer.job_id)
         try:
-            details = state.partial_path.stat()
-            if not stat.S_ISREG(details.st_mode):
-                raise OSError
-            with state.partial_path.open("rb") as payload:
-                actual_sha256 = hashlib.file_digest(payload, "sha256").hexdigest()
+            descriptor = os.open(
+                state.partial_path,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            )
+            with os.fdopen(descriptor, "rb") as payload:
+                details = os.fstat(payload.fileno())
+                if (
+                    not stat.S_ISREG(details.st_mode)
+                    or details.st_nlink != 1
+                    or state.total_length != state.completed_length
+                    or details.st_size != state.completed_length
+                ):
+                    raise OSError
+                digest = hashlib.sha256()
+                if transfer.expected_sha256 is not None:
+                    while True:
+                        if self._observation_cancelled.is_set():
+                            raise DirectTransferError("aria2 verification cancelled")
+                        chunk = payload.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                current = state.partial_path.lstat()
+                if (
+                    self._observation_cancelled.is_set()
+                    or not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                    != (details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
+                ):
+                    raise OSError
         except OSError:
             raise DirectTransferError("aria2 output is unavailable") from None
-        if actual_sha256 != transfer.expected_sha256:
+        if transfer.expected_sha256 is None:
+            return replace(state, verification=CompletionVerification.TRANSPORT_VERIFIED)
+        if digest.hexdigest() != transfer.expected_sha256:
             raise DirectTransferError("aria2 hash verification failed")
         return replace(
             state,

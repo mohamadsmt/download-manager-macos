@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import fcntl
+from dataclasses import dataclass
 import os
 from pathlib import Path
+from queue import Queue
 import stat
 import threading
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Callable, Final, Protocol
 from datetime import UTC, datetime
 
 from hermes_downloads.ipc import (
@@ -41,9 +43,11 @@ from hermes_downloads.store import (
     _DirectDispatchPlan,
     _DirectEngineRecoveryCapability,
     _DirectPublicationReconciliationPlan,
+    _DirectTerminalPlan,
 )
 
 if TYPE_CHECKING:
+    from hermes_downloads.direct import DirectTransfer
     from hermes_downloads.paths import DestinationIntent
 
 __all__ = ["WorkerStateError", "main", "run_worker", "worker_busy"]
@@ -57,6 +61,20 @@ worker_busy: Final = "worker_busy"
 _LEASE_FLAGS: Final = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
 _LEASE_MODE: Final = 0o600
 _IPC_POLL_SECONDS: Final = 0.05
+_OBSERVATION_JOIN_SECONDS: Final = 1.5
+# A timed-out observer from an earlier run_worker in this process must drain
+# before any later run can construct another controller. Process exit retires
+# daemon threads; within a process this single private gate spans worker runs.
+_DIRECT_OBSERVATION_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectObservation:
+    """Only immutable evidence crosses from the observer to the SQLite owner."""
+
+    plan: _DirectTerminalPlan
+    result: DirectTransfer | None
+    failed: bool
 
 
 class _LifecycleEvent(Protocol):
@@ -88,6 +106,10 @@ class _DirectController(Protocol):
     def resume(
         self, *, job_id: str, generation: int, admission: Admission
     ) -> object: ...
+
+    def observe_terminal(
+        self, *, job_id: str, generation: int, gid: str
+    ) -> DirectTransfer | None: ...
 
 
 class WorkerStateError(ValueError):
@@ -392,6 +414,9 @@ def run_worker(
     direct_controller_absent_discard_failed = False
     direct_controller_absent_local_cleanup_complete = False
     active_direct_plan: _DirectDispatchPlan | None = None
+    active_terminal_plan: _DirectTerminalPlan | None = None
+    observation_thread: threading.Thread | None = None
+    observation_results: Queue[_DirectObservation] = Queue(maxsize=1)
     try:
         root = _validate_state_root(state_root)
         requested_socket_path: Path | None = None
@@ -443,6 +468,7 @@ def run_worker(
             nonlocal direct_controller_ready
             nonlocal direct_controller_absent_discard_failed
             nonlocal direct_controller_absent_local_cleanup_complete
+            nonlocal active_terminal_plan
 
             direct_controller = None
             direct_fence = None
@@ -454,14 +480,31 @@ def run_worker(
             direct_controller_absent_discard_failed = False
             direct_controller_absent_local_cleanup_complete = False
             active_direct_plan = None
+            active_terminal_plan = None
 
-        def close_owned_direct_controller() -> None:
+        def close_owned_direct_controller(
+            persist_contained: Callable[[], object] | None = None,
+        ) -> object:
+            nonlocal active_terminal_plan, direct_controller_ready, direct_recovery_blocked
+
             controller = direct_controller
             if controller is None:
                 return
-            controller.close()
-            clear_owned_direct_claim()
-            clear_owned_direct_controller_state()
+            # Invalidate callbacks before containment. Keep durable authority
+            # until both containment and any paused/removed transaction succeed.
+            active_terminal_plan = None
+            direct_controller_ready = False
+            try:
+                controller.close()
+                result = None if persist_contained is None else persist_contained()
+                clear_owned_direct_claim()
+                clear_owned_direct_controller_state()
+                return result
+            except BaseException:
+                if persist_contained is not None:
+                    direct_recovery_blocked = True
+                    raise IPCStateError("direct_dispatch_blocked") from None
+                raise
 
         def discard_absent_owned_direct_controller() -> None:
             nonlocal direct_controller_absent_discard_failed
@@ -485,6 +528,8 @@ def run_worker(
         def shutdown_owned_direct_controller() -> None:
             nonlocal direct_controller_absent_discard_failed
 
+            if direct_recovery_blocked:
+                return
             if direct_controller_absent_local_cleanup_complete:
                 clear_owned_direct_claim()
                 clear_owned_direct_controller_state()
@@ -533,6 +578,12 @@ def run_worker(
                 return DirectEngineActivateResult(
                     worker_epoch=current_epoch, status="blocked"
                 )
+            if direct_controller is None and (
+                observation_thread is not None or _DIRECT_OBSERVATION_LOCK.locked()
+            ):
+                return DirectEngineActivateResult(
+                    worker_epoch=current_epoch, status="blocked"
+                )
             if direct_controller is not None:
                 if (
                     direct_controller_absent_discard_failed
@@ -565,6 +616,12 @@ def run_worker(
                         worker_epoch=current_epoch, status="active"
                     )
                 if reconciliation != "absent":
+                    return DirectEngineActivateResult(
+                        worker_epoch=current_epoch, status="blocked"
+                    )
+                if observation_thread is not None:
+                    # Let the pending readback contain/pause this dispatch;
+                    # absence must not replace a controller under its observer.
                     return DirectEngineActivateResult(
                         worker_epoch=current_epoch, status="blocked"
                     )
@@ -667,7 +724,7 @@ def run_worker(
         ) -> DirectJobDispatchResult:
             """Run one bounded, marker-bound direct admission lifecycle."""
 
-            nonlocal active_direct_plan
+            nonlocal active_direct_plan, active_terminal_plan
 
             controller = direct_controller
             controller_ready = (
@@ -675,6 +732,7 @@ def run_worker(
                 and direct_controller_ready
                 and not direct_recovery_blocked
                 and active_direct_plan is None
+                and observation_thread is None
             )
             try:
                 prepared = store.prepare_direct_dispatch(
@@ -810,13 +868,23 @@ def run_worker(
                     admission=plan.admission,
                 )
                 active_direct_plan = plan
+                if direct_record is None:
+                    raise ValueError("direct engine ownership is absent")
+                active_terminal_plan = _DirectTerminalPlan(
+                    dispatch=plan,
+                    record=direct_record,
+                    marker=binding,
+                    gid=paused_transfer.gid,
+                    partial_path=destination.partial_path,
+                )
                 result = store.finish_direct_dispatch(plan)
             except BaseException:
                 # No failed dispatch leaves a live body-capable controller.  The
                 # durable pending receipt becomes a fail-closed paused result.
                 try:
-                    close_owned_direct_controller()
-                    aborted = store.abort_direct_dispatch(plan)
+                    aborted = close_owned_direct_controller(
+                        lambda: store.abort_direct_dispatch(plan)
+                    )
                 except BaseException:
                     raise IPCError("direct_dispatch_blocked") from None
                 return DirectJobDispatchResult(
@@ -845,15 +913,14 @@ def run_worker(
                 and command.expected_revision == plan.revision
             ):
                 try:
-                    close_owned_direct_controller()
-                    result = store.apply_job_control(
+                    result = close_owned_direct_controller(lambda: store.apply_job_control(
                         job_id=command.job,
                         action=command.action,
                         request_id=command.request_id,
                         payload_digest=command.payload_digest,
                         expected_revision=command.expected_revision,
                         _contained_direct_transfer=True,
-                    )
+                    ))
                 except RequestConflictError:
                     raise
                 except (TypeError, ValueError):
@@ -880,15 +947,104 @@ def run_worker(
                 and snapshot[1] == command.expected_revision
             ):
                 try:
-                    close_owned_direct_controller()
-                    store.pause_active_direct_job(
+                    close_owned_direct_controller(lambda: store.pause_active_direct_job(
                         job_id=plan.job.job_id,
                         generation=plan.generation,
                         revision=plan.revision,
-                    )
+                    ))
                 except (TypeError, ValueError):
                     raise IPCError("direct_dispatch_blocked") from None
             return _queue_gate_from_store(store, command)
+
+        def poll_direct_terminal() -> None:
+            """Reap/launch one readback; all persistence stays on this thread."""
+
+            nonlocal observation_thread, active_direct_plan, active_terminal_plan
+
+            if observation_thread is not None:
+                if observation_thread.is_alive():
+                    return
+                observation_thread.join()
+                observation_thread = None
+                observation = observation_results.get_nowait()
+                if observation.plan is active_terminal_plan:
+                    plan = observation.plan.dispatch
+                    current = store.get_job(plan.job.job_id)
+                    if current is None or (
+                        current.generation, current.revision, current.state
+                    ) != (plan.generation, plan.revision, "downloading"):
+                        # No late result may revive a changed job. Contain the
+                        # old owner without writing a lifecycle for the new one.
+                        close_owned_direct_controller()
+                    else:
+                        failed = observation.failed
+                        if not failed and observation.result is not None:
+                            try:
+                                marker = (observation.plan.partial_path.parent / ".hermes-reservation").lstat()
+                                if (
+                                    not stat.S_ISREG(marker.st_mode)
+                                    or marker.st_nlink != 1
+                                    or (marker.st_dev, marker.st_ino) != (
+                                        observation.plan.marker.marker_device,
+                                        observation.plan.marker.marker_inode,
+                                    )
+                                ):
+                                    raise ValueError("direct terminal marker is stale")
+                                store.finalize_direct_terminal(
+                                    observation.plan, observation.result
+                                )
+                            except Exception:
+                                failed = True
+                            else:
+                                active_direct_plan = None
+                                active_terminal_plan = None
+                        if failed:
+                            close_owned_direct_controller(lambda: store.pause_active_direct_job(
+                                job_id=plan.job.job_id,
+                                generation=plan.generation,
+                                revision=plan.revision,
+                            ))
+
+            controller, terminal = direct_controller, active_terminal_plan
+            if controller is None or terminal is None or not direct_controller_ready:
+                return
+            if not _DIRECT_OBSERVATION_LOCK.acquire(blocking=False):
+                return
+
+            def observe() -> None:
+                try:
+                    try:
+                        from hermes_downloads.direct import DirectTransfer
+
+                        result = controller.observe_terminal(
+                            job_id=terminal.dispatch.job.job_id,
+                            generation=terminal.dispatch.generation,
+                            gid=terminal.gid,
+                        )
+                        if result is not None and type(result) is not DirectTransfer:
+                            raise TypeError("direct observation result is invalid")
+                        outcome = _DirectObservation(terminal, result, False)
+                    except BaseException:
+                        # Never retain exception diagnostics, traceback, URL or
+                        # secret in the channel back to the owning worker thread.
+                        outcome = _DirectObservation(terminal, None, True)
+                    observation_results.put_nowait(outcome)
+                finally:
+                    _DIRECT_OBSERVATION_LOCK.release()
+
+            observation_thread = threading.Thread(
+                target=observe, name="direct-terminal-observation", daemon=True
+            )
+            try:
+                observation_thread.start()
+            except BaseException:
+                observation_thread = None
+                _DIRECT_OBSERVATION_LOCK.release()
+                close_owned_direct_controller(lambda: store.pause_active_direct_job(
+                    job_id=terminal.dispatch.job.job_id,
+                    generation=terminal.dispatch.generation,
+                    revision=terminal.dispatch.revision,
+                ))
 
         if requested_socket_path is not None:
             try:
@@ -910,6 +1066,8 @@ def run_worker(
         else:
             while not shutdown_event.wait(_IPC_POLL_SECONDS):
                 health_server.serve_once()
+                if not shutdown_event.wait(0):
+                    poll_direct_terminal()
         return None
     finally:
         try:
@@ -918,6 +1076,8 @@ def run_worker(
                     shutdown_owned_direct_controller()
             finally:
                 try:
+                    if observation_thread is not None:
+                        observation_thread.join(_OBSERVATION_JOIN_SECONDS)
                     if health_server is not None:
                         health_server.close()
                 finally:

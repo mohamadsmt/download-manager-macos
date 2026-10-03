@@ -2667,3 +2667,90 @@ def test_direct_context_manager_preserves_body_interrupt_when_runtime_cleanup_fa
         controller._clear_runtime_state()
         if runtime_path is not None and runtime_path.exists():
             original_remove(runtime_path)
+
+
+@pytest.mark.parametrize("status", ("active", "waiting", "paused"))
+def test_direct_one_shot_observation_leaves_nonterminal_unverified(tmp_path, monkeypatch, status):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    calls = []
+    def rpc(method, params):
+        calls.append(method)
+        return {"status": status, "totalLength": "10", "completedLength": "0"}
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    monkeypatch.setattr(controller, "_verify_completed_output", lambda *_: pytest.fail("nonterminal verified"))
+    assert controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid) is None
+    assert calls == ["aria2.tellStatus"]
+
+
+@pytest.mark.parametrize("result", (
+    None, {}, {"status": "mystery", "totalLength": "10", "completedLength": "0"},
+    {"status": "error", "totalLength": "10", "completedLength": "0"},
+    {"status": "removed", "totalLength": "10", "completedLength": "0"},
+    {"status": "complete", "totalLength": "10", "completedLength": "9"},
+    {"status": "complete", "totalLength": "-1", "completedLength": "10"},
+))
+def test_direct_one_shot_observation_rejects_bad_terminal_redacted(tmp_path, monkeypatch, result):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    monkeypatch.setattr(controller, "_rpc", lambda *_: result)
+    with pytest.raises(direct.DirectEngineError) as error:
+        controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid)
+    assert "http" not in str(error.value)
+    assert "token" not in str(error.value)
+
+
+@pytest.mark.parametrize("checksum", (None, "matching", "wrong"))
+def test_direct_one_shot_observation_verifies_output_once(tmp_path, monkeypatch, checksum):
+    from dataclasses import replace
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    transfer.destination.partial_path.write_bytes(b"body")
+    digest = None if checksum is None else hashlib.sha256(b"body" if checksum == "matching" else b"wrong").hexdigest()
+    transfer = replace(transfer, expected_sha256=digest)
+    controller._by_job_id[transfer.job_id] = transfer
+    controller._by_gid[transfer.gid] = transfer
+    monkeypatch.setattr(controller, "_rpc", lambda *_: {"status": "complete", "totalLength": "4", "completedLength": "4"})
+    if checksum == "wrong":
+        with pytest.raises(direct.DirectTransferError, match="verification"):
+            controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid)
+    else:
+        result = controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid)
+        assert result.verification is (direct.CompletionVerification.TRANSPORT_VERIFIED if checksum is None else direct.CompletionVerification.CHECKSUM_VERIFIED)
+        assert result.hash_verified is (checksum is not None)
+
+
+@pytest.mark.parametrize("shape", ("missing", "symlink", "size", "hardlink", "parent-symlink"))
+def test_direct_one_shot_transport_verification_requires_real_output(tmp_path, monkeypatch, shape):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    if shape == "symlink":
+        target = tmp_path / "external"
+        target.write_bytes(b"body")
+        transfer.destination.partial_path.symlink_to(target)
+    elif shape == "size":
+        transfer.destination.partial_path.write_bytes(b"short")
+    elif shape == "hardlink":
+        transfer.destination.partial_path.write_bytes(b"body")
+        os.link(transfer.destination.partial_path, tmp_path / "alias")
+    elif shape == "parent-symlink":
+        transfer.destination.partial_path.write_bytes(b"body")
+        relocated = tmp_path / "relocated"
+        transfer.destination.incomplete_dir.rename(relocated)
+        transfer.destination.incomplete_dir.symlink_to(relocated, target_is_directory=True)
+    monkeypatch.setattr(controller, "_rpc", lambda *_: {"status": "complete", "totalLength": "4", "completedLength": "4"})
+    with pytest.raises(direct.DirectTransferError):
+        controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid)
+
+
+@pytest.mark.parametrize("change", ("job", "generation", "gid", "mapping"))
+def test_direct_one_shot_observation_requires_exact_mapping(tmp_path, monkeypatch, change):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    monkeypatch.setattr(controller, "_rpc", lambda *_: pytest.fail("stale readback"))
+    if change == "mapping":
+        controller._by_gid.clear()
+    with pytest.raises(direct.StaleGenerationError):
+        controller.observe_terminal(job_id="other" if change == "job" else transfer.job_id,
+            generation=5 if change == "generation" else 6,
+            gid="ffffffffffffffff" if change == "gid" else transfer.gid)

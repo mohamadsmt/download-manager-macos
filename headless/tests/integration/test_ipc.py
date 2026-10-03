@@ -5232,12 +5232,15 @@ def test_worker_direct_dispatch_defers_completed_body_terminalization(
             assert partial_path.stat().st_size == 1024
             assert marker_path.exists()
             assert not final_path.exists()
+            deadline = time.monotonic() + _WATCHDOG_SECONDS
+            while request_jobs_page(socket_path).jobs[0].state != "finalizing" and time.monotonic() < deadline:
+                time.sleep(0.005)
             assert request_jobs_page(socket_path).jobs == (
                 ipc.PublicJobRecord(
                     job="dispatch-job",
                     generation=1,
-                    revision=4,
-                    state="downloading",
+                    revision=5,
+                    state="finalizing",
                 ),
             )
             observer = SQLiteStore(state_root / "state.db")
@@ -5249,7 +5252,16 @@ def test_worker_direct_dispatch_defers_completed_body_terminalization(
                     "job_start_now_requested",
                     "job_resolving",
                     "job_downloading",
+                    "job_finalizing",
                 ]
+                assert observer._get_staged_payload_binding("dispatch-job") is None
+                assert observer._get_final_publication_binding("dispatch-job") is None
+                assert ipc.dispatch_direct_job(
+                    socket_path, job="dispatch-job", expected_worker_epoch=1,
+                    expected_generation=1, expected_revision=2,
+                    request_id="completed-dispatch",
+                ) == dispatched
+                assert [e.kind for e in observer.list_events()].count("job_finalizing") == 1
             finally:
                 observer.close()
 
@@ -5260,6 +5272,221 @@ def test_worker_direct_dispatch_defers_completed_body_terminalization(
         finally:
             release_paused_add.set()
             release_resume.set()
+            shutdown.set()
+            if process.is_alive():
+                _join(process)
+
+
+
+def _run_terminal_gated_worker(state_root, socket_path, ready, shutdown, stopped, results,
+        origin_url, mode, entered, release, returned):
+    from hermes_downloads import direct, network
+    original_validate = worker.validate_source_url
+    grant = network.LocalOriginGrant.for_url(origin_url)
+    worker.validate_source_url = lambda value: original_validate(value, local_origin_grant=grant)
+    # This is an event handshake around the real controller, never a synthetic success.
+    assert hasattr(direct.DirectAria2Controller, "observe_terminal"), "one-shot terminal observation is missing"
+    original_observe = direct.DirectAria2Controller.observe_terminal
+    original_verify = direct.DirectAria2Controller._verify_completed_output
+    original_rpc = direct.DirectAria2Controller._rpc
+    original_close = direct.DirectAria2Controller.close
+    original_pause = worker.SQLiteStore.pause_active_direct_job
+    original_finalize = worker.SQLiteStore.finalize_direct_terminal
+    owner_thread = threading.get_ident()
+    controllers = []
+    def pause(store, **kwargs):
+        assert threading.get_ident() == owner_thread, "SQLite used by observer"
+        if mode == "rpc-persist-failure":
+            raise RuntimeError("synthetic secret diagnostics")
+        return original_pause(store, **kwargs)
+    def finalize(store, *args):
+        assert threading.get_ident() == owner_thread, "SQLite used by observer"
+        return original_finalize(store, *args)
+    def close(controller):
+        if mode == "rpc-containment-failure":
+            raise RuntimeError("synthetic secret diagnostics")
+        return original_close(controller)
+    def verify(controller, *args):
+        if mode in {"verify", "marker"}:
+            entered.set()
+            assert release.wait(_WATCHDOG_SECONDS)
+        return original_verify(controller, *args)
+    def observe(controller, **kwargs):
+        if controller not in controllers:
+            controllers.append(controller)
+        if mode in {"observe", "absent", "rpc", "rpc-persist-failure", "rpc-containment-failure"}:
+            entered.set()
+            if mode == "absent":
+                deadline = time.monotonic() + _WATCHDOG_SECONDS
+                while controller._process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                assert controller._process.poll() is not None
+                returned.set()
+            assert release.wait(_WATCHDOG_SECONDS)
+        if mode.startswith("rpc"):
+            # Genuine RPC failure: the owned endpoint cannot accept the readback.
+            controller._port = 0
+        result = original_observe(controller, **kwargs)
+        if result is not None and mode in {"late-success", "late-failure"}:
+            entered.set()
+            assert release.wait(_WATCHDOG_SECONDS)
+            returned.set()
+            if mode == "late-failure":
+                raise direct.DirectTransferError("synthetic private diagnostics https://secret.test/?token=hidden")
+        return result
+    direct.DirectAria2Controller.observe_terminal = observe
+    direct.DirectAria2Controller._verify_completed_output = verify
+    direct.DirectAria2Controller.close = close
+    worker.SQLiteStore.pause_active_direct_job = pause
+    worker.SQLiteStore.finalize_direct_terminal = finalize
+    try:
+        _run_worker_process(state_root, socket_path, ready, shutdown, stopped, results)
+    finally:
+        direct.DirectAria2Controller.observe_terminal = original_observe
+        direct.DirectAria2Controller._verify_completed_output = original_verify
+        direct.DirectAria2Controller._rpc = original_rpc
+        direct.DirectAria2Controller.close = original_close
+        worker.SQLiteStore.pause_active_direct_job = original_pause
+        worker.SQLiteStore.finalize_direct_terminal = original_finalize
+        for controller in controllers:
+            original_close(controller)
+        worker.validate_source_url = original_validate
+
+
+@pytest.mark.parametrize("mode,action", (
+    ("observe", None), ("absent", None), ("verify", None), ("marker", None), ("late-success", "pause"),
+    ("late-success", "remove"), ("late-failure", "pause"),
+    ("late-success", "shutdown"), ("rpc", None), ("error", None),
+    ("rpc-persist-failure", None), ("rpc-containment-failure", None),
+))
+def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root, mode, action):
+    state_root = short_socket_root / "state"
+    state_root.mkdir(mode=0o700)
+    socket_path = state_root / "worker.sock"
+    root = Path.home() / "Downloads" / "Hermes"
+    root.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    context = multiprocessing.get_context("spawn")
+    ready, shutdown, stopped = context.Event(), context.Event(), context.Event()
+    entered, release, returned = context.Event(), context.Event(), context.Event()
+    results = context.Queue()
+    with _origin_type()(payload_size=1024) as origin:
+        _seed_local_direct_dispatch_job(state_root, origin.url("/missing" if mode == "error" else "/range"))
+        process = context.Process(target=_run_terminal_gated_worker, args=(str(state_root), str(socket_path),
+            ready, shutdown, stopped, results, origin.url(), mode, entered, release, returned))
+        process.start()
+        try:
+            assert ready.wait(_WATCHDOG_SECONDS)
+            assert set_queue_gate(socket_path, gate="running", request_id="terminal-open", expected_revision=1).applied
+            assert ipc.control_job(socket_path, job="dispatch-job", action="start_now", request_id="terminal-authorize", expected_revision=1).status == "applied"
+            assert activate_direct_engine(socket_path, expected_worker_epoch=1).status == "active"
+            started = ipc.dispatch_direct_job(socket_path, job="dispatch-job", expected_worker_epoch=1,
+                expected_generation=1, expected_revision=2, request_id="terminal-dispatch")
+            assert (started.status, started.state, started.revision) == ("started", "downloading", 4)
+            owned_group = None
+            if mode != "error":
+                assert entered.wait(_WATCHDOG_SECONDS)
+                assert request_health(socket_path).worker_epoch == 1
+                assert request_jobs_page(socket_path).jobs[0].state == "downloading"
+                assert not release.is_set()
+                observer = SQLiteStore(state_root / "state.db")
+                try:
+                    owned = observer.get_direct_engine_record()
+                    assert owned is not None
+                    owned_group = owned.identity.process_group_id
+                finally:
+                    observer.close()
+            if mode == "absent":
+                observer = SQLiteStore(state_root / "state.db")
+                try:
+                    record = observer.get_direct_engine_record()
+                    assert record is not None
+                finally:
+                    observer.close()
+                os.killpg(record.identity.process_group_id, signal.SIGKILL)
+                assert returned.wait(_WATCHDOG_SECONDS)
+                assert reconcile_process_birth(record.identity) == "absent"
+                assert activate_direct_engine(socket_path, expected_worker_epoch=1).status == "blocked"
+                assert not release.is_set()
+            if mode == "marker":
+                marker = root / ".incomplete" / "dispatch-job" / ".hermes-reservation"
+                # Keep the original inode allocated, guaranteeing a distinct replacement.
+                marker.rename(marker.with_name("retained-test-marker"))
+                marker.write_bytes(b"changed fixture marker")
+            if action in {"pause", "remove"}:
+                controlled = ipc.control_job(socket_path, job="dispatch-job", action=action,
+                    request_id="terminal-control", expected_revision=4)
+                assert (controlled.status, controlled.state, controlled.revision) == ("applied", "paused" if action == "pause" else "removed", 5)
+                assert not release.is_set()  # containment and ack cannot await delayed verification
+                assert owned_group is not None and _group_is_gone(owned_group)
+                assert activate_direct_engine(socket_path, expected_worker_epoch=1).status == "blocked"
+                observer = SQLiteStore(state_root / "state.db")
+                try:
+                    assert observer.get_direct_engine_record() is None
+                finally:
+                    observer.close()
+                release.set()
+                assert returned.wait(_WATCHDOG_SECONDS)
+            elif action == "shutdown":
+                shutdown.set()
+                release.set()
+                assert stopped.wait(_WATCHDOG_SECONDS)
+                _join(process)
+                assert _result(results) == ("result", None)
+            else:
+                release.set()
+            if mode in {"rpc-persist-failure", "rpc-containment-failure"}:
+                assert stopped.wait(_WATCHDOG_SECONDS)
+                _join(process)
+                assert _result(results) == ("error", "IPCStateError", "direct_dispatch_blocked")
+                observer = SQLiteStore(state_root / "state.db")
+                try:
+                    retained = observer.get_direct_engine_record()
+                    assert retained is not None
+                    assert observer._get_direct_engine_recovery_capability(retained) is not None
+                    assert (observer.get_job("dispatch-job").state, observer.get_job("dispatch-job").revision) == ("downloading", 4)
+                    assert [e.kind for e in observer.list_events()].count("job_paused") == 1  # cold bootstrap only
+                    assert "job_finalizing" not in [e.kind for e in observer.list_events()]
+                finally:
+                    observer.close()
+                return
+            if action != "shutdown":
+                expected = "paused" if mode in {"rpc", "error", "marker", "absent"} or action == "pause" else "removed" if action == "remove" else "finalizing"
+                deadline = time.monotonic() + _WATCHDOG_SECONDS
+                while request_jobs_page(socket_path).jobs[0].state != expected and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                assert request_jobs_page(socket_path).jobs[0].state == expected
+                if expected in {"paused", "removed"} and owned_group is not None:
+                    assert _group_is_gone(owned_group)
+                assert ipc.dispatch_direct_job(socket_path, job="dispatch-job", expected_worker_epoch=1,
+                    expected_generation=1, expected_revision=2, request_id="terminal-dispatch") == started
+                if action in {"pause", "remove"}:
+                    deadline = time.monotonic() + _WATCHDOG_SECONDS
+                    while activate_direct_engine(socket_path, expected_worker_epoch=1).status != "active" and time.monotonic() < deadline:
+                        time.sleep(0.005)
+                    assert request_jobs_page(socket_path).jobs[0].state == expected
+                observer = SQLiteStore(state_root / "state.db")
+                try:
+                    kinds = [e.kind for e in observer.list_events()]
+                    assert kinds.count("job_finalizing") == (1 if expected == "finalizing" else 0)
+                    assert "job_completed" not in kinds
+                    assert observer._get_final_publication_binding("dispatch-job") is None
+                    assert observer._get_staged_payload_binding("dispatch-job") is None
+                    if mode in {"rpc", "error"}:
+                        assert observer.get_direct_engine_record() is None
+                finally:
+                    observer.close()
+                partial = root / ".incomplete" / "dispatch-job" / "dispatch.bin"
+                if mode != "error":
+                    assert partial.read_bytes() == origin.payload
+                assert (partial.parent / ".hermes-reservation").exists()
+                assert not (root / "Other" / "dispatch.bin").exists()
+                shutdown.set()
+                assert stopped.wait(_WATCHDOG_SECONDS)
+                _join(process)
+                assert _result(results) == ("result", None)
+        finally:
+            release.set()
             shutdown.set()
             if process.is_alive():
                 _join(process)

@@ -20,6 +20,7 @@ from hermes_downloads.models import (
 )
 from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.retry import (
+    CompletionVerification,
     RetryAuditEvent,
     RetryAuditKind,
     RetryAuthority,
@@ -869,6 +870,17 @@ class _DirectDispatchPlan:
     revision: int
     request_id: str
     payload_digest: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectTerminalPlan:
+    """Exact started dispatch and its owned engine/marker/GID observation fence."""
+
+    dispatch: _DirectDispatchPlan
+    record: DirectEngineRecord
+    marker: PublicationMarkerBinding
+    gid: str
+    partial_path: Path
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -2537,6 +2549,85 @@ class SQLiteStore:
             )
             connection.commit()
             return result
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def finalize_direct_terminal(
+        self, terminal: _DirectTerminalPlan, observed: object
+    ) -> DirectDispatchResult:
+        """Atomically audit verified current completion without changing its receipt.
+
+        No staged/final inode is bound here and no filesystem publication occurs.
+        The engine import is confined to this explicitly dispatched terminal path.
+        """
+
+        from hermes_downloads.direct import DirectTransfer
+
+        if type(terminal) is not _DirectTerminalPlan:
+            raise TypeError("terminal must be a direct-terminal plan")
+        plan = terminal.dispatch
+        if (
+            type(plan) is not _DirectDispatchPlan
+            or type(terminal.record) is not DirectEngineRecord
+            or type(terminal.marker) is not PublicationMarkerBinding
+            or type(observed) is not DirectTransfer
+        ):
+            raise TypeError("direct terminal evidence is invalid")
+        if (
+            observed.job_id != plan.job.job_id
+            or observed.generation != plan.generation
+            or observed.gid != terminal.gid
+            or type(terminal.gid) is not str
+            or re.fullmatch(r"[0-9a-fA-F]{16}", terminal.gid) is None
+            or observed.partial_path != terminal.partial_path
+            or terminal.partial_path.name != plan.job.partial_filename
+            or terminal.partial_path.parent.name != plan.job.job_id
+            or observed.status != "complete"
+            or type(observed.verification) is not CompletionVerification
+            or type(observed.hash_verified) is not bool
+            or observed.hash_verified
+            != (observed.verification is CompletionVerification.CHECKSUM_VERIFIED)
+            or _require_counter(observed.total_length, "total_length")
+            != _require_counter(observed.completed_length, "completed_length")
+        ):
+            raise ValueError("direct terminal evidence does not match its owner")
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._read_job_control_projection(connection, plan.job.job_id)
+            command = self._read_direct_dispatch_command(connection, plan.request_id)
+            if (
+                self._current_worker_epoch(connection) != terminal.record.worker_epoch
+                or self.get_direct_engine_record() != terminal.record
+                or self.get_direct_engine_activation_fence() is not None
+                or self._get_direct_engine_recovery_capability(terminal.record) is None
+                or current.generation != plan.generation
+                or current.revision != plan.revision
+                or current.state != JobState.DOWNLOADING.value
+                or self.get_materialized_job(current.job) != plan.job
+                or plan.job.source_kind is not SourceKind.DIRECT
+                or command != _DirectDispatchCommand(
+                    request_id=plan.request_id,
+                    payload_digest=plan.payload_digest,
+                    job=current.job,
+                    status="started",
+                    generation=plan.generation,
+                    revision=plan.revision,
+                    state=JobState.DOWNLOADING.value,
+                )
+                or self._read_publication_reservation(connection, current.job) != plan.reservation
+                or self._read_publication_marker_binding(connection, current.job) != terminal.marker
+            ):
+                raise ValueError("direct terminal state is stale")
+            finalizing = self._persist_direct_dispatch_lifecycle(
+                connection,
+                current=current,
+                state=JobState.FINALIZING.value,
+                event_kind="job_finalizing",
+            )
+            connection.commit()
+            return self._direct_dispatch_result_from_current(finalizing, "started")
         except BaseException:
             connection.rollback()
             raise

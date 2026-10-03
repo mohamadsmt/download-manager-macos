@@ -7374,3 +7374,96 @@ def test_private_final_publication_binding_insert_failure_rolls_back_and_retries
         )
     finally:
         store.close()
+
+
+def _started_terminal_fixture(store):
+    from hermes_downloads.direct import DirectTransfer
+    _admit_direct_dispatch_target(store)
+    plan = store.prepare_direct_dispatch(job_id="job-1", expected_worker_epoch=1,
+        expected_generation=1, expected_revision=2, request_id="terminal-start",
+        payload_digest="1" * 64, controller_ready=True, now=datetime(2032, 1, 2, tzinfo=UTC))
+    marker = store.bind_publication_marker("job-1", claim_token=plan.reservation.claim_token,
+        marker_device=901, marker_inode=902)
+    plan = store.advance_direct_dispatch_to_downloading(plan)
+    started = store.finish_direct_dispatch(plan)
+    record = store_module.DirectEngineRecord(worker_epoch=1, identity=_process_birth_identity())
+    store.set_direct_engine_record(record)
+    store._bind_direct_engine_recovery_capability(record, _recovery_capability())
+    path = Path("/private/synthetic/job-1") / plan.job.partial_filename
+    terminal = store_module._DirectTerminalPlan(dispatch=plan, record=record, marker=marker,
+        gid="0123456789abcdef", partial_path=path)
+    observed = DirectTransfer(job_id="job-1", generation=1, gid=terminal.gid, status="complete",
+        total_length=4, completed_length=4, partial_path=path, hash_verified=False,
+        verification=retry_module.CompletionVerification.TRANSPORT_VERIFIED)
+    return terminal, observed, started
+
+
+def test_direct_terminal_transaction_finalizes_once_keeps_started_receipt(tmp_path):
+    store = SQLiteStore(tmp_path / "state.db")
+    try:
+        terminal, observed, started = _started_terminal_fixture(store)
+        before = store.get_materialized_job("job-1")
+        receipt = tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands").fetchone())
+        finalizing = store.finalize_direct_terminal(terminal, observed)
+        assert (finalizing.state, finalizing.generation, finalizing.revision) == ("finalizing", 1, 5)
+        assert store.get_materialized_job("job-1") == replace(before, intent=replace(before.intent, revision=5))
+        assert tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands").fetchone()) == receipt
+        assert store.prepare_direct_dispatch(job_id="job-1", expected_worker_epoch=1,
+            expected_generation=1, expected_revision=2, request_id="terminal-start",
+            payload_digest="1" * 64, controller_ready=False, now=datetime(2032, 1, 2, tzinfo=UTC)) == started
+        assert store._get_staged_payload_binding("job-1") is None
+        assert store._get_final_publication_binding("job-1") is None
+        with pytest.raises(ValueError):
+            store.finalize_direct_terminal(terminal, observed)
+        events = store.list_events()
+        assert [e.kind for e in events].count("job_finalizing") == 1
+        assert (events[-1].generation, events[-1].revision) == (1, 5)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("damage", ("epoch", "revision", "generation", "receipt", "record", "owner", "reservation", "marker", "job", "gid", "mapping", "verification", "status", "length", "path", "plan"))
+def test_direct_terminal_transaction_rejects_stale_or_unverified_without_writes(tmp_path, damage):
+    store = SQLiteStore(tmp_path / "state.db")
+    try:
+        terminal, observed, _ = _started_terminal_fixture(store)
+        sql = {
+            "epoch": "UPDATE settings SET value = '2' WHERE key = 'worker_epoch'",
+            "revision": "UPDATE jobs SET revision = 9 WHERE job_id = 'job-1'",
+            "generation": "UPDATE jobs SET generation = 2 WHERE job_id = 'job-1'",
+            "receipt": "UPDATE direct_dispatch_commands SET revision = 9",
+            "record": "UPDATE engine_instances SET started_unix_us = started_unix_us + 1",
+            "owner": "UPDATE materialized_jobs SET partial_filename = 'changed.bin'",
+            "reservation": "UPDATE publication_reservations SET final_filename = 'changed.bin'",
+            "marker": "DELETE FROM publication_marker_bindings",
+        }
+        if damage in sql:
+            store._connection.execute(sql[damage])
+        elif damage == "plan":
+            terminal = replace(terminal, dispatch=replace(terminal.dispatch, payload_digest="2" * 64))
+        elif damage == "mapping":
+            terminal = replace(terminal, gid="ffffffffffffffff")
+        else:
+            updates = {"job": {"job_id": "other"}, "gid": {"gid": "ffffffffffffffff"},
+                "verification": {"verification": None}, "status": {"status": "active"},
+                "length": {"completed_length": 3}, "path": {"partial_path": Path("/wrong")}}
+            observed = replace(observed, **updates[damage])
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises((TypeError, ValueError)):
+            store.finalize_direct_terminal(terminal, observed)
+        assert tuple(store._connection.iterdump()) == snapshot
+    finally:
+        store.close()
+
+
+def test_direct_terminal_audit_failure_rolls_back_revision_and_receipt(tmp_path):
+    store = SQLiteStore(tmp_path / "state.db")
+    try:
+        terminal, observed, _ = _started_terminal_fixture(store)
+        store._connection.execute("CREATE TRIGGER fail_terminal BEFORE INSERT ON events WHEN NEW.kind = 'job_finalizing' BEGIN SELECT RAISE(ABORT, 'terminal audit failure'); END")
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(sqlite3.IntegrityError, match="terminal audit failure"):
+            store.finalize_direct_terminal(terminal, observed)
+        assert tuple(store._connection.iterdump()) == snapshot
+    finally:
+        store.close()
