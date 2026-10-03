@@ -629,7 +629,8 @@ def test_held_observation_cannot_overlap_controller_after_same_process_worker_re
                     completed_length=4, partial_path=self.destination.partial_path,
                     hash_verified=False, verification=direct.CompletionVerification.TRANSPORT_VERIFIED,
                     verified_identity=direct._VerifiedPayloadIdentity(
-                        details.st_dev, details.st_ino, 4, details.st_mtime_ns))
+                        details.st_dev, details.st_ino, 4, details.st_mtime_ns,
+                        details.st_mode, details.st_nlink, details.st_ctime_ns))
             entered.set()
             assert release.wait(10)
             returned.set()

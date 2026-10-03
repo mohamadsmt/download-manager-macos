@@ -5524,15 +5524,17 @@ def _run_stage_gated_worker(state_root, socket_path, ready, shutdown, stopped, r
         assert release.wait(_WATCHDOG_SECONDS)
     def sync(fd):
         assert threading.get_ident() != owner, "stage fsync blocked IPC owner"
-        if mode not in {"post-inode", "post-mtime", "crash-after"}:
+        if mode not in {"post-inode", "post-mtime", "pre-rewrite", "post-rewrite", "crash-after"}:
             held()
             if mode in {"error", "late-error", "persist-uncertain", "contain-uncertain"}:
                 returned.set()
                 raise OSError("private fixture diagnostics")
         return original_sync(fd)
     def attest(*args, **kwargs):
+        if mode == "pre-rewrite":
+            held()
         result = original_attest(*args, **kwargs)
-        if mode in {"post-inode", "post-mtime"}:
+        if mode in {"post-inode", "post-mtime", "post-rewrite"}:
             held()
         returned.set()
         return result
@@ -5577,6 +5579,7 @@ def _run_stage_gated_worker(state_root, socket_path, ready, shutdown, stopped, r
     ("success", "pause"), ("success", "remove"), ("success", "queue"), ("success", "close"),
     ("late-error", "pause"), ("late-error", "remove"), ("late-error", "queue"), ("late-error", "close"),
     ("post-inode", None), ("post-mtime", None), ("success", "marker"),
+    ("pre-rewrite", None), ("post-rewrite", None),
     ("success", "crash-before"), ("crash-after", "crash-after"),
 ))
 def test_stage_producer_real_completion_races_and_crash_retention(short_socket_root, mode, action):
@@ -5650,6 +5653,17 @@ def test_stage_producer_real_completion_races_and_crash_retention(short_socket_r
             elif mode == "post-mtime":
                 details = partial.stat()
                 os.utime(partial, ns=(details.st_atime_ns, details.st_mtime_ns + 1000000))
+            elif mode in {"pre-rewrite", "post-rewrite"}:
+                details = partial.stat()
+                with partial.open("r+b") as payload:
+                    payload.write(bytes([origin.payload[0] ^ 1]))
+                    payload.flush()
+                    os.fsync(payload.fileno())
+                os.utime(partial, ns=(details.st_atime_ns, details.st_mtime_ns))
+                current = partial.stat()
+                assert (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) == (
+                    details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
+                assert current.st_ctime_ns != details.st_ctime_ns
             if process.is_alive():
                 release.set()
             if mode in {"persist-uncertain", "contain-uncertain"}:
@@ -5700,7 +5714,9 @@ def test_stage_producer_real_completion_races_and_crash_retention(short_socket_r
                     assert (observer._get_staged_payload_binding("dispatch-job") is not None) == (action == "crash-after")
             finally:
                 observer.close()
-            assert partial.read_bytes() == origin.payload
+            expected_payload = (bytes([origin.payload[0] ^ 1]) + origin.payload[1:]
+                if mode in {"pre-rewrite", "post-rewrite"} else origin.payload)
+            assert partial.read_bytes() == expected_payload
             assert marker.exists()
             assert not (root / "Other" / "dispatch.bin").exists()
         finally:

@@ -1077,9 +1077,11 @@ def run_worker(
                             )
                             identity = stage.observed.verified_identity
                             if type(staged) is not StagedPartialPayload or identity is None or (
-                                staged.path, staged.st_dev, staged.st_ino, staged.logical_size, staged.mtime_ns
+                                staged.path, staged.st_dev, staged.st_ino, staged.logical_size, staged.mtime_ns,
+                                staged.st_mode, staged.st_nlink, staged.ctime_ns
                             ) != (stage.terminal.partial_path, identity.st_dev, identity.st_ino,
-                                  identity.logical_size, identity.mtime_ns):
+                                  identity.logical_size, identity.mtime_ns,
+                                  identity.st_mode, identity.st_nlink, identity.ctime_ns):
                                 raise ValueError("staged payload differs from verified output")
                             outcome = _DirectStageObservation(stage, staged, False)
                         except BaseException:

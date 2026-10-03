@@ -6,9 +6,12 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+import hashlib
 import os
 import secrets
 import sqlite3
+import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -7490,11 +7493,95 @@ def _stage_producer_fixture(store):
     destination.partial_path.write_bytes(b"body")
     details = destination.partial_path.stat()
     observed = replace(observed, partial_path=destination.partial_path,
-        verified_identity=direct._VerifiedPayloadIdentity(details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns))
+        verified_identity=direct._VerifiedPayloadIdentity(details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns,
+            details.st_mode, details.st_nlink, details.st_ctime_ns))
     store.finalize_direct_terminal(terminal, observed)
     plan = store.prepare_direct_stage(terminal, observed)
     staged = paths.attest_staged_partial_payload(destination, terminal.dispatch.reservation)
     return plan, staged, destination, started
+
+
+@pytest.mark.parametrize("rewrite_at", ("before-attestation", "after-attestation"))
+def test_stage_producer_rejects_same_inode_rewrite_restored_mtime(tmp_path, rewrite_at):
+    """Use the real checksum verifier, attester and fenced transactional binder."""
+    from hermes_downloads import direct, paths
+    with closing(SQLiteStore(tmp_path / "state.db")) as store:
+        terminal, observed, started = _started_terminal_fixture(store)
+        job = terminal.dispatch.job
+        (Path.home() / "Downloads/Hermes").mkdir(parents=True, mode=0o700, exist_ok=True)
+        destination = paths.rehydrate_destination(category=job.category,
+            collection=job.destination_collection, partial_filename=job.partial_filename,
+            selected_final_filename=job.selected_final_filename, job_id=job.job_id)
+        paths.prepare_persisted_destination_workspace(destination)
+        marker = paths.attest_publication_reservation_marker(destination, terminal.dispatch.reservation)
+        store._connection.execute("UPDATE publication_marker_bindings SET marker_device = ?, marker_inode = ?",
+            (marker.st_dev, marker.st_ino))
+        terminal = replace(terminal, marker=store.get_publication_marker_binding(job.job_id),
+            partial_path=destination.partial_path,
+            capability=store._get_direct_engine_recovery_capability(terminal.record))
+        destination.partial_path.write_bytes(b"body")
+        controller = object.__new__(direct.DirectAria2Controller)
+        controller._observation_cancelled = threading.Event()
+        observed = controller._verify_completed_output(
+            replace(observed, partial_path=destination.partial_path), SimpleNamespace(
+                destination=destination, job_id=job.job_id,
+                expected_sha256=hashlib.sha256(b"body").hexdigest()))
+        assert observed.hash_verified
+        assert observed.verification is retry_module.CompletionVerification.CHECKSUM_VERIFIED
+        before = destination.partial_path.stat()
+        store.finalize_direct_terminal(terminal, observed)
+        plan = store.prepare_direct_stage(terminal, observed)
+        if rewrite_at == "after-attestation":
+            staged = paths.attest_staged_partial_payload(destination, terminal.dispatch.reservation)
+        with destination.partial_path.open("r+b") as payload:
+            payload.write(b"evil")
+            payload.flush()
+            os.fsync(payload.fileno())
+        os.utime(destination.partial_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = destination.partial_path.stat()
+        assert (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) == (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        assert before.st_ctime_ns != after.st_ctime_ns
+        assert hashlib.sha256(destination.partial_path.read_bytes()).hexdigest() != hashlib.sha256(b"body").hexdigest()
+        if rewrite_at == "before-attestation":
+            staged = paths.attest_staged_partial_payload(destination, terminal.dispatch.reservation)
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises((ValueError, TypeError, paths.PathValidationError)):
+            store.bind_direct_staged_payload(plan, staged)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert store._get_staged_payload_binding(job.job_id) is None
+        assert store.get_job(job.job_id).state == "finalizing"
+        assert destination.partial_path.read_bytes() == b"evil"
+        assert (destination.incomplete_dir / ".hermes-reservation").exists()
+        assert not destination.final_path.exists()
+        assert store.prepare_direct_dispatch(job_id=job.job_id, expected_worker_epoch=1,
+            expected_generation=1, expected_revision=2, request_id="terminal-start",
+            payload_digest="1" * 64, controller_ready=False, now=datetime(2032, 1, 2, tzinfo=UTC)) == started
+
+
+def test_stage_producer_rejects_rewrite_between_fresh_bind_checks(tmp_path, monkeypatch):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / "state.db")) as store:
+        plan, staged, destination, _ = _stage_producer_fixture(store)
+        before = destination.partial_path.stat()
+        original_bind = store._bind_staged_payload_in_transaction
+        def rewrite_after_insert(*args, **kwargs):
+            result = original_bind(*args, **kwargs)
+            with destination.partial_path.open("r+b") as payload:
+                payload.write(b"evil")
+                payload.flush()
+                os.fsync(payload.fileno())
+            os.utime(destination.partial_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return result
+        monkeypatch.setattr(store, "_bind_staged_payload_in_transaction", rewrite_after_insert)
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(paths.PathValidationError):
+            store.bind_direct_staged_payload(plan, staged)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert store._get_staged_payload_binding(plan.job.job_id) is None
+        assert destination.partial_path.read_bytes() == b"evil"
+        assert (destination.incomplete_dir / ".hermes-reservation").exists()
+        assert not destination.final_path.exists()
 
 
 def test_stage_producer_binding_exact_replay_preserves_lifecycle_and_receipt(tmp_path):

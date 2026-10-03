@@ -27,7 +27,12 @@ from typing import Any, Final, cast
 
 from hermes_downloads.models import Admission
 from hermes_downloads.network import SourceURL
-from hermes_downloads.paths import DestinationIntent
+from hermes_downloads.paths import (
+    DestinationIntent,
+    PathValidationError,
+    _require_matching_staged_partial_details,
+    _staged_partial_payload_details,
+)
 from hermes_downloads.processes import (
     EngineIdentity,
     ProcessBirthIdentity,
@@ -89,10 +94,17 @@ class _VerifiedPayloadIdentity:
     st_ino: int
     logical_size: int
     mtime_ns: int
+    st_mode: int
+    st_nlink: int
+    ctime_ns: int
 
     def __post_init__(self) -> None:
         if any(type(value) is not int or value < 0 for value in
-               (self.st_dev, self.st_ino, self.logical_size)) or type(self.mtime_ns) is not int:
+               (self.st_dev, self.st_ino, self.logical_size)) or (
+                   type(self.mtime_ns) is not int or type(self.ctime_ns) is not int
+                   or type(self.st_mode) is not int or not stat.S_ISREG(self.st_mode)
+                   or type(self.st_nlink) is not int or self.st_nlink != 1
+               ):
             raise ValueError("verified payload identity is invalid")
 
 
@@ -543,12 +555,10 @@ class DirectAria2Controller:
                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
             )
             with os.fdopen(descriptor, "rb") as payload:
-                details = os.fstat(payload.fileno())
+                details = _staged_partial_payload_details(os.fstat(payload.fileno()))
                 if (
-                    not stat.S_ISREG(details.st_mode)
-                    or details.st_nlink != 1
-                    or state.total_length != state.completed_length
-                    or details.st_size != state.completed_length
+                    state.total_length != state.completed_length
+                    or details[2] != state.completed_length
                 ):
                     raise OSError
                 digest = hashlib.sha256()
@@ -560,25 +570,23 @@ class DirectAria2Controller:
                         if not chunk:
                             break
                         digest.update(chunk)
-                current = state.partial_path.lstat()
-                if (
-                    self._observation_cancelled.is_set()
-                    or not stat.S_ISREG(current.st_mode)
-                    or current.st_nlink != 1
-                    or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
-                    != (details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
-                ):
+                    if digest.hexdigest() != transfer.expected_sha256:
+                        raise DirectTransferError("aria2 hash verification failed")
+                current = _staged_partial_payload_details(state.partial_path.lstat())
+                _require_matching_staged_partial_details(details, current)
+                _require_matching_staged_partial_details(
+                    details, _staged_partial_payload_details(os.fstat(payload.fileno()))
+                )
+                if self._observation_cancelled.is_set():
                     raise OSError
-        except OSError:
+        except (OSError, PathValidationError):
             raise DirectTransferError("aria2 output is unavailable") from None
         identity = _VerifiedPayloadIdentity(
-            details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns
+            details[0], details[1], details[2], details[5], details[3], details[4], details[6]
         )
         if transfer.expected_sha256 is None:
             return replace(state, verification=CompletionVerification.TRANSPORT_VERIFIED,
                            verified_identity=identity)
-        if digest.hexdigest() != transfer.expected_sha256:
-            raise DirectTransferError("aria2 hash verification failed")
         return replace(
             state,
             hash_verified=True,

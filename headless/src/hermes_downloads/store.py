@@ -2705,7 +2705,8 @@ class SQLiteStore:
         identity = observed.verified_identity
         # Reconstruct to reject malformed evidence even at this private seam.
         _VerifiedPayloadIdentity(identity.st_dev, identity.st_ino,
-                                 identity.logical_size, identity.mtime_ns)
+                                 identity.logical_size, identity.mtime_ns,
+                                 identity.st_mode, identity.st_nlink, identity.ctime_ns)
         current = self._read_job_control_projection(connection, dispatch.job.job_id)
         latest = connection.execute(
             "SELECT event_id, kind, generation, revision FROM events "
@@ -2773,8 +2774,10 @@ class SQLiteStore:
         try:
             self._require_direct_stage_authority(connection, stage)
             identity = stage.observed.verified_identity
-            if (staged.st_dev, staged.st_ino, staged.logical_size, staged.mtime_ns) != (
-                identity.st_dev, identity.st_ino, identity.logical_size, identity.mtime_ns
+            if (staged.st_dev, staged.st_ino, staged.logical_size, staged.mtime_ns,
+                staged.st_mode, staged.st_nlink, staged.ctime_ns) != (
+                identity.st_dev, identity.st_ino, identity.logical_size, identity.mtime_ns,
+                identity.st_mode, identity.st_nlink, identity.ctime_ns
             ):
                 raise ValueError("attested payload differs from original verification")
             job = stage.job

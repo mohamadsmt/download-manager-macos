@@ -2764,7 +2764,54 @@ def test_stage_producer_verification_retains_descriptor_identity(tmp_path, monke
     monkeypatch.setattr(controller, "_rpc", lambda *_: {"status": "complete", "totalLength": "4", "completedLength": "4"})
     result = controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid)
     assert result.verified_identity == direct._VerifiedPayloadIdentity(
-        details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
+        details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns,
+        details.st_mode, details.st_nlink, details.st_ctime_ns)
     from dataclasses import FrozenInstanceError
     with pytest.raises(FrozenInstanceError):
         result.verified_identity.logical_size = 99
+
+
+@pytest.mark.parametrize("rewrite_at", ("checksum", "namespace"))
+def test_stage_producer_verification_rechecks_descriptor_after_checksum(tmp_path, monkeypatch, rewrite_at):
+    from dataclasses import replace
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    partial = transfer.destination.partial_path
+    partial.write_bytes(b"body")
+    before = partial.stat()
+    original_sha256 = hashlib.sha256
+    expected = original_sha256(b"body").hexdigest()
+    transfer = replace(transfer, expected_sha256=expected)
+    controller._by_job_id[transfer.job_id] = transfer
+    controller._by_gid[transfer.gid] = transfer
+    def rewrite():
+        with partial.open("r+b") as payload:
+            payload.write(b"evil")
+            payload.flush()
+            os.fsync(payload.fileno())
+        os.utime(partial, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert partial.stat().st_ctime_ns != before.st_ctime_ns
+    if rewrite_at == "checksum":
+        class Digest:
+            def __init__(self):
+                self.digest = original_sha256()
+            def update(self, chunk):
+                self.digest.update(chunk)
+            def hexdigest(self):
+                result = self.digest.hexdigest()
+                assert result == expected
+                rewrite()
+                return result
+        monkeypatch.setattr(direct.hashlib, "sha256", Digest)
+    else:
+        original_lstat = Path.lstat
+        def stale_namespace_details(path, *args, **kwargs):
+            details = original_lstat(path, *args, **kwargs)
+            if path == partial:
+                rewrite()
+            return details
+        monkeypatch.setattr(Path, "lstat", stale_namespace_details)
+    monkeypatch.setattr(controller, "_rpc", lambda *_: {"status": "complete", "totalLength": "4", "completedLength": "4"})
+    with pytest.raises(direct.DirectTransferError, match="^aria2 terminal verification failed$"):
+        controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid)
+    assert partial.read_bytes() == b"evil"

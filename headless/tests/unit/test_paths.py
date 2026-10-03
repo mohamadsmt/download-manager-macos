@@ -1058,6 +1058,27 @@ def _prepare_staged_partial(paths, payload: bytes = b"complete payload bytes"):
     return destination, reservation
 
 
+@pytest.mark.parametrize("missing", ("mtime_ns", "st_mode", "st_nlink", "ctime_ns"))
+def test_stage_producer_fresh_check_requires_complete_attested_metadata(missing):
+    from dataclasses import replace
+    paths = _paths()
+    destination, reservation = _prepare_staged_partial(paths)
+    marker = paths.attest_publication_reservation_marker(destination, reservation)
+    staged = paths.attest_staged_partial_payload(destination, reservation)
+    with pytest.raises(paths.PathValidationError):
+        paths._require_current_staged_payload(destination, reservation, marker,
+            replace(staged, **{missing: None}))
+    assert destination.partial_path.exists()
+    assert _marker_path(destination).exists()
+    assert not destination.final_path.exists()
+
+
+def test_stage_producer_legacy_staged_constructor_remains_available():
+    paths = _paths()
+    staged = paths.StagedPartialPayload(Path("/legacy/partial"), 1, 2, 3)
+    assert (staged.mtime_ns, staged.st_mode, staged.st_nlink, staged.ctime_ns) == (None,) * 4
+
+
 def test_attests_staged_partial_payload_descriptor_relatively_without_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1114,6 +1135,9 @@ def test_attests_staged_partial_payload_descriptor_relatively_without_publicatio
         "st_ino",
         "logical_size",
         "mtime_ns",
+        "st_mode",
+        "st_nlink",
+        "ctime_ns",
     )
     assert attested == paths.StagedPartialPayload(
         path=destination.partial_path,
@@ -1121,6 +1145,9 @@ def test_attests_staged_partial_payload_descriptor_relatively_without_publicatio
         st_ino=partial_before[1],
         logical_size=len(payload),
         mtime_ns=destination.partial_path.stat().st_mtime_ns,
+        st_mode=destination.partial_path.stat().st_mode,
+        st_nlink=destination.partial_path.stat().st_nlink,
+        ctime_ns=destination.partial_path.stat().st_ctime_ns,
     )
     assert reservation.claim_token not in repr(attested)
     assert len(opens) == 1

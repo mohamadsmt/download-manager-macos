@@ -120,6 +120,9 @@ class StagedPartialPayload:
     st_ino: int
     logical_size: int
     mtime_ns: int | None = None
+    st_mode: int | None = None
+    st_nlink: int | None = None
+    ctime_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,6 +478,9 @@ def attest_staged_partial_payload(
                             st_ino=preflight[1],
                             logical_size=preflight[2],
                             mtime_ns=preflight[5],
+                            st_mode=preflight[3],
+                            st_nlink=preflight[4],
+                            ctime_ns=preflight[6],
                         )
                     finally:
                         os.close(payload_fd)
@@ -499,8 +505,11 @@ def _require_current_staged_payload(
     root, component = _validate_destination_intent(destination)
     reservation = _validate_publication_reservation(destination, component, reservation)
     identity = _validate_staged_partial_payload_identity(destination, staged)
-    if type(staged.mtime_ns) is not int:
-        raise PathValidationError("staged payload mtime evidence is absent")
+    if any(type(value) is not int for value in (
+        staged.st_mode, staged.st_nlink, staged.mtime_ns, staged.ctime_ns
+    )):
+        raise PathValidationError("staged payload metadata evidence is absent or invalid")
+    expected = (*identity, staged.st_mode, staged.st_nlink, staged.mtime_ns, staged.ctime_ns)
     directories = (root, destination.final_path.parent, root / _INCOMPLETE,
                    destination.incomplete_dir)
     chain = tuple((details.st_dev, details.st_ino)
@@ -515,8 +524,7 @@ def _require_current_staged_payload(
         try:
             opened = _fstat_staged_partial_payload(payload_fd)
             _require_matching_staged_partial_details(before, opened)
-            if opened[:3] != identity or opened[5] != staged.mtime_ns:
-                raise UnsafePathError("staged payload no longer matches verified evidence")
+            _require_matching_staged_partial_details(expected, opened)
             # Reopen the visible directories after descriptor checks; detached
             # old directory descriptors must not confer namespace authority.
             fresh = _open_visible_publication_chain(root, component, destination.job_id, chain)
