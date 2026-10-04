@@ -65,7 +65,7 @@ _JOB_CONTROL_STATUSES: Final = frozenset({"applied", "blocked", "stale"})
 _DIRECT_ENGINE_ACTIVATE_STATUSES: Final = frozenset(
     {"active", "blocked", "stale_epoch"}
 )
-_DIRECT_JOB_DISPATCH_STATUSES: Final = frozenset({"started", "blocked", "stale"})
+_DIRECT_JOB_DISPATCH_STATUSES: Final = frozenset({"started", "blocked", "stale", "pending"})
 
 
 class IPCError(RuntimeError):

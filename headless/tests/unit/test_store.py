@@ -1296,7 +1296,7 @@ def test_v8_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1420,7 +1420,7 @@ def test_v8_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         schema = connection.execute(
             """
             SELECT sql
@@ -1631,13 +1631,13 @@ def test_v15_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path)
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 16")
+        connection.execute("PRAGMA user_version = 17")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1796,7 +1796,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1881,14 +1881,14 @@ def test_v8_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
@@ -1932,7 +1932,7 @@ def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert [
             row[1]
             for row in connection.execute(
@@ -3155,14 +3155,14 @@ def test_v8_migrates_v6_database_to_the_exact_command_receipt_catalog(tmp_path: 
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
@@ -3425,7 +3425,7 @@ def test_v8_migrates_v7_receipts_to_the_shared_global_registry(tmp_path: Path) -
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
     assert "command_receipts" in _table_names(database_path)
 
 
@@ -3924,14 +3924,14 @@ def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_v9_receipt_rebuild_failure_restores_v8_database(
@@ -4170,7 +4170,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         projection_after = connection.execute(
             """
             SELECT
@@ -4203,7 +4203,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         }
     assert projection_after == projection_before
     assert receipts == []
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fails(
@@ -4286,19 +4286,19 @@ def test_fresh_v11_bootstrap_retries_after_publication_receipt_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
     finally:
         recovered.close()
 
     with original_connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -4547,7 +4547,7 @@ def test_publication_marker_binding_is_narrow_durable_and_exactly_idempotent(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert [
             row[1]
             for row in connection.execute(
@@ -4878,7 +4878,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert connection.execute(
             "SELECT job_id, marker_device, marker_inode FROM publication_marker_bindings"
         ).fetchall() == []
@@ -4888,7 +4888,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_v11_migration_ddl_failure_leaves_the_exact_v10_database(
@@ -4966,7 +4966,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
     finally:
         recovered.close()
 
@@ -4977,7 +4977,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_v15_rejects_unknown_current_table_without_bootstrap_writes(
@@ -4987,16 +4987,16 @@ def test_v15_rejects_unknown_current_table_without_bootstrap_writes(
     store = SQLiteStore(database_path)
     store.close()
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         connection.execute("CREATE TABLE unexpected_v12_table (value TEXT NOT NULL)")
 
     with pytest.raises(RuntimeError, match="incomplete"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
     assert _table_names(database_path) == {
-        *store_module._V15_TABLE_SCHEMAS,
+        *store_module._V16_TABLE_SCHEMAS,
         "unexpected_v12_table",
     }
 
@@ -5116,7 +5116,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert connection.execute(
             "SELECT COUNT(*) FROM direct_engine_recovery_capabilities"
         ).fetchone()[0] == 0
@@ -5126,7 +5126,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
@@ -5167,7 +5167,7 @@ def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
     finally:
         recovered.close()
 
@@ -6069,7 +6069,7 @@ def test_v14_migrates_v13_owner_chain_without_backfilling_a_staged_payload_bindi
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert connection.execute(
             """
             SELECT job_id, partial_device, partial_inode, logical_size
@@ -6082,7 +6082,7 @@ def test_v14_migrates_v13_owner_chain_without_backfilling_a_staged_payload_bindi
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_v14_migration_rolls_back_and_retries_from_v13(
@@ -6123,7 +6123,7 @@ def test_v14_migration_rolls_back_and_retries_from_v13(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
     finally:
         recovered.close()
 
@@ -6164,7 +6164,7 @@ def test_fresh_v14_bootstrap_retries_after_staged_payload_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
     finally:
         recovered.close()
 
@@ -6175,7 +6175,7 @@ def test_fresh_v14_bootstrap_retries_after_staged_payload_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 def test_private_staged_payload_binding_is_exactly_idempotent_and_durable(
@@ -6689,7 +6689,7 @@ def test_private_final_publication_binding_is_exactly_idempotent_and_durable(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert [
             row[1]
             for row in connection.execute(
@@ -6779,7 +6779,7 @@ def test_v15_migrates_v14_owner_chain_without_backfilling_final_publication_bind
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert connection.execute(
             """
             SELECT job_id, final_device, final_inode, logical_size
@@ -6792,7 +6792,7 @@ def test_v15_migrates_v14_owner_chain_without_backfilling_final_publication_bind
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V15_TABLE_SCHEMAS
+    assert table_schemas == store_module._V16_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -6842,7 +6842,7 @@ def test_v15_migration_rolls_back_and_retries_from_v14(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
     finally:
         recovered.close()
 
@@ -7699,3 +7699,456 @@ def test_stage_producer_prepare_rejects_intervening_same_cutpoint_audit(tmp_path
         with pytest.raises(ValueError):
             store.prepare_direct_stage(plan.terminal, plan.observed)
         assert tuple(store._connection.iterdump()) == snapshot
+
+
+def test_exact_publication_attempt_schema_has_no_historical_backfill(tmp_path):
+    store = SQLiteStore(tmp_path / 'attempt.db')
+    try:
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 16
+        assert store._connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
+        columns = {row[1] for row in store._connection.execute('PRAGMA table_info(direct_publication_attempts)')}
+        assert columns == {'job_id', 'attempt_id', 'original_request_id', 'proof', 'status', 'audit_id', 'generation', 'revision', 'state', 'worker_epoch', 'pending_request_id'}
+    finally:
+        store.close()
+
+
+def _exact_attempt_fixture(store):
+    from hermes_downloads import paths
+    stage, staged, destination, started = _stage_producer_fixture(store)
+    store.bind_direct_staged_payload(stage, staged)
+    marker = paths.PublicationReservationMarker(destination.incomplete_dir / '.hermes-reservation',
+        stage.terminal.marker.marker_device, stage.terminal.marker.marker_inode)
+    prepared = paths.prepare_publication_payload(destination, stage.terminal.dispatch.reservation,
+        marker, staged)
+    attempt = store.reserve_direct_publication(stage, prepared)
+    return stage, attempt, destination, started
+
+
+@pytest.mark.parametrize('action', ('pause', 'resume', 'start_now', 'remove'))
+def test_legacy_control_guard_precedes_malformed_publication_attempt(tmp_path, monkeypatch, action):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _exact_attempt_fixture(store)
+        store._connection.execute("UPDATE materialized_jobs SET source_kind='video' WHERE job_id='job-1'")
+        store._connection.execute("UPDATE direct_publication_attempts SET proof='{}' WHERE job_id='job-1'")
+        store._connection.commit()
+        before = tuple(store._connection.iterdump())
+        def forbidden(*args):
+            pytest.fail('legacy control consulted publication predecessor authority')
+        monkeypatch.setattr(store, '_publication_predecessor_matches', forbidden)
+        result = store.apply_job_control(job_id='job-1', action=action,
+            request_id='new-legacy-control', payload_digest='e' * 64,
+            expected_revision=5, _contained_direct_transfer=True)
+        assert result.status == 'blocked'
+        assert tuple(store._connection.iterdump()) == before
+
+
+@pytest.mark.parametrize('fault', ['binding', 'audit', 'finish', 'post-check'])
+def test_exact_attempt_completion_rolls_back_all_effects(tmp_path, monkeypatch, fault):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, attempt, destination, _ = _exact_attempt_fixture(store)
+        receipt = tuple(store._connection.execute('SELECT * FROM direct_dispatch_commands').fetchone())
+        published = paths.publish_staged_partial_payload(destination, attempt.prepared.reservation,
+            attempt.prepared.staged_payload, prepared=attempt.prepared,
+            creation_permit=paths.PublicationCreationPermit())
+        if fault != 'post-check':
+            targets = {'binding': ('final_publication_bindings','INSERT',''),
+                'audit': ('events','INSERT', "WHEN NEW.kind='job_completed'"),
+                'finish': ('direct_publication_attempts','UPDATE', "WHEN NEW.status='finished'")}
+            table, operation, condition = targets[fault]
+            store._connection.execute(f"CREATE TRIGGER fail_complete BEFORE {operation} ON {table} {condition} BEGIN SELECT RAISE(ABORT,'fault'); END")
+        else:
+            original = paths.require_current_publication_payload
+            calls = []
+            def fail_post(*args):
+                original(*args)
+                calls.append(1)
+                if len(calls) == 2:
+                    raise paths.PathValidationError('post fence')
+            monkeypatch.setattr(paths, 'require_current_publication_payload', fail_post)
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises((sqlite3.IntegrityError, paths.PathValidationError)):
+            store.complete_direct_publication(attempt, published, initial_stage=stage)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert tuple(store._connection.execute('SELECT * FROM direct_dispatch_commands').fetchone()) == receipt
+        assert destination.final_path.read_bytes() == b'body'
+        assert store._get_final_publication_binding(stage.job.job_id) is None
+
+
+@pytest.mark.parametrize('damage', ['digest','receipt','current','epoch','source','closed','audit','stage','marker','missing-attempt'])
+def test_exact_attempt_recovery_never_falls_back_on_invalid_authority(tmp_path, monkeypatch, damage):
+    import json
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, attempt, _, _ = _exact_attempt_fixture(store)
+        if damage == 'digest':
+            proof = json.loads(attempt.proof)
+            proof['sha256'] = 'bad'
+            store._connection.execute('UPDATE direct_publication_attempts SET proof=?', (json.dumps(proof),))
+        else:
+            sql = {'receipt': 'UPDATE direct_dispatch_commands SET revision=9',
+                'current': 'UPDATE jobs SET revision=9',
+                'epoch': "UPDATE settings SET value='2' WHERE key='worker_epoch'",
+                'source': "UPDATE materialized_jobs SET source_kind='video'",
+                'closed': "UPDATE direct_publication_attempts SET status='closed'",
+                'audit': "INSERT INTO events(kind,job_id,generation,revision) VALUES('job_finalizing','job-1',1,5)",
+                'stage': 'UPDATE staged_payload_bindings SET logical_size=7',
+                'marker': 'UPDATE publication_marker_bindings SET marker_inode=marker_inode+1',
+                'missing-attempt': 'DELETE FROM direct_publication_attempts'}[damage]
+            store._connection.execute(sql)
+        calls = []
+        monkeypatch.setattr(store, '_prepare_direct_publication_reconciliation', lambda *a, **k: calls.append(1))
+        try:
+            store.prepare_direct_dispatch(job_id='job-1', expected_worker_epoch=store.worker_epoch(),
+                expected_generation=store.get_job('job-1').generation,
+                expected_revision=store.get_job('job-1').revision, request_id='exact-recovery',
+                payload_digest='3'*64, controller_ready=False, now=datetime(2032,1,2,tzinfo=UTC))
+        except (ValueError, TypeError):
+            pass
+        assert calls == []
+
+
+def test_exact_attempt_repeated_cold_successors_and_explicit_zero_link_recovery(tmp_path, monkeypatch):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, attempt, destination, started = _exact_attempt_fixture(store)
+        paths.publish_staged_partial_payload(destination, attempt.prepared.reservation,
+            attempt.prepared.staged_payload, prepared=attempt.prepared,
+            creation_permit=paths.PublicationCreationPermit())
+        receipt = tuple(store._connection.execute('SELECT * FROM direct_dispatch_commands').fetchone())
+        for _ in range(3):
+            store.recover_cold_start()
+            assert store.get_job('job-1').state == 'paused'
+        current = store.get_job('job-1')
+        recovery = store.prepare_direct_dispatch(job_id='job-1', expected_worker_epoch=store.worker_epoch(),
+            expected_generation=current.generation, expected_revision=current.revision,
+            request_id='exact-recovery', payload_digest='3'*64, controller_ready=False,
+            now=datetime(2032,1,2,tzinfo=UTC))
+        monkeypatch.setattr(paths.os,'link',lambda *a,**k: pytest.fail('recovery must never link'))
+        p = recovery.attempt.prepared
+        published = paths.publish_staged_partial_payload(p.destination,p.reservation,p.staged_payload,
+            prepared=p,existing_only=True)
+        result = store.complete_direct_publication(recovery.attempt,published)
+        assert (result.status,result.state) == ('started','completed')
+        assert tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands WHERE request_id='terminal-start'").fetchone()) == receipt
+        assert sum(e.kind=='job_completed' for e in store.list_events()) == 1
+
+
+@pytest.mark.parametrize('field', ['request','digest','generation','downloading_revision',
+    'finalizing_revision','finalizing_audit','epoch','ownership','marker','stage','chain','sha256'])
+@pytest.mark.parametrize('value', [None, True, -1, 1 << 63, [], {}])
+def test_exact_attempt_strict_immutable_proof_corruption_is_atomic(tmp_path, field, value):
+    import json
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _, attempt, _, _ = _exact_attempt_fixture(store)
+        proof = json.loads(attempt.proof)
+        proof[field] = value
+        store._connection.execute('UPDATE direct_publication_attempts SET proof=?', (json.dumps(proof),))
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises((ValueError, TypeError)):
+            store._read_publication_attempt(store._connection,'job-1')
+        assert tuple(store._connection.iterdump()) == snapshot
+
+
+def test_exact_attempt_queue_receipt_fault_rolls_back_gate_job_and_pointer(tmp_path):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, attempt, _, _ = _exact_attempt_fixture(store)
+        store._connection.execute("CREATE TRIGGER fail_queue BEFORE INSERT ON queue_commands BEGIN SELECT RAISE(ABORT,'queue receipt fault'); END")
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(sqlite3.IntegrityError):
+            store.apply_queue_gate(gate='paused',request_id='queue-close',payload_digest='3'*64,
+                expected_revision=store.queue_gate_snapshot()[1],
+                _contained_direct_job=('job-1',attempt.generation,attempt.revision,True))
+        assert tuple(store._connection.iterdump()) == snapshot
+
+
+def test_exact_attempt_interrupted_pending_cold_settles_new_only(tmp_path):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _, attempt, _, _ = _exact_attempt_fixture(store)
+        original = tuple(store._connection.execute('SELECT * FROM direct_dispatch_commands').fetchone())
+        arguments = dict(job_id='job-1',expected_worker_epoch=1,expected_generation=1,
+            expected_revision=5,request_id='recovery-pending',payload_digest='3'*64,
+            controller_ready=False,now=datetime(2032,1,2,tzinfo=UTC))
+        plan = store.prepare_direct_dispatch(**arguments)
+        assert store.prepare_direct_dispatch(**arguments) == plan
+        store.recover_cold_start()
+        receipt = store._read_direct_dispatch_command(store._connection,'recovery-pending')
+        assert receipt.status == 'blocked'
+        assert tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands WHERE request_id='terminal-start'").fetchone()) == original
+        current = store._read_publication_attempt(store._connection,'job-1')
+        assert current.state == 'paused' and current.pending_request_id is None
+
+
+@pytest.mark.parametrize('failure_statement_prefix', ['CREATE TABLE direct_publication_attempts','PRAGMA user_version = 16'])
+def test_exact_attempt_v16_migration_is_atomic_and_has_no_backfill(tmp_path, monkeypatch, failure_statement_prefix):
+    database = tmp_path / 'attempt.db'
+    _create_v14_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(store_module._FINAL_PUBLICATION_BINDINGS_SCHEMA)
+        connection.execute('PRAGMA user_version = 15')
+        original = tuple(connection.iterdump())
+    connect = sqlite3.connect
+    monkeypatch.setattr(store_module.sqlite3,'connect',lambda *a,**k: _MigrationFailureConnection(
+        connect(*a,**k), failure_statement_prefix=failure_statement_prefix))
+    with pytest.raises(sqlite3.OperationalError):
+        SQLiteStore(database)
+    with connect(database) as connection:
+        assert tuple(connection.iterdump()) == original
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == 15
+    monkeypatch.setattr(store_module.sqlite3,'connect',connect)
+    with closing(SQLiteStore(database)) as store:
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 16
+        assert store._connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('action', ('pause', 'queue'))
+def test_exact_attempt_already_paused_control_settles_pending_without_inventing_audit(tmp_path, action):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _, _, _, _ = _exact_attempt_fixture(store)
+        store.recover_cold_start()
+        current = store.get_job('job-1')
+        pending = store.prepare_direct_dispatch(job_id='job-1', expected_worker_epoch=2,
+            expected_generation=current.generation, expected_revision=current.revision,
+            request_id='held-recovery', payload_digest='3'*64, controller_ready=False,
+            now=datetime(2032,1,2,tzinfo=UTC))
+        if action == 'pause':
+            # First manual pause may change the hold; the next exact control is a no-op.
+            store.apply_job_control(job_id='job-1', action='pause', request_id='first-pause',
+                payload_digest='4'*64, expected_revision=current.revision,
+                _contained_direct_transfer=True, _publication_recoverable=True)
+            current = store.get_job('job-1')
+            pending = store.prepare_direct_dispatch(job_id='job-1', expected_worker_epoch=2,
+                expected_generation=current.generation, expected_revision=current.revision,
+                request_id='held-second', payload_digest='5'*64, controller_ready=False,
+                now=datetime(2032,1,2,tzinfo=UTC))
+        events = store.list_events()
+        if action == 'pause':
+            store.apply_job_control(job_id='job-1', action='pause', request_id='noop-pause',
+                payload_digest='6'*64, expected_revision=current.revision,
+                _contained_direct_transfer=True, _publication_recoverable=True)
+        else:
+            store.apply_queue_gate(gate='paused', request_id='noop-queue', payload_digest='6'*64,
+                expected_revision=store.queue_gate_snapshot()[1],
+                _contained_direct_job=('job-1', current.generation, current.revision, True))
+        assert store.list_events() == events
+        attempt = store._read_publication_attempt(store._connection, 'job-1')
+        assert attempt.pending_request_id is None
+        assert store._read_direct_dispatch_command(store._connection, pending.request_id).status == 'blocked'
+
+
+def test_exact_attempt_current_audit_kind_cannot_be_inherited(tmp_path):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _exact_attempt_fixture(store)
+        store.recover_cold_start()
+        store._connection.execute("UPDATE events SET kind='job_added' WHERE event_id=(SELECT audit_id FROM direct_publication_attempts)")
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):
+            store._read_publication_attempt(store._connection, 'job-1')
+        assert tuple(store._connection.iterdump()) == snapshot
+
+
+def test_exact_attempt_recovery_pending_digest_drift_cannot_complete(tmp_path):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _, attempt, destination, _ = _exact_attempt_fixture(store)
+        paths.publish_staged_partial_payload(destination, attempt.prepared.reservation,
+            attempt.prepared.staged_payload, prepared=attempt.prepared,
+            creation_permit=paths.PublicationCreationPermit())
+        store.recover_cold_start()
+        current = store.get_job('job-1')
+        pending = store.prepare_direct_dispatch(job_id='job-1', expected_worker_epoch=2,
+            expected_generation=current.generation, expected_revision=current.revision,
+            request_id='held-recovery', payload_digest='3'*64, controller_ready=False,
+            now=datetime(2032,1,2,tzinfo=UTC))
+        p = pending.attempt.prepared
+        published = paths.publish_staged_partial_payload(p.destination, p.reservation,
+            p.staged_payload, prepared=p, existing_only=True)
+        store._connection.execute("UPDATE direct_dispatch_commands SET payload_digest=? WHERE request_id='held-recovery'", ('4'*64,))
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):
+            store.complete_direct_publication(pending.attempt, published)
+        assert tuple(store._connection.iterdump()) == snapshot
+
+
+@pytest.mark.parametrize('fault', ('pointer', 'audit', 'job', 'receipt', 'epoch', 'original-receipt'))
+def test_exact_attempt_completion_post_mutation_authority_fault_rolls_back(tmp_path, fault):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _, attempt, destination, _ = _exact_attempt_fixture(store)
+        paths.publish_staged_partial_payload(destination, attempt.prepared.reservation,
+            attempt.prepared.staged_payload, prepared=attempt.prepared,
+            creation_permit=paths.PublicationCreationPermit())
+        store.recover_cold_start()
+        current = store.get_job('job-1')
+        pending = store.prepare_direct_dispatch(job_id='job-1', expected_worker_epoch=2,
+            expected_generation=current.generation, expected_revision=current.revision,
+            request_id='new-completion', payload_digest='3'*64, controller_ready=False,
+            now=datetime(2032,1,2,tzinfo=UTC))
+        p = pending.attempt.prepared
+        published = paths.publish_staged_partial_payload(p.destination,p.reservation,p.staged_payload,
+            prepared=p,existing_only=True)
+        triggers = {
+            'pointer': "AFTER UPDATE ON direct_publication_attempts WHEN NEW.status='finished' BEGIN UPDATE direct_publication_attempts SET audit_id=OLD.audit_id WHERE job_id=NEW.job_id; END",
+            'audit': "AFTER INSERT ON events WHEN NEW.kind='job_completed' BEGIN UPDATE events SET kind='job_added' WHERE event_id=NEW.event_id; END",
+            'job': "AFTER UPDATE ON jobs WHEN NEW.state='completed' BEGIN UPDATE jobs SET revision=NEW.revision+1 WHERE job_id=NEW.job_id; END",
+            'receipt': "AFTER UPDATE ON direct_dispatch_commands WHEN NEW.request_id='new-completion' AND NEW.status='started' BEGIN UPDATE direct_dispatch_commands SET payload_digest='" + '4'*64 + "' WHERE request_id=NEW.request_id; END",
+            'epoch': "AFTER INSERT ON events WHEN NEW.kind='job_completed' BEGIN UPDATE settings SET value='3' WHERE key='worker_epoch'; END",
+            'original-receipt': "AFTER INSERT ON events WHEN NEW.kind='job_completed' BEGIN UPDATE direct_dispatch_commands SET revision=revision+1 WHERE request_id='terminal-start'; END",
+        }
+        store._connection.execute('CREATE TRIGGER corrupt_completion ' + triggers[fault])
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):
+            store.complete_direct_publication(pending.attempt, published)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert store._read_publication_attempt(store._connection,'job-1') == pending.attempt
+        assert destination.final_path.read_bytes() == b'body'
+
+
+@pytest.mark.parametrize('field', ('attempt_id', 'original_request_id', 'proof', 'status',
+    'audit_id', 'generation', 'revision', 'state', 'worker_epoch', 'pending_request_id'))
+def test_exact_attempt_schema_refuses_blob_authority_without_mutation(tmp_path, field):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _exact_attempt_fixture(store)
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(sqlite3.IntegrityError):
+            store._connection.execute(f'UPDATE direct_publication_attempts SET {field}=?', (sqlite3.Binary(b'blob'),))
+        assert tuple(store._connection.iterdump()) == snapshot
+
+
+class _PublicationCommitFailure:
+    def __init__(self, connection):
+        self.connection = connection
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+    def commit(self):
+        raise sqlite3.OperationalError('injected publication commit fault')
+
+
+@pytest.mark.parametrize('phase', ('reserve', 'initial-complete', 'recovery-complete', 'pending', 'abort', 'cold'))
+def test_exact_attempt_commit_fault_is_all_or_none_and_retains_post_link_authority(tmp_path, phase):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, staged, destination, _ = _stage_producer_fixture(store)
+        store.bind_direct_staged_payload(stage, staged)
+        marker = paths.PublicationReservationMarker(destination.incomplete_dir / '.hermes-reservation',
+            stage.terminal.marker.marker_device, stage.terminal.marker.marker_inode)
+        prepared = paths.prepare_publication_payload(destination, stage.terminal.dispatch.reservation, marker, staged)
+        attempt = None if phase == 'reserve' else store.reserve_direct_publication(stage, prepared)
+        published = None
+        if phase != 'reserve':
+            published = paths.publish_staged_partial_payload(destination, prepared.reservation, staged,
+                prepared=prepared,creation_permit=paths.PublicationCreationPermit())
+        pending = None
+        if phase in {'recovery-complete', 'pending', 'abort'}:
+            store.recover_cold_start()
+            current = store.get_job('job-1')
+            arguments = dict(job_id='job-1',expected_worker_epoch=2,expected_generation=current.generation,
+                expected_revision=current.revision,request_id='new-fault-recovery',payload_digest='3'*64,
+                controller_ready=False,now=datetime(2032,1,2,tzinfo=UTC))
+            if phase != 'pending':
+                pending = store.prepare_direct_dispatch(**arguments)
+        snapshot = tuple(store._connection.iterdump())
+        connection = store._connection
+        store._connection = _PublicationCommitFailure(connection)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match='commit fault'):
+                if phase == 'reserve':
+                    store.reserve_direct_publication(stage, prepared)
+                elif phase == 'initial-complete':
+                    store.complete_direct_publication(attempt, published, initial_stage=stage)
+                elif phase == 'recovery-complete':
+                    store.complete_direct_publication(pending.attempt, published)
+                elif phase == 'pending':
+                    store.prepare_direct_dispatch(**arguments)
+                elif phase == 'abort':
+                    store.abort_exact_publication_recovery(pending)
+                else:
+                    store.recover_cold_start()
+        finally:
+            store._connection = connection
+        assert tuple(connection.iterdump()) == snapshot
+        assert destination.partial_path.read_bytes() == b'body'
+        assert destination.final_path.exists() == (phase != 'reserve')
+        if phase != 'reserve':
+            assert store._read_publication_attempt(connection,'job-1') is not None
+
+
+@pytest.mark.parametrize('phase', ('reserve', 'initial-complete', 'recovery-complete'))
+@pytest.mark.parametrize('boundary', ('descriptor-pre', 'descriptor-post', 'rewrite-pre', 'rewrite-post'))
+def test_exact_attempt_descriptor_and_restored_mtime_faults_roll_back_without_cleanup(tmp_path, monkeypatch, phase, boundary):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, staged, destination, _ = _stage_producer_fixture(store)
+        store.bind_direct_staged_payload(stage, staged)
+        marker = paths.PublicationReservationMarker(destination.incomplete_dir / '.hermes-reservation',
+            stage.terminal.marker.marker_device, stage.terminal.marker.marker_inode)
+        prepared = paths.prepare_publication_payload(destination, stage.terminal.dispatch.reservation, marker, staged)
+        attempt = None if phase == 'reserve' else store.reserve_direct_publication(stage, prepared)
+        published = None
+        if attempt is not None:
+            published = paths.publish_staged_partial_payload(destination, prepared.reservation, staged,
+                prepared=prepared,creation_permit=paths.PublicationCreationPermit())
+        if phase == 'recovery-complete':
+            store.recover_cold_start()
+            current = store.get_job('job-1')
+            pending = store.prepare_direct_dispatch(job_id='job-1',expected_worker_epoch=2,
+                expected_generation=current.generation,expected_revision=current.revision,
+                request_id='new-fault-recovery',payload_digest='3'*64,controller_ready=False,
+                now=datetime(2032,1,2,tzinfo=UTC))
+            attempt = pending.attempt
+        name = '_require_current_staged_payload' if phase == 'reserve' else 'require_current_publication_payload'
+        original = getattr(paths,name)
+        calls = []
+        def damaged(*args, **kwargs):
+            calls.append(1)
+            target = 1 if boundary.endswith('pre') else 2
+            if len(calls) == target:
+                if boundary.startswith('descriptor'):
+                    raise paths.PathValidationError('injected descriptor refusal')
+                details = destination.partial_path.stat()
+                destination.partial_path.write_bytes(b'BODY')
+                os.utime(destination.partial_path, ns=(details.st_atime_ns,details.st_mtime_ns))
+            return original(*args, **kwargs)
+        monkeypatch.setattr(paths,name,damaged)
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(paths.PathValidationError):
+            if phase == 'reserve':
+                store.reserve_direct_publication(stage,prepared)
+            else:
+                store.complete_direct_publication(attempt,published,initial_stage=stage if phase=='initial-complete' else None)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert destination.partial_path.exists() and marker.path.exists()
+        assert destination.final_path.exists() == (phase != 'reserve')
+
+
+def test_exact_attempt_recovery_abort_requires_active_direct_and_cold_preserves_historical_video_literal(tmp_path):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        _exact_attempt_fixture(store)
+        pending = store.prepare_direct_dispatch(job_id='job-1',expected_worker_epoch=1,
+            expected_generation=1,expected_revision=5,request_id='pending-before-source-change',
+            payload_digest='3'*64,controller_ready=False,now=datetime(2032,1,2,tzinfo=UTC))
+        store._connection.execute("UPDATE materialized_jobs SET source_kind='video'")
+        attempt_before = tuple(store._connection.execute('SELECT * FROM direct_publication_attempts').fetchone())
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):
+            store.abort_exact_publication_recovery(pending)
+        assert tuple(store._connection.iterdump()) == snapshot
+        store.recover_cold_start()
+        assert tuple(store._connection.execute('SELECT * FROM direct_publication_attempts').fetchone()) == attempt_before
+        assert store.get_materialized_job('job-1').source_kind.value == 'video'
+
+
+def test_exact_attempt_insert_fault_preserves_original_receipt_and_stage(tmp_path):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, staged, destination, _ = _stage_producer_fixture(store)
+        store.bind_direct_staged_payload(stage,staged)
+        marker = paths.PublicationReservationMarker(destination.incomplete_dir / '.hermes-reservation',
+            stage.terminal.marker.marker_device,stage.terminal.marker.marker_inode)
+        prepared = paths.prepare_publication_payload(destination,stage.terminal.dispatch.reservation,marker,staged)
+        store._connection.execute("CREATE TRIGGER reject_attempt BEFORE INSERT ON direct_publication_attempts BEGIN SELECT RAISE(ABORT,'attempt insert fault'); END")
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(sqlite3.IntegrityError, match='attempt insert fault'):
+            store.reserve_direct_publication(stage,prepared)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert not destination.final_path.exists()
+        assert destination.partial_path.read_bytes() == b'body' and marker.path.exists()

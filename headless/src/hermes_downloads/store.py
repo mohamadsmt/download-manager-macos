@@ -6,6 +6,9 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
+import hashlib
+import json
+import stat
 import secrets
 import sqlite3
 from typing import TYPE_CHECKING, Final
@@ -430,7 +433,24 @@ def _expected_table_schemas(*schemas: str) -> dict[str, str]:
     return expected
 
 
-_SUPPORTED_SCHEMA_VERSION: Final = 15
+_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA: Final = """
+CREATE TABLE direct_publication_attempts (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(job_id) CHECK (typeof(job_id) = 'text' AND length(job_id) BETWEEN 1 AND 128),
+    attempt_id TEXT NOT NULL UNIQUE CHECK (typeof(attempt_id) = 'text' AND length(attempt_id) BETWEEN 1 AND 128),
+    original_request_id TEXT NOT NULL UNIQUE REFERENCES direct_dispatch_commands(request_id) CHECK (typeof(original_request_id) = 'text'),
+    proof TEXT NOT NULL CHECK (typeof(proof) = 'text' AND length(proof) BETWEEN 1 AND 4096),
+    status TEXT NOT NULL CHECK (typeof(status) = 'text' AND status IN ('eligible', 'finished', 'closed')),
+    audit_id INTEGER NOT NULL REFERENCES events(event_id) CHECK (typeof(audit_id) = 'integer' AND audit_id > 0),
+    generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation BETWEEN 0 AND 9223372036854775807),
+    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision BETWEEN 0 AND 9223372036854775807),
+    state TEXT NOT NULL CHECK (typeof(state) = 'text' AND state IN ('finalizing', 'paused', 'completed', 'removed', 'queued')),
+    worker_epoch INTEGER NOT NULL CHECK (typeof(worker_epoch) = 'integer' AND worker_epoch BETWEEN 1 AND 9223372036854775807),
+    pending_request_id TEXT UNIQUE REFERENCES direct_dispatch_commands(request_id) CHECK (pending_request_id IS NULL OR typeof(pending_request_id) = 'text'),
+    CHECK (status != 'eligible' OR state IN ('finalizing', 'paused')),
+    CHECK (status != 'finished' OR (state = 'completed' AND pending_request_id IS NULL))
+);
+"""
+_SUPPORTED_SCHEMA_VERSION: Final = 16
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -601,6 +621,8 @@ _V15_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _JOB_CONTROL_COMMANDS_SCHEMA,
     _COMMAND_RECEIPTS_SCHEMA,
 )
+_V16_TABLE_SCHEMAS: Final = dict(_V15_TABLE_SCHEMAS,
+    **_expected_table_schemas(_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA))
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _DIRECT_ENGINE_RECOVERY_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}\Z")
@@ -902,6 +924,28 @@ class _DirectStagePlan:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class _DirectPublicationAttempt:
+    attempt_id: str
+    job: MaterializedJob
+    prepared: object
+    proof: str
+    audit_id: int
+    generation: int
+    revision: int
+    state: str
+    worker_epoch: int
+    pending_request_id: str | None = None
+    pending_payload_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectAttemptRecoveryPlan:
+    attempt: _DirectPublicationAttempt
+    request_id: str
+    payload_digest: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _DirectPublicationReconciliationPlan:
     """Private evidence required to finish an already-published final payload."""
 
@@ -1187,6 +1231,7 @@ class SQLiteStore:
             13: _V13_TABLE_SCHEMAS,
             14: _V14_TABLE_SCHEMAS,
             15: _V15_TABLE_SCHEMAS,
+            16: _V16_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -1359,8 +1404,14 @@ class SQLiteStore:
                 connection.execute(_FINAL_PUBLICATION_BINDINGS_SCHEMA)
                 connection.execute("PRAGMA user_version = 15")
                 version = 15
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 15:
                 if not SQLiteStore._has_table_schemas(connection, _V15_TABLE_SCHEMAS):
+                    raise RuntimeError("database schema version is incomplete")
+                connection.execute(_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA)
+                connection.execute("PRAGMA user_version = 16")
+                version = 16
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V16_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1894,6 +1945,20 @@ class SQLiteStore:
             raise
         return "paused"
 
+    def publication_control_is_current(self, *, job_id, action, request_id, payload_digest, expected_revision):
+        connection = self._connection
+        if self._match_command_receipt(connection,request_id=request_id,payload_digest=payload_digest,
+                scope=_JOB_CONTROL_COMMAND_SCOPE,action=action):
+            return False
+        current = self._read_job_control_projection(connection,job_id)
+        return current.revision == expected_revision and current.state not in _TERMINAL_JOB_CONTROL_STATES
+
+    def publication_queue_control_is_current(self, *, request_id, payload_digest, expected_revision):
+        if self._match_command_receipt(self._connection,request_id=request_id,payload_digest=payload_digest,
+                scope=_QUEUE_GATE_COMMAND_SCOPE,action=_QUEUE_GATE_COMMAND_ACTION):
+            return False
+        return self.queue_gate_snapshot()[1] == expected_revision
+
     def apply_queue_gate(
         self,
         *,
@@ -1901,6 +1966,7 @@ class SQLiteStore:
         request_id: str,
         payload_digest: str,
         expected_revision: int,
+        _contained_direct_job: tuple[str, int, int, bool] | None = None,
     ) -> QueueGateResult:
         """Atomically apply or replay one revision-fenced global gate command."""
 
@@ -1980,6 +2046,22 @@ class SQLiteStore:
                     raise RevisionConflictError("queue gate revision is stale")
                 if current_revision == _MAX_COUNTER:
                     raise OverflowError("queue gate revision exceeds persisted counter range")
+                if _contained_direct_job is not None:
+                    if gate != "paused" or type(_contained_direct_job) is not tuple or len(_contained_direct_job) != 4:
+                        raise ValueError("contained queue publication input is invalid")
+                    job_id, generation, revision, recoverable = _contained_direct_job
+                    if type(recoverable) is not bool:
+                        raise TypeError("publication recovery flag is invalid")
+                    job = self.get_materialized_job(job_id)
+                    if job is None or job.source_kind is not SourceKind.DIRECT:
+                        raise ValueError('contained queue job must be direct')
+                    current = self._read_job_control_projection(connection,job_id)
+                    if (current.generation,current.revision) != (generation,revision) or current.state not in {'downloading','finalizing','paused'}:
+                        raise ValueError("contained queue job is stale")
+                    predecessor = self._publication_predecessor_matches(connection,current)
+                    if current.state != "paused":
+                        self._persist_direct_dispatch_lifecycle(connection,current=current,state="paused",event_kind="job_paused")
+                    self._advance_publication_pointer(connection,current,preserve=predecessor and recoverable)
                 next_revision = current_revision + 1
                 connection.execute(
                     """
@@ -2021,6 +2103,7 @@ class SQLiteStore:
         payload_digest: str,
         expected_revision: int,
         _contained_direct_transfer: bool = False,
+        _publication_recoverable: bool = False,
     ) -> JobControlResult:
         """Atomically apply or replay one revision-fenced materialized-job command."""
 
@@ -2031,6 +2114,8 @@ class SQLiteStore:
         expected_revision = _require_counter(expected_revision, "expected_revision")
         if type(_contained_direct_transfer) is not bool:
             raise TypeError("_contained_direct_transfer must be a boolean")
+        if type(_publication_recoverable) is not bool:
+            raise TypeError("_publication_recoverable must be a boolean")
 
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
@@ -2085,6 +2170,7 @@ class SQLiteStore:
                 if self._read_source_kind(connection, job_id) is SourceKind.LEGACY_VIDEO:
                     connection.commit()
                     return current.to_result("blocked")
+                publication_predecessor = self._publication_predecessor_matches(connection,current)
                 if current.revision != expected_revision:
                     result = current.to_result("stale")
                 elif current.state in _TERMINAL_JOB_CONTROL_STATES:
@@ -2126,6 +2212,9 @@ class SQLiteStore:
                         and next_manual_hold == current.manual_hold
                         and next_start_now_requested == current.start_now_requested
                     ):
+                        if _contained_direct_transfer and action == 'pause':
+                            self._advance_publication_pointer(connection,current,
+                                preserve=publication_predecessor and _publication_recoverable)
                         result = current.to_result("applied")
                     else:
                         if current.revision == _MAX_COUNTER:
@@ -2144,6 +2233,8 @@ class SQLiteStore:
                         self._persist_job_control_mutation(
                             connection, action=action, updated=updated
                         )
+                        self._advance_publication_pointer(connection,current,
+                            preserve=(publication_predecessor and action == "pause" and _publication_recoverable))
                         result = updated.to_result("applied")
                 self._insert_job_control_receipt(
                     connection,
@@ -2396,6 +2487,10 @@ class SQLiteStore:
                     )
                 if replay.status == "pending":
                     current = self._read_job_control_projection(connection, job_id)
+                    exact = self._prepare_exact_publication_recovery(connection,current,request_id,payload_digest,persist=False)
+                    if exact is not None:
+                        connection.commit()
+                        return exact
                     materialized = self.get_materialized_job(job_id)
                     if (
                         materialized is not None
@@ -2407,6 +2502,8 @@ class SQLiteStore:
                         None
                         if (
                             materialized is None
+                            or connection.execute('SELECT 1 FROM direct_publication_attempts WHERE job_id=?', (job_id,)).fetchone() is not None
+                            or self._has_started_direct_publication(connection, job_id)
                             or materialized.source_kind is not SourceKind.DIRECT
                             or replay.generation != current.generation
                             or replay.revision != current.revision
@@ -2458,7 +2555,24 @@ class SQLiteStore:
                 result = self._direct_dispatch_result_from_current(current, "stale")
             elif materialized.source_kind is not SourceKind.DIRECT:
                 result = self._direct_dispatch_result_from_current(current, "blocked")
+            elif (current.state in (JobState.FINALIZING.value, JobState.PAUSED.value)
+                and connection.execute('SELECT 1 FROM direct_publication_attempts WHERE job_id=?', (job_id,)).fetchone() is None
+                and self._has_started_direct_publication(connection, job_id)):
+                # A real STARTED producer cannot inherit metadata-only legacy
+                # authority if its attempt was never committed or is missing.
+                result = self._direct_dispatch_result_from_current(current, "blocked")
             elif current.state in (JobState.FINALIZING.value, JobState.PAUSED.value):
+                exact_row = connection.execute('SELECT status FROM direct_publication_attempts WHERE job_id=?', (job_id,)).fetchone()
+                if exact_row is not None:
+                    exact = self._prepare_exact_publication_recovery(connection,current,request_id,payload_digest)
+                    if exact is not None:
+                        connection.commit()
+                        return exact
+                    result = self._direct_dispatch_result_from_current(current, "blocked")
+                    self._insert_direct_dispatch_command(connection,request_id=request_id,payload_digest=payload_digest,
+                        job=job_id,status=result.status,generation=result.generation,revision=result.revision,state=result.state)
+                    connection.commit()
+                    return result
                 reconciliation = self._prepare_direct_publication_reconciliation(
                     connection,
                     current=current,
@@ -2868,6 +2982,306 @@ class SQLiteStore:
             connection.rollback()
             raise
 
+    @staticmethod
+    def _has_started_direct_publication(connection, job_id):
+        return connection.execute("SELECT 1 FROM direct_dispatch_commands WHERE job_id=? AND status='started' AND state='downloading' LIMIT 1",
+            (job_id,)).fetchone() is not None
+
+    @staticmethod
+    def _publication_ownership(job, reservation) -> str:
+        # Lifecycle and hold flags are fenced by the current pointer instead.
+        values = [job.job_id, job.intent.request_id, job.intent.payload_digest,
+            job.intent.source_url.hex(), job.source_kind.value, job.queue_collection_id,
+            job.priority, job.order_key, None if job.scheduled_for is None else job.scheduled_for.isoformat(),
+            job.category, job.destination_collection, job.partial_filename, job.selected_final_filename,
+            reservation.job_id, reservation.target_component, reservation.final_filename, reservation.claim_token]
+        return hashlib.sha256(json.dumps(values, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+    def _read_publication_attempt(self, connection, job_id, *, require_current=True):
+        from hermes_downloads.paths import (PreparedPublicationPayload, PublicationReservationMarker,
+            StagedPartialPayload, rehydrate_destination)
+        _require_identifier(job_id, 'publication job')
+        row = connection.execute('SELECT * FROM direct_publication_attempts WHERE job_id = ?', (job_id,)).fetchone()
+        if row is None:
+            return None
+        for key in ('job_id', 'attempt_id', 'original_request_id', 'proof', 'status', 'state'):
+            _require_sqlite_text(row[key], 'publication ' + key)
+        if row['job_id'] != job_id:
+            raise ValueError('publication attempt job changed')
+        _require_identifier(row['attempt_id'], 'attempt_id')
+        if row['status'] not in {'eligible','finished','closed'} or row['state'] not in {'finalizing','paused','completed','removed','queued'}:
+            raise ValueError('publication attempt state is invalid')
+        counters = tuple(_require_counter(_require_sqlite_integer(row[k], k), k)
+            for k in ('audit_id','generation','revision','worker_epoch'))
+        if counters[0] < 1 or counters[3] < 1:
+            raise ValueError('publication attempt pointer is invalid')
+        if type(row['proof']) is not str or len(row['proof']) > 4096:
+            raise ValueError('publication attempt proof is invalid')
+        proof = json.loads(row['proof'])
+        if type(proof) is not dict or set(proof) != {'request','digest','generation','downloading_revision',
+                'finalizing_revision','finalizing_audit','epoch','ownership','marker','stage','chain','sha256'}:
+            raise ValueError('publication attempt proof shape is invalid')
+        _require_identifier(proof['request'], 'publication request')
+        for key in ('digest','ownership','sha256'):
+            _require_payload_digest(proof[key])
+        for key in ('generation','downloading_revision','finalizing_revision','finalizing_audit','epoch'):
+            _require_counter(proof[key], key)
+        if (proof['finalizing_revision'] != proof['downloading_revision'] + 1
+                or proof['finalizing_audit'] < 1 or proof['epoch'] < 1
+                or proof['request'] != row['original_request_id']):
+            raise ValueError('publication original fence is invalid')
+        if (counters[1] < proof['generation'] or counters[2] < proof['finalizing_revision']
+            or counters[3] < proof['epoch']
+            or (row['status'] == 'eligible' and row['state'] not in {'finalizing', 'paused'})
+            or (row['status'] == 'finished' and (row['state'] != 'completed' or row['pending_request_id'] is not None))
+            or (row['state'] == 'finalizing' and counters != (proof['finalizing_audit'],
+                proof['generation'], proof['finalizing_revision'], proof['epoch']))):
+            raise ValueError('publication successor fence is invalid')
+        for key, length in (('marker',2),('stage',7)):
+            values = proof[key]
+            if type(values) is not list or len(values) != length:
+                raise ValueError('publication metadata shape is invalid')
+            for value in values:
+                _require_counter(value, 'publication metadata')
+        if not stat.S_ISREG(proof['stage'][3]) or proof['stage'][4] != 1:
+            raise ValueError('publication original stage is invalid')
+        if type(proof['chain']) is not list or len(proof['chain']) != 4:
+            raise ValueError('publication chain is invalid')
+        for pair in proof['chain']:
+            if type(pair) is not list or len(pair) != 2:
+                raise ValueError('publication chain is invalid')
+            for value in pair:
+                _require_counter(value, 'publication directory')
+        receipt = self._read_direct_dispatch_command(connection, proof['request'])
+        expected = _DirectDispatchCommand(proof['request'], proof['digest'], job_id, 'started',
+            proof['generation'], proof['downloading_revision'], 'downloading')
+        job = self.get_materialized_job(job_id)
+        reservation = self._read_publication_reservation(connection, job_id)
+        marker = self._read_publication_marker_binding(connection, job_id)
+        staged = self._read_staged_payload_binding(connection, job_id)
+        if (receipt != expected or job is None or job.source_kind is not SourceKind.DIRECT
+            or reservation is None or marker is None or staged is None
+            or self._publication_ownership(job,reservation) != proof['ownership']
+            or (marker.marker_device,marker.marker_inode) != tuple(proof['marker'])
+            or (staged.partial_device,staged.partial_inode,staged.logical_size) != tuple(proof['stage'][:3])):
+            raise ValueError('publication immutable authority changed')
+        original_event = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id = ?',
+            (proof['finalizing_audit'],)).fetchone()
+        if original_event is None or tuple(original_event) != ('job_finalizing',job_id,proof['generation'],proof['finalizing_revision']):
+            raise ValueError('publication original audit changed')
+        destination = rehydrate_destination(category=job.category, collection=job.destination_collection,
+            partial_filename=job.partial_filename, selected_final_filename=job.selected_final_filename, job_id=job_id)
+        dev,ino,size,mode,nlink,mtime,ctime = proof['stage']
+        prepared = PreparedPublicationPayload(destination,reservation,
+            PublicationReservationMarker(destination.incomplete_dir / '.hermes-reservation', *proof['marker']),
+            StagedPartialPayload(destination.partial_path,dev,ino,size,mtime,mode,nlink,ctime),
+            proof['sha256'],tuple(map(tuple,proof['chain'])))
+        pending = row['pending_request_id']
+        pending_digest = None
+        if pending is not None:
+            _require_identifier(_require_sqlite_text(pending,'publication pending'), 'publication pending')
+            command = self._read_direct_dispatch_command(connection, pending)
+            if (pending == proof['request'] or command is None or command.status != 'pending'
+                or (command.job, command.generation, command.revision, command.state) !=
+                (job_id, counters[1], counters[2], row['state'])):
+                raise ValueError('publication pending receipt is stale')
+            pending_digest = command.payload_digest
+        attempt = _DirectPublicationAttempt(row['attempt_id'],job,prepared,row['proof'],*counters[:3],
+            row['state'],counters[3],pending,pending_digest)
+        if require_current:
+            current = self._read_job_control_projection(connection,job_id)
+            latest = connection.execute('SELECT event_id,generation,revision,kind FROM events WHERE job_id = ? ORDER BY event_id DESC LIMIT 1', (job_id,)).fetchone()
+            if (row['status'] != 'eligible' or latest is None
+                or tuple(latest) != (*counters[:3], 'job_' + row['state'])
+                or (current.generation,current.revision,current.state) != (attempt.generation,attempt.revision,attempt.state)
+                or self._current_worker_epoch(connection) != attempt.worker_epoch):
+                raise ValueError('publication current pointer is stale')
+        return attempt
+
+    def reserve_direct_publication(self, stage, prepared):
+        from hermes_downloads.paths import (PreparedPublicationPayload, _require_current_staged_payload,
+            _require_strict_publication_namespace, _open_visible_publication_chain,
+            _open_staged_partial_payload, _strict_staged_metadata)
+        import os
+        if type(stage) is not _DirectStagePlan or stage.job.source_kind is not SourceKind.DIRECT:
+            raise ValueError('publication requires direct stage')
+        if type(prepared) is not PreparedPublicationPayload:
+            raise TypeError('publication preparation is invalid')
+        connection = self._connection
+        connection.execute('BEGIN IMMEDIATE')
+        try:
+            self._require_direct_stage_authority(connection,stage)
+            if (prepared.reservation != stage.terminal.dispatch.reservation
+                or (prepared.marker.st_dev,prepared.marker.st_ino) != (stage.terminal.marker.marker_device,stage.terminal.marker.marker_inode)):
+                raise ValueError('publication preparation authority changed')
+            identity = stage.observed.verified_identity
+            original = (identity.st_dev,identity.st_ino,identity.logical_size,identity.st_mode,identity.st_nlink,identity.mtime_ns,identity.ctime_ns)
+            if _strict_staged_metadata(prepared.destination,prepared.staged_payload) != original:
+                raise ValueError('publication stage metadata changed')
+            def check():
+                _require_current_staged_payload(prepared.destination,prepared.reservation,prepared.marker,prepared.staged_payload)
+                directories = _open_visible_publication_chain(prepared.destination.root,
+                    prepared.reservation.target_component,stage.job.job_id,prepared.directory_identities)
+                try:
+                    fd = _open_staged_partial_payload(directories[3],prepared.destination.partial_path.name)
+                    try:
+                        _require_strict_publication_namespace(prepared,fd,original,published=False)
+                    finally:
+                        os.close(fd)
+                finally:
+                    for fd in reversed(directories): os.close(fd)
+            check()
+            dispatch = stage.terminal.dispatch
+            proof = json.dumps(dict(request=dispatch.request_id,digest=dispatch.payload_digest,
+                generation=dispatch.generation,downloading_revision=dispatch.revision,
+                finalizing_revision=stage.revision,finalizing_audit=stage.audit_id,
+                epoch=stage.terminal.record.worker_epoch,ownership=self._publication_ownership(stage.job,prepared.reservation),
+                marker=[prepared.marker.st_dev,prepared.marker.st_ino],stage=original,
+                chain=prepared.directory_identities,sha256=prepared.sha256),sort_keys=True,separators=(',',':'))
+            connection.execute('INSERT INTO direct_publication_attempts VALUES (?,?,?,?,?,?,?,?,?,?,NULL)',
+                (stage.job.job_id,secrets.token_hex(32),dispatch.request_id,proof,'eligible',stage.audit_id,
+                 dispatch.generation,stage.revision,'finalizing',stage.terminal.record.worker_epoch))
+            attempt = self._read_publication_attempt(connection,stage.job.job_id)
+            check()
+            connection.commit()
+            return attempt
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def complete_direct_publication(self, attempt, published, *, initial_stage=None):
+        from hermes_downloads.paths import require_current_publication_payload
+        if type(attempt) is not _DirectPublicationAttempt:
+            raise TypeError('publication attempt is invalid')
+        connection = self._connection
+        connection.execute('BEGIN IMMEDIATE')
+        try:
+            current_attempt = self._read_publication_attempt(connection,attempt.job.job_id)
+            if current_attempt != attempt:
+                raise ValueError('publication completion plan is stale')
+            if initial_stage is not None:
+                self._require_direct_stage_authority(connection,initial_stage)
+            if attempt.pending_request_id is not None:
+                command = self._read_direct_dispatch_command(connection,attempt.pending_request_id)
+                if command is None or command.status != 'pending' or (command.job,command.generation,command.revision,command.state) != (attempt.job.job_id,attempt.generation,attempt.revision,attempt.state):
+                    raise ValueError('publication recovery receipt is stale')
+            require_current_publication_payload(attempt.prepared,published)
+            self._bind_final_publication_in_transaction(connection,
+                requested=_FinalPublicationBinding(attempt.job.job_id,published.st_dev,published.st_ino,published.logical_size),
+                claim_token=attempt.prepared.reservation.claim_token)
+            current = self._read_job_control_projection(connection,attempt.job.job_id)
+            completed = self._persist_direct_dispatch_lifecycle(connection,current=current,state='completed',event_kind='job_completed')
+            audit = connection.execute('SELECT MAX(event_id) FROM events WHERE job_id = ?', (completed.job,)).fetchone()[0]
+            connection.execute("UPDATE direct_publication_attempts SET status='finished',audit_id=?,revision=?,state='completed',pending_request_id=NULL WHERE job_id=? AND attempt_id=? AND status='eligible'",
+                (audit,completed.revision,completed.job,attempt.attempt_id))
+            self._require_one_changed_row(connection,'publication finish')
+            result = self._direct_dispatch_result_from_current(completed,'started')
+            if attempt.pending_request_id is not None:
+                self._update_direct_dispatch_command(connection,request_id=attempt.pending_request_id,result=result)
+            # Original receipt, reservation and all immutable proof are checked again.
+            finished = self._read_publication_attempt(connection,completed.job,require_current=False)
+            latest = connection.execute('SELECT event_id,kind,generation,revision FROM events WHERE job_id=? ORDER BY event_id DESC LIMIT 1',
+                (completed.job,)).fetchone()
+            status = connection.execute('SELECT status FROM direct_publication_attempts WHERE job_id=?', (completed.job,)).fetchone()
+            if (finished is None or status['status'] != 'finished'
+                or finished.attempt_id != attempt.attempt_id or finished.proof != attempt.proof
+                or finished.prepared != attempt.prepared
+                or (finished.audit_id,finished.generation,finished.revision,finished.state,finished.worker_epoch) !=
+                    (audit,completed.generation,completed.revision,'completed',attempt.worker_epoch)
+                or self._current_worker_epoch(connection) != attempt.worker_epoch
+                or self._read_job_control_projection(connection,completed.job) != completed
+                or latest is None or tuple(latest) != (audit,'job_completed',completed.generation,completed.revision)):
+                raise ValueError('publication completed authority changed')
+            if attempt.pending_request_id is not None:
+                expected_receipt = _DirectDispatchCommand(attempt.pending_request_id,
+                    attempt.pending_payload_digest,completed.job,'started',completed.generation,
+                    completed.revision,'completed')
+                if self._read_direct_dispatch_command(connection,attempt.pending_request_id) != expected_receipt:
+                    raise ValueError('publication completed receipt changed')
+            require_current_publication_payload(attempt.prepared,published)
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def _prepare_exact_publication_recovery(self, connection, current, request_id, payload_digest, *, persist=True):
+        job = self.get_materialized_job(current.job)
+        if job is None or job.source_kind is not SourceKind.DIRECT:
+            return None
+        row = connection.execute('SELECT status FROM direct_publication_attempts WHERE job_id=?', (current.job,)).fetchone()
+        if row is None or row['status'] != 'eligible':
+            return None
+        attempt = self._read_publication_attempt(connection,current.job)
+        if attempt.pending_request_id not in (None,request_id):
+            raise ValueError('publication recovery already pending')
+        if persist:
+            self._insert_direct_dispatch_command(connection,request_id=request_id,payload_digest=payload_digest,
+                job=current.job,status='pending',generation=current.generation,revision=current.revision,state=current.state)
+            connection.execute('UPDATE direct_publication_attempts SET pending_request_id=? WHERE job_id=?', (request_id,current.job))
+            attempt = self._read_publication_attempt(connection,current.job)
+        else:
+            command = self._read_direct_dispatch_command(connection,request_id)
+            if attempt.pending_request_id != request_id or command is None or command.payload_digest != payload_digest or command.status != 'pending':
+                return None
+        return _DirectAttemptRecoveryPlan(attempt,request_id,payload_digest)
+
+    def abort_exact_publication_recovery(self, plan):
+        if type(plan) is not _DirectAttemptRecoveryPlan:
+            raise TypeError('publication recovery plan is invalid')
+        connection = self._connection
+        connection.execute('BEGIN IMMEDIATE')
+        try:
+            job = self.get_materialized_job(plan.attempt.job.job_id)
+            if job is None or job.source_kind is not SourceKind.DIRECT:
+                raise ValueError('publication recovery requires direct source')
+            current = self._read_job_control_projection(connection,plan.attempt.job.job_id)
+            result = self._direct_dispatch_result_from_current(current,'blocked')
+            command = self._read_direct_dispatch_command(connection,plan.request_id)
+            if command is not None and command.status == 'pending' and command.payload_digest == plan.payload_digest:
+                self._update_direct_dispatch_command(connection,request_id=plan.request_id,result=result)
+            connection.execute('UPDATE direct_publication_attempts SET pending_request_id=NULL WHERE job_id=? AND pending_request_id=?', (current.job,plan.request_id))
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def _advance_publication_pointer(self, connection, predecessor, *, preserve, old_epoch=None):
+        job = self.get_materialized_job(predecessor.job)
+        if job is None or job.source_kind is not SourceKind.DIRECT:
+            return
+        row = connection.execute('SELECT * FROM direct_publication_attempts WHERE job_id=?', (predecessor.job,)).fetchone()
+        if row is None or row['status'] != 'eligible':
+            return
+        latest = connection.execute('SELECT event_id,generation,revision FROM events WHERE job_id=? ORDER BY event_id DESC LIMIT 1', (predecessor.job,)).fetchone()
+        current = self._read_job_control_projection(connection,predecessor.job)
+        epoch = self._current_worker_epoch(connection)
+        old = (predecessor.generation,predecessor.revision,predecessor.state,
+            epoch if old_epoch is None else old_epoch)
+        matches = (row['generation'],row['revision'],row['state'],row['worker_epoch']) == old
+        # Caller checked predecessor's latest audit before its own mutation.
+        eligible = preserve and matches and current.state == 'paused'
+        if row['pending_request_id'] is not None:
+            command = self._read_direct_dispatch_command(connection,row['pending_request_id'])
+            if command is not None and command.status == 'pending':
+                self._update_direct_dispatch_command(connection,request_id=command.request_id,
+                    result=self._direct_dispatch_result_from_current(current,'blocked'))
+        connection.execute('UPDATE direct_publication_attempts SET status=?,audit_id=?,generation=?,revision=?,state=?,worker_epoch=?,pending_request_id=NULL WHERE job_id=?',
+            ('eligible' if eligible else 'closed',latest['event_id'],current.generation,current.revision,current.state,epoch,current.job))
+
+    def _publication_predecessor_matches(self, connection, current):
+        job = self.get_materialized_job(current.job)
+        if job is None or job.source_kind is not SourceKind.DIRECT:
+            return False
+        row = connection.execute('SELECT status FROM direct_publication_attempts WHERE job_id=?', (current.job,)).fetchone()
+        if row is None or row['status'] != 'eligible':
+            return False
+        try:
+            return self._read_publication_attempt(connection, current.job) is not None
+        except (TypeError, ValueError):
+            return False
+
     def abort_direct_dispatch(self, plan: _DirectDispatchPlan) -> DirectDispatchResult:
         """Durably pause a contained uncertain dispatch without retrying it."""
 
@@ -2991,7 +3405,7 @@ class SQLiteStore:
             raise
 
     def pause_active_direct_job(
-        self, *, job_id: str, generation: int, revision: int
+        self, *, job_id: str, generation: int, revision: int, _publication_recoverable: bool = False
     ) -> JobControlResult:
         """Persist a contained active direct job as paused without a new request."""
 
@@ -3008,12 +3422,11 @@ class SQLiteStore:
                 or current.state not in {JobState.DOWNLOADING.value, JobState.FINALIZING.value}
             ):
                 raise ValueError("active direct job is stale")
+            predecessor = self._publication_predecessor_matches(connection,current)
             paused = self._persist_direct_dispatch_lifecycle(
-                connection,
-                current=current,
-                state=JobState.PAUSED.value,
-                event_kind="job_paused",
-            )
+                connection, current=current, state=JobState.PAUSED.value, event_kind="job_paused")
+            self._advance_publication_pointer(connection,current,
+                preserve=predecessor and _publication_recoverable)
             connection.commit()
             return paused.to_result("applied")
         except BaseException:
@@ -3337,6 +3750,14 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
+            old_epoch = self.worker_epoch()
+            eligible_predecessors = {}
+            for row in connection.execute("SELECT job_id FROM direct_publication_attempts WHERE status='eligible'").fetchall():
+                job = self.get_materialized_job(row['job_id'])
+                if job is None or job.source_kind is not SourceKind.DIRECT:
+                    continue
+                current = self._read_job_control_projection(connection,row['job_id'])
+                eligible_predecessors[current.job] = (current,self._publication_predecessor_matches(connection,current))
             epoch_setting = connection.execute(
                 "SELECT value, revision FROM settings WHERE key = 'worker_epoch'"
             ).fetchone()
@@ -3422,6 +3843,8 @@ class SQLiteStore:
                     """,
                     (job_id, generation, revision),
                 )
+            for predecessor, matches in eligible_predecessors.values():
+                self._advance_publication_pointer(connection,predecessor,preserve=matches,old_epoch=old_epoch)
             connection.commit()
         except BaseException:
             connection.rollback()

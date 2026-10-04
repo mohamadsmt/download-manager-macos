@@ -2796,3 +2796,138 @@ def test_strict_existing_only_is_deferred_and_never_enters_creation(final_state,
     assert calls == [] and not permit.snapshot().creation_attempted
     assert destination.final_path.exists() == (final_state != "missing")
     assert destination.partial_path.exists() and _marker_path(destination).exists()
+
+
+@pytest.mark.parametrize("damage", (None, "rewrite", "extra-link", "mode", "marker", "missing", "collision"))
+def test_exact_attempt_existing_only_proves_bytes_without_creation(damage, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, reservation, staged, _ = fixture
+    prepared = _strict_prepare(fixture)
+    os.link(destination.partial_path, destination.final_path)
+    if damage == "rewrite":
+        _strict_rewrite(destination.partial_path)
+    elif damage == "extra-link":
+        os.link(destination.partial_path, destination.partial_path.with_name("retained-extra"))
+    elif damage == "mode":
+        destination.partial_path.chmod(0o400)
+    elif damage == "marker":
+        marker = _marker_path(destination)
+        marker.rename(marker.with_name("retained-marker"))
+        marker.write_bytes(marker.with_name("retained-marker").read_bytes())
+    elif damage == "missing":
+        destination.final_path.rename(destination.final_path.with_name("retained-final"))
+    elif damage == "collision":
+        destination.final_path.rename(destination.final_path.with_name("retained-final"))
+        destination.final_path.write_bytes(b"unowned")
+    calls = []
+    monkeypatch.setattr(paths.os, "link", lambda *a, **k: calls.append(1))
+    if damage is None:
+        result = paths.publish_staged_partial_payload(destination, reservation, staged,
+            prepared=prepared, existing_only=True)
+        assert result.sha256 == prepared.sha256
+        assert result.st_nlink == 2
+        assert result.ctime_ns == destination.partial_path.stat().st_ctime_ns
+        paths.require_current_publication_payload(prepared, result)
+    else:
+        with pytest.raises(paths.PathValidationError):
+            paths.publish_staged_partial_payload(destination, reservation, staged,
+                prepared=prepared, existing_only=True)
+    assert calls == []
+    assert destination.partial_path.exists() and _marker_path(destination).exists()
+
+
+@pytest.mark.parametrize("boundary", ("after-hash", "cheap-recheck"))
+def test_exact_attempt_recovery_rejects_restored_mtime_rewrite(boundary, monkeypatch):
+    fixture = _strict_fixture()
+    paths, destination, reservation, staged, _ = fixture
+    prepared = _strict_prepare(fixture)
+    os.link(destination.partial_path, destination.final_path)
+    if boundary == "after-hash":
+        original = paths._hash_publication_payload
+        def changed(fd, expected):
+            value = original(fd, expected)
+            _strict_rewrite(destination.partial_path)
+            return value
+        monkeypatch.setattr(paths, "_hash_publication_payload", changed)
+        with pytest.raises(paths.PathValidationError):
+            paths.publish_staged_partial_payload(destination, reservation, staged,
+                prepared=prepared, existing_only=True)
+    else:
+        result = paths.publish_staged_partial_payload(destination, reservation, staged,
+            prepared=prepared, existing_only=True)
+        _strict_rewrite(destination.partial_path)
+        with pytest.raises(paths.PathValidationError):
+            paths.require_current_publication_payload(prepared, result)
+
+
+@pytest.mark.parametrize('phase', ('prepare', 'post-link', 'existing-only'))
+def test_strict_hash_consumes_cancellation_between_chunks_without_cleanup(phase, monkeypatch):
+    import threading
+    fixture = _strict_fixture(b'x' * (2 * 1024 * 1024 + 17))
+    paths, destination, reservation, staged, marker = fixture
+    prepared = None if phase == 'prepare' else _strict_prepare(fixture)
+    if phase == 'existing-only':
+        os.link(destination.partial_path, destination.final_path)
+    cancelled = threading.Event()
+    original_read = paths.os.pread
+    reads = []
+    def read(fd, count, offset):
+        value = original_read(fd, count, offset)
+        reads.append((count, offset))
+        cancelled.set()
+        return value
+    monkeypatch.setattr(paths.os, 'pread', read)
+    with pytest.raises(paths.PathValidationError, match='cancelled'):
+        if phase == 'prepare':
+            paths.prepare_publication_payload(destination, reservation, marker, staged,
+                cancelled=cancelled.is_set)
+        else:
+            paths.publish_staged_partial_payload(destination, reservation, staged,
+                prepared=prepared, existing_only=phase == 'existing-only',
+                creation_permit=paths.PublicationCreationPermit() if phase == 'post-link' else None,
+                _cancelled=cancelled.is_set)
+    assert reads == [(1024 * 1024, 0)]
+    assert destination.partial_path.read_bytes() == b'x' * (2 * 1024 * 1024 + 17)
+    assert _marker_path(destination).exists()
+    assert destination.final_path.exists() == (phase != 'prepare')
+
+
+@pytest.mark.parametrize('fault', ('read', 'during-hash-rewrite', 'fsync', 'post-fsync-rewrite', 'fifo', 'symlink', 'directory'))
+def test_exact_attempt_existing_only_faults_retain_authority_and_never_link(fault, monkeypatch):
+    fixture = _strict_fixture(b'x' * (1024 * 1024 + 17))
+    paths, destination, reservation, staged, marker = fixture
+    prepared = _strict_prepare(fixture)
+    os.link(destination.partial_path, destination.final_path)
+    calls = []
+    monkeypatch.setattr(paths.os,'link',lambda *args,**kwargs: calls.append(1))
+    if fault in {'fifo', 'symlink', 'directory'}:
+        destination.final_path.rename(destination.final_path.with_name('retained-final'))
+        if fault == 'fifo':
+            os.mkfifo(destination.final_path)
+        elif fault == 'symlink':
+            destination.final_path.symlink_to(destination.partial_path)
+        else:
+            destination.final_path.mkdir()
+    elif fault in {'read', 'during-hash-rewrite'}:
+        original = os.pread
+        def read(fd, count, offset):
+            if fault == 'read':
+                raise OSError('private read diagnostic')
+            value = original(fd,count,offset)
+            if offset == 0:
+                _strict_rewrite(destination.partial_path)
+            return value
+        monkeypatch.setattr(paths.os,'pread',read)
+    else:
+        original = paths._fsync_published_final_directory
+        def sync(fd):
+            if fault == 'fsync':
+                raise paths.PathValidationError('private fsync diagnostic')
+            original(fd)
+            _strict_rewrite(destination.partial_path)
+        monkeypatch.setattr(paths,'_fsync_published_final_directory',sync)
+    with pytest.raises(paths.PathValidationError):
+        paths.publish_staged_partial_payload(destination,reservation,staged,prepared=prepared,existing_only=True)
+    assert calls == []
+    assert destination.partial_path.exists() and marker.path.exists()
+    assert destination.final_path.exists()

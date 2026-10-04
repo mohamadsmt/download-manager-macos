@@ -583,7 +583,7 @@ def test_worker_without_dispatch_never_observes_or_verifies_terminal(private_roo
 
 
 
-@pytest.mark.parametrize("operation", ("terminal", "stage"))
+@pytest.mark.parametrize("operation", ("terminal", "stage", "prepare", "post-link", "publication-exit"))
 def test_held_observation_cannot_overlap_controller_after_same_process_worker_restart(short_state_root, monkeypatch, operation):
     from types import SimpleNamespace
     from hermes_downloads.processes import ProcessBirthIdentity
@@ -616,13 +616,13 @@ def test_held_observation_cannot_overlap_controller_after_same_process_worker_re
             return _DirectEngineRecoveryCapability(rpc_port=43123, rpc_secret="a" * 43)
         def add_paused(self, **kwargs):
             self.destination = kwargs["destination"]
-            if operation == "stage":
+            if operation != "terminal":
                 self.destination.partial_path.write_bytes(b"body")
             return SimpleNamespace(status="paused", gid="0123456789abcdef")
         def resume(self, **kwargs):
             return None
         def observe_terminal(self, **kwargs):
-            if operation == "stage":
+            if operation != "terminal":
                 details = self.destination.partial_path.stat()
                 return direct.DirectTransfer(job_id="observer-job", generation=1,
                     gid="0123456789abcdef", status="complete", total_length=4,
@@ -638,7 +638,6 @@ def test_held_observation_cannot_overlap_controller_after_same_process_worker_re
         def close(self):
             return None
     if operation == "stage":
-        from hermes_downloads import paths
         original_sync = paths._fsync_staged_partial_payload
         def held_sync(fd):
             entered.set()
@@ -646,6 +645,27 @@ def test_held_observation_cannot_overlap_controller_after_same_process_worker_re
             original_sync(fd)
             returned.set()
         monkeypatch.setattr(paths, "_fsync_staged_partial_payload", held_sync)
+    elif operation in {'prepare', 'post-link'}:
+        name = '_hash_publication_payload' if operation == 'prepare' else '_fsync_published_final_directory'
+        original = getattr(paths, name)
+        def held_publication(*args, **kwargs):
+            entered.set()
+            assert release.wait(10)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                returned.set()
+        monkeypatch.setattr(paths, name, held_publication)
+    elif operation == 'publication-exit':
+        original_thread = threading.Thread
+        class HeldExitThread(original_thread):
+            def run(self):
+                super().run()
+                if self.name == 'direct-publication-observation':
+                    entered.set()
+                    assert release.wait(10)
+                    returned.set()
+        monkeypatch.setattr(worker.threading, 'Thread', HeldExitThread)
     monkeypatch.setattr(direct, "DirectAria2Controller", Controller)
     monkeypatch.setattr("hermes_downloads.processes.reconcile_process_birth", lambda _: "current")
     monkeypatch.setattr(worker, "reconcile_process_birth", lambda _: "current")
@@ -696,3 +716,91 @@ def test_held_observation_cannot_overlap_controller_after_same_process_worker_re
         shutdown.set()
         thread.join(_WATCHDOG_SECONDS)
         assert returned.wait(_WATCHDOG_SECONDS)
+def test_exact_publication_pending_is_redacted_and_bounded():
+    from hermes_downloads.ipc import DirectJobDispatchResult
+    result = DirectJobDispatchResult(status='pending', job='job-1', generation=1,
+        revision=5, state='finalizing')
+    assert DirectJobDispatchResult.from_record(result.to_record()) == result
+
+
+def test_certified_serving_reads_complete_schema16_without_history_effects(short_state_root):
+    import json
+    import sqlite3
+    from hermes_downloads import endpoint_ownership as ownership
+    root = Path('/private') / short_state_root.relative_to('/') if str(short_state_root).startswith('/tmp/') else short_state_root
+    ready, shutdown, stopped = threading.Event(), threading.Event(), threading.Event()
+    errors = []
+    def run():
+        try:
+            worker.run_worker(root, socket_path=root / 'worker.sock', recover_socket=True,
+                ready_event=ready, shutdown_event=shutdown, stopped_event=stopped)
+        except BaseException as error:
+            errors.append(error)
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert ready.wait(_WATCHDOG_SECONDS)
+        record = (root / ownership.RECORD).read_bytes()
+        assert json.loads(record)['schema'] == 1
+        with sqlite3.connect((root / 'state.db').as_uri() + '?mode=ro', uri=True) as connection:
+            before = tuple(connection.iterdump())
+            assert connection.execute('PRAGMA user_version').fetchone()[0] == 16
+            assert connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
+        certificate = ownership.preflight(root)
+        assert certificate.record[1] == record
+        assert json.loads(record)['worker_epoch'] == ipc.request_health(root / 'worker.sock').worker_epoch
+        with sqlite3.connect((root / 'state.db').as_uri() + '?mode=ro', uri=True) as connection:
+            assert tuple(connection.iterdump()) == before
+        assert (root / ownership.RECORD).read_bytes() == record
+    finally:
+        shutdown.set()
+        thread.join(_WATCHDOG_SECONDS)
+        assert stopped.is_set() and not thread.is_alive() and errors == []
+    assert not (root / 'worker.sock').exists() and not (root / ownership.RECORD).exists()
+
+
+@pytest.mark.parametrize('fault', ('incomplete', 'malformed', 'newer'))
+def test_schema16_certificate_refuses_before_lease_bootstrap_and_reclaim(short_state_root, monkeypatch, fault):
+    import sqlite3
+    from hermes_downloads import endpoint_ownership as ownership
+    root = Path('/private') / short_state_root.relative_to('/') if str(short_state_root).startswith('/tmp/') else short_state_root
+    certificate = ownership.preflight(root)
+    store = SQLiteStore(root / 'state.db')
+    store.recover_cold_start()
+    epoch = store.worker_epoch()
+    store.close()
+    server = ipc.HealthServer(root / 'worker.sock', health=lambda: ipc.WorkerHealth(epoch, 'paused'))
+    owned = ownership.publish(root, certificate, epoch, server._identity)
+    try:
+        readback = ownership.preflight(root)
+        assert (readback.root_identity, readback.record, readback.socket) == (
+            owned.root_identity, owned.record, owned.socket)
+        database_details = (root / 'state.db').stat()
+        assert readback.database_identity == (database_details.st_dev, database_details.st_ino)
+        with sqlite3.connect(root / 'state.db') as connection:
+            if fault == 'newer':
+                connection.execute('PRAGMA user_version=17')
+            else:
+                connection.execute('DROP TABLE direct_publication_attempts')
+                if fault == 'malformed':
+                    connection.execute('CREATE TABLE direct_publication_attempts (job_id TEXT)')
+        before = {p.name: (p.lstat().st_dev, p.lstat().st_ino, p.lstat().st_mode,
+            p.read_bytes() if p.is_file() else None) for p in root.iterdir()}
+        def forbidden(*args, **kwargs):
+            pytest.fail('uncertified catalogue reached writable/lease/reclaim effects')
+        monkeypatch.setattr(worker, '_acquire_worker_lease', forbidden)
+        monkeypatch.setattr(worker, 'SQLiteStore', forbidden)
+        monkeypatch.setattr(ownership, 'reclaim', forbidden)
+        stopped = threading.Event()
+        expected_error = 'newer than supported' if fault == 'newer' else 'incomplete'
+        with pytest.raises(RuntimeError, match='database schema version is ' + expected_error):
+            worker.run_worker(root, socket_path=root / 'worker.sock', recover_socket=True,
+                ready_event=threading.Event(), shutdown_event=threading.Event(), stopped_event=stopped)
+        assert stopped.is_set()
+        assert {p.name: (p.lstat().st_dev, p.lstat().st_ino, p.lstat().st_mode,
+            p.read_bytes() if p.is_file() else None) for p in root.iterdir()} == before
+        assert not (root / '.worker.lock').exists()
+    finally:
+        server.close()
+        ownership.clear(root, owned)
+    assert not (root / ownership.RECORD).exists()

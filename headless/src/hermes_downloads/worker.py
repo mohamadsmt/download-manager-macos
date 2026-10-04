@@ -45,6 +45,8 @@ from hermes_downloads.store import (
     _DirectPublicationReconciliationPlan,
     _DirectTerminalPlan,
     _DirectStagePlan,
+    _DirectPublicationAttempt,
+    _DirectAttemptRecoveryPlan,
 )
 
 if TYPE_CHECKING:
@@ -67,6 +69,44 @@ _OBSERVATION_JOIN_SECONDS: Final = 1.5
 # before any later run can construct another controller. Process exit retires
 # daemon threads; within a process this single private gate spans worker runs.
 _DIRECT_OBSERVATION_LOCK = threading.Lock()
+_DIRECT_OBSERVATION_REGISTRY_LOCK = threading.Lock()
+_DIRECT_OBSERVATION_THREAD: threading.Thread | None = None
+
+
+def _retire_exited_direct_observation() -> None:
+    """Called with the registry mutex; only a joined thread retires the lane."""
+    global _DIRECT_OBSERVATION_THREAD
+    thread = _DIRECT_OBSERVATION_THREAD
+    if thread is not None and not thread.is_alive():
+        thread.join()
+        _DIRECT_OBSERVATION_THREAD = None
+        _DIRECT_OBSERVATION_LOCK.release()
+
+
+def _direct_observation_busy() -> bool:
+    with _DIRECT_OBSERVATION_REGISTRY_LOCK:
+        _retire_exited_direct_observation()
+        return _DIRECT_OBSERVATION_LOCK.locked()
+
+
+def _acquire_direct_observation() -> bool:
+    with _DIRECT_OBSERVATION_REGISTRY_LOCK:
+        _retire_exited_direct_observation()
+        return _DIRECT_OBSERVATION_LOCK.acquire(blocking=False)
+
+
+def _start_direct_observation(thread: threading.Thread) -> None:
+    global _DIRECT_OBSERVATION_THREAD
+    with _DIRECT_OBSERVATION_REGISTRY_LOCK:
+        if _DIRECT_OBSERVATION_THREAD is not None:
+            raise RuntimeError('direct observation is already tracked')
+        _DIRECT_OBSERVATION_THREAD = thread
+        try:
+            thread.start()
+        except BaseException:
+            _DIRECT_OBSERVATION_THREAD = None
+            _DIRECT_OBSERVATION_LOCK.release()
+            raise
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -84,6 +124,13 @@ class _DirectStageObservation:
 
     plan: _DirectStagePlan
     result: StagedPartialPayload | None
+    failed: bool
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PublicationObservation:
+    plan: object
+    result: object
     failed: bool
 
 
@@ -429,8 +476,15 @@ def run_worker(
     active_direct_plan: _DirectDispatchPlan | None = None
     active_terminal_plan: _DirectTerminalPlan | None = None
     active_stage_plan: _DirectStagePlan | None = None
+    active_preparation: tuple | None = None
+    active_publication: _DirectPublicationAttempt | None = None
+    publication_stage: _DirectStagePlan | None = None
+    publication_permit = None
+    active_recovery: _DirectAttemptRecoveryPlan | None = None
+    publication_observed = False
+    publication_cancel = threading.Event()
     observation_thread: threading.Thread | None = None
-    observation_results: Queue[_DirectObservation | _DirectStageObservation] = Queue(maxsize=1)
+    observation_results: Queue = Queue(maxsize=1)
     try:
         root = _validate_state_root(state_root)
         if recover_socket:
@@ -512,7 +566,7 @@ def run_worker(
 
             controller = direct_controller
             if controller is None:
-                return
+                return None if persist_contained is None else persist_contained()
             # Invalidate callbacks before containment. Keep durable authority
             # until both containment and any paused/removed transaction succeed.
             active_terminal_plan = None
@@ -603,7 +657,7 @@ def run_worker(
                     worker_epoch=current_epoch, status="blocked"
                 )
             if direct_controller is None and (
-                observation_thread is not None or _DIRECT_OBSERVATION_LOCK.locked()
+                observation_thread is not None or _direct_observation_busy()
             ):
                 return DirectEngineActivateResult(
                     worker_epoch=current_epoch, status="blocked"
@@ -748,7 +802,7 @@ def run_worker(
         ) -> DirectJobDispatchResult:
             """Run one bounded, marker-bound direct admission lifecycle."""
 
-            nonlocal active_direct_plan, active_terminal_plan
+            nonlocal active_direct_plan, active_terminal_plan, active_recovery, active_publication, publication_observed, publication_cancel
 
             controller = direct_controller
             controller_ready = (
@@ -757,6 +811,7 @@ def run_worker(
                 and not direct_recovery_blocked
                 and active_direct_plan is None
                 and observation_thread is None
+                and not _direct_observation_busy()
             )
             try:
                 prepared = store.prepare_direct_dispatch(
@@ -782,6 +837,20 @@ def run_worker(
                     revision=prepared.revision,
                     state=prepared.state,
                 )
+            if type(prepared) is _DirectAttemptRecoveryPlan:
+                if active_recovery != prepared:
+                    if (observation_thread is not None or active_publication is not None
+                        or _direct_observation_busy()):
+                        result = store.abort_exact_publication_recovery(prepared)
+                        return DirectJobDispatchResult(result.status, result.job,
+                            result.generation, result.revision, result.state)
+                    publication_cancel = threading.Event()
+                    active_recovery = prepared
+                    active_publication = prepared.attempt
+                    publication_observed = False
+                attempt = prepared.attempt
+                return DirectJobDispatchResult('pending', attempt.job.job_id,
+                    attempt.generation, attempt.revision, attempt.state)
             if type(prepared) is _DirectPublicationReconciliationPlan:
                 reconciliation = prepared
                 try:
@@ -927,16 +996,36 @@ def run_worker(
                 state=result.state,
             )
 
+        def revoke_publication() -> bool:
+            """Invalidate completion promptly; a syscall must quiesce before ack."""
+            nonlocal active_preparation, publication_stage, active_recovery
+            publication_cancel.set()
+            recoverable = active_recovery is not None
+            if publication_permit is not None:
+                snapshot = publication_permit.revoke()
+                if snapshot.in_flight:
+                    raise IPCError('direct_dispatch_blocked')
+                recoverable = snapshot.creation_attempted
+            active_preparation = None
+            publication_stage = None
+            active_recovery = None
+            return recoverable
+
         def job_control(command: JobControlCommand) -> JobControlResult:
             """Contain the one active body before acknowledging pause/removal."""
 
+            nonlocal active_publication
             plan = active_direct_plan
+            attempt = active_publication
+            tracked_job = plan.job.job_id if plan is not None else (attempt.job.job_id if attempt else None)
             if (
-                plan is not None
-                and command.job == plan.job.job_id
+                command.job == tracked_job
                 and command.action in {"pause", "remove"}
-                and command.expected_revision == plan.revision
+                and store.publication_control_is_current(job_id=command.job,
+                    action=command.action, request_id=command.request_id,
+                    payload_digest=command.payload_digest, expected_revision=command.expected_revision)
             ):
+                recoverable = revoke_publication()
                 try:
                     result = close_owned_direct_controller(lambda: store.apply_job_control(
                         job_id=command.job,
@@ -945,11 +1034,13 @@ def run_worker(
                         payload_digest=command.payload_digest,
                         expected_revision=command.expected_revision,
                         _contained_direct_transfer=True,
+                        _publication_recoverable=recoverable,
                     ))
                 except RequestConflictError:
                     raise
                 except (TypeError, ValueError):
                     raise IPCError("direct_dispatch_blocked") from None
+                active_publication = None
                 return JobControlResult(
                     status=result.status,
                     job=result.job,
@@ -963,22 +1054,31 @@ def run_worker(
         def queue_gate(command: QueueGateCommand) -> QueueGateResult:
             """Contain the one active body before a durable queue pause reply."""
 
+            nonlocal active_publication
             plan = active_direct_plan
+            attempt = active_publication
             snapshot = store.queue_gate_snapshot()
             if (
                 command.gate == "paused"
-                and plan is not None
+                and (plan is not None or attempt is not None)
                 and snapshot is not None
-                and snapshot[1] == command.expected_revision
+                and store.publication_queue_control_is_current(request_id=command.request_id,
+                    payload_digest=command.payload_digest, expected_revision=command.expected_revision)
             ):
+                recoverable = revoke_publication()
+                job_id = plan.job.job_id if plan is not None else attempt.job.job_id
+                generation = plan.generation if plan is not None else attempt.generation
+                revision = plan.revision if plan is not None else attempt.revision
                 try:
-                    close_owned_direct_controller(lambda: store.pause_active_direct_job(
-                        job_id=plan.job.job_id,
-                        generation=plan.generation,
-                        revision=plan.revision,
+                    result = close_owned_direct_controller(lambda: store.apply_queue_gate(
+                        gate=command.gate, request_id=command.request_id,
+                        payload_digest=command.payload_digest, expected_revision=command.expected_revision,
+                        _contained_direct_job=(job_id,generation,revision,recoverable),
                     ))
                 except (TypeError, ValueError):
                     raise IPCError("direct_dispatch_blocked") from None
+                active_publication = None
+                return QueueGateResult(applied=result.applied, queue_gate=result.gate, revision=result.revision)
             return _queue_gate_from_store(store, command)
 
         def poll_direct_terminal() -> None:
@@ -986,14 +1086,61 @@ def run_worker(
 
             nonlocal observation_thread, active_direct_plan, active_terminal_plan
             nonlocal active_stage_plan
+            nonlocal active_preparation, active_publication, publication_permit, publication_stage, active_recovery
+            nonlocal publication_observed, publication_cancel
 
             if observation_thread is not None:
                 if observation_thread.is_alive():
                     return
                 observation_thread.join()
                 observation_thread = None
+                _direct_observation_busy()
                 observation = observation_results.get_nowait()
-                if type(observation) is _DirectStageObservation:
+                if type(observation) is _PublicationObservation:
+                    if observation.plan is active_preparation:
+                        preparation = active_preparation
+                        active_preparation = None
+                        if not observation.failed:
+                            try:
+                                active_publication = store.reserve_direct_publication(preparation[0], observation.result)
+                                from hermes_downloads.paths import PublicationCreationPermit
+                                publication_permit = PublicationCreationPermit()
+                                publication_stage = preparation[0]
+                                publication_observed = False
+                            except Exception:
+                                observation = _PublicationObservation(preparation, None, True)
+                        if observation.failed:
+                            tracked = active_direct_plan
+                            close_owned_direct_controller(lambda: store.pause_active_direct_job(
+                                job_id=tracked.job.job_id, generation=tracked.generation, revision=tracked.revision))
+                    elif observation.plan is active_publication:
+                        attempt = active_publication
+                        recovery = active_recovery
+                        valid = recovery is not None or (publication_stage is not None
+                            and publication_permit is not None and not publication_permit.snapshot().revoked)
+                        publication_observed = True
+                        if valid:
+                            try:
+                                if observation.failed:
+                                    raise ValueError('publication observation failed')
+                                store.complete_direct_publication(attempt, observation.result,
+                                    initial_stage=publication_stage if recovery is None else None)
+                            except Exception:
+                                if recovery is not None:
+                                    store.abort_exact_publication_recovery(recovery)
+                                else:
+                                    recoverable = publication_permit.snapshot().creation_attempted
+                                    close_owned_direct_controller(lambda: store.pause_active_direct_job(
+                                        job_id=attempt.job.job_id, generation=attempt.generation,
+                                        revision=attempt.revision, _publication_recoverable=recoverable))
+                            else:
+                                # Completion is durable before retiring corresponding engine claims.
+                                close_owned_direct_controller()
+                            active_publication = None
+                            publication_stage = None
+                            publication_permit = None
+                            active_recovery = None
+                elif type(observation) is _DirectStageObservation:
                     if observation.plan is active_stage_plan:
                         stage = observation.plan
                         failed = observation.failed
@@ -1004,6 +1151,8 @@ def run_worker(
                                 failed = True
                             else:
                                 active_stage_plan = None
+                                publication_cancel = threading.Event()
+                                active_preparation = (stage, observation.result)
                         if failed:
                             current = store.get_job(stage.job.job_id)
                             if current is not None and (
@@ -1062,68 +1211,105 @@ def run_worker(
                                 revision=tracked.revision if tracked is not None else plan.revision,
                             ))
 
+            if active_preparation is not None or (active_publication is not None and not publication_observed):
+                if not _acquire_direct_observation():
+                    return
+                preparation, attempt, recovery, permit = active_preparation, active_publication, active_recovery, publication_permit
+                cancelled = publication_cancel.is_set
+                token = preparation if preparation is not None else attempt
+                def publication_observe() -> None:
+                    try:
+                        from hermes_downloads.paths import (prepare_publication_payload,
+                            publish_staged_partial_payload, PublicationReservationMarker, rehydrate_destination)
+                        if preparation is not None:
+                            stage, staged = preparation
+                            job = stage.job
+                            if job.source_kind is not SourceKind.DIRECT:
+                                raise ValueError('publication requires direct source')
+                            destination = rehydrate_destination(category=job.category, collection=job.destination_collection,
+                                partial_filename=job.partial_filename, selected_final_filename=job.selected_final_filename,
+                                job_id=job.job_id)
+                            result = prepare_publication_payload(destination, stage.terminal.dispatch.reservation,
+                                PublicationReservationMarker(destination.incomplete_dir / '.hermes-reservation',
+                                    stage.terminal.marker.marker_device, stage.terminal.marker.marker_inode), staged, cancelled=cancelled)
+                        else:
+                            if attempt.job.source_kind is not SourceKind.DIRECT:
+                                raise ValueError('publication requires direct source')
+                            p = attempt.prepared
+                            result = publish_staged_partial_payload(p.destination,p.reservation,p.staged_payload,
+                                prepared=p,creation_permit=None if recovery is not None else permit,
+                                existing_only=recovery is not None, _cancelled=cancelled)
+                        outcome = _PublicationObservation(token,result,False)
+                    except BaseException:
+                        outcome = _PublicationObservation(token,None,True)
+                    observation_results.put_nowait(outcome)
+                observation_thread = threading.Thread(target=publication_observe,
+                    name='direct-publication-observation', daemon=True)
+                try:
+                    _start_direct_observation(observation_thread)
+                except BaseException:
+                    observation_thread = None
+                    raise
+                return
+
             controller, terminal, stage = direct_controller, active_terminal_plan, active_stage_plan
             if controller is None or (terminal is None and stage is None) or not direct_controller_ready:
                 return
-            if not _DIRECT_OBSERVATION_LOCK.acquire(blocking=False):
+            if not _acquire_direct_observation():
                 return
 
             def observe() -> None:
-                try:
-                    if stage is not None:
-                        try:
-                            from hermes_downloads.paths import (
-                                StagedPartialPayload, attest_staged_partial_payload,
-                                rehydrate_destination,
-                            )
-                            job = stage.job
-                            destination = rehydrate_destination(
-                                category=job.category, collection=job.destination_collection,
-                                partial_filename=job.partial_filename,
-                                selected_final_filename=job.selected_final_filename,
-                                job_id=job.job_id,
-                            )
-                            staged = attest_staged_partial_payload(
-                                destination, stage.terminal.dispatch.reservation
-                            )
-                            identity = stage.observed.verified_identity
-                            if type(staged) is not StagedPartialPayload or identity is None or (
-                                staged.path, staged.st_dev, staged.st_ino, staged.logical_size, staged.mtime_ns,
-                                staged.st_mode, staged.st_nlink, staged.ctime_ns
-                            ) != (stage.terminal.partial_path, identity.st_dev, identity.st_ino,
-                                  identity.logical_size, identity.mtime_ns,
-                                  identity.st_mode, identity.st_nlink, identity.ctime_ns):
-                                raise ValueError("staged payload differs from verified output")
-                            outcome = _DirectStageObservation(stage, staged, False)
-                        except BaseException:
-                            outcome = _DirectStageObservation(stage, None, True)
-                    else:
-                        try:
-                            from hermes_downloads.direct import DirectTransfer
+                if stage is not None:
+                    try:
+                        from hermes_downloads.paths import (
+                            StagedPartialPayload, attest_staged_partial_payload,
+                            rehydrate_destination,
+                        )
+                        job = stage.job
+                        destination = rehydrate_destination(
+                            category=job.category, collection=job.destination_collection,
+                            partial_filename=job.partial_filename,
+                            selected_final_filename=job.selected_final_filename,
+                            job_id=job.job_id,
+                        )
+                        staged = attest_staged_partial_payload(
+                            destination, stage.terminal.dispatch.reservation
+                        )
+                        identity = stage.observed.verified_identity
+                        if type(staged) is not StagedPartialPayload or identity is None or (
+                            staged.path, staged.st_dev, staged.st_ino, staged.logical_size, staged.mtime_ns,
+                            staged.st_mode, staged.st_nlink, staged.ctime_ns
+                        ) != (stage.terminal.partial_path, identity.st_dev, identity.st_ino,
+                              identity.logical_size, identity.mtime_ns,
+                              identity.st_mode, identity.st_nlink, identity.ctime_ns):
+                            raise ValueError("staged payload differs from verified output")
+                        outcome = _DirectStageObservation(stage, staged, False)
+                    except BaseException:
+                        outcome = _DirectStageObservation(stage, None, True)
+                else:
+                    try:
+                        from hermes_downloads.direct import DirectTransfer
 
-                            result = controller.observe_terminal(
-                                job_id=terminal.dispatch.job.job_id,
-                                generation=terminal.dispatch.generation,
-                                gid=terminal.gid,
-                            )
-                            if result is not None and type(result) is not DirectTransfer:
-                                raise TypeError("direct observation result is invalid")
-                            outcome = _DirectObservation(terminal, result, False)
-                        except BaseException:
-                            outcome = _DirectObservation(terminal, None, True)
-                    observation_results.put_nowait(outcome)
-                finally:
-                    _DIRECT_OBSERVATION_LOCK.release()
+                        result = controller.observe_terminal(
+                            job_id=terminal.dispatch.job.job_id,
+                            generation=terminal.dispatch.generation,
+                            gid=terminal.gid,
+                        )
+                        if result is not None and type(result) is not DirectTransfer:
+                            raise TypeError("direct observation result is invalid")
+                        outcome = _DirectObservation(terminal, result, False)
+                    except BaseException:
+                        outcome = _DirectObservation(terminal, None, True)
+                observation_results.put_nowait(outcome)
 
             observation_thread = threading.Thread(
                 target=observe, name="direct-stage-observation" if stage is not None else
                 "direct-terminal-observation", daemon=True,
             )
             try:
-                observation_thread.start()
+                _start_direct_observation(observation_thread)
             except BaseException:
                 observation_thread = None
-                _DIRECT_OBSERVATION_LOCK.release()
                 tracked = active_direct_plan
                 close_owned_direct_controller(lambda: store.pause_active_direct_job(
                     job_id=tracked.job.job_id,
@@ -1162,12 +1348,40 @@ def run_worker(
     finally:
         try:
             try:
+                publication_cancel.set()
+                recoverable = active_recovery is not None
+                if publication_permit is not None:
+                    snapshot = publication_permit.revoke()
+                    if snapshot.in_flight:
+                        direct_recovery_blocked = True
+                        if direct_controller is not None:
+                            direct_controller.close()
+                        raise IPCStateError('direct_dispatch_blocked')
+                    recoverable = snapshot.creation_attempted
+                if not direct_recovery_blocked and store is not None:
+                    if active_recovery is not None:
+                        store.abort_exact_publication_recovery(active_recovery)
+                    elif (active_publication is not None and publication_stage is not None
+                        and not publication_observed):
+                        attempt = active_publication
+                        close_owned_direct_controller(lambda: store.pause_active_direct_job(
+                            job_id=attempt.job.job_id, generation=attempt.generation,
+                            revision=attempt.revision, _publication_recoverable=recoverable))
+                    elif active_preparation is not None and active_direct_plan is not None:
+                        tracked = active_direct_plan
+                        close_owned_direct_controller(lambda: store.pause_active_direct_job(
+                            job_id=tracked.job.job_id, generation=tracked.generation,
+                            revision=tracked.revision))
+                active_preparation = None
+                publication_stage = None
+                active_recovery = None
                 if direct_controller is not None:
                     shutdown_owned_direct_controller()
             finally:
                 try:
                     if observation_thread is not None:
                         observation_thread.join(_OBSERVATION_JOIN_SECONDS)
+                        _direct_observation_busy()
                     if health_server is not None:
                         health_server.close()
                         if owned_endpoint_certificate is not None:

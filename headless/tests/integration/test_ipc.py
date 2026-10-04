@@ -101,6 +101,7 @@ def _run_worker_process(
     shutdown_event: object,
     stopped_event: object,
     results: object,
+    recover_socket: bool = False,
 ) -> None:
     try:
         outcome = worker.run_worker(
@@ -109,6 +110,7 @@ def _run_worker_process(
             ready_event=ready_event,
             shutdown_event=shutdown_event,
             stopped_event=stopped_event,
+            recover_socket=recover_socket,
         )
     except BaseException as error:
         results.put(("error", type(error).__name__, str(error)))
@@ -5390,6 +5392,11 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
             started = ipc.dispatch_direct_job(socket_path, job="dispatch-job", expected_worker_epoch=1,
                 expected_generation=1, expected_revision=2, request_id="terminal-dispatch")
             assert (started.status, started.state, started.revision) == ("started", "downloading", 4)
+            successful_publication = action is None and mode in {"observe", "verify"}
+            if successful_publication:
+                with sqlite3.connect(state_root / "state.db") as connection:
+                    original_started_receipt = tuple(connection.execute(
+                        "SELECT * FROM direct_dispatch_commands WHERE request_id='terminal-dispatch'").fetchone())
             owned_group = None
             if mode != "error":
                 assert entered.wait(_WATCHDOG_SECONDS)
@@ -5458,7 +5465,7 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                     observer.close()
                 return
             if action != "shutdown":
-                expected = "paused" if mode in {"rpc", "error", "marker", "absent"} or action == "pause" else "removed" if action == "remove" else "finalizing"
+                expected = "paused" if mode in {"rpc", "error", "marker", "absent"} or action == "pause" else "removed" if action == "remove" else "completed"
                 deadline = time.monotonic() + _WATCHDOG_SECONDS
                 while request_jobs_page(socket_path).jobs[0].state != expected and time.monotonic() < deadline:
                     time.sleep(0.005)
@@ -5475,16 +5482,21 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                 observer = SQLiteStore(state_root / "state.db")
                 try:
                     kinds = [e.kind for e in observer.list_events()]
-                    assert kinds.count("job_finalizing") == (1 if expected == "finalizing" else 0)
-                    assert "job_completed" not in kinds
-                    assert observer._get_final_publication_binding("dispatch-job") is None
-                    if expected == "finalizing":
-                        deadline = time.monotonic() + _WATCHDOG_SECONDS
-                        while observer._get_staged_payload_binding("dispatch-job") is None and time.monotonic() < deadline:
-                            request_health(socket_path)
-                            time.sleep(0.005)
+                    assert kinds.count("job_finalizing") == int(successful_publication)
+                    assert kinds.count("job_completed") == int(successful_publication)
+                    if successful_publication:
+                        binding = observer._get_final_publication_binding("dispatch-job")
+                        assert binding is not None
+                        final = (root / "Other" / "dispatch.bin").stat()
+                        partial_details = (root / ".incomplete" / "dispatch-job" / "dispatch.bin").stat()
+                        assert (binding.final_device, binding.final_inode, binding.logical_size) == (
+                            final.st_dev, final.st_ino, final.st_size) == (
+                            partial_details.st_dev, partial_details.st_ino, partial_details.st_size)
+                        assert tuple(observer._connection.execute(
+                            "SELECT * FROM direct_dispatch_commands WHERE request_id='terminal-dispatch'").fetchone()) == original_started_receipt
                         assert observer._get_staged_payload_binding("dispatch-job") is not None
                     else:
+                        assert observer._get_final_publication_binding("dispatch-job") is None
                         assert observer._get_staged_payload_binding("dispatch-job") is None
                     if mode in {"rpc", "error"}:
                         assert observer.get_direct_engine_record() is None
@@ -5494,7 +5506,7 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                 if mode != "error":
                     assert partial.read_bytes() == origin.payload
                 assert (partial.parent / ".hermes-reservation").exists()
-                assert not (root / "Other" / "dispatch.bin").exists()
+                assert (root / "Other" / "dispatch.bin").exists() == successful_publication
                 shutdown.set()
                 assert stopped.wait(_WATCHDOG_SECONDS)
                 _join(process)

@@ -30,6 +30,7 @@ __all__ = [
     "PublicationCreationPermit",
     "CreationPermitSnapshot",
     "prepare_publication_payload",
+    "require_current_publication_payload",
     "StagedPartialPayload",
     "StorageUsage",
     "UnsafePathError",
@@ -625,6 +626,7 @@ def publish_staged_partial_payload(
     existing_only: bool = False,
     prepared: PreparedPublicationPayload | None = None,
     creation_permit: PublicationCreationPermit | None = None,
+    _cancelled=None,
 ) -> PublishedFinalPayload:
     """Publish one previously attested partial via a no-clobber hard link.
 
@@ -638,7 +640,7 @@ def publish_staged_partial_payload(
     if prepared is not None or creation_permit is not None:
         return _publish_prepared_payload(
             destination, reservation, staged_payload, prepared, creation_permit,
-            existing_only=existing_only,
+            existing_only=existing_only, cancelled=_cancelled,
         )
 
     root, final_component = _validate_destination_intent(destination)
@@ -1988,6 +1990,7 @@ def _validate_strict_marker(
 
 def _hash_publication_payload(
     descriptor: int, expected: tuple[int, int, int, int, int, int, int],
+    *, cancelled=None,
 ) -> str:
     """Bounded descriptor reads, fenced by complete metadata before and after."""
     if _fstat_publication_payload(descriptor) != expected:
@@ -1996,14 +1999,20 @@ def _hash_publication_payload(
     offset = 0
     try:
         while offset < expected[2]:
+            if cancelled is not None and cancelled():
+                raise PathValidationError('publication was cancelled')
             count = min(1024 * 1024, expected[2] - offset)
             chunk = os.pread(descriptor, count, offset)
             if type(chunk) is not bytes or not chunk or len(chunk) > count:
                 raise PathValidationError("payload byte commitment read is incomplete")
             digest.update(chunk)
             offset += len(chunk)
+        if cancelled is not None and cancelled():
+            raise PathValidationError('publication was cancelled')
         if os.pread(descriptor, 1, offset) != b"":
             raise UnsafePathError("payload changed during byte commitment")
+        if cancelled is not None and cancelled():
+            raise PathValidationError('publication was cancelled')
     except OSError as error:
         raise PathValidationError("payload byte commitment cannot be read") from error
     if _fstat_publication_payload(descriptor) != expected:
@@ -2042,6 +2051,7 @@ def _require_strict_publication_namespace(
 def prepare_publication_payload(
     destination: DestinationIntent, reservation: PublicationReservation,
     marker: PublicationReservationMarker, staged_payload: StagedPartialPayload,
+    *, cancelled=None,
 ) -> PreparedPublicationPayload:
     """Prepare strict byte evidence off the owner thread from an original live stage.
 
@@ -2069,7 +2079,8 @@ def prepare_publication_payload(
         payload_fd = _open_staged_partial_payload(descriptors[3], destination.partial_path.name)
         try:
             _require_strict_publication_namespace(provisional, payload_fd, expected, published=False)
-            digest = _hash_publication_payload(payload_fd, expected)
+            digest = (_hash_publication_payload(payload_fd, expected) if cancelled is None else
+                _hash_publication_payload(payload_fd, expected, cancelled=cancelled))
             _require_strict_publication_namespace(provisional, payload_fd, expected, published=False)
             return PreparedPublicationPayload(
                 destination, reservation, marker, staged_payload, digest, chain,
@@ -2084,16 +2095,14 @@ def prepare_publication_payload(
 def _publish_prepared_payload(
     destination: DestinationIntent, reservation: PublicationReservation,
     staged_payload: StagedPartialPayload, prepared: PreparedPublicationPayload | None,
-    creation_permit: PublicationCreationPermit | None, *, existing_only: bool,
+    creation_permit: PublicationCreationPermit | None, *, existing_only: bool, cancelled=None,
 ) -> PublishedFinalPayload:
-    # Existing-only strict recovery needs durable original attempt authority and
-    # is deliberately deferred to its owner slice. Legacy existing-only remains
-    # unchanged and never enters this creation branch.
     root, component = _validate_destination_intent(destination)
     reservation = _validate_publication_reservation(destination, component, reservation)
     expected = _strict_staged_metadata(destination, staged_payload)
-    if (existing_only or type(prepared) is not PreparedPublicationPayload
-        or type(creation_permit) is not PublicationCreationPermit):
+    if (type(prepared) is not PreparedPublicationPayload
+        or (not existing_only and type(creation_permit) is not PublicationCreationPermit)
+        or (existing_only and creation_permit is not None)):
         raise PathValidationError("strict publication requires prepared evidence and a creation permit")
     if (prepared.destination != destination or prepared.reservation != reservation
         or prepared.staged_payload != staged_payload):
@@ -2114,28 +2123,70 @@ def _publish_prepared_payload(
         _require_same_filesystem(descriptors[1], descriptors[3])
         payload_fd = _open_staged_partial_payload(descriptors[3], destination.partial_path.name)
         try:
-            _require_strict_publication_namespace(prepared, payload_fd, expected, published=False)
-            _link_staged_partial_payload(
-                descriptors[3], descriptors[1], destination.partial_path.name,
-                destination.final_path.name, expected[:3], creation_permit=creation_permit,
-            )
+            if cancelled is not None and cancelled():
+                raise PathValidationError('publication was cancelled')
+            if not existing_only:
+                _require_strict_publication_namespace(prepared, payload_fd, expected, published=False)
+                _link_staged_partial_payload(
+                    descriptors[3], descriptors[1], destination.partial_path.name,
+                    destination.final_path.name, expected[:3], creation_permit=creation_permit,
+                )
             post = _fstat_publication_payload(payload_fd)
             if post[:4] != expected[:4] or post[5] != expected[5] or post[4] != 2:
                 raise UnsafePathError("published payload changed from original staged identity")
             # Link legitimately changes ctime/nlink. Freeze the fresh seven-field
             # baseline, then prove actual descriptor bytes and every visible name.
             _require_strict_publication_namespace(prepared, payload_fd, post, published=True)
-            if _hash_publication_payload(payload_fd, post) != prepared.sha256:
+            digest = (_hash_publication_payload(payload_fd, post) if cancelled is None else
+                _hash_publication_payload(payload_fd, post, cancelled=cancelled))
+            if digest != prepared.sha256:
                 raise UnsafePathError("published payload byte commitment does not match")
             _require_strict_publication_namespace(prepared, payload_fd, post, published=True)
+            if cancelled is not None and cancelled():
+                raise PathValidationError('publication was cancelled')
             _fsync_published_final_directory(descriptors[1])
             _require_strict_publication_namespace(prepared, payload_fd, post, published=True)
+            if cancelled is not None and cancelled():
+                raise PathValidationError('publication was cancelled')
             return PublishedFinalPayload(
                 path=destination.final_path, st_dev=post[0], st_ino=post[1], logical_size=post[2],
                 st_mode=post[3], st_nlink=post[4], mtime_ns=post[5], ctime_ns=post[6],
                 sha256=prepared.sha256, marker=prepared.marker,
                 directory_identities=prepared.directory_identities,
             )
+        finally:
+            os.close(payload_fd)
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def require_current_publication_payload(
+    prepared: PreparedPublicationPayload, published: PublishedFinalPayload,
+) -> None:
+    """Cheap exact descriptor/name proof for the owner's atomic transaction.
+
+    No hashing or fsync occurs here. The complete post-read snapshot fences
+    changes since background verification, including restored-mtime rewrites.
+    """
+    if type(prepared) is not PreparedPublicationPayload or type(published) is not PublishedFinalPayload:
+        raise PathValidationError("publication evidence is invalid")
+    original = _strict_staged_metadata(prepared.destination, prepared.staged_payload)
+    post = (published.st_dev, published.st_ino, published.logical_size, published.st_mode,
+            published.st_nlink, published.mtime_ns, published.ctime_ns)
+    if (any(type(value) is not int or value < 0 for value in post)
+        or post[:4] != original[:4] or post[5] != original[5] or post[4] != 2
+        or published.path != prepared.destination.final_path
+        or published.sha256 != prepared.sha256 or published.marker != prepared.marker
+        or published.directory_identities != prepared.directory_identities):
+        raise PathValidationError("publication post evidence does not match")
+    root, component = _validate_destination_intent(prepared.destination)
+    descriptors = _open_visible_publication_chain(root, component,
+        prepared.destination.job_id, prepared.directory_identities)
+    try:
+        payload_fd = _open_staged_partial_payload(descriptors[3], prepared.destination.partial_path.name)
+        try:
+            _require_strict_publication_namespace(prepared, payload_fd, post, published=True)
         finally:
             os.close(payload_fd)
     finally:
