@@ -729,3 +729,109 @@ def test_actual_query_root_oneof_constraints_remain_supported(installer):
     from hermes_downloads.mcp_server import _QUERY_INPUT_SCHEMA
     installer.check_tool({'name': 'downloads_query', 'description': 'Read worker health',
         'schema': _QUERY_INPUT_SCHEMA})
+
+
+def _runtime_creation_fixture(installer, tmp_path, monkeypatch):
+    """Real child creation regression; not UV sync or default installation."""
+    assert sys.version_info[:2] == (3, 12)
+    home = tmp_path / 'creation-home'; home.mkdir(mode=0o700)
+    source = tmp_path / 'creation-source'; source.mkdir(mode=0o700)
+    layout = installer.Layout(home, source)
+    uv = tmp_path / 'creation-uv'
+    uv.write_text(f'#!{Path(sys.executable).resolve()}\n' + '''
+import json, os, sys
+from pathlib import Path
+mask = os.umask(0o022)
+os.umask(mask)
+record = {'pid': os.getpid(), 'pgid': os.getpgrp(), 'umask': mask,
+    'argv': sys.argv, 'runtime': os.environ['UV_PROJECT_ENVIRONMENT']}
+Path(os.environ['HOME'], 'creation-child.json').write_text(json.dumps(record))
+Path(os.environ['UV_PROJECT_ENVIRONMENT']).mkdir()
+''')
+    uv.chmod(0o700)
+    monkeypatch.setattr(installer, 'UV', uv)
+    return layout, home / 'creation-child.json'
+
+
+@pytest.mark.parametrize('probe_failure', [False, True])
+def test_prepare_runtime_creation_is_private_with_parent_022(installer, tmp_path, monkeypatch, probe_failure):
+    layout, child_record = _runtime_creation_fixture(installer, tmp_path, monkeypatch)
+    runtime = layout.runtime(BASE)
+    probes = []
+    def probe(actual_layout, actual_runtime, actual_commit):
+        probes.append((actual_layout, actual_runtime, actual_commit))
+        if probe_failure: raise installer.Blocked('CREATION_TEST_PROBE_FAILURE')
+        return {'creation_regression_only': True}
+    monkeypatch.setattr(installer, 'physical_probe', probe)
+    previous_mask = os.umask(0o022)
+    try:
+        if probe_failure:
+            with pytest.raises(installer.Blocked, match='^CREATION_TEST_PROBE_FAILURE$'):
+                installer.prepare_runtime(layout, BASE)
+        else:
+            assert installer.prepare_runtime(layout, BASE) == {'creation_regression_only': True}
+        caller_mask = os.umask(0o022)
+        assert caller_mask == 0o022
+        assert runtime.stat().st_mode & 0o777 == 0o700
+        assert probes == [(layout, runtime, BASE)]
+    finally:
+        os.umask(previous_mask)
+        if child_record.exists():
+            record = json.loads(child_record.read_text())
+            ledger = os.environ.get('T21A_PROCESS_LOG')
+            if ledger:
+                with open(ledger, 'a') as stream:
+                    stream.write(json.dumps({**record, 'kind': 'runtime-creation-regression'}) + '\n')
+    record = json.loads(child_record.read_text())
+    assert record['umask'] == 0o077
+    assert record['runtime'] == str(runtime)
+    assert record['pid'] == record['pgid']
+    assert record['argv'][1:] == ['sync', '--project', str(layout.source / 'headless'),
+        '--python', '3.12', '--locked', '--no-editable', '--no-dev',
+        '--reinstall-package', 'hermes-downloads']
+
+
+@pytest.mark.parametrize('kind', ['directory', 'file', 'symlink', 'dangling'])
+def test_prepare_runtime_slot_collision_refused_before_uv(installer, tmp_path, monkeypatch, kind):
+    layout, child_record = _runtime_creation_fixture(installer, tmp_path, monkeypatch)
+    runtime = layout.runtime(BASE)
+    runtime.parent.mkdir(parents=True, mode=0o700)
+    target = tmp_path / 'foreign-target'
+    if kind == 'directory':
+        runtime.mkdir(mode=0o755)
+        sentinel = runtime / 'sentinel'; sentinel.write_bytes(b'foreign directory')
+    elif kind == 'file':
+        runtime.write_bytes(b'foreign file'); sentinel = runtime
+    elif kind == 'symlink':
+        target.mkdir(mode=0o700)
+        sentinel = target / 'sentinel'; sentinel.write_bytes(b'foreign symlink target')
+        runtime.symlink_to(target, target_is_directory=True)
+    else:
+        sentinel = tmp_path / 'unrelated-sentinel'; sentinel.write_bytes(b'foreign dangling target')
+        runtime.symlink_to(target, target_is_directory=True)
+    def identity(path):
+        value = path.lstat()
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+            value.st_uid, value.st_gid, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    slot_before = identity(runtime)
+    sentinel_before = identity(sentinel), sentinel.read_bytes()
+    def unexpected_probe(*args): pytest.fail('foreign runtime must never reach physical probe')
+    monkeypatch.setattr(installer, 'physical_probe', unexpected_probe)
+    previous_mask = os.umask(0o022)
+    try:
+        with pytest.raises(installer.Blocked, match='^RUNTIME_COLLISION$'):
+            installer.prepare_runtime(layout, BASE)
+        assert os.umask(0o022) == 0o022
+    finally:
+        os.umask(previous_mask)
+        if child_record.exists():
+            ledger = os.environ.get('T21A_PROCESS_LOG')
+            if ledger:
+                with open(ledger, 'a') as stream:
+                    stream.write(json.dumps({**json.loads(child_record.read_text()),
+                        'kind': 'unexpected-runtime-collision-child'}) + '\n')
+    assert not child_record.exists(), 'UV must not launch for an occupied runtime slot'
+    assert identity(runtime) == slot_before
+    assert (identity(sentinel), sentinel.read_bytes()) == sentinel_before
+    if kind in ('symlink', 'dangling'): assert os.readlink(runtime) == str(target)
+    if kind == 'dangling': assert not target.exists()

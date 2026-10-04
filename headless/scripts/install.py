@@ -572,12 +572,12 @@ def pre_effect(layout, entry, bundle, executor, argv):
 
 def prepare_runtime(layout, commit):
     runtime = layout.runtime(commit)
-    if runtime.exists(): raise Blocked('RUNTIME_COLLISION')
+    if runtime.exists() or runtime.is_symlink(): raise Blocked('RUNTIME_COLLISION')
     private_dir(runtime.parent, create=True)
     env = clean_env(layout.home); env['UV_PROJECT_ENVIRONMENT'] = str(runtime)
     process = subprocess.Popen([str(UV), 'sync', '--project', str(layout.source / 'headless'), '--python', '3.12',
         '--locked', '--no-editable', '--no-dev', '--reinstall-package', 'hermes-downloads'],
-        env=env, cwd=layout.source, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        env=env, cwd=layout.source, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, umask=0o077)
     try: out, err = process.communicate(timeout=120)
     except subprocess.TimeoutExpired:
         if process.poll() is None and os.getpgid(process.pid) == process.pid: os.killpg(process.pid, signal.SIGTERM)
