@@ -1,6 +1,6 @@
 # Hermes Download Manager Implementation Plan
 
-> **For Hermes:** Follow the binding execution contract and ordered independent reviews. The 2026-10-03 bounded removal child uses no agents, integration, push, installation or self-approval; the parent owns later delivery gates.
+> **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
 **Goal:** Deliver a persistent local download service controlled exclusively through Hermes, covering direct HTTP(S) files only, including MP4/WEBM/MP3 and signed/extensionless bytes, with explicit-start queue semantics and predictable Downloads output.
 

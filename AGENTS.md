@@ -8,7 +8,7 @@ Resume from `.hermes/handoffs/2026-10-03-download-manager-direct-only-scope.md` 
 
 - Hermes is the sole control interface. No new download-manager UI or custom downloader engine.
 - Use the existing repository as canonical. Preserve user-owned dirty changes and old payload files/history.
-- Use TDD and bounded execution (no agents when a binding implementation contract prohibits them) with specification PASS followed by quality/security APPROVED on the exact commit; verify child writes/tests independently.
+- Use TDD and bounded subagent execution with specification PASS followed by quality/security APPROVED on the exact commit; verify child writes/tests independently.
 - Python headless work uses an isolated Python 3.12 non-editable environment; clear ambient `PYTHONPATH`/`PYTHONHOME`.
 - Runtime queues, signed URLs, credentials, raw user test inputs and state backups never go into this public repository.
 - Final output belongs under `~/Downloads/Hermes/`; no implicit transfer on startup/list/add-only; pause and deletion semantics follow the spec.
