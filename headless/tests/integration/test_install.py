@@ -289,10 +289,109 @@ def test_long_socket_and_symlink_ancestors_block_without_artifacts(installer, tm
     with pytest.raises(installer.Blocked): installer.snapshot(alias / 'config')
 
 
-def test_actual_all_module_parity_and_tampered_site_rejected(installer, layout, tmp_path):
-    actual = installer.Layout(layout.home, ROOT)
-    result = installer.physical_probe(actual, ROOT / 'headless/.venv', BASE)
-    assert len(result['module_parity']) == len(list((ROOT / 'headless/src/hermes_downloads').rglob('*.py')))
+@pytest.fixture
+def committed_source_snapshot(installer, tmp_path):
+    """Real current bytes in an independent, private, locally committed source tree."""
+    import hashlib
+    import stat
+    import tomllib
+
+    storage = tmp_path / 'committed-source'; storage.mkdir(mode=0o700)
+    source = storage / 'source'; source.mkdir(mode=0o700)
+    home = storage / 'home'; home.mkdir(mode=0o700)
+    template = storage / 'template'; template.mkdir(mode=0o700)
+    hooks = storage / 'hooks'; hooks.mkdir(mode=0o700)
+    package = ROOT / 'headless/src/hermes_downloads'
+    installer.chain(package)
+    entries = sorted(package.rglob('*'))
+    assert entries, 'missing package source inventory'
+    for path in entries:
+        assert not path.is_symlink(), f'symlink source entry: {path}'
+        assert path.is_dir() or (stat.S_ISREG(path.stat().st_mode) and path.suffix == '.py'), f'extra source entry: {path}'
+    modules = sorted(path.relative_to(package).as_posix() for path in entries if path.is_file())
+    assert '__init__.py' in modules, 'missing package initializer'
+    originals = [package / name for name in modules] + [ROOT / 'headless/uv.lock', ROOT / 'headless/pyproject.toml']
+    hashes = {}
+    for original in originals:
+        installer.chain(original)
+        assert stat.S_ISREG(original.stat().st_mode), f'missing regular source: {original}'
+        relative = original.relative_to(ROOT).as_posix()
+        copied = source / relative
+        copied.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        raw = original.read_bytes(); copied.write_bytes(raw); copied.chmod(0o600)
+        assert copied.read_bytes() == raw
+        assert (copied.stat().st_dev, copied.stat().st_ino) != (original.stat().st_dev, original.stat().st_ino)
+        assert copied.stat().st_nlink == 1
+        hashes[relative] = hashlib.sha256(raw).hexdigest()
+    env = {'HOME': str(home), 'PATH': '/usr/bin:/bin', 'GIT_CONFIG_NOSYSTEM': '1',
+        'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null', 'GIT_TERMINAL_PROMPT': '0',
+        'GIT_AUTHOR_NAME': 'Parity Fixture', 'GIT_AUTHOR_EMAIL': 'parity@example.invalid',
+        'GIT_COMMITTER_NAME': 'Parity Fixture', 'GIT_COMMITTER_EMAIL': 'parity@example.invalid'}
+    def git(*args):
+        argv = ['/usr/bin/git', '-c', 'core.hooksPath=' + str(hooks), '-c', 'commit.gpgSign=false', *args]
+        child = subprocess.Popen(argv, cwd=source, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        identity = {'pid': child.pid, 'pgid': child.pid, 'argv': argv, 'kind': 'private-fixture-git'}
+        try:
+            out, err = child.communicate(timeout=10)
+        finally:
+            if child.poll() is None and os.getpgid(child.pid) == child.pid:
+                os.killpg(child.pid, signal.SIGTERM); child.wait(timeout=3)
+            identity.update(returncode=child.returncode, reaped=child.returncode is not None)
+            ledger = os.environ.get('T21A_PROCESS_LOG')
+            if ledger:
+                with open(ledger, 'a') as stream: stream.write(json.dumps(identity) + '\n')
+        assert child.returncode == 0, err.decode(errors='replace')
+        return out
+    git('init', '--quiet', '--template=' + str(template))
+    git('add', '--', *hashes)
+    git('commit', '--quiet', '-m', 'Private current-source parity fixture')
+    commit = git('rev-parse', 'HEAD').decode().strip()
+    assert len(commit) == 40 and all(c in '0123456789abcdef' for c in commit)
+    for original in originals:
+        relative = original.relative_to(ROOT).as_posix()
+        assert (source / relative).read_bytes() == original.read_bytes() == git('show', f'{commit}:{relative}')
+    assert sorted(p.relative_to(source / 'headless/src/hermes_downloads').as_posix()
+        for p in (source / 'headless/src/hermes_downloads').rglob('*.py')) == modules
+    actual = installer.Layout(home, source)
+    locked = {p['name']: p['version'] for p in tomllib.loads((source / 'headless/uv.lock').read_text())['package']}
+    def probe(runtime):
+        record = installer.physical_probe(actual, runtime, commit)
+        assert record['python'] == [3, 12] and record['editable'] is False
+        assert record['direct_url']['dir_info']['editable'] is False
+        assert record['metadata_sha256']
+        assert sorted(record['modules']) == sorted(record['module_parity']) == modules
+        for name in modules:
+            expected = hashes['headless/src/hermes_downloads/' + name]
+            item = record['module_parity'][name]
+            assert item['source'] == item['site'] == item['commit'] == expected
+            copied = source / 'headless/src/hermes_downloads' / name
+            original = package / name
+            site = Path(item['site_path'])
+            assert not site.is_symlink() and site.is_file() and site.is_relative_to(runtime)
+            assert len({(p.stat().st_dev, p.stat().st_ino) for p in (original, copied, site)}) == 3
+        assert record['entrypoints'] == {'hermes-downloads': 'hermes_downloads.cli:main',
+            'hermes-downloads-mcp': 'hermes_downloads.mcp_server:main',
+            'hermes-downloads-worker': 'hermes_downloads.service:worker_main'}
+        assert set(record['executables']) == set(record['entrypoints'])
+        for name, executable in record['executables'].items():
+            assert executable['target'] == record['entrypoints'][name]
+            assert executable['path'] == str(runtime / 'bin' / name)
+        # This physical integration fixture targets the accepted macOS Python 3.12 lock.
+        assert record['dependencies'] == {name: version for name, version in locked.items()
+            if name not in {'colorama', 'pywin32'}}
+        assert record['lock_sha256'] == hashes['headless/uv.lock']
+        evidence = storage / 'parity.json'
+        evidence.write_text(json.dumps({'commit': commit, 'modules': modules, 'source_hashes': hashes, 'parity': record}, sort_keys=True))
+        evidence.chmod(0o600)
+        return record
+    return {'layout': actual, 'commit': commit, 'hashes': hashes, 'git': git, 'probe': probe}
+
+
+def test_private_committed_source_snapshot_parity_and_tampered_site_rejected(installer, committed_source_snapshot, tmp_path):
+    snapshot = committed_source_snapshot
+    actual = snapshot['layout']; commit = snapshot['commit']
+    snapshot['probe'](ROOT / 'headless/.venv')
     # Copy the actual physical runtime to a private canonical fixture, never edit BASE env.
     import shutil
     runtime = tmp_path / 'runtime'
@@ -302,7 +401,26 @@ def test_actual_all_module_parity_and_tampered_site_rejected(installer, layout, 
         path.write_text(path.read_text().replace(str(ROOT / 'headless/.venv'), str(runtime)))
     site = runtime / 'lib/python3.12/site-packages/hermes_downloads'
     (site / 'models.py').write_bytes((site / 'models.py').read_bytes() + b'\n# tampered\n')
-    with pytest.raises(installer.Blocked, match='MODULE_PARITY_MISMATCH'): installer.physical_probe(actual, runtime, BASE)
+    with pytest.raises(installer.Blocked, match='MODULE_PARITY_MISMATCH'): installer.physical_probe(actual, runtime, commit)
+
+
+def test_private_committed_module_mismatch_rejected(installer, committed_source_snapshot):
+    snapshot = committed_source_snapshot
+    relative = 'headless/src/hermes_downloads/models.py'
+    module = snapshot['layout'].source / relative
+    original = module.read_bytes()
+    changed = original + b'\n# different private committed module\n'
+    module.write_bytes(changed)
+    snapshot['git']('add', '--', relative)
+    snapshot['git']('commit', '--quiet', '-m', 'Private mismatched committed module')
+    commit = snapshot['git']('rev-parse', 'HEAD').decode().strip()
+    assert commit != snapshot['commit']
+    assert snapshot['git']('show', f'{commit}:{relative}') == changed
+    module.write_bytes(original)
+    site = ROOT / 'headless/.venv/lib/python3.12/site-packages/hermes_downloads/models.py'
+    assert module.read_bytes() == (ROOT / relative).read_bytes() == site.read_bytes()
+    with pytest.raises(installer.Blocked, match='MODULE_PARITY_MISMATCH'):
+        installer.physical_probe(snapshot['layout'], ROOT / 'headless/.venv', commit)
 
 
 @pytest.mark.parametrize('schema', [None, {'type': 'object', 'properties': {}},
@@ -407,14 +525,14 @@ def test_synthetic_rollback_changed_owned_config_retains_files(installer, layout
     assert 'bootout' not in launch.actions
 
 
-def test_parity_requires_no_dev_only_marker_library(installer, layout, monkeypatch):
+def test_parity_requires_no_dev_only_marker_library(installer, committed_source_snapshot, monkeypatch):
     import builtins
     original = builtins.__import__
     def restricted(name, *args, **kwargs):
         if name.startswith('packaging'): raise ImportError('dev-only library unavailable')
         return original(name, *args, **kwargs)
     monkeypatch.setattr(builtins, '__import__', restricted)
-    result = installer.physical_probe(installer.Layout(layout.home, ROOT), ROOT / 'headless/.venv', BASE)
+    result = committed_source_snapshot['probe'](ROOT / 'headless/.venv')
     assert result['python'] == [3, 12]
 
 

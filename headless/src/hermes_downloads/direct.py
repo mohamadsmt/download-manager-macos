@@ -61,6 +61,8 @@ _GROUP_STOP_GRACE_SECONDS: Final = 0.5
 _GROUP_KILL_GRACE_SECONDS: Final = 0.5
 _POLL_INTERVAL_SECONDS: Final = 0.01
 _MIN_SPLIT_SIZE: Final = "1M"
+_MAX_PAYLOAD_LIMIT_BPS: Final = 2**63 - 1
+_MAX_COUNTER_DIGITS: Final = 4300
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _GID: Final = re.compile(r"[0-9A-Fa-f]{16}\Z")
@@ -174,6 +176,8 @@ class DirectAria2Controller:
         self._by_job_id: dict[str, _TrackedTransfer] = {}
         self._by_gid: dict[str, _TrackedTransfer] = {}
         self._observation_cancelled = threading.Event()
+        self._global_limit_lock = threading.RLock()
+        self._global_resume_blocked = False
 
     def __enter__(self) -> DirectAria2Controller:
         self.start()
@@ -406,20 +410,20 @@ class DirectAria2Controller:
 
         _require_admission(admission)
         transfer = self._current_transfer(job_id, generation)
-        result = self._rpc("aria2.unpause", [transfer.gid])
-        if result != transfer.gid:
-            raise DirectTransferError("aria2 did not acknowledge resume")
-        return self._readback(transfer)
+        with self._global_limit_lock:
+            if self._global_resume_blocked:
+                raise DirectAdmissionError("global payload limit prevents resume")
+            result = self._rpc("aria2.unpause", [transfer.gid])
+            if result != transfer.gid:
+                raise DirectTransferError("aria2 did not acknowledge resume")
+            return self._readback(transfer)
 
     def set_allocation(
         self, *, job_id: str, generation: int, allocation_bps: int | None
     ) -> DirectTransfer:
         """Apply one transfer allocation; zero pauses rather than becoming unlimited."""
 
-        if allocation_bps is not None and (
-            type(allocation_bps) is not int or allocation_bps < 0
-        ):
-            raise ValueError("allocation_bps must be a nonnegative integer or None")
+        _require_payload_limit(allocation_bps, "allocation_bps")
         transfer = self._current_transfer(job_id, generation)
         if allocation_bps == 0:
             result = self._rpc("aria2.pause", [transfer.gid])
@@ -429,16 +433,84 @@ class DirectAria2Controller:
             if state.status != "paused":
                 raise DirectTransferError("aria2 did not confirm pause")
             return state
-        result = self._rpc(
-            "aria2.changeOption",
-            [
-                transfer.gid,
-                {"max-download-limit": "0" if allocation_bps is None else str(allocation_bps)},
-            ],
+        expected = "0" if allocation_bps is None else str(allocation_bps)
+        self._confirm_payload_limit(
+            "aria2.changeOption", [transfer.gid, {"max-download-limit": expected}],
+            "aria2.getOption", [transfer.gid], "max-download-limit", expected,
         )
-        if result != "OK":
-            raise DirectTransferError("aria2 did not acknowledge allocation")
-        return self._readback(transfer)
+        state = None
+        try:
+            state = self._readback(transfer)
+        except DirectEngineError:
+            pass
+        if state is None or state.status not in _TERMINAL_STATUSES | {"active", "waiting", "paused"}:
+            raise DirectTransferError("aria2 did not confirm allocation state")
+        return state
+
+    def set_global_limit(self, *, global_limit_bps: int | None) -> int | None:
+        """Confirm one engine payload cap; product zero closes explicit resume.
+
+        Zero pauses mapped active/waiting jobs without sending aria2's unlimited
+        zero. A failed change also closes resume until a positive/None readback
+        succeeds. Clearing the gate never unpauses jobs. This is engine control,
+        not an ordered batch reallocation or a worker scheduling decision.
+        """
+
+        _require_payload_limit(global_limit_bps, "global_limit_bps")
+        with self._global_limit_lock:
+            self._global_resume_blocked = True
+            if global_limit_bps == 0:
+                failed = False
+                try:
+                    self._require_running()
+                except DirectEngineError:
+                    failed = True
+                if failed:
+                    raise DirectTransferError("aria2 global payload limit failed")
+                for transfer in tuple(self._by_job_id.values()):
+                    try:
+                        state = self._readback(transfer)
+                        if state.status in {"active", "waiting"}:
+                            result = self._rpc("aria2.pause", [transfer.gid])
+                            if result != transfer.gid:
+                                raise DirectTransferError("aria2 pause failed")
+                            state = self._readback(transfer)
+                            if state.status != "paused":
+                                raise DirectTransferError("aria2 pause failed")
+                        elif state.status not in _TERMINAL_STATUSES | {"paused"}:
+                            raise DirectTransferError("aria2 pause failed")
+                    except DirectEngineError:
+                        # Still attempt to pause the remaining owned transfers.
+                        failed = True
+                if failed:
+                    raise DirectTransferError("aria2 global payload limit failed")
+                return 0
+            expected = "0" if global_limit_bps is None else str(global_limit_bps)
+            self._confirm_payload_limit(
+                "aria2.changeGlobalOption", [{"max-overall-download-limit": expected}],
+                "aria2.getGlobalOption", [], "max-overall-download-limit", expected,
+            )
+            self._global_resume_blocked = False
+            return global_limit_bps
+
+    def _confirm_payload_limit(
+        self, change_method: str, change_params: list[Any], read_method: str,
+        read_params: list[Any], field: str, expected: str,
+    ) -> None:
+        confirmed = False
+        try:
+            result = self._rpc(change_method, change_params)
+            if type(result) is str and result == "OK":
+                response = self._rpc(read_method, read_params)
+                confirmed = (
+                    type(response) is dict
+                    and type(response.get(field)) is str
+                    and response[field] == expected
+                )
+        except DirectEngineError:
+            pass
+        if not confirmed:
+            raise DirectTransferError("aria2 did not confirm payload limit")
 
     def readback(self, *, job_id: str, generation: int, gid: str) -> DirectTransfer:
         """Read one exact mapped engine state after validating callback identity."""
@@ -853,6 +925,13 @@ def _require_positive(value: object, name: str) -> int:
     return value
 
 
+def _require_payload_limit(value: object, name: str) -> None:
+    if value is not None and (
+        type(value) is not int or not 0 <= value <= _MAX_PAYLOAD_LIMIT_BPS
+    ):
+        raise ValueError(f"{name} must be a nonnegative signed 64-bit integer or None")
+
+
 def _require_connection_limit(value: object) -> int:
     value = _require_positive(value, "max_connection_per_server")
     if value > 16:
@@ -961,9 +1040,13 @@ def _require_real_directory(path: Path) -> None:
 
 
 def _parse_counter(value: object) -> int:
-    if type(value) is not str or not value.isascii() or not value.isdecimal():
+    if (type(value) is not str or len(value) > _MAX_COUNTER_DIGITS
+            or not value.isascii() or not value.isdecimal()):
         raise DirectTransferError("aria2 returned an invalid state")
-    return int(value)
+    try:
+        return int(value)
+    except ValueError:
+        raise DirectTransferError("aria2 returned an invalid state") from None
 
 
 def _write_private_file(path: Path, content: bytes) -> None:

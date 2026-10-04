@@ -939,6 +939,8 @@ def test_direct_sets_per_transfer_allocation_and_reads_back(
         rpc_calls.append((method, params))
         if method == "aria2.changeOption":
             return "OK"
+        if method == "aria2.getOption":
+            return {"max-download-limit": expected_limit}
         assert method == "aria2.tellStatus"
         return {"status": "active", "totalLength": "1024", "completedLength": "256"}
 
@@ -961,6 +963,7 @@ def test_direct_sets_per_transfer_allocation_and_reads_back(
             "aria2.changeOption",
             [transfer.gid, {"max-download-limit": expected_limit}],
         ),
+        ("aria2.getOption", [transfer.gid]),
         (
             "aria2.tellStatus",
             [transfer.gid, ["status", "totalLength", "completedLength"]],
@@ -2815,3 +2818,304 @@ def test_stage_producer_verification_rechecks_descriptor_after_checksum(tmp_path
     with pytest.raises(direct.DirectTransferError, match="^aria2 terminal verification failed$"):
         controller.observe_terminal(job_id=transfer.job_id, generation=6, gid=transfer.gid)
     assert partial.read_bytes() == b"evil"
+
+
+@pytest.mark.parametrize("reply", ({"max-download-limit": "2048"}, {}, None, [], {"max-download-limit": 1024}, {"max-download-limit": "1K"}))
+def test_payload_limit_requires_exact_per_job_option_readback(tmp_path, monkeypatch, reply):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    calls = []
+
+    def rpc(method, params):
+        calls.append(method)
+        if method == "aria2.changeOption":
+            return "OK"
+        if method == "aria2.getOption":
+            return reply
+        return {"status": "active", "totalLength": "1024", "completedLength": "256"}
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    with pytest.raises(direct.DirectTransferError):
+        controller.set_allocation(job_id=transfer.job_id, generation=6, allocation_bps=1024)
+    assert calls == ["aria2.changeOption", "aria2.getOption"]
+
+
+@pytest.mark.parametrize("value", (False, True, -1, 1.5, "1024", 2**63, [], {}))
+@pytest.mark.parametrize("global_limit", (False, True))
+def test_payload_limit_invalid_types_and_overflow_have_no_rpc(tmp_path, monkeypatch, value, global_limit):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    monkeypatch.setattr(controller, "_rpc", lambda *_: pytest.fail("invalid limit reached RPC"))
+    with pytest.raises(ValueError):
+        if global_limit:
+            controller.set_global_limit(global_limit_bps=value)
+        else:
+            controller.set_allocation(job_id=transfer.job_id, generation=6, allocation_bps=value)
+
+
+@pytest.mark.parametrize("value, expected", ((1024, "1024"), (2**63 - 1, str(2**63 - 1)), (None, "0")))
+def test_payload_limit_global_exact_readback_without_transfer_mutation(tmp_path, monkeypatch, value, expected):
+    direct = _direct_module()
+    controller, _ = _allocation_controller(direct, tmp_path)
+    calls = []
+
+    def rpc(method, params):
+        calls.append((method, params))
+        if method == "aria2.changeGlobalOption":
+            return "OK"
+        assert method == "aria2.getGlobalOption"
+        return {"max-overall-download-limit": expected}
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    assert controller.set_global_limit(global_limit_bps=value) == value
+    assert calls == [("aria2.changeGlobalOption", [{"max-overall-download-limit": expected}]), ("aria2.getGlobalOption", [])]
+
+
+@pytest.mark.parametrize("failure_stage", ("ack", "read", "rpc"))
+@pytest.mark.parametrize("bad_reply", (None, [], {}, True, "wrong", {"max-overall-download-limit": "2048"}, {"max-overall-download-limit": 1024}))
+def test_payload_limit_uncertain_global_change_blocks_resume(tmp_path, monkeypatch, failure_stage, bad_reply):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    calls = []
+
+    def rpc(method, params):
+        calls.append(method)
+        if failure_stage == "rpc":
+            raise direct.DirectEngineError("raw private engine failure")
+        if method == "aria2.changeGlobalOption":
+            return bad_reply if failure_stage == "ack" else "OK"
+        return bad_reply
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    with pytest.raises(direct.DirectTransferError) as caught:
+        controller.set_global_limit(global_limit_bps=1024)
+    assert "raw private" not in str(caught.value)
+    before = list(calls)
+    queue = _admitted_queue(transfer.job_id)
+    with pytest.raises(direct.DirectAdmissionError):
+        controller.resume(job_id=transfer.job_id, generation=6, admission=_admission(queue, transfer.job_id))
+    assert calls == before
+
+
+@pytest.mark.parametrize("initial_status", ("active", "waiting", "paused", "complete", "unknown"))
+def test_payload_limit_zero_pauses_mapped_jobs_and_gates_future_resume(tmp_path, monkeypatch, initial_status):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    queue = _admitted_queue(transfer.job_id)
+    calls = []
+    status = initial_status
+    monkeypatch.setattr(controller, "_require_running", lambda: (object(), 1, "private"))
+
+    def rpc(method, params):
+        nonlocal status
+        calls.append(method)
+        if method == "aria2.pause":
+            status = "paused"
+            return transfer.gid
+        if method == "aria2.tellStatus":
+            return {"status": status, "totalLength": "1024", "completedLength": "256"}
+        if method == "aria2.changeGlobalOption":
+            return "OK"
+        if method == "aria2.getGlobalOption":
+            return {"max-overall-download-limit": "0"}
+        pytest.fail("unexpected mutation")
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    if initial_status == "unknown":
+        with pytest.raises(direct.DirectTransferError):
+            controller.set_global_limit(global_limit_bps=0)
+    else:
+        assert controller.set_global_limit(global_limit_bps=0) == 0
+        assert calls.count("aria2.pause") == (1 if initial_status in ("active", "waiting") else 0)
+    assert "aria2.changeGlobalOption" not in calls
+    before = list(calls)
+    with pytest.raises(direct.DirectAdmissionError):
+        controller.resume(job_id=transfer.job_id, generation=6, admission=_admission(queue, transfer.job_id))
+    assert calls == before
+    assert controller.set_global_limit(global_limit_bps=None) is None
+    assert "aria2.unpause" not in calls
+
+
+def test_payload_limit_unavailable_zero_engine_fails_closed(tmp_path):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    with pytest.raises(direct.DirectTransferError):
+        controller.set_global_limit(global_limit_bps=0)
+    queue = _admitted_queue(transfer.job_id)
+    with pytest.raises(direct.DirectAdmissionError):
+        controller.resume(job_id=transfer.job_id, generation=6, admission=_admission(queue, transfer.job_id))
+
+
+@pytest.mark.parametrize("stage", ("getOption", "tellStatus"))
+def test_payload_limit_per_job_rpc_failure_is_redacted_transfer_error(tmp_path, monkeypatch, stage):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+
+    def rpc(method, params):
+        if method == f"aria2.{stage}":
+            raise direct.DirectEngineError("private transport diagnostic")
+        if method == "aria2.changeOption":
+            return "OK"
+        return {"max-download-limit": "1024"}
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    with pytest.raises(direct.DirectTransferError) as caught:
+        controller.set_allocation(job_id=transfer.job_id, generation=6, allocation_bps=1024)
+    assert "private transport" not in str(caught.value)
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("allocation_bps", (1024, None))
+@pytest.mark.parametrize("counter", ("totalLength", "completedLength"))
+def test_payload_limit_oversized_counter_is_redacted_transfer_error(tmp_path, monkeypatch, allocation_bps, counter):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+    expected = "0" if allocation_bps is None else str(allocation_bps)
+    oversized = "9" * 4301
+    calls = []
+
+    def rpc(method, params):
+        calls.append((method, params))
+        if method == "aria2.changeOption":
+            return "OK"
+        if method == "aria2.getOption":
+            return {"max-download-limit": expected}
+        assert method == "aria2.tellStatus"
+        reply = {"status": "active", "totalLength": "1024", "completedLength": "256"}
+        reply[counter] = oversized
+        return reply
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    with pytest.raises(direct.DirectTransferError, match="^aria2 did not confirm allocation state$") as caught:
+        controller.set_allocation(job_id=transfer.job_id, generation=6, allocation_bps=allocation_bps)
+    assert oversized not in str(caught.value)
+    assert caught.value.__context__ is None
+    assert calls == [
+        ("aria2.changeOption", [transfer.gid, {"max-download-limit": expected}]),
+        ("aria2.getOption", [transfer.gid]),
+        ("aria2.tellStatus", [transfer.gid, ["status", "totalLength", "completedLength"]]),
+    ]
+
+
+@pytest.mark.parametrize("counter", ("totalLength", "completedLength"))
+def test_payload_limit_oversized_counter_zero_attempts_second_job_and_keeps_gate_closed(tmp_path, monkeypatch, counter):
+    direct = _direct_module()
+    controller, first = _allocation_controller(direct, tmp_path)
+    second = direct.replace(first, job_id="second-owned", gid="fedcba9876543210")
+    controller._by_job_id[second.job_id] = second
+    controller._by_gid[second.gid] = second
+    oversized = "9" * 4301
+    paused = set()
+    calls = []
+    monkeypatch.setattr(controller, "_require_running", lambda: (object(), 1, "private"))
+
+    def rpc(method, params):
+        calls.append((method, params[0]))
+        gid = params[0]
+        if method == "aria2.pause":
+            paused.add(gid)
+            return gid
+        assert method == "aria2.tellStatus"
+        reply = {"status": "paused" if gid in paused else "waiting",
+                 "totalLength": "1024", "completedLength": "256"}
+        if gid == first.gid:
+            reply[counter] = oversized
+        return reply
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    with pytest.raises(Exception) as caught:
+        controller.set_global_limit(global_limit_bps=0)
+    before = list(calls)
+    queue = _admitted_queue(second.job_id)
+    with pytest.raises(direct.DirectAdmissionError, match="^global payload limit prevents resume$"):
+        controller.resume(job_id=second.job_id, generation=6, admission=_admission(queue, second.job_id))
+    assert calls == before
+    assert (type(caught.value), str(caught.value), calls) == (
+        direct.DirectTransferError, "aria2 global payload limit failed", [
+            ("aria2.tellStatus", first.gid), ("aria2.tellStatus", second.gid),
+            ("aria2.pause", second.gid), ("aria2.tellStatus", second.gid),
+        ],
+    )
+    assert caught.value.__context__ is None
+    assert oversized not in str(caught.value)
+
+
+def test_payload_limit_unknown_post_change_status_is_not_applied(tmp_path, monkeypatch):
+    direct = _direct_module()
+    controller, transfer = _allocation_controller(direct, tmp_path)
+
+    def rpc(method, params):
+        if method == "aria2.changeOption":
+            return "OK"
+        if method == "aria2.getOption":
+            return {"max-download-limit": "1024"}
+        return {"status": "unknown", "totalLength": "1024", "completedLength": "256"}
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    with pytest.raises(direct.DirectTransferError):
+        controller.set_allocation(job_id=transfer.job_id, generation=6, allocation_bps=1024)
+
+
+@pytest.mark.parametrize("failure", ("ack", "read", "rpc"))
+def test_payload_limit_zero_attempts_other_owned_jobs_after_pause_failure(tmp_path, monkeypatch, failure):
+    direct = _direct_module()
+    controller, first = _allocation_controller(direct, tmp_path)
+    second = direct.replace(first, job_id="second-owned", gid="fedcba9876543210")
+    controller._by_job_id[second.job_id] = second
+    controller._by_gid[second.gid] = second
+    paused = set()
+    pause_calls = []
+    monkeypatch.setattr(controller, "_require_running", lambda: (object(), 1, "private"))
+
+    def rpc(method, params):
+        gid = params[0]
+        if method == "aria2.pause":
+            pause_calls.append(gid)
+            if gid == first.gid and failure == "rpc":
+                raise direct.DirectEngineError("private pause transport diagnostic")
+            paused.add(gid)
+            return "wrong" if gid == first.gid and failure == "ack" else gid
+        assert method == "aria2.tellStatus"
+        status = "paused" if gid in paused else "waiting"
+        if gid == first.gid and failure == "read" and gid in paused:
+            status = "waiting"
+        return {"status": status, "totalLength": "1024", "completedLength": "256"}
+
+    monkeypatch.setattr(controller, "_rpc", rpc)
+    with pytest.raises(direct.DirectTransferError) as caught:
+        controller.set_global_limit(global_limit_bps=0)
+    assert pause_calls == [first.gid, second.gid]
+    assert "private" not in str(caught.value)
+    assert caught.value.__context__ is None
+    queue = _admitted_queue(second.job_id)
+    with pytest.raises(direct.DirectAdmissionError):
+        controller.resume(job_id=second.job_id, generation=6, admission=_admission(queue, second.job_id))
+
+
+def test_payload_limit_zero_gate_survives_blank_restart_without_implicit_transfer(tmp_path):
+    direct = _direct_module()
+    job_id = "zero-restart-future"
+    queue = _admitted_queue(job_id)
+    with _origin_type()() as origin, _running_direct_controller(direct, tmp_path) as (controller, identities):
+        assert controller.set_global_limit(global_limit_bps=0) == 0
+        first = controller.engine_identity
+        restarted = controller.restart()
+        identities.append(restarted)
+        assert restarted != first
+        assert controller.active_job_ids == ()
+        _assert_group_gone(first.process_group_id)
+        transfer = controller.add_paused(
+            job_id=job_id, generation=1, source=_source(origin, "/range"),
+            destination=_destination(job_id, "restart.bin"), expected_sha256=SYNTHETIC_PAYLOAD_SHA256,
+            admission=_admission(queue, job_id),
+        )
+        assert transfer.status == "paused"
+        with pytest.raises(direct.DirectAdmissionError):
+            controller.resume(job_id=job_id, generation=1, admission=_admission(queue, job_id))
+        assert origin.ledger.response_body_bytes == 0
+        assert controller.set_global_limit(global_limit_bps=1024) == 1024
+        assert controller.readback(job_id=job_id, generation=1, gid=transfer.gid).status == "paused"
+        assert origin.ledger.response_body_bytes == 0
+        controller.resume(job_id=job_id, generation=1, admission=_admission(queue, job_id))
+        completed = controller.wait_for_terminal(job_id=job_id, generation=1, timeout=5)
+        assert completed.hash_verified

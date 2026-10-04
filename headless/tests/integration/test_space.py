@@ -39,11 +39,45 @@ def _observed_allocated_bytes(paths: tuple[Path, ...]) -> int | None:
     return sum(value * 512 for value in blocks)
 
 
-def test_observes_a_fresh_job_and_then_current_appended_artifacts() -> None:
+def test_observes_a_fresh_job_and_then_current_appended_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     paths = _paths()
     destination = _destination(paths, job_id="job-space-fresh")
     unlisted = destination.incomplete_dir / "unlisted.bin"
     unlisted.write_bytes(b"not in the owned ledger")
+
+    job_details = os.stat(destination.incomplete_dir)
+    native_fstatvfs = os.fstatvfs
+    native_statvfs = os.statvfs
+    snapshots: list[os.statvfs_result] = []
+    later_samples: list[os.statvfs_result] = []
+
+    def record_fstatvfs(directory_fd: int) -> os.statvfs_result:
+        descriptor = os.fstat(directory_fd)
+        assert (descriptor.st_dev, descriptor.st_ino) == (
+            job_details.st_dev,
+            job_details.st_ino,
+        )
+        snapshot = native_fstatvfs(directory_fd)
+        snapshots.append(snapshot)
+        return snapshot
+
+    def observe_later_statvfs(path: Any) -> os.statvfs_result:
+        if path != destination.incomplete_dir:
+            return native_statvfs(path)
+        assert len(snapshots) == 1
+        snapshot = snapshots[0]
+        assert 2 <= snapshot.f_bavail <= snapshot.f_bfree <= snapshot.f_blocks
+        # Simulate two blocks consumed after the product's native observation.
+        values = list(snapshot)
+        values[3] = snapshot.f_bfree - 2
+        values[4] = snapshot.f_bavail - 2
+        later = os.statvfs_result(values)
+        later_samples.append(later)
+        return later
+
+    monkeypatch.setattr(paths.os, "fstatvfs", record_fstatvfs)
 
     fresh = paths.observe_job_space(
         destination,
@@ -53,8 +87,15 @@ def test_observes_a_fresh_job_and_then_current_appended_artifacts() -> None:
     )
 
     assert fresh.current == paths.StorageUsage(logical_bytes=0, allocated_bytes=0)
+    assert len(snapshots) == 1
+    monkeypatch.setattr(paths.os, "statvfs", observe_later_statvfs)
     filesystem = os.statvfs(destination.incomplete_dir)
-    assert fresh.available_bytes == filesystem.f_bavail * filesystem.f_frsize
+    assert later_samples == [filesystem]
+    assert fresh.available_bytes == snapshots[0].f_bavail * snapshots[0].f_frsize
+    assert filesystem.f_bfree == snapshots[0].f_bfree - 2
+    assert fresh.available_bytes - filesystem.f_bavail * filesystem.f_frsize == (
+        2 * snapshots[0].f_frsize
+    )
     assert fresh.expected_output_logical_bytes == 11
     assert fresh.expected_peak_logical_bytes == 11
 
@@ -69,6 +110,9 @@ def test_observes_a_fresh_job_and_then_current_appended_artifacts() -> None:
         expected_output_logical_bytes=2,
     )
 
+    assert len(snapshots) == 2
+    assert later_samples == [filesystem]
+    assert observed.available_bytes == snapshots[1].f_bavail * snapshots[1].f_frsize
     assert observed.current.logical_bytes == len(b"segment") + len(b"output")
     assert observed.current.allocated_bytes == _observed_allocated_bytes(
         (sidecar, destination.partial_path)
