@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import signal
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -515,4 +516,65 @@ def test_nested_retired_extraction_option_fields_are_rejected(installer, field, 
         schema['properties']['options'] = {'$ref': '#/$defs/options'}
         schema['$defs'] = {'options': options}
     with pytest.raises(installer.Blocked, match='MEDIA_SCHEMA_UNSUPPORTED'):
+        installer.check_schema(schema)
+
+
+def test_private_read_accepts_access_time_only_descriptor_change(installer, tmp_path, monkeypatch):
+    path = tmp_path / 'config'; path.write_bytes(RAW); path.chmod(0o600)
+    real_fstat = os.fstat
+    calls = 0
+    def access_time_view(fd):
+        nonlocal calls
+        value = real_fstat(fd); calls += 1
+        fields = {name: getattr(value, name) for name in dir(value) if name.startswith('st_')}
+        if calls > 1:
+            fields['st_atime'] += 1
+            fields['st_atime_ns'] += 1_000_000_000
+        return SimpleNamespace(**fields)
+    monkeypatch.setattr(installer.os, 'fstat', access_time_view)
+    raw, record = installer.read_file(path)
+    assert raw == RAW and record['sha256'] == installer.digest(RAW)
+    assert calls == 2
+
+
+@pytest.mark.parametrize('field', ['st_dev', 'st_ino', 'st_mode', 'st_nlink',
+    'st_uid', 'st_gid', 'st_size', 'st_mtime_ns', 'st_ctime_ns'])
+def test_private_read_refuses_descriptor_write_or_ownership_change(installer, tmp_path, monkeypatch, field):
+    path = tmp_path / 'config'; path.write_bytes(RAW); path.chmod(0o600)
+    real_fstat = os.fstat
+    calls = 0
+    def changed_view(fd):
+        nonlocal calls
+        value = real_fstat(fd); calls += 1
+        fields = {name: getattr(value, name) for name in dir(value) if name.startswith('st_')}
+        if calls > 1: fields[field] += 1
+        return SimpleNamespace(**fields)
+    monkeypatch.setattr(installer.os, 'fstat', changed_view)
+    with pytest.raises(installer.Blocked, match='^CONCURRENT_EDIT$'):
+        installer.read_file(path)
+
+
+@pytest.mark.parametrize('reference', ['#/$defs/Item', '#/definitions/Item'])
+def test_closed_typed_local_reference_is_supported(installer, reference):
+    definitions = reference.split('/')[1]
+    schema = {'type': 'object', 'additionalProperties': False,
+        'properties': {'items': {'type': 'array', 'items': {'$ref': reference}}},
+        definitions: {'Item': {'type': 'object', 'additionalProperties': False,
+            'properties': {'url': {'type': 'string'}, 'category': {'type': 'string', 'enum': ['Videos', 'Audio']}}}}}
+    installer.check_schema(schema)
+
+
+@pytest.mark.parametrize('kind', ['open', 'untyped', 'dangling', 'external', 'cycle'])
+def test_referenced_item_must_be_closed_typed_and_resolvable(installer, kind):
+    item = {'type': 'object', 'additionalProperties': False,
+        'properties': {'url': {'type': 'string'}}}
+    schema = {'type': 'object', 'additionalProperties': False,
+        'properties': {'items': {'type': 'array', 'items': {'$ref': '#/$defs/Item'}}},
+        '$defs': {'Item': item}}
+    if kind == 'open': item.pop('additionalProperties')
+    elif kind == 'untyped': item['properties']['url'] = {}
+    elif kind == 'dangling': schema['$defs'] = {}
+    elif kind == 'external': schema['properties']['items']['items']['$ref'] = 'https://example.invalid/schema'
+    else: schema['$defs']['Item'] = {'$ref': '#/$defs/Item'}
+    with pytest.raises(installer.Blocked, match='^TOOL_SCHEMA_INVALID$'):
         installer.check_schema(schema)

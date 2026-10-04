@@ -108,9 +108,14 @@ def read_file(path, private=True):
             if not chunk: break
             raw.extend(chunk)
         end = os.fstat(fd)
-        if len(raw) > MAX_BYTES or info != end or path.lstat() != end:
+        def write_identity(value):
+            return (value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+                value.st_uid, value.st_gid, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        if (len(raw) > MAX_BYTES or write_identity(info) != write_identity(end)
+                or write_identity(path.lstat()) != write_identity(end)):
             raise Blocked('CONCURRENT_EDIT')
-        record = {'dev': info.st_dev, 'ino': info.st_ino, 'uid': info.st_uid,
+        record = {'dev': info.st_dev, 'ino': info.st_ino, 'uid': info.st_uid, 'gid': info.st_gid,
+            'nlink': info.st_nlink, 'ctime_ns': info.st_ctime_ns,
             'mode': stat.S_IMODE(info.st_mode), 'size': info.st_size,
             'mtime_ns': info.st_mtime_ns, 'sha256': digest(raw)}
         return bytes(raw), record
@@ -283,16 +288,34 @@ def check_schema(schema):
         raise Blocked('TOOL_SCHEMA_INVALID')
     if not isinstance(schema.get('properties'), dict) or not schema['properties']:
         raise Blocked('TOOL_SCHEMA_INVALID')
-    def typed(value):
+    def typed(value, references=(), depth=0):
+        if depth > 64: raise Blocked('TOOL_SCHEMA_INVALID')
         if not isinstance(value, dict): raise Blocked('TOOL_SCHEMA_INVALID')
         if not any(key in value for key in ('type', '$ref', 'anyOf', 'oneOf', 'allOf', 'const', 'enum')):
             raise Blocked('TOOL_SCHEMA_INVALID')
+        if '$ref' in value:
+            reference = value['$ref']
+            if (not isinstance(reference, str) or not reference.startswith('#/')
+                    or reference in references): raise Blocked('TOOL_SCHEMA_INVALID')
+            target = schema
+            for part in reference[2:].split('/'):
+                if re.search(r'~(?![01])', part): raise Blocked('TOOL_SCHEMA_INVALID')
+                key = part.replace('~1', '/').replace('~0', '~')
+                if not isinstance(target, dict) or key not in target:
+                    raise Blocked('TOOL_SCHEMA_INVALID')
+                target = target[key]
+            typed(target, (*references, reference), depth + 1)
         if value.get('type') == 'object':
             if value.get('additionalProperties') is not False: raise Blocked('TOOL_SCHEMA_INVALID')
-            for child in value.get('properties', {}).values(): typed(child)
-        if value.get('type') == 'array': typed(value.get('items'))
+            properties = value.get('properties', {})
+            if not isinstance(properties, dict): raise Blocked('TOOL_SCHEMA_INVALID')
+            for child in properties.values(): typed(child, references, depth + 1)
+        if value.get('type') == 'array': typed(value.get('items'), references, depth + 1)
         for key in ('anyOf', 'oneOf', 'allOf'):
-            for child in value.get(key, []): typed(child)
+            if key in value:
+                children = value[key]
+                if not isinstance(children, list) or not children: raise Blocked('TOOL_SCHEMA_INVALID')
+                for child in children: typed(child, references, depth + 1)
     for value in schema['properties'].values(): typed(value)
     retired_fields = {'quality', 'video_quality', 'video_options', 'media_options',
         'playlist', 'playlist_selection', 'playlist_positions', 'audio', 'audio_format',
@@ -615,7 +638,7 @@ def read_manifest(path):
         raise Blocked('MANIFEST_INVALID')
     if not re.fullmatch('[0-9a-f]{40}', data['commit']) or type(data['added_plugin']) is not bool or not isinstance(data['files'], dict):
         raise Blocked('MANIFEST_INVALID')
-    identity_keys = {'dev', 'ino', 'uid', 'mode', 'size', 'mtime_ns', 'sha256'}
+    identity_keys = {'dev', 'ino', 'uid', 'gid', 'nlink', 'mode', 'size', 'mtime_ns', 'ctime_ns', 'sha256'}
     def valid_identity(record):
         return (isinstance(record, dict) and set(record) == identity_keys and
             all(type(record[k]) is int and record[k] >= 0 for k in identity_keys - {'sha256'}) and
