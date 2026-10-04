@@ -294,8 +294,28 @@ def check_schema(schema):
         for key in ('anyOf', 'oneOf', 'allOf'):
             for child in value.get(key, []): typed(child)
     for value in schema['properties'].values(): typed(value)
-    if any(word in json.dumps(schema).lower() for word in ('quality', 'video', 'ffmpeg', 'playlist', 'audio_format')):
-        raise Blocked('MEDIA_SCHEMA_UNSUPPORTED')
+    retired_fields = {'quality', 'video_quality', 'video_options', 'media_options',
+        'playlist', 'playlist_selection', 'playlist_positions', 'audio', 'audio_format',
+        'subtitles', 'subtitle', 'video_format', 'format_selection', 'cookies',
+        'cookie_grant', 'extractor', 'extractor_options', 'yt_dlp', 'ffmpeg', 'ffprobe'}
+    def check_extraction_options(value):
+        if not isinstance(value, dict): return
+        properties = value.get('properties', {})
+        if isinstance(properties, dict):
+            for name, child in properties.items():
+                if name in retired_fields: raise Blocked('MEDIA_SCHEMA_UNSUPPORTED')
+                check_extraction_options(child)
+        for key in ('$defs', 'definitions', 'patternProperties'):
+            children = value.get(key, {})
+            if isinstance(children, dict):
+                for child in children.values(): check_extraction_options(child)
+        for key in ('items', 'additionalProperties', 'not', 'if', 'then', 'else'):
+            check_extraction_options(value.get(key))
+        for key in ('anyOf', 'oneOf', 'allOf', 'prefixItems'):
+            children = value.get(key, [])
+            if isinstance(children, list):
+                for child in children: check_extraction_options(child)
+    check_extraction_options(schema)
 
 
 def check_tool(tool):

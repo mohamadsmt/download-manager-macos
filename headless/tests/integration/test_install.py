@@ -434,12 +434,19 @@ def _readiness_repository(layout):
 
 def test_readiness_allows_only_untracked_retained_handoff_markdown(installer, layout):
     handoff = _readiness_repository(layout)
-    before = handoff.stat(), handoff.read_bytes()
+    # This test's own byte read may change atime; retain all ownership/write fields.
+    def identity():
+        value = handoff.stat()
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+            value.st_uid, value.st_gid, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    contents = handoff.read_bytes()
+    before = identity()
     result = installer.readiness(layout)
     assert 'SOURCE_DIRTY' not in result['reasons']
     assert result['status'] == 'NOT_READY'  # Other real prerequisites still absent.
     assert 'MISSING_BUNDLE' in result['reasons']
-    assert (handoff.stat(), handoff.read_bytes()) == before
+    assert handoff.read_bytes() == contents
+    assert identity() == before
     assert not list(layout.home.iterdir())
 
 
@@ -485,3 +492,27 @@ def test_nonobject_bundle_manifest_returns_blocked_report(installer, layout, man
     assert result['status'] == 'NOT_READY'
     assert 'BUNDLE_INVALID' in result['reasons']
     assert not list(layout.home.iterdir())
+
+
+
+def test_direct_media_categories_values_and_descriptions_are_supported(installer):
+    schema = {'type': 'object', 'additionalProperties': False,
+        'properties': {'category': {'type': 'string', 'enum': ['Videos', 'Audio', 'Documents', 'Software', 'Other']},
+            'filename': {'type': 'string', 'enum': ['video-quality-playlist.mp4'],
+                'description': 'Download direct video bytes without extraction or FFmpeg.'}}}
+    installer.check_schema(schema)
+
+
+@pytest.mark.parametrize('field', ['quality', 'playlist_selection', 'audio_format', 'subtitles', 'video_options', 'ffmpeg'])
+@pytest.mark.parametrize('location', ['root', 'array', 'definition'])
+def test_nested_retired_extraction_option_fields_are_rejected(installer, field, location):
+    options = {'type': 'object', 'additionalProperties': False,
+        'properties': {field: {'type': 'string'}}}
+    schema = {'type': 'object', 'additionalProperties': False, 'properties': {'options': options}}
+    if location == 'array':
+        schema['properties']['options'] = {'type': 'array', 'items': options}
+    elif location == 'definition':
+        schema['properties']['options'] = {'$ref': '#/$defs/options'}
+        schema['$defs'] = {'options': options}
+    with pytest.raises(installer.Blocked, match='MEDIA_SCHEMA_UNSUPPORTED'):
+        installer.check_schema(schema)
