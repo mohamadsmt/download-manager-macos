@@ -112,6 +112,8 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     assert project["project"]["requires-python"] == ">=3.12,<3.13"
     assert project["project"]["dependencies"] == [
         "mcp[cli]==1.29.1",
+        "ruamel.yaml==0.18.17",
+        "ruamel.yaml.clib==0.2.15",
     ]
     assert project["project"]["scripts"] == {
         "hermes-downloads": "hermes_downloads.cli:main",
