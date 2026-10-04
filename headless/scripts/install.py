@@ -288,11 +288,21 @@ def check_schema(schema):
         raise Blocked('TOOL_SCHEMA_INVALID')
     if not isinstance(schema.get('properties'), dict) or not schema['properties']:
         raise Blocked('TOOL_SCHEMA_INVALID')
-    def typed(value, references=(), depth=0):
+    def typed(value, references=(), depth=0, object_properties=None):
         if depth > 64: raise Blocked('TOOL_SCHEMA_INVALID')
         if not isinstance(value, dict): raise Blocked('TOOL_SCHEMA_INVALID')
-        if not any(key in value for key in ('type', '$ref', 'anyOf', 'oneOf', 'allOf', 'const', 'enum')):
+        # Existing query branches constrain the enclosing closed object's keys.
+        constraint = (object_properties is not None and bool(value)
+            and set(value).issubset({'properties', 'required'}))
+        if not constraint and not any(key in value for key in ('type', '$ref', 'anyOf', 'oneOf', 'allOf', 'const', 'enum')):
             raise Blocked('TOOL_SCHEMA_INVALID')
+        if constraint:
+            properties = value.get('properties', {})
+            required = value.get('required', [])
+            if (not isinstance(properties, dict) or not set(properties).issubset(object_properties)
+                    or not isinstance(required, list) or any(not isinstance(key, str) for key in required)
+                    or not set(required).issubset(object_properties)):
+                raise Blocked('TOOL_SCHEMA_INVALID')
         if '$ref' in value:
             reference = value['$ref']
             if (not isinstance(reference, str) or not reference.startswith('#/')
@@ -305,8 +315,8 @@ def check_schema(schema):
                     raise Blocked('TOOL_SCHEMA_INVALID')
                 target = target[key]
             typed(target, (*references, reference), depth + 1)
-        if value.get('type') == 'object':
-            if value.get('additionalProperties') is not False: raise Blocked('TOOL_SCHEMA_INVALID')
+        if value.get('type') == 'object' or constraint:
+            if not constraint and value.get('additionalProperties') is not False: raise Blocked('TOOL_SCHEMA_INVALID')
             properties = value.get('properties', {})
             if not isinstance(properties, dict): raise Blocked('TOOL_SCHEMA_INVALID')
             for child in properties.values(): typed(child, references, depth + 1)
@@ -315,8 +325,10 @@ def check_schema(schema):
             if key in value:
                 children = value[key]
                 if not isinstance(children, list) or not children: raise Blocked('TOOL_SCHEMA_INVALID')
-                for child in children: typed(child, references, depth + 1)
-    for value in schema['properties'].values(): typed(value)
+                enclosing = (properties if value.get('type') == 'object' or constraint
+                    else object_properties if 'type' not in value else None)
+                for child in children: typed(child, references, depth + 1, enclosing)
+    typed(schema)
     retired_fields = {'quality', 'video_quality', 'video_options', 'media_options',
         'playlist', 'playlist_selection', 'playlist_positions', 'audio', 'audio_format',
         'subtitles', 'subtitle', 'video_format', 'format_selection', 'cookies',

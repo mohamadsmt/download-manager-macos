@@ -696,3 +696,36 @@ def test_referenced_item_must_be_closed_typed_and_resolvable(installer, kind):
     else: schema['$defs']['Item'] = {'$ref': '#/$defs/Item'}
     with pytest.raises(installer.Blocked, match='^TOOL_SCHEMA_INVALID$'):
         installer.check_schema(schema)
+
+
+@pytest.mark.parametrize('placement', ['root', 'anyOf', 'oneOf', 'allOf'])
+@pytest.mark.parametrize('reference', ['#/$defs/Missing', 'https://example.invalid/schema'])
+def test_tool_root_and_root_combinator_references_fail_closed(installer, placement, reference):
+    schema = {'type': 'object', 'additionalProperties': False,
+        'required': ['scope'], 'properties': {'scope': {'type': 'string'}}}
+    if placement == 'root':
+        schema['$ref'] = reference
+    else:
+        schema[placement] = [{'$ref': reference}]
+    tool = {'name': 'downloads_query', 'description': 'Read worker health', 'schema': schema}
+    with pytest.raises(installer.Blocked, match='^TOOL_SCHEMA_INVALID$'):
+        installer.check_tool(tool)
+
+
+@pytest.mark.parametrize('placement', ['root', 'anyOf', 'oneOf', 'allOf'])
+def test_tool_root_and_root_combinator_closed_local_references_are_supported(installer, placement):
+    target = {'type': 'object', 'additionalProperties': False,
+        'required': ['scope'], 'properties': {'scope': {'type': 'string', 'enum': ['health', 'list']}}}
+    schema = {'type': 'object', 'additionalProperties': False,
+        'required': ['scope'], 'properties': {'scope': {'type': 'string'}}, '$defs': {'Query': target}}
+    if placement == 'root':
+        schema['$ref'] = '#/$defs/Query'
+    else:
+        schema[placement] = [{'$ref': '#/$defs/Query'}]
+    installer.check_tool({'name': 'downloads_query', 'description': 'Read worker health', 'schema': schema})
+
+
+def test_actual_query_root_oneof_constraints_remain_supported(installer):
+    from hermes_downloads.mcp_server import _QUERY_INPUT_SCHEMA
+    installer.check_tool({'name': 'downloads_query', 'description': 'Read worker health',
+        'schema': _QUERY_INPUT_SCHEMA})
