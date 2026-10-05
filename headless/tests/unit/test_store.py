@@ -1296,7 +1296,7 @@ def test_v8_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1420,7 +1420,7 @@ def test_v8_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         schema = connection.execute(
             """
             SELECT sql
@@ -1631,13 +1631,13 @@ def test_v15_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path)
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 17")
+        connection.execute("PRAGMA user_version = 18")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1796,7 +1796,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1881,14 +1881,14 @@ def test_v8_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
@@ -1932,7 +1932,7 @@ def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert [
             row[1]
             for row in connection.execute(
@@ -3155,14 +3155,14 @@ def test_v8_migrates_v6_database_to_the_exact_command_receipt_catalog(tmp_path: 
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
@@ -3425,7 +3425,7 @@ def test_v8_migrates_v7_receipts_to_the_shared_global_registry(tmp_path: Path) -
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
     assert "command_receipts" in _table_names(database_path)
 
 
@@ -3924,14 +3924,14 @@ def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_v9_receipt_rebuild_failure_restores_v8_database(
@@ -4170,7 +4170,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         projection_after = connection.execute(
             """
             SELECT
@@ -4203,7 +4203,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         }
     assert projection_after == projection_before
     assert receipts == []
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fails(
@@ -4286,19 +4286,19 @@ def test_fresh_v11_bootstrap_retries_after_publication_receipt_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 17
     finally:
         recovered.close()
 
     with original_connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -4547,7 +4547,7 @@ def test_publication_marker_binding_is_narrow_durable_and_exactly_idempotent(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert [
             row[1]
             for row in connection.execute(
@@ -4878,7 +4878,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert connection.execute(
             "SELECT job_id, marker_device, marker_inode FROM publication_marker_bindings"
         ).fetchall() == []
@@ -4888,7 +4888,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_v11_migration_ddl_failure_leaves_the_exact_v10_database(
@@ -4966,7 +4966,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 17
     finally:
         recovered.close()
 
@@ -4977,7 +4977,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_v15_rejects_unknown_current_table_without_bootstrap_writes(
@@ -4987,16 +4987,16 @@ def test_v15_rejects_unknown_current_table_without_bootstrap_writes(
     store = SQLiteStore(database_path)
     store.close()
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         connection.execute("CREATE TABLE unexpected_v12_table (value TEXT NOT NULL)")
 
     with pytest.raises(RuntimeError, match="incomplete"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
     assert _table_names(database_path) == {
-        *store_module._V16_TABLE_SCHEMAS,
+        *store_module._V17_TABLE_SCHEMAS,
         "unexpected_v12_table",
     }
 
@@ -5116,7 +5116,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert connection.execute(
             "SELECT COUNT(*) FROM direct_engine_recovery_capabilities"
         ).fetchone()[0] == 0
@@ -5126,7 +5126,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
@@ -5167,7 +5167,7 @@ def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 17
     finally:
         recovered.close()
 
@@ -6069,7 +6069,7 @@ def test_v14_migrates_v13_owner_chain_without_backfilling_a_staged_payload_bindi
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert connection.execute(
             """
             SELECT job_id, partial_device, partial_inode, logical_size
@@ -6082,7 +6082,7 @@ def test_v14_migrates_v13_owner_chain_without_backfilling_a_staged_payload_bindi
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_v14_migration_rolls_back_and_retries_from_v13(
@@ -6123,7 +6123,7 @@ def test_v14_migration_rolls_back_and_retries_from_v13(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 17
     finally:
         recovered.close()
 
@@ -6164,7 +6164,7 @@ def test_fresh_v14_bootstrap_retries_after_staged_payload_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 17
     finally:
         recovered.close()
 
@@ -6175,7 +6175,7 @@ def test_fresh_v14_bootstrap_retries_after_staged_payload_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 def test_private_staged_payload_binding_is_exactly_idempotent_and_durable(
@@ -6689,7 +6689,7 @@ def test_private_final_publication_binding_is_exactly_idempotent_and_durable(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert [
             row[1]
             for row in connection.execute(
@@ -6779,7 +6779,7 @@ def test_v15_migrates_v14_owner_chain_without_backfilling_final_publication_bind
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert connection.execute(
             """
             SELECT job_id, final_device, final_inode, logical_size
@@ -6792,7 +6792,7 @@ def test_v15_migrates_v14_owner_chain_without_backfilling_final_publication_bind
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V16_TABLE_SCHEMAS
+    assert table_schemas == store_module._V17_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -6842,7 +6842,7 @@ def test_v15_migration_rolls_back_and_retries_from_v14(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 17
     finally:
         recovered.close()
 
@@ -7704,7 +7704,7 @@ def test_stage_producer_prepare_rejects_intervening_same_cutpoint_audit(tmp_path
 def test_exact_publication_attempt_schema_has_no_historical_backfill(tmp_path):
     store = SQLiteStore(tmp_path / 'attempt.db')
     try:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 16
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 17
         assert store._connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
         assert store._connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
         columns = {row[1] for row in store._connection.execute('PRAGMA table_info(direct_publication_attempts)')}
@@ -7964,8 +7964,50 @@ def test_exact_attempt_v16_migration_is_atomic_and_has_no_backfill(tmp_path, mon
         assert connection.execute('PRAGMA user_version').fetchone()[0] == 15
     monkeypatch.setattr(store_module.sqlite3,'connect',connect)
     with closing(SQLiteStore(database)) as store:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 16
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 17
         assert store._connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
+
+
+def _retain_actual_v16_fixture(database):
+    """Actual g4b producer rows, with the accepted verbatim v16 catalog."""
+    with closing(SQLiteStore(database)) as store:
+        _exact_attempt_fixture(store)
+        store._connection.execute('DROP TABLE add_batch_entries')
+        store._connection.execute('DROP TABLE add_batch_commands')
+        store._connection.execute('ALTER TABLE command_receipts RENAME TO receipts17')
+        store._connection.execute(store_module._COMMAND_RECEIPTS_SCHEMA)
+        store._connection.execute('INSERT INTO command_receipts SELECT * FROM receipts17')
+        store._connection.execute('DROP TABLE receipts17')
+        store._connection.execute('PRAGMA user_version = 16')
+        assert store._has_table_schemas(store._connection,store_module._V16_TABLE_SCHEMAS)
+        return {name: [tuple(row) for row in store._connection.execute(f'SELECT * FROM {name}')]
+            for name in store_module._V16_TABLE_SCHEMAS}
+
+
+def test_t17_actual_g4b_migration_preserves_every_old_row_and_sql(tmp_path):
+    database=tmp_path/'g4b.db'; before=_retain_actual_v16_fixture(database)
+    with closing(SQLiteStore(database)) as store:
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 17
+        for name, rows in before.items():
+            assert [tuple(row) for row in store._connection.execute(f'SELECT * FROM {name}')] == rows
+        assert store._has_table_schemas(store._connection,store_module._V17_TABLE_SCHEMAS)
+        assert store._connection.execute('SELECT count(*) FROM add_batch_commands').fetchone()[0] == 0
+        assert store._connection.execute('SELECT count(*) FROM add_batch_entries').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('prefix',['ALTER TABLE command_receipts','CREATE TABLE command_receipts',
+    'INSERT INTO command_receipts','DROP TABLE command_receipts_v16','CREATE TABLE add_batch_commands',
+    'CREATE TABLE add_batch_entries','PRAGMA user_version = 17'])
+def test_t17_ddl_copy_and_version_faults_roll_back_actual_g4b(tmp_path,monkeypatch,prefix):
+    database=tmp_path/'g4b.db'; _retain_actual_v16_fixture(database)
+    connect=sqlite3.connect
+    with connect(database) as connection: before=tuple(connection.iterdump())
+    monkeypatch.setattr(store_module.sqlite3,'connect',lambda *a,**k: _MigrationFailureConnection(
+        connect(*a,**k),failure_statement_prefix=prefix))
+    with pytest.raises(sqlite3.OperationalError): SQLiteStore(database)
+    with connect(database) as connection:
+        assert tuple(connection.iterdump()) == before
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == 16
 
 
 @pytest.mark.parametrize('action', ('pause', 'queue'))

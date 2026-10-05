@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import socket
 import stat
+import time
 from typing import Callable, Final, Mapping
 import unicodedata
 
@@ -187,17 +188,23 @@ def _canonical_payload_digest(record: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _append_bounded_bytes(output: bytearray, value: bytes) -> None:
+def _append_bounded_bytes(output: bytearray, value: bytes, maximum: int = MAX_MESSAGE_BYTES) -> None:
     """Append fixed JSON bytes without exceeding the complete IPC record cap."""
 
-    if len(value) > MAX_MESSAGE_BYTES - len(output):
+    if len(value) > maximum - len(output):
         raise ValueError("job-add request exceeds the IPC message limit")
     output.extend(value)
 
 
-def _append_bounded_json_string(output: bytearray, value: str) -> None:
+def _append_bounded_json_string(output: bytearray, value: str, maximum: int = MAX_MESSAGE_BYTES) -> None:
     """Append one ensure_ascii JSON string without materializing an unbounded value."""
 
+    if maximum != MAX_MESSAGE_BYTES:
+        # A v2 scalar is bounded before the C encoder can allocate its escaped form.
+        if len(value) > 32768 or len(value.encode('utf-8')) > 32768:
+            raise ValueError('batch scalar exceeds limit')
+        _append_bounded_bytes(output, json.dumps(value, ensure_ascii=True).encode('ascii'), maximum)
+        return
     _append_bounded_bytes(output, b'"')
     for character in value:
         code_point = ord(character)
@@ -261,6 +268,264 @@ def _job_add_wire_request(
     _append_bounded_json_string(output, source_url)
     _append_bounded_bytes(output, b',"start":false}\n')
     return bytes(output)
+
+
+_BATCH_PREAMBLE: Final = b'HDM2\n'
+_MAX_BATCH_BODY: Final = 16 * 1024 * 1024
+_MAX_BATCH_ENTRY: Final = 32 * 1024
+_MAX_BATCH_REPLY: Final = 256 * 1024
+_BATCH_REASONS: Final = frozenset({'invalid_entry', 'invalid_source', 'invalid_destination',
+    'job_conflict', 'destination_conflict', 'request_conflict'})
+_BATCH_ENTRY_KEYS: Final = frozenset({'job', 'source_kind', 'source_url', 'priority',
+    'category', 'partial_filename', 'selected_final_filename', 'expected_sha256'})
+
+
+def _batch_component(value: object) -> str:
+    name = _require_path_component(value, 'batch component')
+    if len(name) > 255 or len(name.encode('utf-8')) > 255:
+        raise ValueError('batch component exceeds limit')
+    return name
+
+
+def _batch_collection_id(name: str | None) -> str | None:
+    return None if name is None else 'collection:' + hashlib.sha256(
+        b'hermes-downloads:collection:v1\0' + name.encode('utf-8')).hexdigest()
+
+
+def _batch_entry(value: object) -> dict[str, object]:
+    """Syntactic normalization only. URL policy is applied once by the store."""
+    if type(value) is not dict or not (_BATCH_ENTRY_KEYS - {'expected_sha256'}) <= set(value) <= _BATCH_ENTRY_KEYS:
+        raise ValueError('invalid batch entry')
+    job = _require_identifier(value['job'], 'job')
+    if type(value['source_kind']) is not str or value['source_kind'] != 'direct':
+        raise ValueError('invalid batch source kind')
+    url = value['source_url']
+    if type(url) is not str or len(url) > 8192 or len(url.encode('utf-8')) > 8192:
+        raise ValueError('invalid batch source bytes')
+    _require_priority(value['priority']); _require_category(value['category'])
+    original = _batch_component(value['partial_filename'])
+    final = _batch_component(value['selected_final_filename'])
+    if final not in {original, _collision_filename(original, job)}:
+        raise ValueError('invalid batch selected filename')
+    expected = value.get('expected_sha256')
+    if expected is not None and (type(expected) is not str or re.fullmatch('[0-9a-f]{64}', expected, flags=re.ASCII) is None):
+        raise ValueError('invalid batch expected hash')
+    return {**value, 'expected_sha256': expected}
+
+
+def _batch_canonical(value: object, maximum: int, *, depth: int = 0) -> bytes:
+    """Bounded canonical JSON for this closed command and its sealed creation record."""
+    output = bytearray()
+    def append(raw):
+        _append_bounded_bytes(output, raw, maximum)
+    def encode(item, level):
+        if level > 8:
+            raise ValueError('batch depth exceeds limit')
+        if item is None: append(b'null')
+        elif type(item) is bool: append(b'true' if item else b'false')
+        elif type(item) is str: _append_bounded_json_string(output, item, maximum)
+        elif type(item) is int:
+            if not -(1 << 63) <= item <= (1 << 63) - 1:
+                raise ValueError('batch scalar exceeds limit')
+            append(str(item).encode('ascii'))
+        elif type(item) is float:
+            append(json.dumps(item, allow_nan=False).encode('ascii'))
+        elif type(item) in {list, tuple}:
+            if len(item) > 500: raise ValueError('batch array exceeds limit')
+            append(b'[')
+            for index, child in enumerate(item):
+                if index: append(b',')
+                encode(child, level + 1)
+            append(b']')
+        elif type(item) is dict:
+            if len(item) > 32 or any(type(key) is not str or len(key) > 128 for key in item):
+                raise ValueError('batch object exceeds limit')
+            append(b'{')
+            for index, key in enumerate(sorted(item)):
+                if index: append(b',')
+                encode(key, level + 1); append(b':'); encode(item[key], level + 1)
+            append(b'}')
+        else: raise ValueError('invalid batch scalar')
+    encode(value, depth)
+    return bytes(output)
+
+
+def _batch_decode(payload: bytes) -> object:
+    # Check lexical nesting before json.loads, ignoring braces in escaped strings.
+    nesting = 0; quoted = False; escaped = False
+    for byte in payload:
+        if quoted:
+            if escaped: escaped = False
+            elif byte == 92: escaped = True
+            elif byte == 34: quoted = False
+        elif byte == 34: quoted = True
+        elif byte in (91, 123):
+            nesting += 1
+            if nesting > 8: raise ValueError('batch depth exceeds limit')
+        elif byte in (93, 125): nesting -= 1
+    def reject_constant(_): raise ValueError('invalid batch number')
+    return json.loads(payload.decode('utf-8'), object_pairs_hook=_reject_duplicate_object_keys,
+        parse_constant=reject_constant)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AddBatchCommand:
+    request_id: str
+    collection: str | None
+    entries: object = field(repr=False)
+    payload_digest: str = field(init=False)
+    _wire_request: bytes = field(init=False, repr=False)
+
+    def __post_init__(self):
+        _require_identifier(self.request_id, 'request_id')
+        if self.collection is not None: _batch_component(self.collection)
+        if type(self.entries) is not list or not 1 <= len(self.entries) <= 500:
+            raise ValueError('invalid batch count')
+        # Canonical bytes are the immutable snapshot; no caller-owned containers survive.
+        frozen = []
+        for value in self.entries:
+            try: normalized = _batch_entry(value)
+            except (TypeError, ValueError): normalized = value
+            frozen.append(_batch_canonical(normalized, _MAX_BATCH_ENTRY, depth=2))
+        prefix = _batch_canonical({'collection': self.collection}, _MAX_BATCH_ENTRY)
+        body = bytearray(prefix[:-1]); body.extend(b',"entries":[')
+        for index, raw in enumerate(frozen):
+            if index: _append_bounded_bytes(body, b',', _MAX_BATCH_BODY)
+            _append_bounded_bytes(body, raw, _MAX_BATCH_BODY)
+        _append_bounded_bytes(body, b'],"op":"add_batch","protocol_version":2,"request_id":', _MAX_BATCH_BODY)
+        _append_bounded_json_string(body, self.request_id, _MAX_BATCH_BODY)
+        _append_bounded_bytes(body, b',"start":false}', _MAX_BATCH_BODY)
+        raw = bytes(body)
+        object.__setattr__(self, 'entries', tuple(frozen))
+        object.__setattr__(self, '_wire_request', raw)
+        object.__setattr__(self, 'payload_digest', hashlib.sha256(raw).hexdigest())
+
+    def to_record(self):
+        return _batch_decode(self._wire_request)
+
+    @classmethod
+    def from_record(cls, record):
+        if type(record) is not dict or set(record) != {'op', 'protocol_version', 'request_id', 'start', 'collection', 'entries'}:
+            raise ValueError('invalid batch envelope')
+        if (record['op'] != 'add_batch' or type(record['op']) is not str
+                or type(record['protocol_version']) is not int or record['protocol_version'] != 2
+                or record['start'] is not False):
+            raise ValueError('invalid batch envelope')
+        return cls(record['request_id'], record['collection'], record['entries'])
+
+
+@dataclass(frozen=True, slots=True)
+class AddBatchEntryResult:
+    index: int
+    status: str
+    reason: str | None
+    job: str | None
+    child_request_id: str | None
+    generation: int | None
+    revision: int | None
+    state: str | None
+    order_key: int | None
+
+    def __post_init__(self):
+        if type(self.index) is not int or not 0 <= self.index < 500: raise ValueError('invalid batch index')
+        if self.status == 'applied':
+            _require_identifier(self.job, 'job'); _require_identifier(self.child_request_id, 'child_request_id')
+            if self.reason is not None or type(self.generation) is not int or self.generation != 0 or type(self.revision) is not int or self.revision != 0 or self.state != 'queued':
+                raise ValueError('invalid batch creation receipt')
+            _require_counter(self.order_key, 'order_key')
+        elif self.status == 'blocked':
+            if type(self.reason) is not str or self.reason not in _BATCH_REASONS or any(value is not None for value in (self.job, self.child_request_id, self.generation, self.revision, self.state, self.order_key)):
+                raise ValueError('invalid batch rejection receipt')
+        else: raise ValueError('invalid batch result status')
+
+    def to_record(self):
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+    @classmethod
+    def from_record(cls, record):
+        if type(record) is not dict or set(record) != set(cls.__dataclass_fields__): raise ValueError('invalid batch result')
+        return cls(**record)
+
+
+@dataclass(frozen=True, slots=True)
+class AddBatchResult:
+    request_id: str
+    replayed: bool
+    results: tuple[AddBatchEntryResult, ...]
+
+    def __post_init__(self):
+        _require_identifier(self.request_id, 'request_id')
+        if type(self.replayed) is not bool or type(self.results) is not tuple or not 1 <= len(self.results) <= 500:
+            raise ValueError('invalid batch reply')
+        for index, result in enumerate(self.results):
+            if type(result) is not AddBatchEntryResult or result.index != index: raise ValueError('invalid batch ordered reply')
+
+    def to_record(self):
+        return dict(protocol_version=2, request_id=self.request_id, status='applied',
+            readback_kind='creation_receipt', replayed=self.replayed,
+            results=[result.to_record() for result in self.results])
+
+    @classmethod
+    def from_record(cls, record):
+        if type(record) is not dict or set(record) != {'protocol_version', 'request_id', 'status', 'readback_kind', 'replayed', 'results'}:
+            raise ValueError('invalid batch reply')
+        if type(record['protocol_version']) is not int or record['protocol_version'] != 2 or record['status'] != 'applied' or record['readback_kind'] != 'creation_receipt' or type(record['results']) is not list:
+            raise ValueError('invalid batch reply')
+        return cls(record['request_id'], record['replayed'], tuple(AddBatchEntryResult.from_record(r) for r in record['results']))
+
+
+def _batch_frame(payload: bytes) -> bytes:
+    return _BATCH_PREAMBLE + len(payload).to_bytes(4, 'big') + payload
+
+
+def _batch_read_exact(connection, count, deadline):
+    output = bytearray()
+    while len(output) < count:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: raise TimeoutError
+        connection.settimeout(remaining)
+        chunk = connection.recv(min(65536, count - len(output)))
+        if not chunk: raise ValueError('truncated batch frame')
+        output.extend(chunk)
+    return bytes(output)
+
+
+def _batch_read_body(connection, deadline, maximum):
+    length = int.from_bytes(_batch_read_exact(connection, 4, deadline), 'big')
+    if not 1 <= length <= maximum: raise ValueError('invalid batch length')
+    payload = _batch_read_exact(connection, length, deadline)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0: raise TimeoutError
+    connection.settimeout(remaining)
+    if connection.recv(1): raise ValueError('trailing batch bytes')
+    return payload
+
+
+def add_batch(socket_path: Path, *, request_id: str, collection: str | None, entries: list) -> AddBatchResult:
+    deadline = time.monotonic() + 5.0
+    path = _require_socket_path(socket_path)
+    try: command = AddBatchCommand(request_id, collection, entries)
+    except (TypeError, ValueError, RecursionError): raise IPCError('invalid_request') from None
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: raise TimeoutError
+            client.settimeout(remaining); client.connect(str(path))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: raise TimeoutError
+            client.settimeout(remaining); client.sendall(_batch_frame(command._wire_request)); client.shutdown(socket.SHUT_WR)
+            if _batch_read_exact(client, 5, deadline) != _BATCH_PREAMBLE: raise ValueError('invalid batch preamble')
+            record = _batch_decode(_batch_read_body(client, deadline, _MAX_BATCH_REPLY))
+        except (OSError, TimeoutError): raise IPCError('ipc_unavailable') from None
+        except (TypeError, ValueError, RecursionError): raise IPCError('ipc_response_invalid') from None
+    if record == _COMMAND_CONFLICT: raise IPCError('command_conflict')
+    if record == _INVALID_REQUEST: raise IPCError('invalid_request')
+    if record == {'error': 'batch_state_invalid'}: raise IPCError('batch_state_invalid')
+    try:
+        result = AddBatchResult.from_record(record)
+        if result.request_id != command.request_id or len(result.results) != len(command.entries): raise ValueError('batch reply identity changed')
+        return result
+    except (TypeError, ValueError): raise IPCError('ipc_response_invalid') from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -994,9 +1259,9 @@ def _encoded_record(
 
 
 def _read_line(
-    connection: socket.socket, *, maximum_bytes: int = MAX_MESSAGE_BYTES
+    connection: socket.socket, *, maximum_bytes: int = MAX_MESSAGE_BYTES, initial: bytes = b''
 ) -> bytes | None:
-    received = bytearray()
+    received = bytearray(initial)
     while True:
         try:
             chunk = connection.recv(maximum_bytes + 1 - len(received))
@@ -1102,6 +1367,7 @@ class HealthServer:
         queue_gate: Callable[[QueueGateCommand], QueueGateResult] | None = None,
         job_control: Callable[[JobControlCommand], JobControlResult] | None = None,
         job_add: Callable[[JobAddCommand], JobAddResult] | None = None,
+        add_batch: Callable[[AddBatchCommand], AddBatchResult] | None = None,
         direct_engine_activate: Callable[
             [DirectEngineActivateCommand], DirectEngineActivateResult
         ]
@@ -1122,6 +1388,8 @@ class HealthServer:
             raise TypeError("job_control must be callable")
         if job_add is not None and not callable(job_add):
             raise TypeError("job_add must be callable")
+        if add_batch is not None and not callable(add_batch):
+            raise TypeError('add_batch must be callable')
         if direct_engine_activate is not None and not callable(direct_engine_activate):
             raise TypeError("direct_engine_activate must be callable")
         if direct_job_dispatch is not None and not callable(direct_job_dispatch):
@@ -1150,6 +1418,7 @@ class HealthServer:
         self._queue_gate = queue_gate
         self._job_control = job_control
         self._job_add = job_add
+        self._add_batch = add_batch
         self._direct_engine_activate = direct_engine_activate
         self._direct_job_dispatch = direct_job_dispatch
         self._listener = listener
@@ -1165,8 +1434,16 @@ class HealthServer:
         except OSError as error:
             raise IPCStateError("ipc_socket_invalid") from error
         with connection:
+            deadline = time.monotonic() + 2.0
             connection.settimeout(_CONNECTION_TIMEOUT_SECONDS)
-            payload = _read_line(connection)
+            try:
+                first = connection.recv(1)
+            except (OSError, TimeoutError):
+                return
+            if first == b'H':
+                self._serve_add_batch(connection, deadline)
+                return
+            payload = _read_line(connection, initial=first)
             request = _decode_request(payload)
             try:
                 if _is_health_request(request):
@@ -1278,6 +1555,36 @@ class HealthServer:
                 connection.sendall(response)
             except (OSError, TimeoutError):
                 return
+
+    def _serve_add_batch(self, connection, deadline):
+        try:
+            if b'H' + _batch_read_exact(connection, 4, deadline) != _BATCH_PREAMBLE:
+                raise ValueError('invalid batch preamble')
+            command = AddBatchCommand.from_record(_batch_decode(
+                _batch_read_body(connection, deadline, _MAX_BATCH_BODY)))
+        except (OSError, TimeoutError, TypeError, ValueError, RecursionError):
+            record = _INVALID_REQUEST
+        else:
+            if self._add_batch is None:
+                record = _INVALID_REQUEST
+            else:
+                try:
+                    result = self._add_batch(command)
+                    if type(result) is not AddBatchResult: raise ValueError('invalid batch callback')
+                    record = result.to_record()
+                except IPCError as error:
+                    record = _COMMAND_CONFLICT if str(error) == 'command_conflict' else {'error': 'batch_state_invalid'}
+                except Exception:
+                    record = {'error': 'batch_state_invalid'}
+        try:
+            payload = _batch_canonical(record, _MAX_BATCH_REPLY)
+        except (TypeError, ValueError):
+            payload = b'{"error":"batch_state_invalid"}'
+        try:
+            connection.settimeout(0.2)
+            connection.sendall(_batch_frame(payload))
+        except (OSError, TimeoutError):
+            return
 
     def close(self) -> None:
         """Close the listener and remove only the exact socket this server created."""

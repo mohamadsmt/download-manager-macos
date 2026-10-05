@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Callable, Final, Protocol
 from datetime import UTC, datetime
 
 from hermes_downloads.ipc import (
+    AddBatchCommand,
+    AddBatchResult,
     DirectEngineActivateCommand,
     DirectEngineActivateResult,
     DirectJobDispatchCommand,
@@ -339,6 +341,13 @@ def _queue_gate_from_store(
         queue_gate=result.gate,
         revision=result.revision,
     )
+
+
+def _add_batch_from_store(store: SQLiteStore, command: AddBatchCommand) -> AddBatchResult:
+    try:
+        return store.apply_add_batch(command)
+    except RequestConflictError:
+        raise IPCError('command_conflict') from None
 
 
 def _job_add_from_store(store: SQLiteStore, command: JobAddCommand) -> JobAddResult:
@@ -1325,6 +1334,7 @@ def run_worker(
                     jobs_page=lambda cursor: _jobs_page_from_store(store, cursor),
                     queue_gate=queue_gate,
                     job_add=lambda command: _job_add_from_store(store, command),
+                    add_batch=lambda command: _add_batch_from_store(store, command),
                     job_control=job_control,
                     direct_engine_activate=direct_engine_activate,
                     direct_job_dispatch=direct_job_dispatch,

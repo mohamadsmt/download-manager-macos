@@ -810,7 +810,7 @@ def test_certified_restart_recovers_only_new_exact_direct_attempt_preserving_leg
                 assert legacy_snapshot() == history
                 assert _receipt(database) == original and origin.ledger == before_body
                 with sqlite3.connect(database) as connection:
-                    assert connection.execute('PRAGMA user_version').fetchone()[0] == 16
+                    assert connection.execute('PRAGMA user_version').fetchone()[0] == 17
                     assert connection.execute("SELECT manual_hold FROM materialized_jobs WHERE job_id='dispatch-job'").fetchone()[0] == int(retained_final)
                     assert connection.execute('SELECT COUNT(*) FROM final_publication_bindings WHERE job_id=\'dispatch-job\'').fetchone()[0] == 0
                     assert connection.execute("SELECT COUNT(*) FROM events WHERE kind='job_completed'").fetchone()[0] == 0

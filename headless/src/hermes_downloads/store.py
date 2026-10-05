@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ import json
 import stat
 import secrets
 import sqlite3
+import time
 from typing import TYPE_CHECKING, Final
 
 from hermes_downloads.models import (
@@ -22,6 +24,10 @@ from hermes_downloads.models import (
     SourceKind,
 )
 from hermes_downloads.processes import ProcessBirthIdentity
+from hermes_downloads.ipc import (AddBatchCommand, AddBatchResult, AddBatchEntryResult,
+    JobControlCommand, _batch_entry, _batch_canonical, _batch_decode, _batch_collection_id,
+    _batch_component, _MAX_BATCH_REPLY)
+from hermes_downloads.network import validate_source_url, SourcePolicyError
 from hermes_downloads.retry import (
     CompletionVerification,
     RetryAuditEvent,
@@ -465,7 +471,7 @@ CREATE TABLE closed_direct_publication_attempts (
     pending_request_id TEXT CHECK (pending_request_id IS NULL)
 );
 """
-_SUPPORTED_SCHEMA_VERSION: Final = 16
+_SUPPORTED_SCHEMA_VERSION: Final = 17
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -639,12 +645,67 @@ _V15_TABLE_SCHEMAS: Final = _expected_table_schemas(
 _V16_TABLE_SCHEMAS: Final = dict(_V15_TABLE_SCHEMAS,
     **_expected_table_schemas(_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA,
         _CLOSED_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA))
+_V17_COMMAND_RECEIPTS_SCHEMA: Final = """
+CREATE TABLE command_receipts (
+    request_id TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL CHECK (
+        length(payload_digest) = 64 AND payload_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    scope TEXT NOT NULL CHECK (scope IN ('add', 'queue_gate', 'job_control', 'add_batch', 'add_batch_entry')),
+    action TEXT NOT NULL CHECK (
+        (scope = 'add' AND action = 'add')
+        OR (scope = 'queue_gate' AND action = 'queue_gate')
+        OR (scope = 'job_control' AND action IN ('pause', 'resume', 'start_now', 'remove'))
+        OR (scope = 'add_batch' AND action = 'add_batch')
+        OR (scope = 'add_batch_entry' AND action = 'add_batch_entry')
+    )
+);
+"""
+_ADD_BATCH_COMMANDS_SCHEMA: Final = """
+CREATE TABLE add_batch_commands (
+    request_id TEXT PRIMARY KEY NOT NULL REFERENCES command_receipts(request_id),
+    payload_digest TEXT NOT NULL CHECK (length(payload_digest)=64 AND payload_digest NOT GLOB '*[^0-9a-f]*'),
+    entry_count INTEGER NOT NULL CHECK (entry_count BETWEEN 1 AND 500),
+    receipt BLOB NOT NULL CHECK (length(receipt) BETWEEN 1 AND 262144)
+) STRICT;
+"""
+_ADD_BATCH_ENTRIES_SCHEMA: Final = """
+CREATE TABLE add_batch_entries (
+    parent_request_id TEXT NOT NULL REFERENCES add_batch_commands(request_id) DEFERRABLE INITIALLY DEFERRED,
+    entry_index INTEGER NOT NULL CHECK (entry_index BETWEEN 0 AND 499),
+    status TEXT NOT NULL CHECK (status IN ('applied','blocked')),
+    reason TEXT,
+    job_id TEXT UNIQUE REFERENCES jobs(job_id),
+    child_request_id TEXT UNIQUE REFERENCES commands(request_id),
+    generation INTEGER,
+    revision INTEGER,
+    order_key INTEGER,
+    creation_intent_blob BLOB,
+    creation_intent_digest TEXT,
+    PRIMARY KEY (parent_request_id, entry_index),
+    CHECK (
+        (status='applied' AND reason IS NULL AND job_id IS NOT NULL AND child_request_id IS NOT NULL
+         AND generation IS NOT NULL AND generation=0 AND revision IS NOT NULL AND revision=0
+         AND order_key IS NOT NULL AND order_key>=0 AND creation_intent_blob IS NOT NULL
+         AND length(creation_intent_blob) BETWEEN 1 AND 40960 AND creation_intent_digest IS NOT NULL
+         AND length(creation_intent_digest)=64 AND creation_intent_digest NOT GLOB '*[^0-9a-f]*')
+        OR
+        (status='blocked' AND reason IS NOT NULL
+         AND reason IN ('invalid_entry','invalid_source','invalid_destination','job_conflict','destination_conflict','request_conflict')
+         AND job_id IS NULL AND child_request_id IS NULL AND generation IS NULL AND revision IS NULL
+         AND order_key IS NULL AND creation_intent_blob IS NULL AND creation_intent_digest IS NULL)
+    )
+) STRICT;
+"""
+_V17_TABLE_SCHEMAS: Final = dict(_V16_TABLE_SCHEMAS,
+    **_expected_table_schemas(_V17_COMMAND_RECEIPTS_SCHEMA,
+        _ADD_BATCH_COMMANDS_SCHEMA, _ADD_BATCH_ENTRIES_SCHEMA))
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _DIRECT_ENGINE_RECOVERY_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
 _JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now", "remove"})
-_COMMAND_RECEIPT_SCOPES: Final = frozenset({"add", "queue_gate", "job_control"})
+_COMMAND_RECEIPT_SCOPES: Final = frozenset({"add", "queue_gate", "job_control", "add_batch", "add_batch_entry"})
 _ADD_COMMAND_SCOPE: Final = "add"
 _ADD_COMMAND_ACTION: Final = "add"
 _QUEUE_GATE_COMMAND_SCOPE: Final = "queue_gate"
@@ -730,6 +791,7 @@ def _require_command_receipt_action(scope: str, value: object) -> str:
         (scope == _ADD_COMMAND_SCOPE and value == _ADD_COMMAND_ACTION)
         or (scope == _QUEUE_GATE_COMMAND_SCOPE and value == _QUEUE_GATE_COMMAND_ACTION)
         or (scope == _JOB_CONTROL_COMMAND_SCOPE and value in _JOB_CONTROL_ACTIONS)
+        or (scope in {'add_batch', 'add_batch_entry'} and value == scope)
     ):
         return value
     raise ValueError("persisted command receipt action is invalid")
@@ -1198,6 +1260,43 @@ class DirectEngineRecord:
         )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _BatchCreationIntent:
+    parent_request_id: str
+    parent_payload_digest: str
+    index: int
+    audit_id: int
+    seal: str
+    original_job: MaterializedJob = field(repr=False)
+    reservation: PublicationReservation = field(repr=False)
+    expected_sha256: str | None = field(repr=False)
+
+
+class _BatchEntryBlocked(ValueError):
+    """Only these explicitly detected domain outcomes may survive a savepoint."""
+
+
+def _batch_child_id(parent: str, index: int) -> str:
+    return 'batch-entry:' + hashlib.sha256(parent.encode('utf-8') + b'\0' + str(index).encode('ascii')).hexdigest()
+
+
+def _batch_child_digest(key: dict) -> str:
+    return hashlib.sha256(b'hermes-downloads:batch-entry:v1\0' + _batch_canonical(key, 40960)).hexdigest()
+
+
+def _batch_creation_seal(blob: bytes) -> str:
+    return hashlib.sha256(b'hermes-downloads:batch-creation-intent:v1\0' + blob).hexdigest()
+
+
+def _batch_original_job(entry, collection, creation, child_id, digest):
+    intent = DownloadIntent(entry['job'], child_id, digest, entry['source_url'].encode('utf-8'),
+        expected_revision=None, generation=0, revision=0)
+    return MaterializedJob(entry['job'], intent, SourceKind.DIRECT,
+        creation['queue_collection_id'], entry['priority'], creation['order_key'], None,
+        False, False, False, entry['category'], collection,
+        entry['partial_filename'], entry['selected_final_filename'])
+
+
 class SQLiteStore:
     """A small single-writer SQLite store with command idempotency."""
 
@@ -1248,6 +1347,7 @@ class SQLiteStore:
             14: _V14_TABLE_SCHEMAS,
             15: _V15_TABLE_SCHEMAS,
             16: _V16_TABLE_SCHEMAS,
+            17: _V17_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -1427,8 +1527,22 @@ class SQLiteStore:
                 connection.execute(_CLOSED_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA)
                 connection.execute("PRAGMA user_version = 16")
                 version = 16
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 16:
                 if not SQLiteStore._has_table_schemas(connection, _V16_TABLE_SCHEMAS):
+                    raise RuntimeError('database schema version is incomplete')
+                rows = connection.execute('SELECT request_id FROM command_receipts').fetchall()
+                for row in rows:
+                    SQLiteStore._read_command_receipt(connection, row[0])
+                connection.execute('ALTER TABLE command_receipts RENAME TO command_receipts_v16')
+                connection.execute(_V17_COMMAND_RECEIPTS_SCHEMA)
+                connection.execute('INSERT INTO command_receipts SELECT * FROM command_receipts_v16')
+                connection.execute('DROP TABLE command_receipts_v16')
+                connection.execute(_ADD_BATCH_COMMANDS_SCHEMA)
+                connection.execute(_ADD_BATCH_ENTRIES_SCHEMA)
+                connection.execute('PRAGMA user_version = 17')
+                version = 17
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V17_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1580,10 +1694,14 @@ class SQLiteStore:
                 SELECT request_id FROM job_control_commands WHERE request_id = ?
                 UNION ALL
                 SELECT request_id FROM direct_dispatch_commands WHERE request_id = ?
+                UNION ALL
+                SELECT request_id FROM add_batch_commands WHERE request_id = ?
+                UNION ALL
+                SELECT child_request_id FROM add_batch_entries WHERE child_request_id = ?
             )
             LIMIT 1
             """,
-            (request_id, request_id, request_id, request_id),
+            (request_id, request_id, request_id, request_id, request_id, request_id),
         ).fetchone()
         if row is not None:
             raise RuntimeError("command receipt registry is incomplete")
@@ -1651,115 +1769,599 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
-            replay = self._match_command_receipt(
-                connection,
-                request_id=intent.request_id,
-                payload_digest=intent.payload_digest,
-                scope=_ADD_COMMAND_SCOPE,
-                action=_ADD_COMMAND_ACTION,
-            )
-            existing = connection.execute(
-                """
-                SELECT payload_digest, job_id, generation, revision
-                FROM commands
-                WHERE request_id = ?
-                """,
-                (intent.request_id,),
-            ).fetchone()
-            if replay:
-                if existing is None:
-                    raise RuntimeError("command receipt is missing its add readback")
-                receipt_digest = _require_payload_digest(
-                    _require_sqlite_text(existing["payload_digest"], "command payload_digest")
-                )
-                if receipt_digest != intent.payload_digest:
-                    raise RuntimeError("command receipt does not match its add readback")
-                stored_job_id = _require_identifier(
-                    _require_sqlite_text(existing["job_id"], "command job_id"),
-                    "command job_id",
-                )
-                reservation = self._read_publication_reservation(connection, stored_job_id)
-                has_stored_projection = (
-                    connection.execute(
-                        "SELECT 1 FROM materialized_jobs WHERE job_id = ?", (stored_job_id,)
-                    ).fetchone()
-                    is not None
-                )
-                if (materialized is not None or has_stored_projection) and reservation is None:
-                    raise ValueError("materialized add replay is missing publication reservation")
-                if materialized is not None and not self._stored_projection_matches(
-                    connection, stored_job_id, intent, materialized
-                ):
-                    raise RequestConflictError(
-                        "request_id is already bound to a different materialized projection"
-                    )
-                result = CommandResult(
-                    applied=False,
-                    job=stored_job_id,
-                    generation=existing["generation"],
-                    revision=existing["revision"],
-                )
-            else:
-                if existing is not None:
-                    raise RuntimeError("command receipt registry is incomplete")
-                if materialized is not None:
-                    if materialized.source_kind is not SourceKind.DIRECT:
-                        raise ValueError("unsupported source kind")
-                    self._ensure_publication_target_is_available(connection, materialized)
-                connection.execute(
-                    """
-                    INSERT INTO jobs (job_id, source_url, generation, revision, state)
-                    VALUES (?, ?, ?, ?, 'queued')
-                    """,
-                    (
-                        intent.job_id,
-                        intent.source_url,
-                        intent.generation,
-                        intent.revision,
-                    ),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO commands (
-                        request_id, payload_digest, job_id, generation, revision
-                    )
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        intent.request_id,
-                        intent.payload_digest,
-                        intent.job_id,
-                        intent.generation,
-                        intent.revision,
-                    ),
-                )
-                self._insert_command_receipt(
-                    connection,
-                    request_id=intent.request_id,
-                    payload_digest=intent.payload_digest,
-                    scope=_ADD_COMMAND_SCOPE,
-                    action=_ADD_COMMAND_ACTION,
-                )
-                if materialized is not None:
-                    self._insert_materialized_projection(connection, materialized)
-                    self._insert_publication_reservation(connection, materialized)
-                connection.execute(
-                    """
-                    INSERT INTO events (kind, job_id, generation, revision)
-                    VALUES ('job_added', ?, ?, ?)
-                    """,
-                    (intent.job_id, intent.generation, intent.revision),
-                )
-                result = CommandResult(
-                    applied=True,
-                    job=intent.job_id,
-                    generation=intent.generation,
-                    revision=intent.revision,
-                )
+            result = self._apply_add_in_transaction(connection, intent, materialized,
+                scope=_ADD_COMMAND_SCOPE, action=_ADD_COMMAND_ACTION)
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
+        return result
+
+    @contextmanager
+    def _batch_budget(self):
+        connection = self._connection
+        deadline = time.monotonic() + 2.0
+        previous = connection.execute('PRAGMA busy_timeout').fetchone()[0]
+        connection.execute('PRAGMA busy_timeout = 2000')
+        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        try:
+            yield deadline
+            if time.monotonic() >= deadline:
+                raise TimeoutError('batch database deadline')
+        finally:
+            connection.set_progress_handler(None, 0)
+            connection.execute(f'PRAGMA busy_timeout = {previous}')
+
+    def apply_add_batch(self, command: AddBatchCommand) -> AddBatchResult:
+        """One owner transaction captures inactive jobs and their original sealed intent."""
+        if type(command) is not AddBatchCommand:
+            raise TypeError('invalid batch command')
+        connection = self._connection
+        try:
+            with self._batch_budget() as deadline:
+                connection.execute('BEGIN IMMEDIATE')
+                try:
+                    try:
+                        replay = self._match_command_receipt(connection, request_id=command.request_id,
+                            payload_digest=command.payload_digest, scope='add_batch', action='add_batch')
+                    except RuntimeError:
+                        # Dispatch has its own accepted registry. It has no fabricated global scope.
+                        direct = self._read_direct_dispatch_command(connection, command.request_id)
+                        other = connection.execute('''SELECT 1 FROM commands WHERE request_id=?
+                            UNION ALL SELECT 1 FROM queue_commands WHERE request_id=?
+                            UNION ALL SELECT 1 FROM job_control_commands WHERE request_id=?
+                            UNION ALL SELECT 1 FROM add_batch_commands WHERE request_id=?
+                            UNION ALL SELECT 1 FROM add_batch_entries WHERE child_request_id=? LIMIT 1''',
+                            (command.request_id,) * 5).fetchone()
+                        if direct is not None and other is None:
+                            raise RequestConflictError('request_id is bound to direct dispatch') from None
+                        raise
+                    if replay:
+                        result, _ = self._read_batch(command.request_id)
+                        # Read-only replay releases the snapshot without a commit or any writes.
+                        connection.rollback()
+                        return result
+                    queue_id = _batch_collection_id(command.collection)
+                    if queue_id is not None and connection.execute(
+                            'SELECT 1 FROM materialized_jobs WHERE queue_collection_id=? AND (destination_collection IS NULL OR destination_collection != ?) LIMIT 1',
+                            (queue_id, command.collection)).fetchone() is not None:
+                        raise RuntimeError('batch collection identity changed')
+                    maximum = connection.execute('SELECT MAX(order_key) FROM materialized_jobs').fetchone()[0]
+                    # SQLite MAX hides invalid lower storage values, so validate all existing counters too.
+                    if connection.execute("SELECT 1 FROM materialized_jobs WHERE typeof(order_key) != 'integer' OR order_key < 0 LIMIT 1").fetchone() is not None:
+                        raise RuntimeError('batch order is invalid')
+                    base = 0 if maximum is None else _require_counter(maximum, 'batch order') + 1
+                    if base + len(command.entries) - 1 > _MAX_COUNTER:
+                        raise OverflowError('batch order overflow')
+                    results = []
+                    for index, raw in enumerate(command.entries):
+                        if time.monotonic() >= deadline: raise TimeoutError('batch database deadline')
+                        connection.execute('SAVEPOINT batch_entry')
+                        blob = seal = None
+                        try:
+                            try: entry = _batch_entry(_batch_decode(raw))
+                            except (TypeError, ValueError): raise _BatchEntryBlocked('invalid_entry') from None
+                            try: source = validate_source_url(entry['source_url'])
+                            except SourcePolicyError: raise _BatchEntryBlocked('invalid_source') from None
+                            child_id = _batch_child_id(command.request_id, index)
+                            if child_id == command.request_id or self._read_command_receipt(connection, child_id) is not None:
+                                raise _BatchEntryBlocked('request_conflict')
+                            if self._read_direct_dispatch_command(connection, child_id) is not None:
+                                raise _BatchEntryBlocked('request_conflict')
+                            self._reject_unregistered_legacy_receipt(connection, child_id)
+                            if connection.execute('SELECT 1 FROM jobs WHERE job_id=?', (entry['job'],)).fetchone() is not None:
+                                raise _BatchEntryBlocked('job_conflict')
+                            creation = dict(generation=0, revision=0, state='queued', expected_revision=None,
+                                order_key=base + index, queue_collection_id=queue_id, scheduled_for_us=None,
+                                authorized=False, manual_hold=False, start_now_requested=False)
+                            key = dict(v=1, parent_request_id=command.request_id,
+                                parent_payload_digest=command.payload_digest, index=index,
+                                collection=command.collection, entry=entry, creation=creation)
+                            child_digest = _batch_child_digest(key)
+                            job = _batch_original_job(entry, command.collection, creation, child_id, child_digest)
+                            if job.intent.source_url != source.raw_url: raise RuntimeError('batch source snapshot changed')
+                            try: self._ensure_publication_target_is_available(connection, job)
+                            except sqlite3.IntegrityError as error:
+                                if str(error) != 'publication target is already reserved': raise
+                                raise _BatchEntryBlocked('destination_conflict') from None
+                            applied = self._apply_add_in_transaction(connection, job.intent, job,
+                                scope='add_batch_entry', action='add_batch_entry')
+                            if not applied.applied: raise RuntimeError('unexpected child replay')
+                            events = connection.execute("SELECT event_id,generation,revision FROM events WHERE job_id=? AND kind='job_added' LIMIT 2", (job.job_id,)).fetchall()
+                            if len(events) != 1 or tuple(events[0])[1:] != (0, 0): raise RuntimeError('batch creation audit invalid')
+                            audit_id = _require_counter(events[0][0], 'batch audit')
+                            if audit_id < 1: raise RuntimeError('batch creation audit invalid')
+                            reservation = self._read_publication_reservation(connection, job.job_id)
+                            if reservation is None: raise RuntimeError('batch reservation missing')
+                            record = {**key, 'child_request_id': child_id, 'child_payload_digest': child_digest,
+                                'creation': {**creation, 'audit_id': audit_id}, 'reservation': dict(
+                                    target_component=reservation.target_component, final_filename=reservation.final_filename,
+                                    claim_token=reservation.claim_token)}
+                            blob = _batch_canonical(record, 40960); seal = _batch_creation_seal(blob)
+                            item = AddBatchEntryResult(index, 'applied', None, job.job_id, child_id, 0, 0, 'queued', base + index)
+                        except _BatchEntryBlocked as error:
+                            connection.execute('ROLLBACK TO batch_entry')
+                            item = AddBatchEntryResult(index, 'blocked', str(error), None, None, None, None, None, None)
+                        connection.execute('RELEASE batch_entry')
+                        connection.execute('''INSERT INTO add_batch_entries
+                            (parent_request_id,entry_index,status,reason,job_id,child_request_id,generation,revision,order_key,creation_intent_blob,creation_intent_digest)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)''', (command.request_id, index, item.status, item.reason,
+                                item.job, item.child_request_id, item.generation, item.revision, item.order_key, blob, seal))
+                        results.append(item)
+                    result = AddBatchResult(command.request_id, False, tuple(results))
+                    receipt = _batch_canonical(result.to_record(), _MAX_BATCH_REPLY)
+                    self._insert_command_receipt(connection, request_id=command.request_id,
+                        payload_digest=command.payload_digest, scope='add_batch', action='add_batch')
+                    connection.execute('INSERT INTO add_batch_commands VALUES (?,?,?,?)',
+                        (command.request_id, command.payload_digest, len(results), receipt))
+                    if time.monotonic() >= deadline: raise TimeoutError('batch database deadline')
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                return result
+        except RequestConflictError:
+            raise
+        except Exception:
+            raise RuntimeError('batch_state_invalid') from None
+
+    def _read_batch(self, parent_id):
+        connection = self._connection
+        rows = connection.execute('SELECT * FROM add_batch_commands WHERE request_id=? LIMIT 2', (parent_id,)).fetchall()
+        if len(rows) != 1: raise ValueError('batch parent missing')
+        parent = rows[0]
+        _require_identifier(parent['request_id'], 'batch parent')
+        digest = _require_payload_digest(parent['payload_digest'])
+        count = parent['entry_count']
+        if type(count) is not int or not 1 <= count <= 500: raise ValueError('batch parent count invalid')
+        if self._read_command_receipt(connection, parent_id) != (digest, 'add_batch', 'add_batch'):
+            raise ValueError('batch parent registry invalid')
+        raw = parent['receipt']
+        if type(raw) is not bytes or not 1 <= len(raw) <= _MAX_BATCH_REPLY: raise ValueError('batch receipt invalid')
+        record = _batch_decode(raw)
+        if _batch_canonical(record, _MAX_BATCH_REPLY) != raw: raise ValueError('batch receipt noncanonical')
+        original = AddBatchResult.from_record(record)
+        if original.replayed or original.request_id != parent_id or len(original.results) != count:
+            raise ValueError('batch parent receipt invalid')
+        entries = connection.execute('SELECT * FROM add_batch_entries WHERE parent_request_id=? ORDER BY entry_index', (parent_id,)).fetchall()
+        if len(entries) != count: raise ValueError('batch indexed count invalid')
+        intents = {}
+        for index, row in enumerate(entries):
+            if type(row['entry_index']) is not int or row['entry_index'] != index or row['parent_request_id'] != parent_id:
+                raise ValueError('batch index invalid')
+            item = AddBatchEntryResult(index, row['status'], row['reason'], row['job_id'], row['child_request_id'],
+                row['generation'], row['revision'], 'queued' if row['status'] == 'applied' else None, row['order_key'])
+            if item != original.results[index]: raise ValueError('batch indexed receipt changed')
+            if item.status == 'blocked':
+                if row['creation_intent_blob'] is not None or row['creation_intent_digest'] is not None:
+                    raise ValueError('batch rejection has intent authority')
+            else:
+                intents[item.job] = self._read_batch_creation(row, parent_id, digest)
+        return AddBatchResult(parent_id, True, original.results), intents
+
+    def _read_batch_creation(self, row, parent_id, parent_digest):
+        connection = self._connection
+        blob = row['creation_intent_blob']; seal = row['creation_intent_digest']
+        if type(blob) is not bytes or not 1 <= len(blob) <= 40960: raise ValueError('batch intent invalid')
+        _require_payload_digest(seal)
+        if _batch_creation_seal(blob) != seal: raise ValueError('batch intent seal changed')
+        record = _batch_decode(blob)
+        if type(record) is not dict or set(record) != {'v','parent_request_id','parent_payload_digest','index','child_request_id','child_payload_digest','collection','entry','creation','reservation'}:
+            raise ValueError('batch intent shape invalid')
+        if _batch_canonical(record, 40960) != blob: raise ValueError('batch intent noncanonical')
+        if (type(record['v']) is not int or record['v'] != 1 or record['parent_request_id'] != parent_id
+                or record['parent_payload_digest'] != parent_digest or type(record['index']) is not int
+                or record['index'] != row['entry_index']): raise ValueError('batch intent parent changed')
+        collection = record['collection']
+        if collection is not None: _batch_component(collection)
+        entry = record['entry']
+        if type(entry) is not dict or set(entry) != {'job','source_kind','source_url','priority','category','partial_filename','selected_final_filename','expected_sha256'}:
+            raise ValueError('batch normalized intent missing')
+        if _batch_entry(entry) != entry: raise ValueError('batch normalized intent changed')
+        creation = record['creation']
+        if type(creation) is not dict or set(creation) != {'audit_id','generation','revision','state','expected_revision','order_key','queue_collection_id','scheduled_for_us','authorized','manual_hold','start_now_requested'}:
+            raise ValueError('batch creation shape invalid')
+        if (type(creation['generation']) is not int or creation['generation'] != 0
+                or type(creation['revision']) is not int or creation['revision'] != 0
+                or creation['state'] != 'queued' or creation['expected_revision'] is not None
+                or creation['scheduled_for_us'] is not None
+                or any(creation[key] is not False for key in ('authorized','manual_hold','start_now_requested'))
+                or creation['queue_collection_id'] != _batch_collection_id(collection)):
+            raise ValueError('batch creation projection changed')
+        _require_counter(creation['order_key'], 'batch order')
+        audit_id = _require_counter(creation['audit_id'], 'batch audit')
+        if audit_id < 1: raise ValueError('batch audit invalid')
+        child_id = _batch_child_id(parent_id, record['index'])
+        if record['child_request_id'] != child_id or row['child_request_id'] != child_id or row['job_id'] != entry['job'] or row['order_key'] != creation['order_key']:
+            raise ValueError('batch indexed original changed')
+        key = {name: record[name] for name in ('v','parent_request_id','parent_payload_digest','index','collection','entry')}
+        key['creation'] = {name: value for name, value in creation.items() if name != 'audit_id'}
+        digest = _require_payload_digest(record['child_payload_digest'])
+        if _batch_child_digest(key) != digest: raise ValueError('batch child digest changed')
+        commands = connection.execute('SELECT request_id,payload_digest,job_id,generation,revision FROM commands WHERE job_id=? LIMIT 2', (entry['job'],)).fetchall()
+        if len(commands) != 1 or tuple(commands[0]) != (child_id, digest, entry['job'], 0, 0):
+            raise ValueError('batch child command changed')
+        if any(type(commands[0][k]) is not int for k in ('generation','revision')):
+            raise ValueError('batch child counters invalid')
+        if self._read_command_receipt(connection, child_id) != (digest, 'add_batch_entry', 'add_batch_entry'):
+            raise ValueError('batch child registry changed')
+        original = _batch_original_job(entry, collection, creation, child_id, digest)
+        reserved = record['reservation']
+        if type(reserved) is not dict or set(reserved) != {'target_component','final_filename','claim_token'}:
+            raise ValueError('batch reservation shape invalid')
+        reservation = PublicationReservation(entry['job'], **reserved)
+        if (reservation.target_component != (collection if collection is not None else entry['category'])
+                or reservation.final_filename != entry['selected_final_filename']):
+            raise ValueError('batch captured reservation changed')
+        # Build original first. Current data is only a separately checked successor.
+        current = self.get_materialized_job(original.job_id)
+        if current is None or current.intent.source_url != original.intent.source_url or current.intent.request_id != child_id or current.intent.payload_digest != digest or self._immutable_projection_values(current) != self._immutable_projection_values(original):
+            raise ValueError('batch immutable projection changed')
+        if self._read_publication_reservation(connection, original.job_id) != reservation:
+            raise ValueError('batch reservation changed')
+        captured = _BatchCreationIntent(parent_id, parent_digest, row['entry_index'], audit_id, seal,
+            original, reservation, entry['expected_sha256'])
+        self._validate_batch_lifecycle(captured, current)
+        return captured
+
+    def get_batch_creation_intent(self, job_id: str) -> _BatchCreationIntent | None:
+        """Readonly original metadata; never reconstruct missing intent or grant work."""
+        _require_identifier(job_id, 'job_id')
+        connection = self._connection
+        try:
+            with self._batch_budget():
+                connection.execute('BEGIN')
+                try:
+                    links = connection.execute('SELECT parent_request_id FROM add_batch_entries WHERE job_id=? LIMIT 2', (job_id,)).fetchall()
+                    commands = connection.execute('SELECT request_id,payload_digest,job_id,generation,revision FROM commands WHERE job_id=? LIMIT 2', (job_id,)).fetchall()
+                    if links:
+                        if len(links) != 1: raise ValueError('batch job link invalid')
+                        _, intents = self._read_batch(links[0][0])
+                        if job_id not in intents: raise ValueError('batch accepted link missing')
+                        return intents[job_id]
+                    if not commands:
+                        if connection.execute('SELECT 1 FROM jobs WHERE job_id=?', (job_id,)).fetchone() is not None or connection.execute('SELECT 1 FROM events WHERE job_id=?', (job_id,)).fetchone() is not None:
+                            raise ValueError('creation provenance missing')
+                        return None
+                    if len(commands) != 1: raise ValueError('creation provenance not unique')
+                    command = commands[0]
+                    request = _require_identifier(command['request_id'], 'legacy request')
+                    digest = _require_payload_digest(command['payload_digest'])
+                    if self._read_command_receipt(connection, request) != (digest, 'add', 'add'):
+                        raise ValueError('batch child link missing')
+                    generation = _require_counter(command['generation'], 'legacy generation')
+                    revision = _require_counter(command['revision'], 'legacy revision')
+                    added = connection.execute("SELECT event_id,generation,revision FROM events WHERE job_id=? AND kind='job_added' LIMIT 2", (job_id,)).fetchall()
+                    if len(added) != 1 or tuple(added[0])[1:] != (generation, revision) or type(added[0][0]) is not int or added[0][0] < 1 or self.get_job(job_id) is None:
+                        raise ValueError('legacy creation provenance invalid')
+                    return None
+                finally:
+                    connection.rollback()
+        except Exception:
+            raise RuntimeError('batch_state_invalid') from None
+
+    def _batch_control_corroborated(self, job_id, action, generation, revision, state, authorized):
+        connection = self._connection
+        # Include all compatible receipts. Later no-ops are distinguished by their exact input digest.
+        cursor = connection.execute('SELECT * FROM job_control_commands WHERE job_id=? AND action=? AND generation=? AND revision=?',
+            (job_id, action, generation, revision))
+        for row in cursor:
+            result = self._job_control_result_from_receipt(row)
+            request = _require_identifier(row['request_id'], 'control request')
+            digest = _require_payload_digest(row['payload_digest'])
+            if self._read_command_receipt(connection, request) != (digest, 'job_control', action):
+                raise ValueError('batch control registry invalid')
+            original = JobControlCommand(job=job_id, action=action, request_id=request,
+                expected_revision=revision - 1)
+            if (result.status == 'applied' and result.job == job_id and result.generation == generation
+                    and result.revision == revision and result.state == state and result.authorized is authorized
+                    and original.payload_digest == digest):
+                return True
+        return False
+
+    def _batch_dispatch_corroborated(self, job_id, generation, revision, kind):
+        connection = self._connection
+        cursor = connection.execute('SELECT request_id FROM direct_dispatch_commands WHERE job_id=? AND generation=? AND revision BETWEEN ? AND ?',
+            (job_id, generation, revision, revision + (2 if kind == 'job_resolving' else 1)))
+        for row in cursor:
+            receipt = self._read_direct_dispatch_command(connection, row[0])
+            if receipt is None or receipt.status not in {'pending','started','blocked'}:
+                raise ValueError('batch dispatch receipt invalid')
+            if receipt.job != job_id or receipt.generation != generation: raise ValueError('batch dispatch target invalid')
+            expected = 'resolving' if kind == 'job_resolving' else 'downloading'
+            if receipt.revision == revision and receipt.state == expected and receipt.status in {'pending','started'}:
+                return True
+            # A resolving receipt may already be at its exact downloading successor.
+            if kind == 'job_resolving' and receipt.revision == revision + 1 and receipt.state == 'downloading' and receipt.status in {'pending','started'}:
+                event = connection.execute('SELECT kind FROM events WHERE job_id=? AND generation=? AND revision=?', (job_id,generation,revision+1)).fetchall()
+                if len(event) == 1 and event[0][0] == 'job_downloading': return True
+            # Contained pending dispatch records its actual immediately paused successor.
+            if receipt.status == 'blocked' and receipt.state == 'paused' and receipt.revision > revision:
+                events = connection.execute('SELECT kind,revision FROM events WHERE job_id=? AND generation=? AND revision>? AND revision<=? ORDER BY event_id',
+                    (job_id, generation, revision, receipt.revision)).fetchall()
+                wanted = [('job_paused', revision + 1)] if receipt.revision == revision + 1 else [('job_downloading', revision + 1), ('job_paused', revision + 2)]
+                if [tuple(e) for e in events] == wanted: return True
+        return False
+
+    def _batch_publication_record(self, row, captured, *, archived):
+        """Strict database-only qualification of one explicitly named attempt, never a permit."""
+        connection = self._connection
+        keys = ('job_id','attempt_id','original_request_id','proof','status','audit_id','generation','revision','state','worker_epoch','pending_request_id')
+        if tuple(row.keys()) != keys: raise ValueError('batch publication columns invalid')
+        for key in ('job_id','attempt_id','original_request_id'):
+            _require_identifier(row[key], 'publication identity')
+        if row['job_id'] != captured.original_job.job_id: raise ValueError('publication job changed')
+        status = row['status']; state = row['state']
+        if type(status) is not str or type(state) is not str: raise ValueError('publication scalar invalid')
+        if status not in {'eligible','finished','closed'} or state not in {'finalizing','paused','completed','removed','queued'}:
+            raise ValueError('publication status invalid')
+        if archived and (status != 'closed' or state not in {'paused','removed','queued'} or row['pending_request_id'] is not None):
+            raise ValueError('publication archive invalid')
+        counters = tuple(_require_counter(row[key], key) for key in ('audit_id','generation','revision','worker_epoch'))
+        audit, generation, revision, epoch = counters
+        if audit < 1 or epoch < 1: raise ValueError('publication pointer invalid')
+        raw = row['proof']
+        if type(raw) is not str or not 1 <= len(raw.encode('utf-8')) <= 4096: raise ValueError('publication proof invalid')
+        proof = _batch_decode(raw.encode('utf-8'))
+        if type(proof) is not dict or set(proof) != {'request','digest','generation','downloading_revision','finalizing_revision','finalizing_audit','epoch','ownership','marker','stage','chain','sha256'}:
+            raise ValueError('publication proof shape invalid')
+        _require_identifier(proof['request'], 'publication request')
+        for name in ('digest','ownership','sha256'): _require_payload_digest(proof[name])
+        for name in ('generation','downloading_revision','finalizing_revision','finalizing_audit','epoch'): _require_counter(proof[name], name)
+        if (proof['request'] != row['original_request_id'] or proof['finalizing_revision'] != proof['downloading_revision'] + 1
+                or proof['epoch'] < 1 or proof['finalizing_audit'] < 1 or generation < proof['generation']
+                or revision < proof['finalizing_revision'] or epoch < proof['epoch']):
+            raise ValueError('publication original fence invalid')
+        for name, length in (('marker',2),('stage',7)):
+            if type(proof[name]) is not list or len(proof[name]) != length: raise ValueError('publication proof counters invalid')
+            for value in proof[name]: _require_counter(value, 'publication metadata')
+        if not stat.S_ISREG(proof['stage'][3]) or proof['stage'][4] != 1: raise ValueError('publication stage invalid')
+        if type(proof['chain']) is not list or len(proof['chain']) != 4: raise ValueError('publication chain invalid')
+        for pair in proof['chain']:
+            if type(pair) is not list or len(pair) != 2: raise ValueError('publication chain invalid')
+            for value in pair: _require_counter(value, 'publication directory')
+        if self._publication_ownership(captured.original_job, captured.reservation) != proof['ownership']:
+            raise ValueError('publication original ownership changed')
+        if captured.expected_sha256 is not None and captured.expected_sha256 != proof['sha256']:
+            raise ValueError('publication expected checksum metadata changed')
+        receipt = self._read_direct_dispatch_command(connection, proof['request'])
+        if receipt != _DirectDispatchCommand(proof['request'], proof['digest'], captured.original_job.job_id,
+                'started', proof['generation'], proof['downloading_revision'], 'downloading'):
+            raise ValueError('publication original dispatch changed')
+        event = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?', (proof['finalizing_audit'],)).fetchone()
+        if event is None or tuple(event) != ('job_finalizing',captured.original_job.job_id,proof['generation'],proof['finalizing_revision']):
+            raise ValueError('publication original audit changed')
+        opposite = 'direct_publication_attempts' if archived else 'closed_direct_publication_attempts'
+        if connection.execute(f'SELECT 1 FROM {opposite} WHERE attempt_id=? OR original_request_id=? LIMIT 1', (row['attempt_id'],row['original_request_id'])).fetchone() is not None:
+            raise ValueError('publication identity overlaps archive')
+        if status == 'closed':
+            if state not in {'paused','removed','queued'} or row['pending_request_id'] is not None or audit <= proof['finalizing_audit']:
+                raise ValueError('publication closed pointer invalid')
+            closure = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?', (audit,)).fetchone()
+            if closure is None or tuple(closure) != ('job_'+state,captured.original_job.job_id,generation,revision):
+                raise ValueError('publication closure audit changed')
+            current = self._read_job_control_projection(connection, captured.original_job.job_id)
+            if generation > current.generation or epoch > self._current_worker_epoch(connection):
+                raise ValueError('publication closure chronology changed')
+            if archived:
+                fresh = connection.execute('SELECT proof FROM direct_publication_attempts WHERE job_id=?', (current.job,)).fetchone()
+                if fresh is None: raise ValueError('publication archive has no successor')
+                newer = _batch_decode(fresh[0].encode('utf-8'))
+                if revision >= newer['finalizing_revision']: raise ValueError('publication retirement chronology changed')
+        else:
+            if epoch - proof['epoch'] != generation - proof['generation']:
+                raise ValueError('publication cold epoch relation changed')
+            current = self._read_job_control_projection(connection, captured.original_job.job_id)
+            latest = connection.execute('SELECT event_id,generation,revision,kind FROM events WHERE job_id=? ORDER BY event_id DESC LIMIT 1', (current.job,)).fetchone()
+            if latest is None or tuple(latest) != (audit,generation,revision,'job_'+state) or (current.generation,current.revision,current.state) != (generation,revision,state):
+                raise ValueError('publication current pointer changed')
+            if status == 'eligible':
+                if state not in {'finalizing','paused'} or self._current_worker_epoch(connection) != epoch:
+                    raise ValueError('publication eligible epoch changed')
+                self._read_publication_attempt(connection, current.job)
+            else:
+                if state != 'completed' or row['pending_request_id'] is not None or self._current_worker_epoch(connection) < epoch:
+                    raise ValueError('publication finished pointer invalid')
+                self._read_publication_attempt(connection, current.job, require_current=False)
+                binding = self._read_final_publication_binding(connection, current.job)
+                if binding is None or (binding.final_device,binding.final_inode,binding.logical_size) != tuple(proof['stage'][:3]):
+                    raise ValueError('publication final binding changed')
+        return proof
+
+    def _validate_batch_lifecycle(self, captured, current):
+        connection = self._connection
+        job_id = captured.original_job.job_id
+        generation = revision = 0; state = 'queued'
+        flags = {(False,False,False)}
+        first = True; last_audit = None; direct_lineage = False; finalizing_event = None
+        cursor = connection.execute('SELECT event_id,kind,generation,revision FROM events WHERE job_id=? ORDER BY event_id', (job_id,))
+        for row in cursor:
+            audit = _require_counter(row['event_id'], 'batch lifecycle audit')
+            kind = _require_sqlite_text(row['kind'], 'batch lifecycle kind')
+            next_generation = _require_counter(row['generation'], 'batch lifecycle generation')
+            next_revision = _require_counter(row['revision'], 'batch lifecycle revision')
+            if first:
+                if (audit,kind,next_generation,next_revision) != (captured.audit_id,'job_added',0,0):
+                    raise ValueError('batch original creation audit changed')
+                first = False; last_audit = audit; continue
+            if audit <= last_audit or next_revision != revision + 1:
+                raise ValueError('batch lifecycle revision gap')
+            successors = set()
+            if kind == 'job_paused' and next_generation == generation + 1:
+                if state not in _RECOVERABLE_COLD_START_STATES: raise ValueError('batch cold predecessor invalid')
+                successors = flags; next_state = 'paused'; direct_lineage = False
+            elif next_generation != generation:
+                raise ValueError('batch unsupported generation jump')
+            elif kind == 'job_paused':
+                next_state = 'paused'
+                for authorized, hold, start in flags:
+                    candidate = (authorized,True,start)
+                    if (state != 'paused' or candidate != (authorized,hold,start)) and self._batch_control_corroborated(job_id,'pause',generation,next_revision,'paused',authorized):
+                        successors.add(candidate)
+                if state in {'resolving','downloading','finalizing'} and direct_lineage:
+                    successors.update(flags)
+            elif kind in {'job_resumed','job_start_now_requested','job_removed'}:
+                action = {'job_resumed':'resume','job_start_now_requested':'start_now','job_removed':'remove'}[kind]
+                next_state = ('queued' if state == 'paused' else state) if action == 'resume' else ('queued' if action == 'start_now' else 'removed')
+                for authorized, hold, start in flags:
+                    candidate = (authorized,False,start) if action == 'resume' else ((True,False,True) if action == 'start_now' else (False,True,False))
+                    if (next_state,candidate) != (state,(authorized,hold,start)) and self._batch_control_corroborated(job_id,action,generation,next_revision,next_state,candidate[0]):
+                        successors.add(candidate)
+                direct_lineage = False
+            elif kind in {'job_resolving','job_downloading'}:
+                expected = 'queued' if kind == 'job_resolving' else 'resolving'
+                if state != expected or not self._batch_dispatch_corroborated(job_id,generation,next_revision,kind):
+                    raise ValueError('batch dispatch lifecycle invalid')
+                next_state = 'resolving' if kind == 'job_resolving' else 'downloading'
+                successors = flags; direct_lineage = True
+            elif kind == 'job_finalizing':
+                if state != 'downloading' or not direct_lineage: raise ValueError('batch finalizing predecessor invalid')
+                receipts = connection.execute("SELECT request_id FROM direct_dispatch_commands WHERE job_id=? AND generation=? AND revision=? AND status='started' AND state='downloading'", (job_id,generation,revision)).fetchall()
+                if not receipts: raise ValueError('batch finalizing dispatch missing')
+                for receipt in receipts: self._read_direct_dispatch_command(connection,receipt[0])
+                finalizing_event = (audit,generation,next_revision)
+                next_state = 'finalizing'; successors = flags
+            elif kind == 'job_completed':
+                if state not in {'finalizing','paused'} or finalizing_event is None:
+                    raise ValueError('batch completion predecessor invalid')
+                attempt = connection.execute('SELECT * FROM direct_publication_attempts WHERE job_id=?', (job_id,)).fetchone()
+                if attempt is None or attempt['status'] != 'finished': raise ValueError('batch completed attempt missing')
+                proof = self._batch_publication_record(attempt,captured,archived=False)
+                if proof['finalizing_audit'] != finalizing_event[0]: raise ValueError('batch completed original audit changed')
+                if (attempt['audit_id'],attempt['generation'],attempt['revision']) != (audit,generation,next_revision):
+                    raise ValueError('batch completed audit pointer changed')
+                next_state = 'completed'; successors = flags
+            else:
+                raise ValueError('batch unsupported lifecycle mutation')
+            if not successors or len(successors) > 8: raise ValueError('batch lifecycle flags unsupported')
+            flags = successors; generation = next_generation; revision = next_revision; state = next_state; last_audit = audit
+        if first or (current.intent.generation,current.intent.revision) != (generation,revision):
+            raise ValueError('batch lifecycle terminal counters changed')
+        actual = self.get_job(job_id)
+        if actual is None or actual.state != state or (current.authorized,current.manual_hold,current.start_now_requested) not in flags:
+            raise ValueError('batch lifecycle terminal tuple changed')
+        attempt = connection.execute('SELECT * FROM direct_publication_attempts WHERE job_id=?', (job_id,)).fetchone()
+        if attempt is not None:
+            self._batch_publication_record(attempt,captured,archived=False)
+        # Qualify only named archived proofs associated with actual finalizing audits in this lineage.
+        audits = connection.execute("SELECT event_id,generation,revision FROM events WHERE job_id=? AND kind='job_finalizing' ORDER BY event_id", (job_id,))
+        for event in audits:
+            receipts = connection.execute("SELECT request_id FROM direct_dispatch_commands WHERE job_id=? AND generation=? AND revision=? AND status='started' AND state='downloading'", (job_id,event['generation'],event['revision']-1))
+            for receipt in receipts:
+                archived = connection.execute('SELECT * FROM closed_direct_publication_attempts WHERE original_request_id=?', (receipt[0],)).fetchone()
+                if archived is not None:
+                    proof = self._batch_publication_record(archived,captured,archived=True)
+                    if proof['finalizing_audit'] != event['event_id']: raise ValueError('batch archive original audit changed')
+
+    def _apply_add_in_transaction(self, connection, intent, materialized, *, scope, action):
+        """Apply one validated add in its owner transaction; never begin or commit."""
+        if (scope, action) not in {("add", "add"), ("add_batch_entry", "add_batch_entry")}:
+            raise ValueError("invalid add scope")
+        replay = self._match_command_receipt(
+            connection,
+            request_id=intent.request_id,
+            payload_digest=intent.payload_digest,
+            scope=scope,
+            action=action,
+        )
+        existing = connection.execute(
+            """
+            SELECT payload_digest, job_id, generation, revision
+            FROM commands
+            WHERE request_id = ?
+            """,
+            (intent.request_id,),
+        ).fetchone()
+        if replay:
+            if existing is None:
+                raise RuntimeError("command receipt is missing its add readback")
+            receipt_digest = _require_payload_digest(
+                _require_sqlite_text(existing["payload_digest"], "command payload_digest")
+            )
+            if receipt_digest != intent.payload_digest:
+                raise RuntimeError("command receipt does not match its add readback")
+            stored_job_id = _require_identifier(
+                _require_sqlite_text(existing["job_id"], "command job_id"),
+                "command job_id",
+            )
+            reservation = self._read_publication_reservation(connection, stored_job_id)
+            has_stored_projection = (
+                connection.execute(
+                    "SELECT 1 FROM materialized_jobs WHERE job_id = ?", (stored_job_id,)
+                ).fetchone()
+                is not None
+            )
+            if (materialized is not None or has_stored_projection) and reservation is None:
+                raise ValueError("materialized add replay is missing publication reservation")
+            if materialized is not None and not self._stored_projection_matches(
+                connection, stored_job_id, intent, materialized
+            ):
+                raise RequestConflictError(
+                    "request_id is already bound to a different materialized projection"
+                )
+            result = CommandResult(
+                applied=False,
+                job=stored_job_id,
+                generation=existing["generation"],
+                revision=existing["revision"],
+            )
+        else:
+            if existing is not None:
+                raise RuntimeError("command receipt registry is incomplete")
+            if materialized is not None:
+                if materialized.source_kind is not SourceKind.DIRECT:
+                    raise ValueError("unsupported source kind")
+                self._ensure_publication_target_is_available(connection, materialized)
+            connection.execute(
+                """
+                INSERT INTO jobs (job_id, source_url, generation, revision, state)
+                VALUES (?, ?, ?, ?, 'queued')
+                """,
+                (
+                    intent.job_id,
+                    intent.source_url,
+                    intent.generation,
+                    intent.revision,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO commands (
+                    request_id, payload_digest, job_id, generation, revision
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    intent.request_id,
+                    intent.payload_digest,
+                    intent.job_id,
+                    intent.generation,
+                    intent.revision,
+                ),
+            )
+            self._insert_command_receipt(
+                connection,
+                request_id=intent.request_id,
+                payload_digest=intent.payload_digest,
+                scope=scope,
+                action=action,
+            )
+            if materialized is not None:
+                self._insert_materialized_projection(connection, materialized)
+                self._insert_publication_reservation(connection, materialized)
+            connection.execute(
+                """
+                INSERT INTO events (kind, job_id, generation, revision)
+                VALUES ('job_added', ?, ?, ?)
+                """,
+                (intent.job_id, intent.generation, intent.revision),
+            )
+            result = CommandResult(
+                applied=True,
+                job=intent.job_id,
+                generation=intent.generation,
+                revision=intent.revision,
+            )
         return result
 
     @staticmethod
