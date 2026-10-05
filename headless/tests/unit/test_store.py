@@ -8417,3 +8417,48 @@ def test_closed_retirement_never_takes_an_already_linked_final(tmp_path):
         assert store._connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
         assert destination.final_path.stat() == final and prepared.marker.path.stat() == marker
         assert destination.final_path.read_bytes() == destination.partial_path.read_bytes() == b'body'
+
+
+@pytest.mark.parametrize('action', ('resume', 'start_now'))
+def test_eligible_cold_paused_attempt_typed_queued_closure_retires(tmp_path, action):
+    from hermes_downloads import ipc, paths
+    with closing(SQLiteStore(tmp_path / 'queued-closure.db')) as store:
+        stage, old, destination, started = _exact_attempt_fixture(store)
+        original = tuple(store._connection.execute('SELECT * FROM direct_dispatch_commands').fetchone())
+        assert not destination.final_path.exists()
+        assert store.recover_cold_start() == 2
+        assert store._connection.execute('SELECT status,state FROM direct_publication_attempts').fetchone()[:] == ('eligible','paused')
+        assert store.apply_queue_gate(gate='running',request_id='cold-running',payload_digest='6'*64,
+            expected_revision=store.queue_gate_snapshot()[1]).applied
+        current = store.get_job('job-1')
+        command = ipc.JobControlCommand('job-1',action,'cold-'+action,current.revision)
+        assert store.apply_job_control(job_id=command.job,action=command.action,request_id=command.request_id,
+            payload_digest=command.payload_digest,expected_revision=command.expected_revision).state == 'queued'
+        closed = tuple(store._connection.execute('SELECT * FROM direct_publication_attempts').fetchone())
+        current = store.get_job('job-1')
+        plan = store.prepare_direct_dispatch(job_id='job-1',expected_worker_epoch=2,
+            expected_generation=current.generation,expected_revision=current.revision,
+            request_id='cold-fresh',payload_digest='7'*64,controller_ready=True,now=datetime(2032,1,2,tzinfo=UTC))
+        plan = store.advance_direct_dispatch_to_downloading(plan)
+        assert store.finish_direct_dispatch(plan).status == 'started'
+        assert store._clear_direct_engine_record_and_recovery_capability(stage.terminal.record,stage.capability)
+        record = replace(stage.terminal.record,worker_epoch=2)
+        store.set_direct_engine_record(record)
+        store._bind_direct_engine_recovery_capability(record,_recovery_capability())
+        terminal = replace(stage.terminal,dispatch=plan,record=record,
+            capability=store._get_direct_engine_recovery_capability(record))
+        observed = replace(stage.observed,generation=plan.generation)
+        store.finalize_direct_terminal(terminal,observed)
+        fresh = store.prepare_direct_stage(terminal,observed)
+        staged = paths.attest_staged_partial_payload(destination,plan.reservation)
+        store.bind_direct_staged_payload(fresh,staged)
+        prepared = paths.prepare_publication_payload(destination,plan.reservation,old.prepared.marker,staged)
+        attempt = store.reserve_direct_publication(fresh,prepared)
+        assert attempt.attempt_id != old.attempt_id
+        assert tuple(store._connection.execute('SELECT * FROM closed_direct_publication_attempts').fetchone()) == closed
+        published = paths.publish_staged_partial_payload(destination,plan.reservation,staged,
+            prepared=prepared,creation_permit=paths.PublicationCreationPermit())
+        assert store.complete_direct_publication(attempt,published,initial_stage=fresh).state == 'completed'
+        assert tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands WHERE request_id='terminal-start'").fetchone()) == original
+        assert destination.final_path.read_bytes() == b'body'
+        assert sum(event.kind == 'job_completed' for event in store.list_events()) == 1

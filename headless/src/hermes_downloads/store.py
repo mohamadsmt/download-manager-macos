@@ -2083,6 +2083,24 @@ class SQLiteStore:
                 if [tuple(e) for e in events] == wanted: return True
         return False
 
+    def _publication_closure_corroborated(self, connection, row):
+        event = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?',
+            (row['audit_id'],)).fetchone()
+        if event is None or tuple(event)[1:] != (row['job_id'],row['generation'],row['revision']):
+            return False
+        if row['state'] in {'paused','removed'}:
+            return event['kind'] == 'job_' + row['state']
+        if row['state'] != 'queued' or event['kind'] not in {'job_resumed','job_start_now_requested'}:
+            return False
+        action = 'resume' if event['kind'] == 'job_resumed' else 'start_now'
+        predecessor = connection.execute('SELECT kind,generation,revision FROM events WHERE job_id=? AND event_id<? ORDER BY event_id DESC LIMIT 1',
+            (row['job_id'],row['audit_id'])).fetchone()
+        if (predecessor is None or predecessor['kind'] not in ({'job_paused'} if action == 'resume' else {'job_paused','job_finalizing'})
+                or tuple(predecessor)[1:] != (row['generation'],row['revision'] - 1)):
+            return False
+        return any(self._batch_control_corroborated(row['job_id'],action,row['generation'],row['revision'],'queued',authorized)
+            for authorized in ((False,True) if action == 'resume' else (True,)))
+
     def _batch_publication_record(self, row, captured, *, archived):
         """Strict database-only qualification of one explicitly named attempt, never a permit."""
         connection = self._connection
@@ -2137,8 +2155,7 @@ class SQLiteStore:
         if status == 'closed':
             if state not in {'paused','removed','queued'} or row['pending_request_id'] is not None or audit <= proof['finalizing_audit']:
                 raise ValueError('publication closed pointer invalid')
-            closure = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?', (audit,)).fetchone()
-            if closure is None or tuple(closure) != ('job_'+state,captured.original_job.job_id,generation,revision):
+            if not self._publication_closure_corroborated(connection,row):
                 raise ValueError('publication closure audit changed')
             current = self._read_job_control_projection(connection, captured.original_job.job_id)
             if generation > current.generation or epoch > self._current_worker_epoch(connection):
@@ -3692,12 +3709,9 @@ class SQLiteStore:
         if original_event is None or tuple(original_event) != ('job_finalizing',job_id,proof['generation'],proof['finalizing_revision']):
             raise ValueError('publication original audit changed')
         if _retiring_closed:
-            closed_event = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?',
-                (row['audit_id'],)).fetchone()
             current = self._read_job_control_projection(connection,job_id)
             if (require_current or row['status'] != 'closed' or row['pending_request_id'] is not None
-                or row['state'] not in {'paused','removed','queued'} or closed_event is None
-                or tuple(closed_event) != ('job_'+row['state'],job_id,counters[1],counters[2])
+                or not self._publication_closure_corroborated(connection,row)
                 or counters[0] <= proof['finalizing_audit']
                 or counters[1] > current.generation or counters[2] >= current.revision
                 or counters[3] > self._current_worker_epoch(connection)):

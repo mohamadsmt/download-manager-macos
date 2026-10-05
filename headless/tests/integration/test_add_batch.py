@@ -600,3 +600,139 @@ def test_add_list_and_cold_preserve_output_and_real_body_zero(service):
             sentinel_unchanged=True,accepted_inactive=1,rejected_literal_local=1))
     finally:
         origin.shutdown();origin.server_close();thread.join(timeout=2);assert not thread.is_alive()
+
+
+def _queued_batch_attempt(store, action):
+    """Real captured 0/0 intent, stage, pre-link cold pause and typed control."""
+    from dataclasses import replace
+    from datetime import UTC, datetime
+    from hermes_downloads import direct, paths, processes, retry, store as storage
+    body = b'body'
+    command = ipc.AddBatchCommand('queued-parent',None,[entry(expected_sha256=hashlib.sha256(body).hexdigest())])
+    receipt = store.apply_add_batch(command)
+    captured = store.get_batch_creation_intent('batch-job-0')
+    store.recover_cold_start()
+    def running(request):
+        assert store.apply_queue_gate(gate='running',request_id=request,payload_digest='6'*64,
+            expected_revision=store.queue_gate_snapshot()[1]).applied
+    def control(action, request):
+        command = ipc.JobControlCommand('batch-job-0',action,request,store.get_job('batch-job-0').revision)
+        result = store.apply_job_control(job_id=command.job,action=command.action,request_id=command.request_id,
+            payload_digest=command.payload_digest,expected_revision=command.expected_revision)
+        assert result.status == 'applied' and result.state == 'queued'
+        return command
+    running('initial-running'); control('start_now','initial-start')
+    job = store.get_materialized_job('batch-job-0')
+    destination = paths.rehydrate_destination(category=job.category,collection=job.destination_collection,
+        partial_filename=job.partial_filename,selected_final_filename=job.selected_final_filename,job_id=job.job_id)
+    destination.root.mkdir(parents=True,mode=0o700,exist_ok=True)
+    paths.prepare_persisted_destination_workspace(destination)
+    reservation = store.get_publication_reservation(job.job_id)
+    marker = paths.attest_publication_reservation_marker(destination,reservation)
+    binding = store.bind_publication_marker(job.job_id,claim_token=reservation.claim_token,
+        marker_device=marker.st_dev,marker_inode=marker.st_ino)
+    identity = processes.ProcessBirthIdentity.from_record(dict(leader_pid=4242,process_group_id=4242,
+        session_id=4242,owner_uid=os.getuid(),started_unix_us=1700000000000001,argv_sha256='a'*64))
+    def stage(request):
+        current = store.get_job(job.job_id); epoch = store.worker_epoch()
+        dispatch = store.prepare_direct_dispatch(job_id=job.job_id,expected_worker_epoch=epoch,
+            expected_generation=current.generation,expected_revision=current.revision,
+            request_id=request,payload_digest='7'*64,controller_ready=True,now=datetime(2032,1,2,tzinfo=UTC))
+        dispatch = store.advance_direct_dispatch_to_downloading(dispatch)
+        assert store.finish_direct_dispatch(dispatch).status == 'started'
+        record = storage.DirectEngineRecord(epoch,identity)
+        store.set_direct_engine_record(record)
+        capability = storage._DirectEngineRecoveryCapability(43123,'a'*43)
+        store._bind_direct_engine_recovery_capability(record,capability)
+        destination.partial_path.write_bytes(body)
+        details = destination.partial_path.stat()
+        terminal = storage._DirectTerminalPlan(dispatch,record,binding,'0123456789abcdef',destination.partial_path,capability)
+        observed = direct.DirectTransfer(job_id=job.job_id,generation=dispatch.generation,gid=terminal.gid,status='complete',
+            total_length=4,completed_length=4,partial_path=destination.partial_path,hash_verified=False,
+            verification=retry.CompletionVerification.TRANSPORT_VERIFIED,
+            verified_identity=direct._VerifiedPayloadIdentity(details.st_dev,details.st_ino,details.st_size,details.st_mtime_ns,
+                details.st_mode,details.st_nlink,details.st_ctime_ns))
+        store.finalize_direct_terminal(terminal,observed)
+        plan = store.prepare_direct_stage(terminal,observed)
+        staged = paths.attest_staged_partial_payload(destination,reservation)
+        store.bind_direct_staged_payload(plan,staged)
+        prepared = paths.prepare_publication_payload(destination,reservation,marker,staged)
+        return plan,prepared
+    original_stage,prepared = stage('original-dispatch')
+    old = store.reserve_direct_publication(original_stage,prepared)
+    original_receipt = tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands WHERE request_id='original-dispatch'").fetchone())
+    assert not destination.final_path.exists()
+    assert store.recover_cold_start() == 2
+    assert tuple(store._connection.execute('SELECT status,state FROM direct_publication_attempts').fetchone()) == ('eligible','paused')
+    running('successor-running'); closure = control(action,'closure-'+action)
+    closed = tuple(store._connection.execute('SELECT * FROM direct_publication_attempts').fetchone())
+    assert closed[4] == 'closed' and closed[8] == 'queued' and closed[3] == old.proof
+    assert store._clear_direct_engine_record_and_recovery_capability(original_stage.terminal.record,original_stage.capability)
+    return command,receipt,captured,old,original_receipt,destination,stage,closure,closed
+
+
+@pytest.mark.parametrize('action', ('resume','start_now'))
+@pytest.mark.parametrize('damage', (None,'unknown-audit','audit-generation','missing-control',
+    'blocked-control','noop-digest','missing-registry','wrong-registry'))
+def test_eligible_paused_batch_queued_closure_original_replay_and_retirement(tmp_path, action, damage):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'queued-batch.db')) as store:
+        command,receipt,captured,old,original_receipt,destination,stage,closure,closed = _queued_batch_attempt(store,action)
+        original_blob = tuple(store._connection.execute('SELECT creation_intent_blob,creation_intent_digest FROM add_batch_entries').fetchone())
+        source = store.get_materialized_job('batch-job-0').intent.source_url
+        reservation = store.get_publication_reservation('batch-job-0')
+        if damage:
+            sql = {
+                'unknown-audit': "UPDATE events SET kind='job_unknown' WHERE event_id=?",
+                'audit-generation': 'UPDATE events SET generation=generation+1 WHERE event_id=?',
+                'missing-control': 'DELETE FROM job_control_commands WHERE request_id=?',
+                'blocked-control': "UPDATE job_control_commands SET status='blocked' WHERE request_id=?",
+                'noop-digest': 'UPDATE job_control_commands SET payload_digest=? WHERE request_id=?',
+                'missing-registry': 'DELETE FROM command_receipts WHERE request_id=?',
+                'wrong-registry': "UPDATE command_receipts SET action='pause' WHERE request_id=?",
+            }[damage]
+            if damage == 'noop-digest':
+                noop = ipc.JobControlCommand(closure.job,closure.action,closure.request_id,closure.expected_revision+1)
+                store._connection.execute(sql,(noop.payload_digest,closure.request_id))
+                store._connection.execute('UPDATE command_receipts SET payload_digest=? WHERE request_id=?',(noop.payload_digest,closure.request_id))
+            else:
+                store._connection.execute(sql,(closed[5] if 'audit' in damage else closure.request_id,))
+        before = tuple(store._connection.iterdump())
+        if damage:
+            with pytest.raises(RuntimeError,match='^batch_state_invalid$'): store.get_batch_creation_intent('batch-job-0')
+            with pytest.raises(RuntimeError,match='^batch_state_invalid$'): store.apply_add_batch(command)
+        else:
+            assert store.get_batch_creation_intent('batch-job-0') == captured
+            replay = store.apply_add_batch(command)
+            assert replay.replayed and replay.results == receipt.results
+        assert tuple(store._connection.iterdump()) == before
+        fresh,prepared = stage('fresh-dispatch')
+        before = tuple(store._connection.iterdump())
+        if damage:
+            with pytest.raises(ValueError): store.reserve_direct_publication(fresh,prepared)
+            assert tuple(store._connection.iterdump()) == before
+            assert not destination.final_path.exists()
+            return
+        attempt = store.reserve_direct_publication(fresh,prepared)
+        assert attempt.attempt_id != old.attempt_id and attempt.prepared.staged_payload != old.prepared.staged_payload
+        assert tuple(store._connection.execute('SELECT * FROM closed_direct_publication_attempts').fetchone()) == closed
+        assert store.get_batch_creation_intent('batch-job-0') == captured
+        published = paths.publish_staged_partial_payload(destination,prepared.reservation,prepared.staged_payload,
+            prepared=prepared,creation_permit=paths.PublicationCreationPermit())
+        assert store.complete_direct_publication(attempt,published,initial_stage=fresh).state == 'completed'
+        assert destination.final_path.read_bytes() == destination.partial_path.read_bytes() == b'body'
+        assert store.get_batch_creation_intent('batch-job-0') == captured
+        assert store.apply_add_batch(command).results == receipt.results
+        assert tuple(store._connection.execute('SELECT creation_intent_blob,creation_intent_digest FROM add_batch_entries').fetchone()) == original_blob
+        assert store.get_materialized_job('batch-job-0').intent.source_url == source
+        assert store.get_publication_reservation('batch-job-0') == reservation == captured.reservation
+        assert tuple(store._connection.execute("SELECT * FROM direct_dispatch_commands WHERE request_id='original-dispatch'").fetchone()) == original_receipt
+        assert tuple(store._connection.execute('SELECT * FROM closed_direct_publication_attempts').fetchone()) == closed
+        before = tuple(store._connection.iterdump())
+        with pytest.raises(ValueError): store.complete_direct_publication(old,None)
+        with pytest.raises(ValueError): store.complete_direct_publication(attempt,published,initial_stage=fresh)
+        assert tuple(store._connection.iterdump()) == before
+        assert sum(event.kind == 'job_completed' for event in store.list_events()) == 1
+        evidence('queued-closure-regression.jsonl',dict(action=action,original_attempt=old.attempt_id,
+            successor_attempt=attempt.attempt_id,original_hash=captured.expected_sha256,archived_tuple_preserved=True,
+            blob_seal_preserved=True,source_claim_preserved=True,original_started_preserved=True,completed_once=True))
