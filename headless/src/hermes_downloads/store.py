@@ -450,6 +450,21 @@ CREATE TABLE direct_publication_attempts (
     CHECK (status != 'finished' OR (state = 'completed' AND pending_request_id IS NULL))
 );
 """
+_CLOSED_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA: Final = """
+CREATE TABLE closed_direct_publication_attempts (
+    job_id TEXT NOT NULL REFERENCES jobs(job_id) CHECK (typeof(job_id) = 'text' AND length(job_id) BETWEEN 1 AND 128),
+    attempt_id TEXT PRIMARY KEY NOT NULL CHECK (typeof(attempt_id) = 'text' AND length(attempt_id) BETWEEN 1 AND 128),
+    original_request_id TEXT NOT NULL UNIQUE REFERENCES direct_dispatch_commands(request_id) CHECK (typeof(original_request_id) = 'text'),
+    proof TEXT NOT NULL CHECK (typeof(proof) = 'text' AND length(proof) BETWEEN 1 AND 4096),
+    status TEXT NOT NULL CHECK (typeof(status) = 'text' AND status = 'closed'),
+    audit_id INTEGER NOT NULL REFERENCES events(event_id) CHECK (typeof(audit_id) = 'integer' AND audit_id > 0),
+    generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation BETWEEN 0 AND 9223372036854775807),
+    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision BETWEEN 0 AND 9223372036854775807),
+    state TEXT NOT NULL CHECK (typeof(state) = 'text' AND state IN ('paused', 'removed', 'queued')),
+    worker_epoch INTEGER NOT NULL CHECK (typeof(worker_epoch) = 'integer' AND worker_epoch BETWEEN 1 AND 9223372036854775807),
+    pending_request_id TEXT CHECK (pending_request_id IS NULL)
+);
+"""
 _SUPPORTED_SCHEMA_VERSION: Final = 16
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
@@ -622,7 +637,8 @@ _V15_TABLE_SCHEMAS: Final = _expected_table_schemas(
     _COMMAND_RECEIPTS_SCHEMA,
 )
 _V16_TABLE_SCHEMAS: Final = dict(_V15_TABLE_SCHEMAS,
-    **_expected_table_schemas(_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA))
+    **_expected_table_schemas(_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA,
+        _CLOSED_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA))
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _DIRECT_ENGINE_RECOVERY_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}\Z")
@@ -1408,6 +1424,7 @@ class SQLiteStore:
                 if not SQLiteStore._has_table_schemas(connection, _V15_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
                 connection.execute(_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA)
+                connection.execute(_CLOSED_DIRECT_PUBLICATION_ATTEMPTS_SCHEMA)
                 connection.execute("PRAGMA user_version = 16")
                 version = 16
             if version == _SUPPORTED_SCHEMA_VERSION:
@@ -2997,7 +3014,7 @@ class SQLiteStore:
             reservation.job_id, reservation.target_component, reservation.final_filename, reservation.claim_token]
         return hashlib.sha256(json.dumps(values, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
-    def _read_publication_attempt(self, connection, job_id, *, require_current=True):
+    def _read_publication_attempt(self, connection, job_id, *, require_current=True, _retiring_closed=False):
         from hermes_downloads.paths import (PreparedPublicationPayload, PublicationReservationMarker,
             StagedPartialPayload, rehydrate_destination)
         _require_identifier(job_id, 'publication job')
@@ -3011,6 +3028,9 @@ class SQLiteStore:
         _require_identifier(row['attempt_id'], 'attempt_id')
         if row['status'] not in {'eligible','finished','closed'} or row['state'] not in {'finalizing','paused','completed','removed','queued'}:
             raise ValueError('publication attempt state is invalid')
+        if connection.execute('SELECT 1 FROM closed_direct_publication_attempts WHERE attempt_id=? OR original_request_id=?',
+                (row['attempt_id'],row['original_request_id'])).fetchone() is not None:
+            raise ValueError('publication attempt is also retired')
         counters = tuple(_require_counter(_require_sqlite_integer(row[k], k), k)
             for k in ('audit_id','generation','revision','worker_epoch'))
         if counters[0] < 1 or counters[3] < 1:
@@ -3063,12 +3083,23 @@ class SQLiteStore:
             or reservation is None or marker is None or staged is None
             or self._publication_ownership(job,reservation) != proof['ownership']
             or (marker.marker_device,marker.marker_inode) != tuple(proof['marker'])
-            or (staged.partial_device,staged.partial_inode,staged.logical_size) != tuple(proof['stage'][:3])):
+            or (not _retiring_closed and (staged.partial_device,staged.partial_inode,staged.logical_size) != tuple(proof['stage'][:3]))):
             raise ValueError('publication immutable authority changed')
         original_event = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id = ?',
             (proof['finalizing_audit'],)).fetchone()
         if original_event is None or tuple(original_event) != ('job_finalizing',job_id,proof['generation'],proof['finalizing_revision']):
             raise ValueError('publication original audit changed')
+        if _retiring_closed:
+            closed_event = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?',
+                (row['audit_id'],)).fetchone()
+            current = self._read_job_control_projection(connection,job_id)
+            if (require_current or row['status'] != 'closed' or row['pending_request_id'] is not None
+                or row['state'] not in {'paused','removed','queued'} or closed_event is None
+                or tuple(closed_event) != ('job_'+row['state'],job_id,counters[1],counters[2])
+                or counters[0] <= proof['finalizing_audit']
+                or counters[1] > current.generation or counters[2] >= current.revision
+                or counters[3] > self._current_worker_epoch(connection)):
+                raise ValueError('closed publication attempt authority is invalid')
         destination = rehydrate_destination(category=job.category, collection=job.destination_collection,
             partial_filename=job.partial_filename, selected_final_filename=job.selected_final_filename, job_id=job_id)
         dev,ino,size,mode,nlink,mtime,ctime = proof['stage']
@@ -3138,10 +3169,37 @@ class SQLiteStore:
                 epoch=stage.terminal.record.worker_epoch,ownership=self._publication_ownership(stage.job,prepared.reservation),
                 marker=[prepared.marker.st_dev,prepared.marker.st_ino],stage=original,
                 chain=prepared.directory_identities,sha256=prepared.sha256),sort_keys=True,separators=(',',':'))
+            closed = connection.execute('SELECT * FROM direct_publication_attempts WHERE job_id=?',
+                (stage.job.job_id,)).fetchone()
+            if closed is not None:
+                # A retired attempt is proof only. It never authorizes a new permit
+                # or supplies the current pointer, even if its files still exist.
+                retired = self._read_publication_attempt(connection,stage.job.job_id,
+                    require_current=False,_retiring_closed=True)
+                retired_proof = json.loads(retired.proof)
+                retired_receipt = self._read_direct_dispatch_command(connection,closed['original_request_id'])
+                retired_audits = tuple(tuple(connection.execute('SELECT * FROM events WHERE event_id=?',
+                    (event_id,)).fetchone()) for event_id in (retired_proof['finalizing_audit'],closed['audit_id']))
+                connection.execute('INSERT INTO closed_direct_publication_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?)',tuple(closed))
+                connection.execute("DELETE FROM direct_publication_attempts WHERE job_id=? AND attempt_id=? AND status='closed'",
+                    (stage.job.job_id,closed['attempt_id']))
+                self._require_one_changed_row(connection,'closed publication retirement')
             connection.execute('INSERT INTO direct_publication_attempts VALUES (?,?,?,?,?,?,?,?,?,?,NULL)',
                 (stage.job.job_id,secrets.token_hex(32),dispatch.request_id,proof,'eligible',stage.audit_id,
                  dispatch.generation,stage.revision,'finalizing',stage.terminal.record.worker_epoch))
             attempt = self._read_publication_attempt(connection,stage.job.job_id)
+            if attempt is None:
+                raise ValueError('publication attempt insert did not persist')
+            if closed is not None:
+                archived = connection.execute('SELECT * FROM closed_direct_publication_attempts WHERE attempt_id=?',
+                    (closed['attempt_id'],)).fetchone()
+                if archived is None or tuple(archived) != tuple(closed):
+                    raise ValueError('closed publication proof changed')
+                if (self._read_direct_dispatch_command(connection,closed['original_request_id']) != retired_receipt
+                    or tuple(tuple(row) if row is not None else () for row in
+                        (connection.execute('SELECT * FROM events WHERE event_id=?',(event_id,)).fetchone()
+                         for event_id in (retired_proof['finalizing_audit'],closed['audit_id']))) != retired_audits):
+                    raise ValueError('closed publication receipt or audit changed')
             check()
             connection.commit()
             return attempt

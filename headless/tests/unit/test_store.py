@@ -7706,6 +7706,7 @@ def test_exact_publication_attempt_schema_has_no_historical_backfill(tmp_path):
     try:
         assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 16
         assert store._connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
+        assert store._connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
         columns = {row[1] for row in store._connection.execute('PRAGMA table_info(direct_publication_attempts)')}
         assert columns == {'job_id', 'attempt_id', 'original_request_id', 'proof', 'status', 'audit_id', 'generation', 'revision', 'state', 'worker_epoch', 'pending_request_id'}
     finally:
@@ -7722,6 +7723,72 @@ def _exact_attempt_fixture(store):
         marker, staged)
     attempt = store.reserve_direct_publication(stage, prepared)
     return stage, attempt, destination, started
+
+
+def _fresh_stage_after_closed_attempt(store, stage, destination, *, action='resume', request_prefix='retire'):
+    """A new explicit dispatch and actual path/store stage, with no old permit."""
+    from hermes_downloads import paths
+    current = store.get_job('job-1')
+    assert store.apply_job_control(job_id='job-1', action='pause', request_id=request_prefix+'-pause',
+        payload_digest='3'*64, expected_revision=current.revision,
+        _contained_direct_transfer=True, _publication_recoverable=False).status == 'applied'
+    closed = tuple(store._connection.execute('SELECT * FROM direct_publication_attempts').fetchone())
+    current = store.get_job('job-1')
+    assert store.apply_job_control(job_id='job-1', action=action, request_id=request_prefix+'-resume',
+        payload_digest='4'*64, expected_revision=current.revision).state == 'queued'
+    current = store.get_job('job-1')
+    plan = store.prepare_direct_dispatch(job_id='job-1', expected_worker_epoch=1,
+        expected_generation=current.generation, expected_revision=current.revision,
+        request_id=request_prefix+'-new-dispatch', payload_digest='5'*64, controller_ready=True,
+        now=datetime(2032,1,2,tzinfo=UTC))
+    plan = store.advance_direct_dispatch_to_downloading(plan)
+    assert store.finish_direct_dispatch(plan).status == 'started'
+    terminal = replace(stage.terminal, dispatch=plan)
+    observed = replace(stage.observed, generation=plan.generation)
+    store.finalize_direct_terminal(terminal, observed)
+    fresh_stage = store.prepare_direct_stage(terminal, observed)
+    staged = paths.attest_staged_partial_payload(destination, plan.reservation)
+    store.bind_direct_staged_payload(fresh_stage, staged)
+    marker = paths.PublicationReservationMarker(destination.incomplete_dir / '.hermes-reservation',
+        terminal.marker.marker_device, terminal.marker.marker_inode)
+    prepared = paths.prepare_publication_payload(destination, plan.reservation, marker, staged)
+    return fresh_stage, prepared, closed
+
+
+@pytest.mark.parametrize('action', ('resume', 'start_now'))
+def test_closed_attempt_allows_new_dispatch_publication_without_rearming(tmp_path, action):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, old, destination, _ = _exact_attempt_fixture(store)
+        original_receipt = tuple(store._connection.execute(
+            "SELECT * FROM direct_dispatch_commands WHERE request_id='terminal-start'").fetchone())
+        original_events = tuple(tuple(row) for row in store._connection.execute('SELECT * FROM events'))
+        fresh, prepared, closed = _fresh_stage_after_closed_attempt(store, stage, destination, action=action)
+        attempt = store.reserve_direct_publication(fresh, prepared)
+        assert attempt.attempt_id != old.attempt_id
+        assert tuple(store._connection.execute('SELECT * FROM closed_direct_publication_attempts').fetchone()) == closed
+        assert store._read_publication_attempt(store._connection, 'job-1') == attempt
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):
+            store.complete_direct_publication(old, None)
+        assert tuple(store._connection.iterdump()) == snapshot
+        retired_permit = paths.PublicationCreationPermit()
+        retired_permit.revoke()
+        with pytest.raises(paths.PathValidationError):
+            paths.publish_staged_partial_payload(destination,prepared.reservation,
+                prepared.staged_payload,prepared=prepared,creation_permit=retired_permit)
+        assert not destination.final_path.exists()
+        published = paths.publish_staged_partial_payload(destination, prepared.reservation,
+            prepared.staged_payload, prepared=prepared,
+            creation_permit=paths.PublicationCreationPermit())
+        assert store.complete_direct_publication(attempt, published, initial_stage=fresh).state == 'completed'
+        assert destination.final_path.stat().st_ino == destination.partial_path.stat().st_ino
+        assert destination.final_path.read_bytes() == b'body'
+        assert tuple(store._connection.execute(
+            "SELECT * FROM direct_dispatch_commands WHERE request_id='terminal-start'").fetchone()) == original_receipt
+        assert tuple(tuple(row) for row in store._connection.execute('SELECT * FROM events'))[:len(original_events)] == original_events
+        assert sum(event.kind == 'job_completed' for event in store.list_events()) == 1
+        assert tuple(store._connection.execute('SELECT * FROM closed_direct_publication_attempts').fetchone()) == closed
 
 
 @pytest.mark.parametrize('action', ('pause', 'resume', 'start_now', 'remove'))
@@ -7878,7 +7945,8 @@ def test_exact_attempt_interrupted_pending_cold_settles_new_only(tmp_path):
         assert current.state == 'paused' and current.pending_request_id is None
 
 
-@pytest.mark.parametrize('failure_statement_prefix', ['CREATE TABLE direct_publication_attempts','PRAGMA user_version = 16'])
+@pytest.mark.parametrize('failure_statement_prefix', ['CREATE TABLE direct_publication_attempts',
+    'CREATE TABLE closed_direct_publication_attempts','PRAGMA user_version = 16'])
 def test_exact_attempt_v16_migration_is_atomic_and_has_no_backfill(tmp_path, monkeypatch, failure_statement_prefix):
     database = tmp_path / 'attempt.db'
     _create_v14_database(database)
@@ -8152,3 +8220,158 @@ def test_exact_attempt_insert_fault_preserves_original_receipt_and_stage(tmp_pat
         assert tuple(store._connection.iterdump()) == snapshot
         assert not destination.final_path.exists()
         assert destination.partial_path.read_bytes() == b'body' and marker.path.exists()
+
+
+@pytest.mark.parametrize('fault', ('archive', 'delete', 'insert', 'proof', 'receipt', 'audit', 'descriptor', 'commit',
+    'archive-ignore', 'current-ignore', 'current-drop'))
+def test_closed_attempt_retirement_fault_rolls_back_entire_transaction(tmp_path, monkeypatch, fault):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, _, destination, _ = _exact_attempt_fixture(store)
+        fresh, prepared, closed = _fresh_stage_after_closed_attempt(store, stage, destination)
+        triggers = {
+            'archive': "BEFORE INSERT ON closed_direct_publication_attempts BEGIN SELECT RAISE(ABORT,'archive fault'); END",
+            'delete': "BEFORE DELETE ON direct_publication_attempts BEGIN SELECT RAISE(ABORT,'delete fault'); END",
+            'insert': "BEFORE INSERT ON direct_publication_attempts BEGIN SELECT RAISE(ABORT,'insert fault'); END",
+            'proof': "AFTER INSERT ON direct_publication_attempts BEGIN UPDATE closed_direct_publication_attempts SET proof='{}'; END",
+            'receipt': "AFTER INSERT ON direct_publication_attempts BEGIN UPDATE direct_dispatch_commands SET revision=revision+1 WHERE request_id='terminal-start'; END",
+            'audit': "AFTER INSERT ON direct_publication_attempts BEGIN UPDATE events SET kind='job_added' WHERE event_id=(SELECT audit_id FROM closed_direct_publication_attempts); END",
+            'archive-ignore': "BEFORE INSERT ON closed_direct_publication_attempts BEGIN SELECT RAISE(IGNORE); END",
+            'current-ignore': "BEFORE INSERT ON direct_publication_attempts BEGIN SELECT RAISE(IGNORE); END",
+            'current-drop': "AFTER INSERT ON direct_publication_attempts BEGIN DELETE FROM direct_publication_attempts WHERE job_id=NEW.job_id; END",
+        }
+        if fault in triggers:
+            store._connection.execute('CREATE TRIGGER fail_retirement '+triggers[fault])
+        elif fault == 'commit':
+            store._connection = _PublicationCommitFailure(store._connection)
+        elif fault == 'descriptor':
+            original = paths._require_strict_publication_namespace
+            calls = []
+            def fail_after_retirement(*args, **kwargs):
+                calls.append(1)
+                if len(calls) == 2:
+                    raise paths.PathValidationError('retirement post-check fault')
+                return original(*args, **kwargs)
+            monkeypatch.setattr(paths, '_require_strict_publication_namespace', fail_after_retirement)
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises((ValueError, sqlite3.Error, paths.PathValidationError)):
+            store.reserve_direct_publication(fresh, prepared)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert tuple(store._connection.execute('SELECT * FROM direct_publication_attempts').fetchone()) == closed
+        assert store._connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
+        assert destination.partial_path.read_bytes() == b'body' and prepared.marker.path.exists()
+        assert not destination.final_path.exists()
+
+
+@pytest.mark.parametrize('damage', ('eligible', 'finished', 'proof', 'receipt', 'audit', 'pending', 'ambiguous'))
+def test_closed_attempt_retirement_rejects_invalid_or_competing_authority(tmp_path, damage):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, _, destination, _ = _exact_attempt_fixture(store)
+        fresh, prepared, closed = _fresh_stage_after_closed_attempt(store, stage, destination)
+        if damage in {'eligible','finished'}:
+            state = 'paused' if damage == 'eligible' else 'completed'
+            store._connection.execute('UPDATE direct_publication_attempts SET status=?,state=?', (damage,state))
+        elif damage == 'proof':
+            store._connection.execute("UPDATE direct_publication_attempts SET proof='{}'")
+        elif damage == 'receipt':
+            store._connection.execute("UPDATE direct_dispatch_commands SET revision=revision+1 WHERE request_id='terminal-start'")
+        elif damage == 'audit':
+            store._connection.execute("UPDATE events SET kind='job_added' WHERE event_id=(SELECT audit_id FROM direct_publication_attempts)")
+        elif damage == 'pending':
+            store._connection.execute("UPDATE direct_publication_attempts SET pending_request_id='retire-new-dispatch'")
+        else:
+            store._connection.execute('INSERT INTO closed_direct_publication_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?)',closed)
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises((TypeError,ValueError,sqlite3.Error)):
+            store.reserve_direct_publication(fresh,prepared)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert not destination.final_path.exists()
+
+
+@pytest.mark.parametrize('damage', ('missing-current', 'invalid-current', 'missing-final'))
+def test_closed_archive_never_supplies_recovery_authority(tmp_path, damage):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, _, destination, _ = _exact_attempt_fixture(store)
+        fresh, prepared, closed = _fresh_stage_after_closed_attempt(store,stage,destination)
+        store.reserve_direct_publication(fresh,prepared)
+        store.recover_cold_start()
+        if damage == 'missing-current':
+            store._connection.execute('DELETE FROM direct_publication_attempts')
+        elif damage == 'invalid-current':
+            store._connection.execute("UPDATE direct_publication_attempts SET proof='{}'")
+        current = store.get_job('job-1')
+        arguments = dict(job_id='job-1',expected_worker_epoch=2,
+            expected_generation=current.generation,expected_revision=current.revision,
+            request_id='archive-not-authority',payload_digest='6'*64,controller_ready=False,
+            now=datetime(2032,1,2,tzinfo=UTC))
+        if damage == 'invalid-current':
+            snapshot = tuple(store._connection.iterdump())
+            with pytest.raises(ValueError,match='publication attempt proof shape'):
+                store.prepare_direct_dispatch(**arguments)
+            assert tuple(store._connection.iterdump()) == snapshot
+        elif damage == 'missing-final':
+            # Valid current proof can request only existing-only verification.
+            from hermes_downloads import paths
+            result = store.prepare_direct_dispatch(**arguments)
+            assert result.attempt.attempt_id != closed[1]
+            with pytest.raises(paths.PathValidationError):
+                paths.publish_staged_partial_payload(destination,prepared.reservation,
+                    prepared.staged_payload,prepared=prepared,existing_only=True)
+            store.abort_exact_publication_recovery(result)
+        else:
+            result = store.prepare_direct_dispatch(**arguments)
+            assert result.status == 'blocked'
+        assert tuple(store._connection.execute('SELECT * FROM closed_direct_publication_attempts').fetchone()) == closed
+        assert not destination.final_path.exists()
+
+
+@pytest.mark.parametrize('field', ('job_id','attempt_id','original_request_id','proof','status',
+    'audit_id','generation','revision','state','worker_epoch','pending_request_id'))
+def test_closed_archive_schema_rejects_blob_proof(tmp_path,field):
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, _, destination, _ = _exact_attempt_fixture(store)
+        fresh, prepared, _ = _fresh_stage_after_closed_attempt(store,stage,destination)
+        store.reserve_direct_publication(fresh,prepared)
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(sqlite3.IntegrityError):
+            store._connection.execute(f'UPDATE closed_direct_publication_attempts SET {field}=?',(sqlite3.Binary(b'blob'),))
+        assert tuple(store._connection.iterdump()) == snapshot
+
+
+def test_closed_archive_retains_multiple_distinct_attempts_and_only_current_can_complete(tmp_path):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, first, destination, _ = _exact_attempt_fixture(store)
+        next_stage, prepared, first_closed = _fresh_stage_after_closed_attempt(store,stage,destination)
+        second = store.reserve_direct_publication(next_stage,prepared)
+        final_stage, prepared, second_closed = _fresh_stage_after_closed_attempt(store,next_stage,
+            destination,action='start_now',request_prefix='third')
+        third = store.reserve_direct_publication(final_stage,prepared)
+        assert len({first.attempt_id,second.attempt_id,third.attempt_id}) == 3
+        archives = {row['attempt_id']:tuple(row) for row in store._connection.execute('SELECT * FROM closed_direct_publication_attempts')}
+        assert archives == {first.attempt_id:first_closed,second.attempt_id:second_closed}
+        for stale in (first,second):
+            with pytest.raises(ValueError):
+                store.complete_direct_publication(stale,None)
+        published = paths.publish_staged_partial_payload(destination,prepared.reservation,
+            prepared.staged_payload,prepared=prepared,creation_permit=paths.PublicationCreationPermit())
+        assert store.complete_direct_publication(third,published,initial_stage=final_stage).state == 'completed'
+        assert {row['attempt_id']:tuple(row) for row in store._connection.execute('SELECT * FROM closed_direct_publication_attempts')} == archives
+
+
+def test_closed_retirement_never_takes_an_already_linked_final(tmp_path):
+    from hermes_downloads import paths
+    with closing(SQLiteStore(tmp_path / 'attempt.db')) as store:
+        stage, _, destination, _ = _exact_attempt_fixture(store)
+        fresh, prepared, closed = _fresh_stage_after_closed_attempt(store,stage,destination)
+        os.link(destination.partial_path,destination.final_path)
+        final = destination.final_path.stat()
+        marker = prepared.marker.path.stat()
+        snapshot = tuple(store._connection.iterdump())
+        with pytest.raises(paths.PathValidationError):
+            store.reserve_direct_publication(fresh,prepared)
+        assert tuple(store._connection.iterdump()) == snapshot
+        assert tuple(store._connection.execute('SELECT * FROM direct_publication_attempts').fetchone()) == closed
+        assert store._connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
+        assert destination.final_path.stat() == final and prepared.marker.path.stat() == marker
+        assert destination.final_path.read_bytes() == destination.partial_path.read_bytes() == b'body'

@@ -746,6 +746,7 @@ def test_certified_serving_reads_complete_schema16_without_history_effects(short
             before = tuple(connection.iterdump())
             assert connection.execute('PRAGMA user_version').fetchone()[0] == 16
             assert connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
+            assert connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
         certificate = ownership.preflight(root)
         assert certificate.record[1] == record
         assert json.loads(record)['worker_epoch'] == ipc.request_health(root / 'worker.sock').worker_epoch
@@ -759,7 +760,7 @@ def test_certified_serving_reads_complete_schema16_without_history_effects(short
     assert not (root / 'worker.sock').exists() and not (root / ownership.RECORD).exists()
 
 
-@pytest.mark.parametrize('fault', ('incomplete', 'malformed', 'newer'))
+@pytest.mark.parametrize('fault', ('incomplete', 'malformed', 'newer', 'missing-archive', 'malformed-archive'))
 def test_schema16_certificate_refuses_before_lease_bootstrap_and_reclaim(short_state_root, monkeypatch, fault):
     import sqlite3
     from hermes_downloads import endpoint_ownership as ownership
@@ -780,6 +781,10 @@ def test_schema16_certificate_refuses_before_lease_bootstrap_and_reclaim(short_s
         with sqlite3.connect(root / 'state.db') as connection:
             if fault == 'newer':
                 connection.execute('PRAGMA user_version=17')
+            elif fault.endswith('archive'):
+                connection.execute('DROP TABLE closed_direct_publication_attempts')
+                if fault == 'malformed-archive':
+                    connection.execute('CREATE TABLE closed_direct_publication_attempts (job_id TEXT)')
             else:
                 connection.execute('DROP TABLE direct_publication_attempts')
                 if fault == 'malformed':

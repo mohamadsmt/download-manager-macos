@@ -201,6 +201,12 @@ def _publication_worker(state, sock, ready, shutdown, stopped, results, origin, 
             hold()
             return original(*args, **kwargs)
         paths.prepare_publication_payload = prepare
+    elif barrier == 'pre-create':
+        original = paths._publish_prepared_payload
+        def before_creation(*args, **kwargs):
+            hold()
+            return original(*args, **kwargs)
+        paths._publish_prepared_payload = before_creation
     elif barrier in {'link', 'cut-link'}:
         original = paths.os.link
         def link(*args, **kwargs):
@@ -505,6 +511,57 @@ def _start_real_publication(state, origin, barrier, evidence, *, restart=False, 
     assert (started.status, started.state, started.revision) == ('started', 'downloading', 4)
     assert child['entered'].wait(6)
     return child, started, _receipt(state / 'state.db')
+
+
+def test_real_same_job_closed_attempt_new_dispatch_transfers_and_publishes(publication_evidence):
+    with tempfile.TemporaryDirectory(dir='/private/tmp', prefix='hd-pub-') as temp:
+        state = Path(temp) / 'state'; state.mkdir(mode=0o700)
+        sock = state / 'worker.sock'
+        root = Path.home() / 'Downloads/Hermes'; root.mkdir(parents=True,mode=0o700)
+        partial = root / '.incomplete/dispatch-job/dispatch.bin'
+        final = root / 'Other/dispatch.bin'
+        with _helpers._origin_type()(payload_size=1024) as origin:
+            child, started, original = _start_real_publication(state,origin,'pre-create',publication_evidence)
+            try:
+                assert not final.exists()
+                assert ipc.control_job(sock,job='dispatch-job',action='pause',
+                    request_id='closed-before-create',expected_revision=5).status == 'applied'
+                current = _wait_state(sock,'paused')
+                with sqlite3.connect(state / 'state.db') as connection:
+                    closed = tuple(connection.execute('SELECT * FROM direct_publication_attempts').fetchone())
+                    assert closed[4] == 'closed'
+                child['release'].set()
+                assert ipc.control_job(sock,job='dispatch-job',action='start_now',
+                    request_id='new-attempt-authorize',expected_revision=current.revision).state == 'queued'
+                deadline = time.monotonic()+5
+                while ipc.activate_direct_engine(sock,expected_worker_epoch=1).status != 'active':
+                    assert time.monotonic()<deadline
+                    time.sleep(.01)
+                current = ipc.request_jobs_page(sock).jobs[0]
+                second = ipc.dispatch_direct_job(sock,job='dispatch-job',expected_worker_epoch=1,
+                    expected_generation=current.generation,expected_revision=current.revision,
+                    request_id='new-attempt-start')
+                assert (second.status,second.state)==('started','downloading')
+                _wait_state(sock,'completed')
+                assert final.read_bytes() == partial.read_bytes() and final.stat().st_ino == partial.stat().st_ino
+                assert final.stat().st_size == 1024
+                assert _receipt(state / 'state.db') == original
+                assert ipc.dispatch_direct_job(sock,job='dispatch-job',expected_worker_epoch=1,
+                    expected_generation=1,expected_revision=2,request_id='publication-start') == started
+                with sqlite3.connect(state / 'state.db') as connection:
+                    assert tuple(connection.execute('SELECT * FROM closed_direct_publication_attempts').fetchone()) == closed
+                    active = tuple(connection.execute('SELECT * FROM direct_publication_attempts').fetchone())
+                    assert active[1] != closed[1] and active[4] == 'finished'
+                    assert connection.execute("SELECT COUNT(*) FROM events WHERE kind='job_completed'").fetchone()[0] == 1
+                rows = [json.loads(line) for line in (publication_evidence / f"fixture-{child['process'].pid}.jsonl").read_text().splitlines()]
+                assert len([row for row in rows if row['kind']=='engine-birth']) == 2
+                outcome = dict(original_receipt=original,closed_attempt=closed,current_attempt=active,
+                    origin_ledger=asdict(origin.ledger),partial_sha256=hashlib.sha256(partial.read_bytes()).hexdigest(),
+                    final_sha256=hashlib.sha256(final.read_bytes()).hexdigest(),engine_births=2,payload_bytes=1024)
+                path = publication_evidence / 'closed-continuation-outcome.json'
+                path.write_text(json.dumps(outcome,sort_keys=True));path.chmod(0o600)
+            finally:
+                _finish_publication_worker(child,publication_evidence)
 
 
 @pytest.mark.parametrize('action', ('pause', 'remove', 'queue', 'shutdown'))
