@@ -2237,8 +2237,16 @@ class SQLiteStore:
                 captured.audit_id, captured.original_job.intent.generation, captured.original_job.intent.revision,
                 captured.seal, captured)
         if not commands:
-            for table in ('jobs','events','materialized_jobs','publication_reservations','target_members','job_authorization_heads'):
+            for table in ('jobs','events','materialized_jobs','publication_reservations','job_authorization_heads'):
                 if connection.execute(f'SELECT 1 FROM {table} WHERE job_id=? LIMIT 1', (job_id,)).fetchone() is not None:
+                    raise ValueError('creation provenance missing')
+            for row in connection.execute('SELECT request_id,target_index FROM target_members WHERE job_id=?', (job_id,)):
+                command, _, members = self._read_target_command(connection, row['request_id'], parent_cache)
+                member = members[row['target_index']]
+                # Sealed unknown results are negative history, never creation or authority.
+                if (command.to_record()['selector']['kind'] != 'jobs' or member['job_id'] != job_id
+                        or (member['outcome'], member['reason']) != ('blocked', 'unknown_job')
+                        or any(member[name] is not None for name in _TARGET_MEMBER_COLUMNS[5:])):
                     raise ValueError('creation provenance missing')
             return _TargetCreationOrigin('unknown')
         if len(commands) != 1: raise ValueError('creation provenance not unique')

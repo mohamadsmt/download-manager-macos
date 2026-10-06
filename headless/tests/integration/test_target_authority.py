@@ -94,6 +94,106 @@ def authorize(store, request='target', action='start', selector=None):
         target(request,store.worker_epoch(),action,selector))).to_record()
 
 
+def test_unknown_history_stays_negative_across_requests_cold_and_real_creation(tmp_path):
+    database=tmp_path/'unknown-history.db';selector=select_jobs(['missing'])
+    with closing(SQLiteStore(database)) as store:
+        store.recover_cold_start()
+        command=ipc.TargetAuthorizeCommand.from_record(target('missing-first',selector=selector))
+        first=store.apply_target_authorize(command).to_record()
+        assert first['results']==[dict(index=0,job='missing',outcome='blocked',reason='unknown_job',
+            round_generation=None,captured_generation=None,captured_revision=None,held_by=None)]
+        before=tuple(store._connection.iterdump())
+        assert store.apply_target_authorize(command).to_record()=={**first,'replayed':True}
+        assert tuple(store._connection.iterdump())==before
+        second=authorize(store,'missing-second',selector=selector)
+        assert second['results']==first['results'] and second['replayed'] is False
+        assert store.get_batch_creation_intent('missing') is None
+        assert not store._target_managed(store._connection,'missing',{})
+        assert store._connection.execute('SELECT count(*) FROM authorization_rounds').fetchone()[0]==0
+        assert store._connection.execute('SELECT count(*) FROM job_authorization_heads').fetchone()[0]==0
+    with closing(SQLiteStore(database)) as store:
+        store.recover_cold_start();before=tuple(store._connection.iterdump())
+        assert store.apply_target_authorize(command).to_record()=={**first,'replayed':True}
+        assert tuple(store._connection.iterdump())==before
+        assert authorize(store,'missing-third',selector=selector)['results']==first['results']
+        worker._job_add_from_store(store,ipc.JobAddCommand('missing','real-add',
+            'https://example.test/created',0,2,'Other','created.bin','created.bin'))
+        assert authorize(store,'no-inherited-grant','resume',selector)['results'][0]['reason']=='incompatible_authority'
+        assert not store.get_materialized_job('missing').authorized
+        real=authorize(store,'real-grant',selector=selector)['results'][0]
+        assert real['outcome']=='new_authority' and real['round_generation']==1
+        head=store._connection.execute('SELECT * FROM job_authorization_heads').fetchone()
+        assert head['owner_request_id']=='real-grant' and head['cohort_request_id']=='real-add'
+        before=tuple(store._connection.iterdump())
+        assert store.apply_target_authorize(command).to_record()=={**first,'replayed':True}
+        assert tuple(store._connection.iterdump())==before
+
+
+def test_unknown_history_wire_mixed_request_keeps_independent_valid_target(service):
+    root,_=service;selector=select_jobs(['missing'])
+    command=ipc.TargetAuthorizeCommand.from_record(target('missing-first',selector=selector))
+    first=ipc.target_authorize(root/'worker.sock',command).to_record()
+    with sqlite3.connect(root/'state.db') as connection:before=tuple(connection.iterdump())
+    assert ipc.target_authorize(root/'worker.sock',command).to_record()=={**first,'replayed':True}
+    with sqlite3.connect(root/'state.db') as connection:assert tuple(connection.iterdump())==before
+    assert exchange(root,canonical(envelope()))['results'][0]['status']=='applied'
+    mixed=ipc.target_authorize(root/'worker.sock',ipc.TargetAuthorizeCommand.from_record(
+        target('mixed-missing',selector=select_jobs(['missing','batch-job-0'])))).to_record()
+    assert [(r['index'],r['job'],r['outcome'],r['reason']) for r in mixed['results']]==[
+        (0,'missing','blocked','unknown_job'),(1,'batch-job-0','new_authority',None)]
+    again=ipc.target_authorize(root/'worker.sock',ipc.TargetAuthorizeCommand.from_record(
+        target('missing-again',selector=selector))).to_record()
+    assert again['results']==first['results']
+    with sqlite3.connect(root/'state.db') as connection:
+        assert connection.execute('SELECT count(*) FROM authorization_rounds').fetchone()[0]==1
+        assert connection.execute('SELECT count(*) FROM job_authorization_heads WHERE job_id="missing"').fetchone()[0]==0
+    assert ipc.request_health(root/'worker.sock').worker_epoch==1
+    evidence('unknown-repair.jsonl',dict(real_owner_wire=True,repeated_unknown=True,mixed_independent=True,
+        original_replay=True,unknown_rounds=0,unknown_heads=0,execution_effect=mixed['execution_effect']))
+
+
+@pytest.mark.parametrize('damage',['vector','receipt','registry','orphan','reason','observed'])
+def test_unknown_history_corruption_still_refuses_without_writes(tmp_path,damage):
+    with closing(SQLiteStore(tmp_path/'unknown-corrupt.db')) as store:
+        store.recover_cold_start();selector=select_jobs(['missing'])
+        authorize(store,'negative',selector=selector)
+        connection=store._connection;connection.execute('PRAGMA foreign_keys=OFF')
+        if damage=='vector':connection.execute('UPDATE target_commands SET vector_digest=printf("%064d",0)')
+        elif damage=='receipt':connection.execute('UPDATE target_commands SET receipt_blob=CAST("{}" AS BLOB)')
+        elif damage=='registry':connection.execute('DELETE FROM command_receipts WHERE request_id="negative"')
+        elif damage=='orphan':connection.execute('DELETE FROM target_commands')
+        else:
+            # A recomputed seal cannot turn a non-unknown or observed member into absence.
+            connection.execute('UPDATE target_members SET '+('reason="terminal"' if damage=='reason' else 'held_mask=0'))
+            members=[dict(row) for row in connection.execute('SELECT * FROM target_members ORDER BY target_index')]
+            receipt=json.loads(connection.execute('SELECT receipt_blob FROM target_commands').fetchone()[0])
+            receipt['results']=[store_module._target_result(m) for m in members]
+            connection.execute('UPDATE target_commands SET vector_digest=?,receipt_blob=?',
+                (store_module._target_vector_digest(members),canonical(receipt)))
+        connection.execute('PRAGMA foreign_keys=ON');before=tuple(connection.iterdump())
+        with pytest.raises(RuntimeError,match='target_authority_corrupt'):
+            authorize(store,'new-negative',selector=selector)
+        assert tuple(connection.iterdump())==before
+        with pytest.raises(RuntimeError,match='batch_state_invalid'):store.get_batch_creation_intent('missing')
+        assert tuple(connection.iterdump())==before
+
+
+@pytest.mark.parametrize('upgraded',[False,True])
+def test_missing_real_creation_links_never_become_unknown(tmp_path,upgraded):
+    with closing(SQLiteStore(tmp_path/'missing-positive.db')) as store:
+        store.recover_cold_start();store.apply_add_batch(ipc.AddBatchCommand.from_record(envelope()))
+        if upgraded:authorize(store,'positive')
+        connection=store._connection;connection.execute('PRAGMA foreign_keys=OFF')
+        connection.execute('DELETE FROM add_batch_entries');connection.execute('DELETE FROM commands')
+        if upgraded:
+            for table in ('job_authorization_heads','publication_reservations','materialized_jobs','jobs','events'):
+                connection.execute(f'DELETE FROM {table}')
+        connection.execute('PRAGMA foreign_keys=ON');before=tuple(connection.iterdump())
+        with pytest.raises(RuntimeError,match='target_authority_corrupt'):
+            authorize(store,'missing-proof',selector=select_jobs(['batch-job-0']))
+        assert tuple(connection.iterdump())==before
+
+
 def control(store, job, action, request, **contained):
     command = ipc.JobControlCommand(job,action,request,store.get_job(job).revision)
     return store.apply_job_control(job_id=job,action=action,request_id=request,
