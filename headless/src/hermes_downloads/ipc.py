@@ -271,6 +271,11 @@ def _job_add_wire_request(
 
 
 _BATCH_PREAMBLE: Final = b'HDM2\n'
+_TARGET_PREAMBLE: Final = b'HDT2\n'
+_MAX_TARGET_BODY: Final = 128 * 1024
+_MAX_TARGET_REPLY: Final = 256 * 1024
+_TARGET_ERRORS: Final = frozenset({'target_request_invalid', 'unsupported_selection_size',
+    'target_epoch_stale', 'command_conflict', 'target_authority_corrupt', 'target_deadline'})
 _MAX_BATCH_BODY: Final = 16 * 1024 * 1024
 _MAX_BATCH_ENTRY: Final = 32 * 1024
 _MAX_BATCH_REPLY: Final = 256 * 1024
@@ -524,6 +529,150 @@ def add_batch(socket_path: Path, *, request_id: str, collection: str | None, ent
     try:
         result = AddBatchResult.from_record(record)
         if result.request_id != command.request_id or len(result.results) != len(command.entries): raise ValueError('batch reply identity changed')
+        return result
+    except (TypeError, ValueError): raise IPCError('ipc_response_invalid') from None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TargetAuthorizeCommand:
+    request_id: str
+    expected_worker_epoch: int
+    action: str
+    selector: object = field(repr=False)
+    payload_digest: str = field(init=False)
+    _wire_request: bytes = field(init=False, repr=False)
+
+    def __post_init__(self):
+        _require_identifier(self.request_id, 'request_id')
+        _require_positive_counter(self.expected_worker_epoch, 'expected_worker_epoch')
+        if type(self.action) is not str or self.action not in {'start', 'resume', 'start_now'}:
+            raise ValueError('target_request_invalid')
+        selector = self.selector
+        if type(selector) is not dict: raise ValueError('target_request_invalid')
+        if selector.get('kind') == 'jobs' and set(selector) == {'kind', 'targets'}:
+            targets = selector['targets']
+            if type(targets) is not list or not targets: raise ValueError('target_request_invalid')
+            if len(targets) > 500: raise ValueError('unsupported_selection_size')
+            jobs = set()
+            for item in targets:
+                if type(item) is not dict or set(item) != {'job', 'expected_revision'}:
+                    raise ValueError('target_request_invalid')
+                job = _require_identifier(item['job'], 'job')
+                if job in jobs: raise ValueError('target_request_invalid')
+                jobs.add(job)
+                if item['expected_revision'] is not None:
+                    _require_counter(item['expected_revision'], 'expected_revision')
+        elif selector.get('kind') == 'creation_cohort' and set(selector) == {'kind', 'creation', 'indices'}:
+            creation = selector['creation']
+            if (type(creation) is not dict or set(creation) != {'kind', 'request_id'}
+                    or type(creation['kind']) is not str or creation['kind'] not in {'single', 'batch'}):
+                raise ValueError('target_request_invalid')
+            _require_identifier(creation['request_id'], 'creation request_id')
+            indices = selector['indices']
+            if indices is not None:
+                if type(indices) is not list or not indices: raise ValueError('target_request_invalid')
+                if len(indices) > 500: raise ValueError('unsupported_selection_size')
+                if any(type(i) is not int or not 0 <= i < 500 or (creation['kind'] == 'single' and i != 0) for i in indices):
+                    raise ValueError('target_request_invalid')
+                if len(set(indices)) != len(indices): raise ValueError('target_request_invalid')
+        else: raise ValueError('target_request_invalid')
+        raw = _batch_canonical(dict(op='target_authorize', protocol_version=2,
+            request_id=self.request_id, expected_worker_epoch=self.expected_worker_epoch,
+            action=self.action, selector=selector), _MAX_TARGET_BODY)
+        object.__setattr__(self, 'selector', raw)
+        object.__setattr__(self, '_wire_request', raw)
+        object.__setattr__(self, 'payload_digest', hashlib.sha256(raw).hexdigest())
+
+    def to_record(self):
+        return _batch_decode(self._wire_request)
+
+    @classmethod
+    def from_record(cls, record):
+        if (type(record) is not dict or set(record) != {'op', 'protocol_version', 'request_id',
+                'expected_worker_epoch', 'action', 'selector'} or record['op'] != 'target_authorize'
+                or type(record['protocol_version']) is not int or record['protocol_version'] != 2):
+            raise ValueError('target_request_invalid')
+        return cls(record['request_id'], record['expected_worker_epoch'], record['action'], record['selector'])
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TargetAuthorizeResult:
+    request_id: str
+    worker_epoch: int
+    replayed: bool
+    results: object = field(repr=False)
+    _wire_reply: bytes = field(init=False, repr=False)
+
+    def __post_init__(self):
+        _require_identifier(self.request_id, 'request_id')
+        _require_positive_counter(self.worker_epoch, 'worker_epoch')
+        if type(self.replayed) is not bool or type(self.results) is not list or not 1 <= len(self.results) <= 500:
+            raise ValueError('invalid target receipt')
+        for index, result in enumerate(self.results):
+            if type(result) is not dict or set(result) != {'index', 'job', 'outcome', 'reason',
+                    'round_generation', 'captured_generation', 'captured_revision', 'held_by'}:
+                raise ValueError('invalid target member')
+            if type(result['index']) is not int or result['index'] != index:
+                raise ValueError('invalid target index')
+            _require_identifier(result['job'], 'job')
+            outcome, reason = result['outcome'], result['reason']
+            if outcome in {'new_authority', 'existing_authority'}:
+                if reason is not None: raise ValueError('invalid target outcome')
+                _require_positive_counter(result['round_generation'], 'round_generation')
+            elif outcome == 'stale':
+                if reason != 'stale_revision' or result['round_generation'] is not None: raise ValueError('invalid target outcome')
+            elif outcome == 'blocked':
+                if reason not in {'unknown_job', 'legacy_kind', 'terminal', 'busy', 'incompatible_authority'} or result['round_generation'] is not None:
+                    raise ValueError('invalid target outcome')
+            else: raise ValueError('invalid target outcome')
+            for name in ('captured_generation', 'captured_revision'):
+                if result[name] is not None: _require_counter(result[name], name)
+            held = result['held_by']
+            if held is not None and (type(held) is not list or held != [gate for gate in ('global','collection','manual','not_due') if gate in held]):
+                raise ValueError('invalid target gates')
+            if outcome in {'new_authority', 'existing_authority'} and any(result[n] is None for n in ('captured_generation','captured_revision','held_by')):
+                raise ValueError('missing target capture')
+            if reason == 'unknown_job' and any(result[n] is not None for n in ('captured_generation','captured_revision','held_by')):
+                raise ValueError('fabricated unknown target')
+        raw = _batch_canonical(dict(op='target_authorize_result', protocol_version=2,
+            request_id=self.request_id, status='applied', readback_kind='authorization_receipt',
+            replayed=self.replayed, worker_epoch=self.worker_epoch, execution_effect='none', results=self.results), _MAX_TARGET_REPLY)
+        object.__setattr__(self, 'results', raw)
+        object.__setattr__(self, '_wire_reply', raw)
+
+    def to_record(self):
+        return _batch_decode(self._wire_reply)
+
+    @classmethod
+    def from_record(cls, record):
+        if (type(record) is not dict or set(record) != {'op','protocol_version','request_id','status',
+                'readback_kind','replayed','worker_epoch','execution_effect','results'}
+                or record['op'] != 'target_authorize_result' or type(record['protocol_version']) is not int
+                or record['protocol_version'] != 2 or record['status'] != 'applied'
+                or record['readback_kind'] != 'authorization_receipt' or record['execution_effect'] != 'none'):
+            raise ValueError('invalid target receipt')
+        return cls(record['request_id'], record['worker_epoch'], record['replayed'], record['results'])
+
+
+def target_authorize(socket_path: Path, command: TargetAuthorizeCommand) -> TargetAuthorizeResult:
+    deadline = time.monotonic() + 5.0
+    if type(command) is not TargetAuthorizeCommand: raise IPCError('target_request_invalid')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+            client.settimeout(max(0.001, deadline - time.monotonic()))
+            client.connect(str(_require_socket_path(socket_path)))
+            client.settimeout(max(0.001, deadline - time.monotonic()))
+            client.sendall(_TARGET_PREAMBLE + len(command._wire_request).to_bytes(4,'big') + command._wire_request)
+            client.shutdown(socket.SHUT_WR)
+            if _batch_read_exact(client, 5, deadline) != _TARGET_PREAMBLE: raise ValueError('wrong target preamble')
+            record = _batch_decode(_batch_read_body(client, deadline, _MAX_TARGET_REPLY))
+        except (OSError, TimeoutError): raise IPCError('ipc_unavailable') from None
+        except (TypeError, ValueError, RecursionError): raise IPCError('ipc_response_invalid') from None
+    if type(record) is dict and set(record) == {'error'} and type(record['error']) is str and record['error'] in _TARGET_ERRORS:
+        raise IPCError(record['error'])
+    try:
+        result = TargetAuthorizeResult.from_record(record)
+        if result.request_id != command.request_id: raise ValueError('target reply identity changed')
         return result
     except (TypeError, ValueError): raise IPCError('ipc_response_invalid') from None
 
@@ -1368,6 +1517,7 @@ class HealthServer:
         job_control: Callable[[JobControlCommand], JobControlResult] | None = None,
         job_add: Callable[[JobAddCommand], JobAddResult] | None = None,
         add_batch: Callable[[AddBatchCommand], AddBatchResult] | None = None,
+        target_authorize: Callable[[TargetAuthorizeCommand], TargetAuthorizeResult] | None = None,
         direct_engine_activate: Callable[
             [DirectEngineActivateCommand], DirectEngineActivateResult
         ]
@@ -1390,6 +1540,8 @@ class HealthServer:
             raise TypeError("job_add must be callable")
         if add_batch is not None and not callable(add_batch):
             raise TypeError('add_batch must be callable')
+        if target_authorize is not None and not callable(target_authorize):
+            raise TypeError('target_authorize must be callable')
         if direct_engine_activate is not None and not callable(direct_engine_activate):
             raise TypeError("direct_engine_activate must be callable")
         if direct_job_dispatch is not None and not callable(direct_job_dispatch):
@@ -1419,6 +1571,7 @@ class HealthServer:
         self._job_control = job_control
         self._job_add = job_add
         self._add_batch = add_batch
+        self._target_authorize = target_authorize
         self._direct_engine_activate = direct_engine_activate
         self._direct_job_dispatch = direct_job_dispatch
         self._listener = listener
@@ -1441,7 +1594,14 @@ class HealthServer:
             except (OSError, TimeoutError):
                 return
             if first == b'H':
-                self._serve_add_batch(connection, deadline)
+                try:
+                    preamble = b'H' + _batch_read_exact(connection, 4, deadline)
+                except (OSError, TimeoutError, ValueError):
+                    preamble = b''
+                if preamble == _TARGET_PREAMBLE:
+                    self._serve_target_authorize(connection, deadline)
+                else:
+                    self._serve_add_batch(connection, deadline, preamble)
                 return
             payload = _read_line(connection, initial=first)
             request = _decode_request(payload)
@@ -1556,9 +1716,9 @@ class HealthServer:
             except (OSError, TimeoutError):
                 return
 
-    def _serve_add_batch(self, connection, deadline):
+    def _serve_add_batch(self, connection, deadline, preamble):
         try:
-            if b'H' + _batch_read_exact(connection, 4, deadline) != _BATCH_PREAMBLE:
+            if preamble != _BATCH_PREAMBLE:
                 raise ValueError('invalid batch preamble')
             command = AddBatchCommand.from_record(_batch_decode(
                 _batch_read_body(connection, deadline, _MAX_BATCH_BODY)))
@@ -1584,6 +1744,29 @@ class HealthServer:
             connection.settimeout(0.2)
             connection.sendall(_batch_frame(payload))
         except (OSError, TimeoutError):
+            return
+
+    def _serve_target_authorize(self, connection, deadline):
+        try:
+            command = TargetAuthorizeCommand.from_record(_batch_decode(
+                _batch_read_body(connection, deadline, _MAX_TARGET_BODY)))
+        except (OSError, TimeoutError, TypeError, ValueError, RecursionError) as error:
+            record = {'error': 'unsupported_selection_size' if str(error) == 'unsupported_selection_size' else 'target_request_invalid'}
+        else:
+            try:
+                if self._target_authorize is None: raise IPCError('target_request_invalid')
+                result = self._target_authorize(command)
+                if type(result) is not TargetAuthorizeResult: raise ValueError('invalid target callback')
+                record = result.to_record()
+            except IPCError as error:
+                record = {'error': str(error) if str(error) in _TARGET_ERRORS else 'target_authority_corrupt'}
+            except Exception:
+                record = {'error': 'target_authority_corrupt'}
+        try:
+            payload = _batch_canonical(record, _MAX_TARGET_REPLY)
+            connection.settimeout(0.2)
+            connection.sendall(_TARGET_PREAMBLE + len(payload).to_bytes(4, 'big') + payload)
+        except (OSError, TimeoutError, TypeError, ValueError):
             return
 
     def close(self) -> None:

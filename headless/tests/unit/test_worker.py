@@ -744,7 +744,7 @@ def test_certified_serving_reads_complete_schema16_without_history_effects(short
         assert json.loads(record)['schema'] == 1
         with sqlite3.connect((root / 'state.db').as_uri() + '?mode=ro', uri=True) as connection:
             before = tuple(connection.iterdump())
-            assert connection.execute('PRAGMA user_version').fetchone()[0] == 17
+            assert connection.execute('PRAGMA user_version').fetchone()[0] == 18
             assert connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
             assert connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
         certificate = ownership.preflight(root)
@@ -780,7 +780,7 @@ def test_schema16_certificate_refuses_before_lease_bootstrap_and_reclaim(short_s
         assert readback.database_identity == (database_details.st_dev, database_details.st_ino)
         with sqlite3.connect(root / 'state.db') as connection:
             if fault == 'newer':
-                connection.execute('PRAGMA user_version=18')
+                connection.execute('PRAGMA user_version=19')
             elif fault.endswith('archive'):
                 connection.execute('DROP TABLE closed_direct_publication_attempts')
                 if fault == 'malformed-archive':

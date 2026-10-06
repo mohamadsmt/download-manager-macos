@@ -25,7 +25,7 @@ from hermes_downloads.models import (
 )
 from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.ipc import (AddBatchCommand, AddBatchResult, AddBatchEntryResult,
-    JobControlCommand, _batch_entry, _batch_canonical, _batch_decode, _batch_collection_id,
+    JobControlCommand, JobAddCommand, TargetAuthorizeCommand, TargetAuthorizeResult, _batch_entry, _batch_canonical, _batch_decode, _batch_collection_id,
     _batch_component, _MAX_BATCH_REPLY)
 from hermes_downloads.network import validate_source_url, SourcePolicyError
 from hermes_downloads.retry import (
@@ -471,7 +471,7 @@ CREATE TABLE closed_direct_publication_attempts (
     pending_request_id TEXT CHECK (pending_request_id IS NULL)
 );
 """
-_SUPPORTED_SCHEMA_VERSION: Final = 17
+_SUPPORTED_SCHEMA_VERSION: Final = 18
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -700,12 +700,125 @@ CREATE TABLE add_batch_entries (
 _V17_TABLE_SCHEMAS: Final = dict(_V16_TABLE_SCHEMAS,
     **_expected_table_schemas(_V17_COMMAND_RECEIPTS_SCHEMA,
         _ADD_BATCH_COMMANDS_SCHEMA, _ADD_BATCH_ENTRIES_SCHEMA))
+_V18_COMMAND_RECEIPTS_SCHEMA: Final = _V17_COMMAND_RECEIPTS_SCHEMA.replace(
+    "'add_batch_entry'))", "'add_batch_entry', 'target_authorize'))").replace(
+    "OR (scope = 'add_batch_entry' AND action = 'add_batch_entry')",
+    "OR (scope = 'add_batch_entry' AND action = 'add_batch_entry')\n        OR (scope = 'target_authorize' AND action = 'target_authorize')")
+_TARGET_COMMANDS_SCHEMA: Final = """
+CREATE TABLE target_commands (
+    request_id TEXT PRIMARY KEY NOT NULL REFERENCES command_receipts(request_id),
+    payload_digest TEXT NOT NULL CHECK (length(payload_digest)=64 AND payload_digest NOT GLOB '*[^0-9a-f]*'),
+    action TEXT NOT NULL CHECK (action IN ('start','resume','start_now')),
+    worker_epoch INTEGER NOT NULL CHECK (worker_epoch>0),
+    captured_at_us INTEGER NOT NULL CHECK (captured_at_us>=0),
+    member_count INTEGER NOT NULL CHECK (member_count BETWEEN 1 AND 500),
+    command_blob BLOB NOT NULL CHECK (length(command_blob) BETWEEN 1 AND 131072),
+    receipt_blob BLOB NOT NULL CHECK (length(receipt_blob) BETWEEN 1 AND 262144),
+    vector_digest TEXT NOT NULL CHECK (length(vector_digest)=64 AND vector_digest NOT GLOB '*[^0-9a-f]*')
+) STRICT;
+"""
+_TARGET_MEMBERS_SCHEMA: Final = """
+CREATE TABLE target_members (
+    request_id TEXT NOT NULL REFERENCES target_commands(request_id) DEFERRABLE INITIALLY DEFERRED,
+    target_index INTEGER NOT NULL CHECK (target_index BETWEEN 0 AND 499),
+    job_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('new_authority','existing_authority','blocked','stale')),
+    reason TEXT CHECK (reason IN ('unknown_job','legacy_kind','terminal','busy','incompatible_authority','stale_revision')),
+    creation_kind TEXT CHECK (creation_kind IN ('single','batch')),
+    creation_request_id TEXT,
+    creation_payload_digest TEXT,
+    creation_index INTEGER CHECK (creation_index BETWEEN 0 AND 499),
+    creation_child_request_id TEXT,
+    creation_child_payload_digest TEXT,
+    creation_audit_id INTEGER REFERENCES events(event_id),
+    creation_generation INTEGER CHECK (creation_generation>=0),
+    creation_revision INTEGER CHECK (creation_revision>=0),
+    creation_seal TEXT,
+    reservation_claim_token TEXT,
+    immutable_identity_digest TEXT,
+    captured_audit_id INTEGER REFERENCES events(event_id),
+    captured_generation INTEGER CHECK (captured_generation>=0),
+    captured_revision INTEGER CHECK (captured_revision>=0),
+    captured_state TEXT,
+    captured_authorized INTEGER CHECK (captured_authorized IN (0,1)),
+    captured_manual_hold INTEGER CHECK (captured_manual_hold IN (0,1)),
+    captured_start_now_requested INTEGER CHECK (captured_start_now_requested IN (0,1)),
+    round_generation INTEGER CHECK (round_generation>0),
+    owner_request_id TEXT,
+    owner_target_index INTEGER CHECK (owner_target_index BETWEEN 0 AND 499),
+    intent_audit_id INTEGER UNIQUE REFERENCES events(event_id),
+    intent_generation INTEGER CHECK (intent_generation>=0),
+    intent_revision INTEGER CHECK (intent_revision>=0),
+    intent_state TEXT,
+    intent_authorized INTEGER CHECK (intent_authorized IN (0,1)),
+    intent_manual_hold INTEGER CHECK (intent_manual_hold IN (0,1)),
+    intent_start_now_requested INTEGER CHECK (intent_start_now_requested IN (0,1)),
+    preserved_publication_attempt_id TEXT,
+    held_mask INTEGER CHECK (held_mask BETWEEN 0 AND 15),
+    PRIMARY KEY (request_id,target_index),
+    UNIQUE (request_id,job_id),
+    FOREIGN KEY (creation_kind,creation_request_id,round_generation)
+        REFERENCES authorization_rounds(cohort_kind,cohort_request_id,round_generation) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (owner_request_id,owner_target_index)
+        REFERENCES target_members(request_id,target_index) DEFERRABLE INITIALLY DEFERRED,
+    CHECK ((outcome IN ('new_authority','existing_authority') AND reason IS NULL AND round_generation IS NOT NULL
+            AND owner_request_id IS NOT NULL AND owner_target_index IS NOT NULL AND creation_kind IS NOT NULL
+            AND captured_audit_id IS NOT NULL AND held_mask IS NOT NULL)
+        OR (outcome IN ('blocked','stale') AND reason IS NOT NULL AND round_generation IS NULL
+            AND owner_request_id IS NULL AND owner_target_index IS NULL AND intent_audit_id IS NULL)),
+    CHECK ((intent_audit_id IS NULL AND intent_generation IS NULL AND intent_revision IS NULL AND intent_state IS NULL
+            AND intent_authorized IS NULL AND intent_manual_hold IS NULL AND intent_start_now_requested IS NULL)
+        OR (intent_audit_id IS NOT NULL AND intent_generation IS NOT NULL AND intent_revision IS NOT NULL AND intent_state IS NOT NULL
+            AND intent_authorized IS NOT NULL AND intent_manual_hold IS NOT NULL AND intent_start_now_requested IS NOT NULL))
+) STRICT;
+"""
+_AUTHORIZATION_ROUNDS_SCHEMA: Final = """
+CREATE TABLE authorization_rounds (
+    cohort_kind TEXT NOT NULL CHECK (cohort_kind IN ('single','batch')),
+    cohort_request_id TEXT NOT NULL,
+    round_generation INTEGER NOT NULL CHECK (round_generation>0),
+    origin_request_id TEXT NOT NULL REFERENCES target_commands(request_id) DEFERRABLE INITIALLY DEFERRED,
+    member_count INTEGER NOT NULL CHECK (member_count BETWEEN 1 AND 500),
+    vector_digest TEXT NOT NULL CHECK (length(vector_digest)=64 AND vector_digest NOT GLOB '*[^0-9a-f]*'),
+    status TEXT NOT NULL CHECK (status IN ('open','terminal')),
+    PRIMARY KEY (cohort_kind,cohort_request_id,round_generation)
+) STRICT;
+"""
+_JOB_AUTHORIZATION_HEADS_SCHEMA: Final = """
+CREATE TABLE job_authorization_heads (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(job_id),
+    owner_request_id TEXT NOT NULL,
+    owner_target_index INTEGER NOT NULL CHECK (owner_target_index BETWEEN 0 AND 499),
+    activation_request_id TEXT NOT NULL,
+    cohort_kind TEXT NOT NULL CHECK (cohort_kind IN ('single','batch')),
+    cohort_request_id TEXT NOT NULL,
+    round_generation INTEGER NOT NULL CHECK (round_generation>0),
+    current_audit_id INTEGER NOT NULL REFERENCES events(event_id),
+    current_generation INTEGER NOT NULL CHECK (current_generation>=0),
+    current_revision INTEGER NOT NULL CHECK (current_revision>=0),
+    current_state TEXT NOT NULL,
+    current_worker_epoch INTEGER NOT NULL CHECK (current_worker_epoch>0),
+    intent_status TEXT NOT NULL CHECK (intent_status IN ('current','inactive','terminal')),
+    last_admission_serial INTEGER NOT NULL CHECK (last_admission_serial>=0),
+    FOREIGN KEY (owner_request_id,owner_target_index) REFERENCES target_members(request_id,target_index) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (activation_request_id,job_id) REFERENCES target_members(request_id,job_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (cohort_kind,cohort_request_id,round_generation)
+        REFERENCES authorization_rounds(cohort_kind,cohort_request_id,round_generation) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+"""
+_V18_TABLE_SCHEMAS: Final = dict(_V17_TABLE_SCHEMAS,
+    **_expected_table_schemas(_V18_COMMAND_RECEIPTS_SCHEMA, _TARGET_COMMANDS_SCHEMA,
+        _TARGET_MEMBERS_SCHEMA, _AUTHORIZATION_ROUNDS_SCHEMA, _JOB_AUTHORIZATION_HEADS_SCHEMA))
+# SQLite preserves the final name quoted after the FK-safe temporary-table rename.
+_V18_TABLE_SCHEMAS['command_receipts'] = _V18_TABLE_SCHEMAS['command_receipts'].replace(
+    'CREATE TABLE COMMAND_RECEIPTS', 'CREATE TABLE "COMMAND_RECEIPTS"', 1)
+
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _DIRECT_ENGINE_RECOVERY_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _QUEUE_GATES: Final = frozenset({"paused", "running"})
 _JOB_CONTROL_ACTIONS: Final = frozenset({"pause", "resume", "start_now", "remove"})
-_COMMAND_RECEIPT_SCOPES: Final = frozenset({"add", "queue_gate", "job_control", "add_batch", "add_batch_entry"})
+_COMMAND_RECEIPT_SCOPES: Final = frozenset({"add", "queue_gate", "job_control", "add_batch", "add_batch_entry", "target_authorize"})
 _ADD_COMMAND_SCOPE: Final = "add"
 _ADD_COMMAND_ACTION: Final = "add"
 _QUEUE_GATE_COMMAND_SCOPE: Final = "queue_gate"
@@ -791,7 +904,7 @@ def _require_command_receipt_action(scope: str, value: object) -> str:
         (scope == _ADD_COMMAND_SCOPE and value == _ADD_COMMAND_ACTION)
         or (scope == _QUEUE_GATE_COMMAND_SCOPE and value == _QUEUE_GATE_COMMAND_ACTION)
         or (scope == _JOB_CONTROL_COMMAND_SCOPE and value in _JOB_CONTROL_ACTIONS)
-        or (scope in {'add_batch', 'add_batch_entry'} and value == scope)
+        or (scope in {'add_batch', 'add_batch_entry', 'target_authorize'} and value == scope)
     ):
         return value
     raise ValueError("persisted command receipt action is invalid")
@@ -1272,6 +1385,68 @@ class _BatchCreationIntent:
     expected_sha256: str | None = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _TargetCreationOrigin:
+    kind: str
+    job: MaterializedJob | None = None
+    reservation: PublicationReservation | None = None
+    request_id: str | None = None
+    payload_digest: str | None = None
+    index: int | None = None
+    audit_id: int | None = None
+    generation: int | None = None
+    revision: int | None = None
+    seal: str | None = None
+    batch: _BatchCreationIntent | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _TargetAuthorization:
+    job_id: str
+    owner_request_id: str
+    owner_target_index: int
+    activation_request_id: str
+    cohort_kind: str
+    cohort_request_id: str
+    round_generation: int
+    current_audit_id: int
+    current_generation: int
+    current_revision: int
+    current_state: str
+    current_worker_epoch: int
+    intent_status: str
+    last_admission_serial: int
+
+
+_TARGET_MEMBER_COLUMNS: Final = tuple("""request_id target_index job_id outcome reason creation_kind creation_request_id
+creation_payload_digest creation_index creation_child_request_id creation_child_payload_digest creation_audit_id
+creation_generation creation_revision creation_seal reservation_claim_token immutable_identity_digest
+captured_audit_id captured_generation captured_revision captured_state captured_authorized captured_manual_hold
+captured_start_now_requested round_generation owner_request_id owner_target_index intent_audit_id intent_generation
+intent_revision intent_state intent_authorized intent_manual_hold intent_start_now_requested
+preserved_publication_attempt_id held_mask""".split())
+_TARGET_CREATION_COLUMNS: Final = _TARGET_MEMBER_COLUMNS[5:17]
+_TARGET_CAPTURE_COLUMNS: Final = _TARGET_MEMBER_COLUMNS[17:24]
+_TARGET_INTENT_COLUMNS: Final = _TARGET_MEMBER_COLUMNS[27:34]
+
+
+def _target_vector_digest(members, columns=_TARGET_MEMBER_COLUMNS):
+    digest = hashlib.sha256(b'[')
+    for index, member in enumerate(members):
+        if index: digest.update(b',')
+        digest.update(_batch_canonical([member[name] for name in columns], 16384))
+    digest.update(b']')
+    return digest.hexdigest()
+
+
+def _target_result(member):
+    held = member['held_mask']
+    return dict(index=member['target_index'], job=member['job_id'], outcome=member['outcome'],
+        reason=member['reason'], round_generation=member['round_generation'],
+        captured_generation=member['captured_generation'], captured_revision=member['captured_revision'],
+        held_by=None if held is None else [gate for bit, gate in enumerate(('global','collection','manual','not_due')) if held & (1 << bit)])
+
+
 class _BatchEntryBlocked(ValueError):
     """Only these explicitly detected domain outcomes may survive a savepoint."""
 
@@ -1348,6 +1523,7 @@ class SQLiteStore:
             15: _V15_TABLE_SCHEMAS,
             16: _V16_TABLE_SCHEMAS,
             17: _V17_TABLE_SCHEMAS,
+            18: _V18_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -1381,6 +1557,9 @@ class SQLiteStore:
     def _migrate_schema_v15(connection: sqlite3.Connection) -> None:
         """Bootstrap v1 then apply additive v2 through v15 migrations atomically."""
 
+        if connection.execute('PRAGMA foreign_keys').fetchone()[0] != 1:
+            raise RuntimeError('migration requires enabled foreign keys')
+        connection.execute('PRAGMA foreign_keys = OFF')
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("PRAGMA user_version").fetchone()
@@ -1541,8 +1720,23 @@ class SQLiteStore:
                 connection.execute(_ADD_BATCH_ENTRIES_SCHEMA)
                 connection.execute('PRAGMA user_version = 17')
                 version = 17
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 17:
                 if not SQLiteStore._has_table_schemas(connection, _V17_TABLE_SCHEMAS):
+                    raise RuntimeError('database schema version is incomplete')
+                for row in connection.execute('SELECT request_id FROM command_receipts').fetchall():
+                    SQLiteStore._read_command_receipt(connection, row[0])
+                connection.execute(_V18_COMMAND_RECEIPTS_SCHEMA.replace('CREATE TABLE command_receipts', 'CREATE TABLE target_registry_v18', 1))
+                connection.execute('INSERT INTO target_registry_v18 SELECT * FROM command_receipts')
+                connection.execute('DROP TABLE command_receipts')
+                connection.execute('ALTER TABLE target_registry_v18 RENAME TO command_receipts')
+                for ddl in (_TARGET_COMMANDS_SCHEMA, _TARGET_MEMBERS_SCHEMA, _AUTHORIZATION_ROUNDS_SCHEMA, _JOB_AUTHORIZATION_HEADS_SCHEMA):
+                    connection.execute(ddl)
+                if connection.execute('PRAGMA foreign_key_check').fetchone() is not None:
+                    raise RuntimeError('migration foreign key violation')
+                connection.execute('PRAGMA user_version = 18')
+                version = 18
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V18_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1553,6 +1747,11 @@ class SQLiteStore:
             except BaseException:
                 pass
             raise
+
+        finally:
+            connection.execute('PRAGMA foreign_keys = ON')
+            if connection.execute('PRAGMA foreign_keys').fetchone()[0] != 1:
+                raise RuntimeError('migration foreign key restoration failed')
 
     @staticmethod
     def _backfill_command_receipts(connection: sqlite3.Connection) -> None:
@@ -1698,10 +1897,12 @@ class SQLiteStore:
                 SELECT request_id FROM add_batch_commands WHERE request_id = ?
                 UNION ALL
                 SELECT child_request_id FROM add_batch_entries WHERE child_request_id = ?
+                UNION ALL
+                SELECT request_id FROM target_commands WHERE request_id = ?
             )
             LIMIT 1
             """,
-            (request_id, request_id, request_id, request_id, request_id, request_id),
+            (request_id, request_id, request_id, request_id, request_id, request_id, request_id),
         ).fetchone()
         if row is not None:
             raise RuntimeError("command receipt registry is incomplete")
@@ -1905,7 +2106,8 @@ class SQLiteStore:
         except Exception:
             raise RuntimeError('batch_state_invalid') from None
 
-    def _read_batch(self, parent_id):
+    def _read_batch(self, parent_id, parent_cache=None):
+        if parent_cache is None: parent_cache = {}
         connection = self._connection
         rows = connection.execute('SELECT * FROM add_batch_commands WHERE request_id=? LIMIT 2', (parent_id,)).fetchall()
         if len(rows) != 1: raise ValueError('batch parent missing')
@@ -1936,10 +2138,10 @@ class SQLiteStore:
                 if row['creation_intent_blob'] is not None or row['creation_intent_digest'] is not None:
                     raise ValueError('batch rejection has intent authority')
             else:
-                intents[item.job] = self._read_batch_creation(row, parent_id, digest)
+                intents[item.job] = self._read_batch_creation(row, parent_id, digest, parent_cache)
         return AddBatchResult(parent_id, True, original.results), intents
 
-    def _read_batch_creation(self, row, parent_id, parent_digest):
+    def _read_batch_creation(self, row, parent_id, parent_digest, parent_cache=None):
         connection = self._connection
         blob = row['creation_intent_blob']; seal = row['creation_intent_digest']
         if type(blob) is not bytes or not 1 <= len(blob) <= 40960: raise ValueError('batch intent invalid')
@@ -2001,7 +2203,7 @@ class SQLiteStore:
             raise ValueError('batch reservation changed')
         captured = _BatchCreationIntent(parent_id, parent_digest, row['entry_index'], audit_id, seal,
             original, reservation, entry['expected_sha256'])
-        self._validate_batch_lifecycle(captured, current)
+        self._validate_batch_lifecycle(captured, current, parent_cache)
         return captured
 
     def get_batch_creation_intent(self, job_id: str) -> _BatchCreationIntent | None:
@@ -2012,33 +2214,554 @@ class SQLiteStore:
             with self._batch_budget():
                 connection.execute('BEGIN')
                 try:
-                    links = connection.execute('SELECT parent_request_id FROM add_batch_entries WHERE job_id=? LIMIT 2', (job_id,)).fetchall()
-                    commands = connection.execute('SELECT request_id,payload_digest,job_id,generation,revision FROM commands WHERE job_id=? LIMIT 2', (job_id,)).fetchall()
-                    if links:
-                        if len(links) != 1: raise ValueError('batch job link invalid')
-                        _, intents = self._read_batch(links[0][0])
-                        if job_id not in intents: raise ValueError('batch accepted link missing')
-                        return intents[job_id]
-                    if not commands:
-                        if connection.execute('SELECT 1 FROM jobs WHERE job_id=?', (job_id,)).fetchone() is not None or connection.execute('SELECT 1 FROM events WHERE job_id=?', (job_id,)).fetchone() is not None:
-                            raise ValueError('creation provenance missing')
-                        return None
-                    if len(commands) != 1: raise ValueError('creation provenance not unique')
-                    command = commands[0]
-                    request = _require_identifier(command['request_id'], 'legacy request')
-                    digest = _require_payload_digest(command['payload_digest'])
-                    if self._read_command_receipt(connection, request) != (digest, 'add', 'add'):
-                        raise ValueError('batch child link missing')
-                    generation = _require_counter(command['generation'], 'legacy generation')
-                    revision = _require_counter(command['revision'], 'legacy revision')
-                    added = connection.execute("SELECT event_id,generation,revision FROM events WHERE job_id=? AND kind='job_added' LIMIT 2", (job_id,)).fetchall()
-                    if len(added) != 1 or tuple(added[0])[1:] != (generation, revision) or type(added[0][0]) is not int or added[0][0] < 1 or self.get_job(job_id) is None:
-                        raise ValueError('legacy creation provenance invalid')
-                    return None
+                    origin = self._read_creation_origin(connection, job_id, {}, target=False)
+                    return origin.batch if origin.kind == 'batch' else None
                 finally:
                     connection.rollback()
         except Exception:
             raise RuntimeError('batch_state_invalid') from None
+
+    def _read_creation_origin(self, connection, job_id, parent_cache, *, target=True):
+        """Qualify original creation inside the caller's transaction and budget."""
+        links = connection.execute('SELECT parent_request_id FROM add_batch_entries WHERE job_id=? LIMIT 2', (job_id,)).fetchall()
+        commands = connection.execute('SELECT request_id,payload_digest,job_id,generation,revision FROM commands WHERE job_id=? LIMIT 2', (job_id,)).fetchall()
+        if links:
+            if len(links) != 1: raise ValueError('batch job link invalid')
+            parent = links[0][0]
+            if parent not in parent_cache: parent_cache[parent] = self._read_batch(parent, parent_cache)
+            _, intents = parent_cache[parent]
+            if job_id not in intents: raise ValueError('batch accepted link missing')
+            captured = intents[job_id]
+            return _TargetCreationOrigin('batch', captured.original_job, captured.reservation,
+                captured.parent_request_id, captured.parent_payload_digest, captured.index,
+                captured.audit_id, captured.original_job.intent.generation, captured.original_job.intent.revision,
+                captured.seal, captured)
+        if not commands:
+            for table in ('jobs','events','materialized_jobs','publication_reservations','target_members','job_authorization_heads'):
+                if connection.execute(f'SELECT 1 FROM {table} WHERE job_id=? LIMIT 1', (job_id,)).fetchone() is not None:
+                    raise ValueError('creation provenance missing')
+            return _TargetCreationOrigin('unknown')
+        if len(commands) != 1: raise ValueError('creation provenance not unique')
+        command = commands[0]
+        request = _require_identifier(command['request_id'], 'single request')
+        digest = _require_payload_digest(command['payload_digest'])
+        generation = _require_counter(command['generation'], 'single generation')
+        revision = _require_counter(command['revision'], 'single revision')
+        if self._read_command_receipt(connection, request) != (digest, 'add', 'add'):
+            raise ValueError('single registry changed')
+        added = connection.execute("SELECT event_id,generation,revision FROM events WHERE job_id=? AND kind='job_added' LIMIT 2", (job_id,)).fetchall()
+        if (len(added) != 1 or tuple(added[0])[1:] != (generation,revision)
+                or type(added[0][0]) is not int or added[0][0] < 1 or self.get_job(job_id) is None):
+            raise ValueError('single creation audit changed')
+        if not target:
+            return _TargetCreationOrigin('unsupported_single',request_id=request,payload_digest=digest,
+                index=0,audit_id=added[0][0],generation=generation,revision=revision)
+        job = self.get_materialized_job(job_id)
+        if job is None:
+            return _TargetCreationOrigin('unsupported_single', request_id=request, payload_digest=digest,
+                index=0, audit_id=added[0][0], generation=generation, revision=revision)
+        reservation = self._read_publication_reservation(connection, job_id)
+        if reservation is None: raise ValueError('single reservation missing')
+        origin = _TargetCreationOrigin('unsupported_single', job, reservation, request, digest, 0,
+            added[0][0], generation, revision)
+        if job.source_kind is not SourceKind.DIRECT: return origin
+        source = validate_source_url(job.intent.source_url.decode('utf-8'))
+        if source.raw_url != job.intent.source_url: raise ValueError('single source changed')
+        if (job.queue_collection_id is not None or job.destination_collection is not None
+                or job.scheduled_for is not None or job.intent.expected_revision is not None):
+            return origin
+        typed = JobAddCommand(job_id, request, job.intent.source_url.decode('utf-8'), job.priority,
+            job.order_key, job.category, job.partial_filename, job.selected_final_filename)
+        if typed.payload_digest != digest: raise ValueError('single typed digest changed')
+        latest = self._target_latest(connection, job_id)
+        current = self._read_job_control_projection(connection, job_id)
+        if (latest['generation'],latest['revision']) != (current.generation,current.revision):
+            raise ValueError('single current audit changed')
+        if current.generation < generation or current.revision < revision: raise ValueError('single chronology changed')
+        return replace(origin, kind='supported_single')
+
+    @staticmethod
+    def _target_latest(connection, job_id):
+        row = connection.execute('SELECT event_id,kind,generation,revision FROM events WHERE job_id=? ORDER BY event_id DESC LIMIT 1', (job_id,)).fetchone()
+        if row is None: raise ValueError('target audit missing')
+        for name in ('event_id','generation','revision'): _require_counter(row[name], name)
+        if row['event_id'] < 1: raise ValueError('target audit invalid')
+        _require_sqlite_text(row['kind'], 'target audit kind')
+        return row
+
+    def _target_creation_values(self, origin):
+        if origin.kind not in {'batch','supported_single','unsupported_single'} or origin.job is None or origin.reservation is None: return {}
+        job = origin.job
+        return dict(creation_kind='batch' if origin.kind == 'batch' else 'single',
+            creation_request_id=origin.request_id, creation_payload_digest=origin.payload_digest,
+            creation_index=origin.index, creation_child_request_id=job.intent.request_id,
+            creation_child_payload_digest=job.intent.payload_digest, creation_audit_id=origin.audit_id,
+            creation_generation=origin.generation, creation_revision=origin.revision, creation_seal=origin.seal,
+            reservation_claim_token=origin.reservation.claim_token,
+            immutable_identity_digest=self._publication_ownership(job, origin.reservation))
+
+    @staticmethod
+    def _target_transform(action, current, preserved):
+        state = current.state
+        if action in {'resume','start_now'} and state == 'paused' and not preserved: state = 'queued'
+        return replace(current, state=state, authorized=True,
+            manual_hold=current.manual_hold if action == 'start' else False,
+            start_now_requested=True if action == 'start_now' else current.start_now_requested)
+
+    def _read_target_command(self, connection, request_id, cache):
+        key = ('target', request_id)
+        if key in cache: return cache[key]
+        row = connection.execute('SELECT * FROM target_commands WHERE request_id=?', (request_id,)).fetchone()
+        if row is None: raise ValueError('target command missing')
+        for name in ('command_blob','receipt_blob'): _require_sqlite_blob(row[name], name)
+        command = TargetAuthorizeCommand.from_record(_batch_decode(row['command_blob']))
+        if (command._wire_request != row['command_blob'] or command.request_id != request_id
+                or command.payload_digest != row['payload_digest'] or command.action != row['action']
+                or command.expected_worker_epoch != row['worker_epoch']
+                or self._read_command_receipt(connection, request_id) != (command.payload_digest,'target_authorize','target_authorize')):
+            raise ValueError('target command seal changed')
+        _require_counter(row['captured_at_us'], 'target owner UTC')
+        result = TargetAuthorizeResult.from_record(_batch_decode(row['receipt_blob']))
+        if result._wire_reply != row['receipt_blob'] or result.replayed or result.request_id != request_id or result.worker_epoch != command.expected_worker_epoch:
+            raise ValueError('target original receipt changed')
+        members = [dict(m) for m in connection.execute('SELECT * FROM target_members WHERE request_id=? ORDER BY target_index', (request_id,))]
+        if type(row['member_count']) is not int or len(members) != row['member_count'] or not 1 <= len(members) <= 500:
+            raise ValueError('target member count changed')
+        if _target_vector_digest(members) != _require_payload_digest(row['vector_digest']): raise ValueError('target member seal changed')
+        selector = command.to_record()['selector']
+        if selector['kind'] == 'jobs' and len(selector['targets']) != len(members): raise ValueError('target selection changed')
+        for index, member in enumerate(members):
+            if tuple(member) != _TARGET_MEMBER_COLUMNS or member['request_id'] != request_id or type(member['target_index']) is not int or member['target_index'] != index:
+                raise ValueError('target indexed relation changed')
+            _require_identifier(member['job_id'], 'target job')
+            for name in ('creation_request_id','creation_child_request_id','owner_request_id','preserved_publication_attempt_id'):
+                if member[name] is not None: _require_identifier(member[name], name)
+            for name in ('creation_payload_digest','creation_child_payload_digest','creation_seal','reservation_claim_token','immutable_identity_digest'):
+                if member[name] is not None: _require_payload_digest(member[name])
+            for name in ('creation_index','creation_audit_id','creation_generation','creation_revision','captured_audit_id',
+                    'captured_generation','captured_revision','round_generation','owner_target_index','intent_audit_id','intent_generation','intent_revision','held_mask'):
+                if member[name] is not None: _require_counter(member[name], name)
+            for name in ('captured_authorized','captured_manual_hold','captured_start_now_requested','intent_authorized','intent_manual_hold','intent_start_now_requested'):
+                if member[name] is not None: _require_sqlite_boolean(member[name], name)
+            for name in ('captured_state','intent_state'):
+                if member[name] is not None: _require_public_job_state(member[name], name)
+            if member['held_mask'] is not None and member['held_mask'] > 15: raise ValueError('target gate mask invalid')
+            for columns in (_TARGET_CAPTURE_COLUMNS, _TARGET_INTENT_COLUMNS):
+                values = [member[n] for n in columns]
+                if any(v is None for v in values) and not all(v is None for v in values): raise ValueError('target partial scalar group')
+            creation = [member[n] for n in _TARGET_CREATION_COLUMNS if n != 'creation_seal']
+            if any(v is None for v in creation) and not all(v is None for v in creation): raise ValueError('target partial creation')
+            if member['creation_kind'] is None and member['creation_seal'] is not None:
+                raise ValueError('target orphan creation seal')
+            if member['creation_kind'] is not None:
+                if member['creation_kind'] not in {'single','batch'} or member['creation_index'] > 499 or member['creation_audit_id'] < 1:
+                    raise ValueError('target creation invalid')
+                if (member['creation_kind'] == 'single' and (member['creation_index'] != 0 or member['creation_seal'] is not None)) or (member['creation_kind'] == 'batch' and member['creation_seal'] is None):
+                    raise ValueError('target creation seal invalid')
+                audit = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?', (member['creation_audit_id'],)).fetchone()
+                if audit is None or tuple(audit) != ('job_added',member['job_id'],member['creation_generation'],member['creation_revision']):
+                    raise ValueError('target original audit changed')
+                original = connection.execute('SELECT request_id,payload_digest,job_id,generation,revision FROM commands WHERE request_id=?',
+                    (member['creation_child_request_id'],)).fetchone()
+                if original is None or tuple(original) != (member['creation_child_request_id'],member['creation_child_payload_digest'],
+                        member['job_id'],member['creation_generation'],member['creation_revision']):
+                    raise ValueError('target original command changed')
+                scope = 'add_batch_entry' if member['creation_kind']=='batch' else 'add'
+                if self._read_command_receipt(connection,member['creation_child_request_id']) != (member['creation_child_payload_digest'],scope,scope):
+                    raise ValueError('target original registry changed')
+                if member['creation_kind']=='batch':
+                    if self._read_command_receipt(connection,member['creation_request_id']) != (member['creation_payload_digest'],'add_batch','add_batch'):
+                        raise ValueError('target original parent registry changed')
+                    sealed = connection.execute('SELECT job_id,child_request_id,creation_intent_blob,creation_intent_digest FROM add_batch_entries WHERE parent_request_id=? AND entry_index=? AND status="applied"',
+                        (member['creation_request_id'],member['creation_index'])).fetchone()
+                    if (sealed is None or tuple(sealed)[:2] != (member['job_id'],member['creation_child_request_id'])
+                            or sealed['creation_intent_digest'] != member['creation_seal']
+                            or _batch_creation_seal(_require_sqlite_blob(sealed['creation_intent_blob'],'original target creation')) != member['creation_seal']):
+                        raise ValueError('target original batch seal changed')
+                elif (member['creation_request_id'],member['creation_payload_digest']) != (member['creation_child_request_id'],member['creation_child_payload_digest']):
+                    raise ValueError('target original single relation changed')
+                materialized = self.get_materialized_job(member['job_id'])
+                reservation = self._read_publication_reservation(connection,member['job_id'])
+                if (materialized is None or reservation is None or reservation.claim_token != member['reservation_claim_token']
+                        or self._publication_ownership(materialized,reservation) != member['immutable_identity_digest']):
+                    raise ValueError('target immutable creation changed')
+            if member['captured_audit_id'] is not None:
+                audit = connection.execute('SELECT job_id,generation,revision FROM events WHERE event_id=?', (member['captured_audit_id'],)).fetchone()
+                if audit is None or tuple(audit) != (member['job_id'],member['captured_generation'],member['captured_revision']):
+                    raise ValueError('target captured audit changed')
+            positive = member['outcome'] in {'new_authority','existing_authority'}
+            if positive:
+                if any(member[n] is None for n in (*_TARGET_CAPTURE_COLUMNS,'creation_kind','round_generation','owner_request_id','owner_target_index','held_mask')):
+                    raise ValueError('target authority incomplete')
+                if member['round_generation'] < 1 or member['owner_target_index'] > 499: raise ValueError('target round invalid')
+                owner = connection.execute('SELECT * FROM target_members WHERE request_id=? AND target_index=?', (member['owner_request_id'],member['owner_target_index'])).fetchone()
+                if owner is None or owner['outcome'] != 'new_authority' or owner['job_id'] != member['job_id'] or owner['round_generation'] != member['round_generation'] or any(owner[n] != member[n] for n in _TARGET_CREATION_COLUMNS):
+                    raise ValueError('target original owner changed')
+                if (owner['owner_request_id'],owner['owner_target_index']) != (owner['request_id'],owner['target_index']): raise ValueError('target owner cycle')
+                if member['outcome'] == 'new_authority' and (member['owner_request_id'],member['owner_target_index']) != (request_id,index):
+                    raise ValueError('target new owner changed')
+                current = _JobControlProjection(member['job_id'],member['captured_generation'],member['captured_revision'],member['captured_state'],
+                    bool(member['captured_authorized']),bool(member['captured_manual_hold']),bool(member['captured_start_now_requested']))
+                wanted = self._target_transform(command.action,current,member['preserved_publication_attempt_id'] is not None)
+                if member['intent_audit_id'] is None:
+                    if wanted != current: raise ValueError('target missing intent audit')
+                else:
+                    if member['intent_generation'] != current.generation or member['intent_revision'] != current.revision + 1:
+                        raise ValueError('target intent counters changed')
+                    if (member['intent_state'],member['intent_authorized'],member['intent_manual_hold'],member['intent_start_now_requested']) != (wanted.state,int(wanted.authorized),int(wanted.manual_hold),int(wanted.start_now_requested)):
+                        raise ValueError('target intent transform changed')
+                    if current.state not in {'queued','paused'} or wanted == current: raise ValueError('target unsafe intent')
+                    audit = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?', (member['intent_audit_id'],)).fetchone()
+                    if audit is None or tuple(audit) != ('job_target_authorized',member['job_id'],member['intent_generation'],member['intent_revision']):
+                        raise ValueError('target intent audit changed')
+                    predecessor = connection.execute('SELECT event_id FROM events WHERE job_id=? AND event_id<? ORDER BY event_id DESC LIMIT 1', (member['job_id'],member['intent_audit_id'])).fetchone()
+                    if predecessor is None or predecessor[0] != member['captured_audit_id']: raise ValueError('target predecessor changed')
+            elif any(member[n] is not None for n in ('round_generation','owner_request_id','owner_target_index',*_TARGET_INTENT_COLUMNS,'preserved_publication_attempt_id')):
+                raise ValueError('blocked target has authority')
+            if selector['kind'] == 'jobs':
+                expected = selector['targets'][index]
+                if expected['job'] != member['job_id']: raise ValueError('target ordered selector changed')
+                if positive and expected['expected_revision'] not in (None,member['captured_revision']): raise ValueError('target selected fence changed')
+            else:
+                creation = selector['creation']; indices = selector['indices']
+                if member['creation_kind'] is not None and (member['creation_kind'],member['creation_request_id']) != (creation['kind'],creation['request_id']):
+                    raise ValueError('target cohort selector changed')
+                if indices is not None and (len(indices) != len(members) or member['creation_index'] != indices[index]): raise ValueError('target selected positions changed')
+        if result.to_record()['results'] != [_target_result(m) for m in members]: raise ValueError('target receipt vector changed')
+        cache[key] = (command,result,members)
+        try:
+            for member in members:
+                if member['outcome'] in {'new_authority','existing_authority'}:
+                    self._target_round(connection,member,cache)
+                    if member['owner_request_id'] != request_id:
+                        self._read_target_command(connection,member['owner_request_id'],cache)
+        except Exception:
+            cache.pop(key,None)
+            raise
+        return cache[key]
+
+    def _target_round(self, connection, member, cache):
+        cohort = (member['creation_kind'],member['creation_request_id'])
+        generation = member['round_generation']; key = ('round',*cohort,generation)
+        if key in cache: return cache[key]
+        row = connection.execute('SELECT * FROM authorization_rounds WHERE cohort_kind=? AND cohort_request_id=? AND round_generation=?', (*cohort,generation)).fetchone()
+        if row is None or row['status'] not in {'open','terminal'}: raise ValueError('target round missing')
+        _require_identifier(row['origin_request_id'], 'round origin')
+        if row['origin_request_id'] != member['owner_request_id']: raise ValueError('target round owner changed')
+        selected = [dict(m) for m in connection.execute("SELECT * FROM target_members WHERE request_id=? AND creation_kind=? AND creation_request_id=? AND round_generation=? AND outcome='new_authority' ORDER BY target_index", (row['origin_request_id'],*cohort,generation))]
+        if type(row['member_count']) is not int or not 1 <= row['member_count'] <= 500 or len(selected) != row['member_count']:
+            raise ValueError('target round count changed')
+        if _target_vector_digest(selected,('request_id','target_index','job_id')) != _require_payload_digest(row['vector_digest']): raise ValueError('target round seal changed')
+        counter = self._target_counter(connection,cohort,cache)
+        if counter < generation: raise ValueError('target round exceeds cohort counter')
+        cache[key] = row
+        return row
+
+    def _target_counter(self, connection, cohort, cache):
+        key = ('counter',*cohort)
+        if key in cache: return cache[key]
+        name = 'authorization_round:' + hashlib.sha256(_batch_canonical(dict(kind=cohort[0],request_id=cohort[1]),512)).hexdigest()
+        row = connection.execute('SELECT key,value,revision FROM settings WHERE key=?', (name,)).fetchone()
+        if row is None:
+            if connection.execute('SELECT 1 FROM authorization_rounds WHERE cohort_kind=? AND cohort_request_id=? LIMIT 1',cohort).fetchone() is not None:
+                raise ValueError('target counter missing')
+            counter = 0
+        else:
+            counter = _require_counter(row['revision'],'cohort counter')
+            if counter < 1 or type(row['value']) is not str or row['value'] != str(counter) or row['key'] != name:
+                raise ValueError('target counter invalid')
+            last = connection.execute('SELECT origin_request_id FROM authorization_rounds WHERE cohort_kind=? AND cohort_request_id=? AND round_generation=?',(*cohort,counter)).fetchone()
+            if last is None: raise ValueError('target counter round missing')
+        cache[key] = counter
+        if counter:
+            try:
+                _,_,members = self._read_target_command(connection,last['origin_request_id'],cache)
+                selected = [m for m in members if m['outcome']=='new_authority'
+                    and (m['creation_kind'],m['creation_request_id'],m['round_generation']) == (*cohort,counter)]
+                if not selected: raise ValueError('target counter causal members missing')
+                self._target_round(connection,selected[0],cache)
+            except Exception:
+                cache.pop(key,None)
+                raise
+        return counter
+
+    def _target_managed(self, connection, job_id, cache):
+        member = connection.execute("SELECT request_id FROM target_members WHERE job_id=? AND outcome IN ('new_authority','existing_authority') LIMIT 1", (job_id,)).fetchone()
+        if member is None:
+            if connection.execute('SELECT 1 FROM job_authorization_heads WHERE job_id=?', (job_id,)).fetchone() is not None:
+                raise ValueError('target head without membership')
+            return False
+        self._read_target_command(connection,member[0],cache)
+        return True
+
+    def _read_target_head(self, connection, job_id, origin, cache, *, epoch=None):
+        managed = self._target_managed(connection,job_id,cache)
+        row = connection.execute('SELECT * FROM job_authorization_heads WHERE job_id=?', (job_id,)).fetchone()
+        if not managed: return None
+        if row is None: raise ValueError('upgraded target head missing')
+        head = _TargetAuthorization(**dict(row))
+        for name in ('job_id','owner_request_id','activation_request_id','cohort_request_id'): _require_identifier(getattr(head,name), name)
+        for name in ('owner_target_index','round_generation','current_audit_id','current_generation','current_revision','current_worker_epoch','last_admission_serial'):
+            _require_counter(getattr(head,name), name)
+        if head.owner_target_index > 499 or head.round_generation < 1 or head.current_audit_id < 1 or head.current_worker_epoch < 1:
+            raise ValueError('target head counter invalid')
+        if head.intent_status not in {'current','inactive','terminal'}: raise ValueError('target head status invalid')
+        current = self._read_job_control_projection(connection,job_id); latest = self._target_latest(connection,job_id)
+        epoch = self._current_worker_epoch(connection) if epoch is None else epoch
+        if (head.current_generation,head.current_revision,head.current_state,head.current_audit_id,head.current_worker_epoch) != (current.generation,current.revision,current.state,latest['event_id'],epoch):
+            raise ValueError('target head current fence changed')
+        owner_command,_,owners = self._read_target_command(connection,head.owner_request_id,cache)
+        if head.owner_target_index >= len(owners): raise ValueError('target owner missing')
+        owner = owners[head.owner_target_index]
+        activation_command,_,activations = self._read_target_command(connection,head.activation_request_id,cache)
+        activated = [m for m in activations if m['job_id'] == job_id]
+        if len(activated) != 1: raise ValueError('target activation missing')
+        activation = activated[0]
+        expected_creation = self._target_creation_values(origin)
+        if (not expected_creation or owner['outcome'] != 'new_authority' or activation['outcome'] not in {'new_authority','existing_authority'}
+                or owner['job_id'] != job_id or any(owner[n] != v or activation[n] != v for n,v in expected_creation.items())
+                or (head.cohort_kind,head.cohort_request_id,head.round_generation) != (owner['creation_kind'],owner['creation_request_id'],owner['round_generation'])
+                or (activation['owner_request_id'],activation['owner_target_index'],activation['round_generation']) != (head.owner_request_id,head.owner_target_index,head.round_generation)):
+            raise ValueError('target head original authority changed')
+        if head.intent_status == 'current' and activation_command.expected_worker_epoch != epoch:
+            raise ValueError('target current activation epoch changed')
+        prefix = 'intent' if activation['intent_audit_id'] is not None else 'captured'
+        generation,revision,state = (activation[prefix+'_'+n] for n in ('generation','revision','state'))
+        flags = tuple(bool(activation[prefix+'_'+n]) for n in ('authorized','manual_hold','start_now_requested'))
+        last = activation[prefix+'_audit_id']
+        cold_successors = 0
+        for audit in connection.execute('SELECT event_id,kind,generation,revision FROM events WHERE job_id=? AND event_id>? ORDER BY event_id', (job_id,last)):
+            if audit['revision'] != revision + 1: raise ValueError('target head audit gap')
+            if audit['generation'] == generation + 1 and audit['kind'] == 'job_paused':
+                if state not in _RECOVERABLE_COLD_START_STATES: raise ValueError('target cold predecessor changed')
+                state = 'paused'; cold_successors += 1
+            elif audit['generation'] != generation: raise ValueError('target head generation changed')
+            elif audit['kind'] == 'job_paused':
+                if self._batch_control_corroborated(job_id,'pause',generation,audit['revision'],'paused',flags[0]):
+                    flags = (flags[0],True,flags[2])
+                elif state not in {'resolving','downloading','finalizing'}:
+                    raise ValueError('target pause receipt missing')
+                state = 'paused'
+            elif audit['kind'] == 'job_removed':
+                if not self._batch_control_corroborated(job_id,'remove',generation,audit['revision'],'removed',False):
+                    raise ValueError('target removal receipt missing')
+                state = 'removed'; flags = (False,True,False)
+            elif audit['kind'] == 'job_completed':
+                if state not in {'paused','finalizing'} or self._read_final_publication_binding(connection,job_id) is None:
+                    raise ValueError('target completion proof missing')
+                state = 'completed'
+            else: raise ValueError('target unsupported head successor')
+            generation,revision,last = audit['generation'],audit['revision'],audit['event_id']
+        if (generation,revision,state,last,flags) != (current.generation,current.revision,current.state,latest['event_id'],(current.authorized,current.manual_hold,current.start_now_requested)):
+            raise ValueError('target head flags changed')
+        if epoch < activation_command.expected_worker_epoch or cold_successors > epoch - activation_command.expected_worker_epoch:
+            raise ValueError('target head cold epoch changed')
+        if head.intent_status == 'current' and cold_successors:
+            raise ValueError('target cold head still active')
+        if (head.intent_status == 'terminal') != (current.state in _TERMINAL_JOB_CONTROL_STATES): raise ValueError('target terminal status changed')
+        return head
+
+    def _target_audit_member(self, connection, audit_id, cache):
+        row = connection.execute('SELECT request_id,target_index FROM target_members WHERE intent_audit_id=?', (audit_id,)).fetchone()
+        if row is None: raise ValueError('target audit member missing')
+        _,_,members = self._read_target_command(connection,row['request_id'],cache)
+        member = members[row['target_index']]
+        if member['intent_audit_id'] != audit_id: raise ValueError('target audit relation changed')
+        return member
+
+    def _target_publication_audit(self, connection, row, cache=None):
+        member = self._target_audit_member(connection,row['audit_id'],{} if cache is None else cache)
+        if ((member['job_id'],member['intent_generation'],member['intent_revision'],member['intent_state'])
+                != (row['job_id'],row['generation'],row['revision'],row['state'])
+                or member['preserved_publication_attempt_id'] != row['attempt_id'] or row['state'] != 'paused'):
+            raise ValueError('target publication cutpoint changed')
+        return True
+
+    def _capture_target_head(self, connection, job_id, cache=None, *, epoch=None):
+        cache = {} if cache is None else cache
+        if not self._target_managed(connection,job_id,cache): return None
+        origin = self._read_creation_origin(connection,job_id,cache)
+        return self._read_target_head(connection,job_id,origin,cache,epoch=epoch)
+
+    def _advance_target_head(self, connection, head, *, inactive=False):
+        if head is None: return
+        current = self._read_job_control_projection(connection,head.job_id)
+        audit = self._target_latest(connection,head.job_id)
+        status = 'terminal' if current.state in _TERMINAL_JOB_CONTROL_STATES else ('inactive' if inactive else head.intent_status)
+        connection.execute('''UPDATE job_authorization_heads SET current_audit_id=?,current_generation=?,current_revision=?,
+            current_state=?,current_worker_epoch=?,intent_status=? WHERE job_id=? AND owner_request_id=? AND owner_target_index=?
+            AND activation_request_id=? AND cohort_kind=? AND cohort_request_id=? AND round_generation=?
+            AND current_audit_id=? AND current_generation=? AND current_revision=? AND current_state=?
+            AND current_worker_epoch=? AND intent_status=? AND last_admission_serial=?''',
+            (audit['event_id'],current.generation,current.revision,current.state,self._current_worker_epoch(connection),status,
+             head.job_id,head.owner_request_id,head.owner_target_index,head.activation_request_id,head.cohort_kind,head.cohort_request_id,
+             head.round_generation,head.current_audit_id,head.current_generation,head.current_revision,head.current_state,
+             head.current_worker_epoch,head.intent_status,head.last_admission_serial))
+        self._require_one_changed_row(connection,'target successor CAS')
+
+    def _close_target_round(self, connection, job_id):
+        cache = {}; head = self._capture_target_head(connection,job_id,cache)
+        if head is None or head.intent_status != 'terminal': return
+        _,_,members = self._read_target_command(connection,head.owner_request_id,cache)
+        selected = [m for m in members if m['outcome']=='new_authority' and
+            (m['creation_kind'],m['creation_request_id'],m['round_generation']) ==
+            (head.cohort_kind,head.cohort_request_id,head.round_generation)]
+        for member in selected:
+            row = connection.execute('SELECT intent_status FROM job_authorization_heads WHERE job_id=?', (member['job_id'],)).fetchone()
+            if row is None: raise ValueError('target terminal member head missing')
+            if row[0] != 'terminal': return
+        for member in selected:
+            terminal = self._capture_target_head(connection,member['job_id'],cache)
+            if terminal is None or terminal.intent_status != 'terminal': raise ValueError('target terminal authority changed')
+        connection.execute("UPDATE authorization_rounds SET status='terminal' WHERE cohort_kind=? AND cohort_request_id=? AND round_generation=? AND status='open'",
+            (head.cohort_kind,head.cohort_request_id,head.round_generation))
+
+    def apply_target_authorize(self, command: TargetAuthorizeCommand) -> TargetAuthorizeResult:
+        """Seal explicit metadata intent; no execution or filesystem entry point."""
+        if type(command) is not TargetAuthorizeCommand: raise ValueError('target_request_invalid')
+        connection = self._connection; cache = {}
+        try:
+            with self._batch_budget() as deadline:
+                connection.execute('BEGIN IMMEDIATE')
+                try:
+                    try:
+                        replay = self._match_command_receipt(connection,request_id=command.request_id,
+                            payload_digest=command.payload_digest,scope='target_authorize',action='target_authorize')
+                    except RuntimeError:
+                        if self._read_direct_dispatch_command(connection,command.request_id) is not None:
+                            raise RequestConflictError('request_id already belongs to direct dispatch') from None
+                        raise
+                    if replay:
+                        _,result,_ = self._read_target_command(connection,command.request_id,cache)
+                        connection.rollback()
+                        return TargetAuthorizeResult.from_record({**result.to_record(),'replayed':True})
+                    if command.expected_worker_epoch != self._current_worker_epoch(connection): raise ValueError('target_epoch_stale')
+                    selector = command.to_record()['selector']
+                    if selector['kind'] == 'jobs':
+                        selection = [(t['job'],t['expected_revision']) for t in selector['targets']]
+                    elif selector['creation']['kind'] == 'batch':
+                        parent = selector['creation']['request_id']
+                        if connection.execute('SELECT 1 FROM add_batch_commands WHERE request_id=?',(parent,)).fetchone() is None: raise ValueError('target_request_invalid')
+                        result,intents = self._read_batch(parent,cache); cache[parent] = (result,intents)
+                        accepted = {c.index: c.original_job.job_id for c in intents.values()}
+                        indices = list(accepted) if selector['indices'] is None else selector['indices']
+                        if not indices or any(i not in accepted for i in indices): raise ValueError('target_request_invalid')
+                        selection = [(accepted[i],None) for i in indices]
+                    else:
+                        row = connection.execute('SELECT job_id FROM commands WHERE request_id=?', (selector['creation']['request_id'],)).fetchone()
+                        if row is None: raise ValueError('target_request_invalid')
+                        selection = [(row[0],None)]
+                    now = datetime.now(UTC); captured_at = self._utc_microseconds(now)
+                    members = []; captures = []; new_groups = {}
+                    for index,(job_id,expected_revision) in enumerate(selection):
+                        origin = self._read_creation_origin(connection,job_id,cache)
+                        member = dict.fromkeys(_TARGET_MEMBER_COLUMNS)
+                        member.update(request_id=command.request_id,target_index=index,job_id=job_id,outcome='blocked',reason='unknown_job')
+                        head = None; current = None; preserved = None; wanted = None
+                        if origin.kind != 'unknown':
+                            if origin.job is not None:
+                                current = self._read_job_control_projection(connection,job_id)
+                                latest = self._target_latest(connection,job_id)
+                                member.update(captured_audit_id=latest['event_id'],captured_generation=current.generation,
+                                    captured_revision=current.revision,captured_state=current.state,captured_authorized=int(current.authorized),
+                                    captured_manual_hold=int(current.manual_hold),captured_start_now_requested=int(current.start_now_requested))
+                            member.update(self._target_creation_values(origin))
+                            if current is None: member['reason'] = 'incompatible_authority'
+                            elif origin.job.source_kind is not SourceKind.DIRECT: member['reason'] = 'legacy_kind'
+                            else:
+                                head = self._read_target_head(connection,job_id,origin,cache)
+                                if expected_revision is not None and expected_revision != current.revision:
+                                    member.update(outcome='stale',reason='stale_revision')
+                                elif current.state in _TERMINAL_JOB_CONTROL_STATES: member['reason'] = 'terminal'
+                                elif origin.kind == 'unsupported_single': member['reason'] = 'incompatible_authority'
+                                elif command.action == 'resume' and head is None: member['reason'] = 'incompatible_authority'
+                                else:
+                                    attempt = connection.execute("SELECT attempt_id FROM direct_publication_attempts WHERE job_id=? AND status='eligible'", (job_id,)).fetchone()
+                                    if attempt is not None:
+                                        if not self._publication_predecessor_matches(connection,current): raise ValueError('target publication predecessor changed')
+                                        if current.state == 'paused': preserved = attempt[0]
+                                    wanted = self._target_transform(command.action,current,preserved is not None)
+                                    if current.state not in {'queued','paused'} and (head is None or wanted != current): member['reason'] = 'busy'
+                                    elif current.state not in {'queued','paused',*_ACTIVE_JOB_CONTROL_STATES}: member['reason'] = 'busy'
+                                    else:
+                                        member.update(outcome='existing_authority' if head else 'new_authority',reason=None,
+                                            preserved_publication_attempt_id=preserved)
+                                        if head:
+                                            member.update(round_generation=head.round_generation,owner_request_id=head.owner_request_id,owner_target_index=head.owner_target_index)
+                                        else:
+                                            member.update(owner_request_id=command.request_id,owner_target_index=index)
+                                            cohort = (member['creation_kind'],member['creation_request_id'])
+                                            new_groups.setdefault(cohort,[]).append(member)
+                        if current is not None:
+                            after = wanted if member['outcome'] in {'new_authority','existing_authority'} else current
+                            due = after.start_now_requested or origin.job.scheduled_for is None or origin.job.scheduled_for <= now
+                            collection = origin.job.queue_collection_id
+                            held = (int(self._current_queue_gate(connection) != 'running')
+                                | (2 if collection is not None and self.collection_hold(collection) else 0)
+                                | (4 if after.manual_hold else 0) | (8 if not due else 0))
+                            member['held_mask'] = held
+                        members.append(member); captures.append((origin,current,head,wanted))
+                    for cohort,group in new_groups.items():
+                        counter = self._target_counter(connection,cohort,cache)
+                        if counter == _MAX_COUNTER: raise OverflowError('cohort round overflow')
+                        name = 'authorization_round:' + hashlib.sha256(_batch_canonical(dict(kind=cohort[0],request_id=cohort[1]),512)).hexdigest()
+                        if counter == 0: connection.execute('INSERT INTO settings VALUES (?,?,?)',(name,'1',1))
+                        else:
+                            connection.execute('UPDATE settings SET value=?,revision=? WHERE key=? AND value=? AND revision=?', (str(counter+1),counter+1,name,str(counter),counter))
+                            self._require_one_changed_row(connection,'target cohort CAS')
+                        cache[('counter',*cohort)] = counter + 1
+                        for member in group: member['round_generation'] = counter + 1
+                        connection.execute('INSERT INTO authorization_rounds VALUES (?,?,?,?,?,?,?)', (*cohort,counter+1,command.request_id,len(group),
+                            _target_vector_digest(group,('request_id','target_index','job_id')),'open'))
+                    for member,(origin,current,head,wanted) in zip(members,captures):
+                        if member['outcome'] not in {'new_authority','existing_authority'}: continue
+                        if wanted != current:
+                            if current.revision == _MAX_COUNTER: raise OverflowError('target revision overflow')
+                            wanted = replace(wanted,revision=current.revision+1)
+                            connection.execute('UPDATE jobs SET revision=?,state=? WHERE job_id=? AND generation=? AND revision=? AND state=?',
+                                (wanted.revision,wanted.state,current.job,current.generation,current.revision,current.state))
+                            self._require_one_changed_row(connection,'target projection CAS')
+                            connection.execute('UPDATE materialized_jobs SET authorized=?,manual_hold=?,start_now_requested=? WHERE job_id=?',
+                                (int(wanted.authorized),int(wanted.manual_hold),int(wanted.start_now_requested),current.job))
+                            self._require_one_changed_row(connection,'target flags')
+                            audit = connection.execute("INSERT INTO events(kind,job_id,generation,revision) VALUES ('job_target_authorized',?,?,?)", (current.job,wanted.generation,wanted.revision)).lastrowid
+                            member.update(intent_audit_id=audit,intent_generation=wanted.generation,intent_revision=wanted.revision,
+                                intent_state=wanted.state,intent_authorized=int(wanted.authorized),intent_manual_hold=int(wanted.manual_hold),intent_start_now_requested=int(wanted.start_now_requested))
+                            self._advance_publication_pointer(connection,current,preserve=member['preserved_publication_attempt_id'] is not None)
+                        else: audit = member['captured_audit_id']
+                        if head is None:
+                            connection.execute('INSERT INTO job_authorization_heads VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                (current.job,command.request_id,member['target_index'],command.request_id,member['creation_kind'],member['creation_request_id'],
+                                member['round_generation'],audit,wanted.generation,wanted.revision,wanted.state,command.expected_worker_epoch,'current',0))
+                        else:
+                            connection.execute("""UPDATE job_authorization_heads SET activation_request_id=?,current_audit_id=?,current_generation=?,current_revision=?,current_state=?,intent_status='current'
+                                WHERE job_id=? AND owner_request_id=? AND owner_target_index=? AND activation_request_id=?
+                                AND cohort_kind=? AND cohort_request_id=? AND round_generation=? AND current_audit_id=?
+                                AND current_generation=? AND current_revision=? AND current_state=? AND current_worker_epoch=?
+                                AND intent_status=? AND last_admission_serial=?""",
+                                (command.request_id,audit,wanted.generation,wanted.revision,wanted.state,current.job,
+                                 head.owner_request_id,head.owner_target_index,head.activation_request_id,head.cohort_kind,head.cohort_request_id,head.round_generation,
+                                 head.current_audit_id,head.current_generation,head.current_revision,head.current_state,head.current_worker_epoch,head.intent_status,head.last_admission_serial))
+                            self._require_one_changed_row(connection,'target activation CAS')
+                    result = TargetAuthorizeResult(command.request_id,command.expected_worker_epoch,False,[_target_result(m) for m in members])
+                    self._insert_command_receipt(connection,request_id=command.request_id,payload_digest=command.payload_digest,scope='target_authorize',action='target_authorize')
+                    connection.execute('INSERT INTO target_commands VALUES (?,?,?,?,?,?,?,?,?)',
+                        (command.request_id,command.payload_digest,command.action,command.expected_worker_epoch,captured_at,len(members),command._wire_request,result._wire_reply,_target_vector_digest(members)))
+                    placeholders = ','.join('?' for _ in _TARGET_MEMBER_COLUMNS)
+                    connection.executemany(f'INSERT INTO target_members VALUES ({placeholders})', [tuple(m[n] for n in _TARGET_MEMBER_COLUMNS) for m in members])
+                    self._read_target_command(connection,command.request_id,cache)
+                    if time.monotonic() >= deadline: raise TimeoutError('target deadline')
+                    connection.commit()
+                    return result
+                except BaseException:
+                    connection.rollback(); raise
+        except RequestConflictError: raise
+        except (TimeoutError,sqlite3.OperationalError) as error:
+            if isinstance(error,TimeoutError) or 'interrupt' in str(error) or 'locked' in str(error): raise RuntimeError('target_deadline') from None
+            raise RuntimeError('target_authority_corrupt') from None
+        except Exception as error:
+            if str(error) in {'target_epoch_stale','target_request_invalid','unsupported_selection_size'}: raise RuntimeError(str(error)) from None
+            raise RuntimeError('target_authority_corrupt') from None
 
     def _batch_control_corroborated(self, job_id, action, generation, revision, state, authorized):
         connection = self._connection
@@ -2088,6 +2811,14 @@ class SQLiteStore:
             (row['audit_id'],)).fetchone()
         if event is None or tuple(event)[1:] != (row['job_id'],row['generation'],row['revision']):
             return False
+        if event['kind'] == 'job_target_authorized':
+            member = self._target_audit_member(connection,row['audit_id'],{})
+            command,_,_ = self._read_target_command(connection,member['request_id'],{})
+            return (row['state'] == 'queued' and command.action in {'resume','start_now'}
+                and member['preserved_publication_attempt_id'] is None and member['captured_state']=='paused'
+                and (member['job_id'],member['intent_generation'],member['intent_revision'],member['intent_state'])
+                    == (row['job_id'],row['generation'],row['revision'],row['state'])
+                and member['immutable_identity_digest'] == _batch_decode(row['proof'].encode('utf-8'))['ownership'])
         if row['state'] in {'paused','removed'}:
             return event['kind'] == 'job_' + row['state']
         if row['state'] != 'queued' or event['kind'] not in {'job_resumed','job_start_now_requested'}:
@@ -2170,7 +2901,11 @@ class SQLiteStore:
                 raise ValueError('publication cold epoch relation changed')
             current = self._read_job_control_projection(connection, captured.original_job.job_id)
             latest = connection.execute('SELECT event_id,generation,revision,kind FROM events WHERE job_id=? ORDER BY event_id DESC LIMIT 1', (current.job,)).fetchone()
-            if latest is None or tuple(latest) != (audit,generation,revision,'job_'+state) or (current.generation,current.revision,current.state) != (generation,revision,state):
+            audit_kind = 'job_'+state
+            if latest is not None and latest['kind']=='job_target_authorized' and state=='paused':
+                self._target_publication_audit(connection,row)
+                audit_kind = 'job_target_authorized'
+            if latest is None or tuple(latest) != (audit,generation,revision,audit_kind) or (current.generation,current.revision,current.state) != (generation,revision,state):
                 raise ValueError('publication current pointer changed')
             if status == 'eligible':
                 if state not in {'finalizing','paused'} or self._current_worker_epoch(connection) != epoch:
@@ -2185,7 +2920,8 @@ class SQLiteStore:
                     raise ValueError('publication final binding changed')
         return proof
 
-    def _validate_batch_lifecycle(self, captured, current):
+    def _validate_batch_lifecycle(self, captured, current, parent_cache=None):
+        if parent_cache is None: parent_cache = {}
         connection = self._connection
         job_id = captured.original_job.job_id
         generation = revision = 0; state = 'queued'
@@ -2209,6 +2945,18 @@ class SQLiteStore:
                 successors = flags; next_state = 'paused'; direct_lineage = False
             elif next_generation != generation:
                 raise ValueError('batch unsupported generation jump')
+            elif kind == 'job_target_authorized':
+                member = self._target_audit_member(connection,audit,parent_cache)
+                origin = _TargetCreationOrigin('batch',captured.original_job,captured.reservation,
+                    captured.parent_request_id,captured.parent_payload_digest,captured.index,captured.audit_id,
+                    captured.original_job.intent.generation,captured.original_job.intent.revision,captured.seal,captured)
+                if (any(member[n] != value for n,value in self._target_creation_values(origin).items())
+                        or (member['captured_audit_id'],member['captured_generation'],member['captured_revision'],member['captured_state'])
+                            != (last_audit,generation,revision,state)
+                        or tuple(bool(member['captured_'+n]) for n in ('authorized','manual_hold','start_now_requested')) not in flags):
+                    raise ValueError('batch target predecessor changed')
+                next_state = member['intent_state']
+                successors = {tuple(bool(member['intent_'+n]) for n in ('authorized','manual_hold','start_now_requested'))}
             elif kind == 'job_paused':
                 next_state = 'paused'
                 for authorized, hold, start in flags:
@@ -2806,8 +3554,13 @@ class SQLiteStore:
                 if self._read_source_kind(connection, job_id) is SourceKind.LEGACY_VIDEO:
                     connection.commit()
                     return current.to_result("blocked")
-                publication_predecessor = self._publication_predecessor_matches(connection,current)
-                if current.revision != expected_revision:
+                managed_control = action in {'resume','start_now'} and self._target_managed(connection,job_id,{})
+                if action in {'pause','remove'}:
+                    self._capture_target_head(connection,job_id)
+                publication_predecessor = False if managed_control else self._publication_predecessor_matches(connection,current)
+                if managed_control:
+                    result = current.to_result('blocked')
+                elif current.revision != expected_revision:
                     result = current.to_result("stale")
                 elif current.state in _TERMINAL_JOB_CONTROL_STATES:
                     result = current.to_result("blocked")
@@ -2886,6 +3639,8 @@ class SQLiteStore:
                     scope=_JOB_CONTROL_COMMAND_SCOPE,
                     action=action,
                 )
+                if result.status == 'applied' and result.state in _TERMINAL_JOB_CONTROL_STATES:
+                    self._close_target_round(connection,job_id)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -2958,8 +3713,8 @@ class SQLiteStore:
             _require_sqlite_text(rows[0]["value"], "queue gate value")
         )
 
-    @staticmethod
     def _persist_job_control_mutation(
+        self,
         connection: sqlite3.Connection,
         *,
         action: str,
@@ -2968,6 +3723,7 @@ class SQLiteStore:
         """Persist exactly one supported lifecycle/domain transition and audit."""
 
         SQLiteStore._require_mutable_source(connection, updated.job, direct_only=True)
+        head = self._capture_target_head(connection,updated.job)
         connection.execute(
             """
             UPDATE jobs
@@ -3003,6 +3759,7 @@ class SQLiteStore:
                 updated.revision,
             ),
         )
+        self._advance_target_head(connection,head)
 
     @staticmethod
     def _require_one_changed_row(connection: sqlite3.Connection, operation: str) -> None:
@@ -3182,7 +3939,9 @@ class SQLiteStore:
                 connection.commit()
                 return self._direct_dispatch_result_from_current(current, "blocked")
 
-            if expected_worker_epoch != current_epoch:
+            if self._target_managed(connection,job_id,{}):
+                result = self._direct_dispatch_result_from_current(current,'blocked')
+            elif expected_worker_epoch != current_epoch:
                 result = self._direct_dispatch_result_from_current(current, "stale")
             elif (
                 expected_generation != current.generation
@@ -3738,8 +4497,12 @@ class SQLiteStore:
         if require_current:
             current = self._read_job_control_projection(connection,job_id)
             latest = connection.execute('SELECT event_id,generation,revision,kind FROM events WHERE job_id = ? ORDER BY event_id DESC LIMIT 1', (job_id,)).fetchone()
+            audit_kind = 'job_' + row['state']
+            if latest is not None and latest['kind']=='job_target_authorized' and row['state']=='paused':
+                self._target_publication_audit(connection,row)
+                audit_kind = 'job_target_authorized'
             if (row['status'] != 'eligible' or latest is None
-                or tuple(latest) != (*counters[:3], 'job_' + row['state'])
+                or tuple(latest) != (*counters[:3], audit_kind)
                 or (current.generation,current.revision,current.state) != (attempt.generation,attempt.revision,attempt.state)
                 or self._current_worker_epoch(connection) != attempt.worker_epoch):
                 raise ValueError('publication current pointer is stale')
@@ -3873,6 +4636,7 @@ class SQLiteStore:
                 if self._read_direct_dispatch_command(connection,attempt.pending_request_id) != expected_receipt:
                     raise ValueError('publication completed receipt changed')
             require_current_publication_payload(attempt.prepared,published)
+            self._close_target_round(connection,completed.job)
             connection.commit()
             return result
         except BaseException:
@@ -4041,6 +4805,7 @@ class SQLiteStore:
             self._update_direct_dispatch_command(
                 connection, request_id=plan.request_id, result=result
             )
+            self._close_target_round(connection,completed.job)
             connection.commit()
             return result
         except BaseException:
@@ -4230,8 +4995,8 @@ class SQLiteStore:
             due=due,
         )
 
-    @staticmethod
     def _persist_direct_dispatch_lifecycle(
+        self,
         connection: sqlite3.Connection,
         *,
         current: _JobControlProjection,
@@ -4239,6 +5004,7 @@ class SQLiteStore:
         event_kind: str,
     ) -> _JobControlProjection:
         SQLiteStore._require_mutable_source(connection, current.job, direct_only=True)
+        head = self._capture_target_head(connection,current.job)
         if current.revision == _MAX_COUNTER:
             raise OverflowError("job revision exceeds persisted counter range")
         next_state = _require_public_job_state(state, "direct dispatch state")
@@ -4255,6 +5021,7 @@ class SQLiteStore:
             """,
             (event_kind, updated.job, updated.generation, updated.revision),
         )
+        self._advance_target_head(connection,head)
         return updated
 
     @staticmethod
@@ -4425,6 +5192,9 @@ class SQLiteStore:
         connection.execute("BEGIN IMMEDIATE")
         try:
             old_epoch = self.worker_epoch()
+            target_cache = {}
+            target_heads = [self._capture_target_head(connection,row[0],target_cache,epoch=old_epoch)
+                for row in connection.execute("SELECT job_id FROM job_authorization_heads UNION SELECT job_id FROM target_members WHERE outcome IN ('new_authority','existing_authority')").fetchall()]
             eligible_predecessors = {}
             for row in connection.execute("SELECT job_id FROM direct_publication_attempts WHERE status='eligible'").fetchall():
                 job = self.get_materialized_job(row['job_id'])
@@ -4519,6 +5289,8 @@ class SQLiteStore:
                 )
             for predecessor, matches in eligible_predecessors.values():
                 self._advance_publication_pointer(connection,predecessor,preserve=matches,old_epoch=old_epoch)
+            for head in target_heads:
+                self._advance_target_head(connection,head,inactive=True)
             connection.commit()
         except BaseException:
             connection.rollback()

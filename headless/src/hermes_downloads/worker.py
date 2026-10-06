@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from hermes_downloads.ipc import (
     AddBatchCommand,
     AddBatchResult,
+    TargetAuthorizeCommand,
+    TargetAuthorizeResult,
     DirectEngineActivateCommand,
     DirectEngineActivateResult,
     DirectJobDispatchCommand,
@@ -348,6 +350,15 @@ def _add_batch_from_store(store: SQLiteStore, command: AddBatchCommand) -> AddBa
         return store.apply_add_batch(command)
     except RequestConflictError:
         raise IPCError('command_conflict') from None
+
+
+def _target_authorize_from_store(store: SQLiteStore, command: TargetAuthorizeCommand) -> TargetAuthorizeResult:
+    try:
+        return store.apply_target_authorize(command)
+    except RequestConflictError:
+        raise IPCError('command_conflict') from None
+    except RuntimeError as error:
+        raise IPCError(str(error)) from None
 
 
 def _job_add_from_store(store: SQLiteStore, command: JobAddCommand) -> JobAddResult:
@@ -1335,6 +1346,7 @@ def run_worker(
                     queue_gate=queue_gate,
                     job_add=lambda command: _job_add_from_store(store, command),
                     add_batch=lambda command: _add_batch_from_store(store, command),
+                    target_authorize=lambda command: _target_authorize_from_store(store, command),
                     job_control=job_control,
                     direct_engine_activate=direct_engine_activate,
                     direct_job_dispatch=direct_job_dispatch,
