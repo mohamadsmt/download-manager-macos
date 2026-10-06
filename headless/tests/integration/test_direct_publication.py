@@ -445,17 +445,19 @@ def test_real_direct_initial_publication_and_exact_attempt_recovery(barrier, act
                         assert (finished.status, finished.state) == ('started','completed')
                 else:
                     _wait_state(sock,'completed')
-                    assert final.stat().st_ino == partial.stat().st_ino
-                    assert final.read_bytes() == partial.read_bytes()
+                expected = int(action is None or (barrier == 'post-link' and action in {'pause','queue','cold'}))
+                cleanup = None
+                if expected:
+                    cleanup = _helpers._assert_finished_direct_cleanup(state / 'state.db', partial, final, origin.payload)
+                else:
+                    assert partial.exists() and partial.with_name('.hermes-reservation').exists()
                 evidence = publication_evidence / f'outcome-{barrier}-{action}-{os.getpid()}.json'
-                evidence.write_text(json.dumps(dict(barrier=barrier, action=action, origin_ledger=asdict(origin.ledger), original_receipt=original, final_exists=final.exists(), partial_sha256=hashlib.sha256(partial.read_bytes()).hexdigest()), sort_keys=True))
+                evidence.write_text(json.dumps(dict(barrier=barrier, action=action, origin_ledger=asdict(origin.ledger), original_receipt=original, final_exists=final.exists(), partial_exists=partial.exists(), partial_sha256=hashlib.sha256(partial.read_bytes()).hexdigest() if partial.exists() else None, final_sha256=hashlib.sha256(final.read_bytes()).hexdigest() if final.exists() else None, cleanup_claim=cleanup), sort_keys=True))
                 evidence.chmod(0o600)
                 assert _receipt(state / 'state.db') == original
-                assert partial.exists() and partial.with_name('.hermes-reservation').exists()
                 observer = SQLiteStore(state / 'state.db')
                 try:
                     count = sum(e.kind == 'job_completed' for e in observer.list_events())
-                    expected = int(action is None or (barrier == 'post-link' and action in {'pause','queue','cold'}))
                     assert count == expected
                     with sqlite3.connect(state / 'state.db') as connection:
                         details = dict(attempts=[tuple(r) for r in connection.execute('SELECT * FROM direct_publication_attempts')],
@@ -543,7 +545,7 @@ def test_real_same_job_closed_attempt_new_dispatch_transfers_and_publishes(publi
                     request_id='new-attempt-start')
                 assert (second.status,second.state)==('started','downloading')
                 _wait_state(sock,'completed')
-                assert final.read_bytes() == partial.read_bytes() and final.stat().st_ino == partial.stat().st_ino
+                cleanup = _helpers._assert_finished_direct_cleanup(state / 'state.db', partial, final, origin.payload)
                 assert final.stat().st_size == 1024
                 assert _receipt(state / 'state.db') == original
                 assert ipc.dispatch_direct_job(sock,job='dispatch-job',expected_worker_epoch=1,
@@ -556,7 +558,7 @@ def test_real_same_job_closed_attempt_new_dispatch_transfers_and_publishes(publi
                 rows = [json.loads(line) for line in (publication_evidence / f"fixture-{child['process'].pid}.jsonl").read_text().splitlines()]
                 assert len([row for row in rows if row['kind']=='engine-birth']) == 2
                 outcome = dict(original_receipt=original,closed_attempt=closed,current_attempt=active,
-                    origin_ledger=asdict(origin.ledger),partial_sha256=hashlib.sha256(partial.read_bytes()).hexdigest(),
+                    origin_ledger=asdict(origin.ledger),partial_exists=False,partial_sha256=None,cleanup_claim=cleanup,
                     final_sha256=hashlib.sha256(final.read_bytes()).hexdigest(),engine_births=2,payload_bytes=1024)
                 path = publication_evidence / 'closed-continuation-outcome.json'
                 path.write_text(json.dumps(outcome,sort_keys=True));path.chmod(0o600)
@@ -722,8 +724,8 @@ def test_real_direct_finite_crash_matrix_cold_inert_and_new_existing_only(cut, p
                     request_id='new-crash-recovery')
                 result = ipc.dispatch_direct_job(sock, **args)
                 final_present = cut in {'link', 'before-fsync', 'after-fsync', 'before-commit', 'after-commit'}
-                if final_present and not completed_before_crash:
-                    assert result.status == 'pending'
+                if final_present:
+                    assert result.status == ('blocked' if completed_before_crash else 'pending')
                     assert recovery['entered'].wait(6)
                     assert ipc.dispatch_direct_job(sock, **args) == result
                     recovery['release'].set()
@@ -738,8 +740,16 @@ def test_real_direct_finite_crash_matrix_cold_inert_and_new_existing_only(cut, p
                     assert not recovery['entered'].is_set()
                 assert _receipt(state / 'state.db') == original
                 assert origin.ledger == before_body
+                partial = root / '.incomplete/dispatch-job/dispatch.bin'
+                final = root / 'Other/dispatch.bin'
+                cleanup = (_helpers._assert_finished_direct_cleanup(state / 'state.db', partial, final, origin.payload)
+                    if final_present else None)
+                assert origin.ledger == before_body
                 with sqlite3.connect(state / 'state.db') as connection:
                     details = dict(cut=cut, final_present=final_present, original_receipt=original,
+                        cleanup_claim=cleanup, partial_exists=partial.exists(),
+                        partial_sha256=hashlib.sha256(partial.read_bytes()).hexdigest() if partial.exists() else None,
+                        final_sha256=hashlib.sha256(final.read_bytes()).hexdigest() if final.exists() else None,
                         origin_ledger=asdict(origin.ledger), attempts=[tuple(r) for r in connection.execute('SELECT * FROM direct_publication_attempts')],
                         events=[tuple(r) for r in connection.execute('SELECT * FROM events')],
                         final_bindings=[tuple(r) for r in connection.execute('SELECT * FROM final_publication_bindings')])
@@ -747,13 +757,10 @@ def test_real_direct_finite_crash_matrix_cold_inert_and_new_existing_only(cut, p
                 record = publication_evidence / 'crash-outcome.json'
                 record.write_text(json.dumps(details, sort_keys=True))
                 record.chmod(0o600)
-                partial = root / '.incomplete/dispatch-job/dispatch.bin'
-                assert partial.read_bytes() == origin.payload
-                assert partial.with_name('.hermes-reservation').exists()
-                final = root / 'Other/dispatch.bin'
+                if not final_present:
+                    assert partial.read_bytes() == origin.payload
+                    assert partial.with_name('.hermes-reservation').exists()
                 assert final.exists() == final_present
-                if final_present:
-                    assert final.stat().st_ino == partial.stat().st_ino
             finally:
                 for child in children:
                     _finish_publication_worker(child, publication_evidence)
@@ -810,7 +817,7 @@ def test_certified_restart_recovers_only_new_exact_direct_attempt_preserving_leg
                 assert legacy_snapshot() == history
                 assert _receipt(database) == original and origin.ledger == before_body
                 with sqlite3.connect(database) as connection:
-                    assert connection.execute('PRAGMA user_version').fetchone()[0] == 18
+                    assert connection.execute('PRAGMA user_version').fetchone()[0] == 19
                     assert connection.execute("SELECT manual_hold FROM materialized_jobs WHERE job_id='dispatch-job'").fetchone()[0] == int(retained_final)
                     assert connection.execute('SELECT COUNT(*) FROM final_publication_bindings WHERE job_id=\'dispatch-job\'').fetchone()[0] == 0
                     assert connection.execute("SELECT COUNT(*) FROM events WHERE kind='job_completed'").fetchone()[0] == 0
@@ -851,24 +858,30 @@ def test_certified_restart_recovers_only_new_exact_direct_attempt_preserving_leg
                 assert _receipt(database) == original and origin.ledger == before_body
                 assert legacy_snapshot() == history
                 assert ipc.request_health(sock).queue_gate == 'paused'
+                partial = root / '.incomplete/dispatch-job/dispatch.bin'
+                final = root / 'Other/dispatch.bin'
+                cleanup = (_helpers._assert_finished_direct_cleanup(database, partial, final, origin.payload)
+                    if retained_final else None)
+                assert _receipt(database) == original and origin.ledger == before_body
+                assert legacy_snapshot() == history
                 with sqlite3.connect(database) as connection:
                     assert connection.execute("SELECT manual_hold FROM materialized_jobs WHERE job_id='dispatch-job'").fetchone()[0] == int(retained_final)
                     assert connection.execute("SELECT COUNT(*) FROM events WHERE kind='job_completed'").fetchone()[0] == int(retained_final)
                     assert connection.execute("SELECT COUNT(*) FROM final_publication_bindings WHERE job_id='dispatch-job'").fetchone()[0] == int(retained_final)
                     assert connection.execute('SELECT COUNT(*) FROM engine_instances').fetchone()[0] == 0
                     details = dict(retained_final=retained_final, original_receipt=original,
+                        cleanup_claim=cleanup, partial_exists=partial.exists(),
+                        partial_sha256=hashlib.sha256(partial.read_bytes()).hexdigest() if partial.exists() else None,
+                        final_sha256=hashlib.sha256(final.read_bytes()).hexdigest() if final.exists() else None,
                         recovery_result=result.to_record(), origin_ledger=asdict(origin.ledger),
                         legacy_history_unchanged=True,
                         attempts=[tuple(row) for row in connection.execute('SELECT * FROM direct_publication_attempts')])
                 (publication_evidence / 'certified-restart-outcome.json').write_text(json.dumps(details))
                 (publication_evidence / 'certified-restart-outcome.json').chmod(0o600)
-                partial = root / '.incomplete/dispatch-job/dispatch.bin'
-                assert partial.read_bytes() == origin.payload
-                assert partial.with_name('.hermes-reservation').exists()
-                final = root / 'Other/dispatch.bin'
+                if not retained_final:
+                    assert partial.read_bytes() == origin.payload
+                    assert partial.with_name('.hermes-reservation').exists()
                 assert final.exists() == retained_final
-                if retained_final:
-                    assert final.stat().st_ino == partial.stat().st_ino
             finally:
                 for child in children:
                     _finish_publication_worker(child, publication_evidence)

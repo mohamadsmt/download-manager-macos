@@ -2931,3 +2931,199 @@ def test_exact_attempt_existing_only_faults_retain_authority_and_never_link(faul
     assert calls == []
     assert destination.partial_path.exists() and marker.path.exists()
     assert destination.final_path.exists()
+
+
+def _cleanup_fixture():
+    fixture = _strict_fixture(b"owned cleanup payload" * 4096)
+    prepared = _strict_prepare(fixture)
+    published = _strict_publish(fixture, prepared)
+    return fixture, prepared, published
+
+
+def test_direct_cleanup_removes_only_owned_names_after_fresh_certificate(monkeypatch):
+    fixture, prepared, published = _cleanup_fixture()
+    paths, destination, _, _, marker = fixture
+    sidecar = destination.incomplete_dir / "unknown.sidecar"
+    sidecar.write_bytes(b"retain unknown bytes")
+    baseline = _strict_metadata(destination.final_path)
+    blocks = destination.final_path.stat().st_blocks
+    synced = []
+    original_sync = paths._fsync_staged_partial_directory
+    def sync(fd):
+        original_sync(fd)
+        synced.append(1)
+    monkeypatch.setattr(paths, "_fsync_staged_partial_directory", sync)
+    partial_permit = paths._PartialUnlinkPermit()
+    certified = paths.prepare_direct_cleanup_payload(
+        prepared, baseline, partial_permit=partial_permit)
+    certificate = _strict_metadata(destination.final_path)
+    assert certificate[:4] == baseline[:4] and certificate[5] == baseline[5]
+    assert certificate[4] == 1
+    assert certified.sha256 == prepared.sha256
+    assert destination.final_path.stat().st_blocks == blocks
+    assert not destination.partial_path.exists() and marker.path.exists()
+    assert sidecar.read_bytes() == b"retain unknown bytes"
+    assert partial_permit.snapshot().unlink_attempted
+    paths.require_current_direct_cleanup_payload(prepared, certified, marker_present=True)
+    with pytest.raises(paths.PathValidationError):
+        paths.require_current_publication_payload(prepared, published)
+    marker_permit = paths._MarkerUnlinkPermit()
+    finished = paths.finish_direct_cleanup_payload(
+        prepared, certificate, marker_permit=marker_permit)
+    paths.require_current_direct_cleanup_payload(prepared, finished, marker_present=False)
+    paths.require_direct_cleanup_namespace(prepared, certificate, phase="finished")
+    assert marker_permit.snapshot().unlink_attempted and synced == [1, 1]
+    assert not marker.path.exists() and sidecar.exists()
+    assert destination.final_path.read_bytes() == b"owned cleanup payload" * 4096
+
+
+@pytest.mark.parametrize("cut", ("partial", "marker"))
+def test_direct_cleanup_existing_claim_cutpoints_use_no_relink_or_second_unlink(cut, monkeypatch):
+    fixture, prepared, _ = _cleanup_fixture()
+    paths, destination, _, _, marker = fixture
+    baseline = _strict_metadata(destination.final_path)
+    destination.partial_path.unlink()
+    certified = paths.prepare_direct_cleanup_payload(
+        prepared, baseline, partial_permit=paths._PartialUnlinkPermit())
+    certificate = _strict_metadata(destination.final_path)
+    if cut == "marker":
+        marker.path.unlink()
+    monkeypatch.setattr(paths.os, "link", lambda *a, **k: pytest.fail("cleanup must never relink"))
+    unlinks = []
+    original_unlink = paths.os.unlink
+    def unlink(name, *, dir_fd=None):
+        unlinks.append(name)
+        original_unlink(name, dir_fd=dir_fd)
+    monkeypatch.setattr(paths.os, "unlink", unlink)
+    if cut == "partial":
+        recovered = paths.prepare_direct_cleanup_payload(
+            prepared, baseline, partial_permit=paths._PartialUnlinkPermit())
+        assert recovered == certified and unlinks == []
+    finished = paths.finish_direct_cleanup_payload(
+        prepared, certificate, marker_permit=paths._MarkerUnlinkPermit())
+    assert unlinks == ([] if cut == "marker" else [".hermes-reservation"])
+    paths.require_current_direct_cleanup_payload(prepared, finished, marker_present=False)
+
+
+@pytest.mark.parametrize("damage", ("rewrite", "extra-link", "partial", "final", "marker"))
+def test_direct_cleanup_rejects_drift_before_any_unlink(damage, monkeypatch):
+    fixture, prepared, _ = _cleanup_fixture()
+    paths, destination, _, _, marker = fixture
+    baseline = _strict_metadata(destination.final_path)
+    if damage == "rewrite":
+        _strict_rewrite(destination.final_path)
+    elif damage == "extra-link":
+        os.link(destination.final_path, destination.incomplete_dir / "unknown-link")
+    else:
+        target = {"partial": destination.partial_path, "final": destination.final_path,
+                  "marker": marker.path}[damage]
+        target.rename(target.with_name("retained-" + target.name))
+        target.write_bytes(b"unowned replacement")
+        target.chmod(0o600)
+    monkeypatch.setattr(paths.os, "unlink", lambda *a, **k: pytest.fail("drift must retain every name"))
+    with pytest.raises(paths.PathValidationError):
+        paths.prepare_direct_cleanup_payload(prepared, baseline, partial_permit=paths._PartialUnlinkPermit())
+    assert destination.partial_path.exists() and destination.final_path.exists() and marker.path.exists()
+
+
+@pytest.mark.parametrize("fault", ("sync", "hash", "rewrite-after-unlink", "rewrite-after-hash"))
+def test_direct_cleanup_post_unlink_fault_keeps_marker_and_never_certifies(fault, monkeypatch):
+    fixture, prepared, _ = _cleanup_fixture()
+    paths, destination, _, _, marker = fixture
+    baseline = _strict_metadata(destination.final_path)
+    if fault == "sync":
+        def sync(fd):
+            raise paths.PathValidationError("private directory sync cut")
+        monkeypatch.setattr(paths, "_fsync_staged_partial_directory", sync)
+    else:
+        original_hash = paths._hash_publication_payload
+        def digest(fd, expected, **kwargs):
+            if fault == "hash":
+                raise paths.PathValidationError("private descriptor hash cut")
+            if fault == "rewrite-after-unlink":
+                _strict_rewrite(destination.final_path)
+            value = original_hash(fd, expected, **kwargs)
+            if fault == "rewrite-after-hash":
+                _strict_rewrite(destination.final_path)
+            return value
+        monkeypatch.setattr(paths, "_hash_publication_payload", digest)
+    with pytest.raises(paths.PathValidationError):
+        paths.prepare_direct_cleanup_payload(prepared, baseline, partial_permit=paths._PartialUnlinkPermit())
+    assert not destination.partial_path.exists()
+    assert destination.final_path.exists() and marker.path.exists()
+
+
+def test_direct_cleanup_cancelled_hash_keeps_marker_and_rejects_late_evidence(monkeypatch):
+    import threading
+    fixture, prepared, _ = _cleanup_fixture()
+    paths, destination, _, _, marker = fixture
+    baseline = _strict_metadata(destination.final_path)
+    cancelled = threading.Event()
+    original_hash = paths._hash_publication_payload
+    def digest(fd, expected, **kwargs):
+        value = original_hash(fd, expected, **kwargs)
+        cancelled.set()
+        return value
+    monkeypatch.setattr(paths, "_hash_publication_payload", digest)
+    with pytest.raises(paths.PathValidationError, match="cancelled"):
+        paths.prepare_direct_cleanup_payload(prepared, baseline,
+            partial_permit=paths._PartialUnlinkPermit(), cancelled=cancelled.is_set)
+    assert not destination.partial_path.exists() and marker.path.exists()
+
+
+def test_direct_cleanup_cheap_certificate_rejects_restored_mtime_rewrite():
+    fixture, prepared, _ = _cleanup_fixture()
+    paths, destination, _, _, marker = fixture
+    certified = paths.prepare_direct_cleanup_payload(prepared,
+        _strict_metadata(destination.final_path), partial_permit=paths._PartialUnlinkPermit())
+    _strict_rewrite(destination.final_path)
+    with pytest.raises(paths.PathValidationError):
+        paths.require_current_direct_cleanup_payload(prepared, certified, marker_present=True)
+    with pytest.raises(paths.PathValidationError):
+        paths.finish_direct_cleanup_payload(prepared,
+            (certified.st_dev, certified.st_ino, certified.logical_size, certified.st_mode,
+             certified.st_nlink, certified.mtime_ns, certified.ctime_ns),
+            marker_permit=paths._MarkerUnlinkPermit())
+    assert marker.path.exists()
+
+
+@pytest.mark.parametrize("permit_kind", ("partial", "marker"))
+def test_direct_cleanup_unlink_permit_revocation_is_one_shot_and_nonblocking(permit_kind, monkeypatch):
+    import threading
+    fixture, prepared, _ = _cleanup_fixture()
+    paths, destination, _, _, marker = fixture
+    baseline = _strict_metadata(destination.final_path)
+    if permit_kind == "marker":
+        paths.prepare_direct_cleanup_payload(prepared, baseline, partial_permit=paths._PartialUnlinkPermit())
+        baseline = _strict_metadata(destination.final_path)
+    entered, release = threading.Event(), threading.Event()
+    original_unlink = paths.os.unlink
+    def unlink(name, *, dir_fd=None):
+        entered.set()
+        assert release.wait(5)
+        original_unlink(name, dir_fd=dir_fd)
+    monkeypatch.setattr(paths.os, "unlink", unlink)
+    permit = paths._PartialUnlinkPermit() if permit_kind == "partial" else paths._MarkerUnlinkPermit()
+    errors = []
+    def run():
+        try:
+            if permit_kind == "partial":
+                paths.prepare_direct_cleanup_payload(prepared, baseline, partial_permit=permit)
+            else:
+                paths.finish_direct_cleanup_payload(prepared, baseline, marker_permit=permit)
+        except paths.PathValidationError as error:
+            errors.append(error)
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        snapshot = permit.revoke()
+        assert snapshot.revoked and snapshot.unlink_attempted and snapshot.in_flight
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive() and not permit.snapshot().in_flight and len(errors) == 1
+    if permit_kind == "partial":
+        assert marker.path.exists()
+    with pytest.raises(paths.PathValidationError):
+        permit._enter_unlink()

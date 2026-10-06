@@ -5362,6 +5362,40 @@ def _run_terminal_gated_worker(state_root, socket_path, ready, shutdown, stopped
         worker.validate_source_url = original_validate
 
 
+def _assert_finished_direct_cleanup(database, partial, final, payload):
+    """Wait for durable cleanup, then bind the final to original producer proof."""
+    deadline = time.monotonic() + _WATCHDOG_SECONDS
+    with sqlite3.connect(database) as connection:
+        while time.monotonic() < deadline:
+            phase = connection.execute(
+                "SELECT phase FROM direct_cleanup_claims WHERE job_id='dispatch-job'").fetchone()
+            if phase == ("finished",):
+                break
+            time.sleep(0.01)
+        assert phase == ("finished",), "successful publication did not finish durable cleanup"
+    observer = SQLiteStore(database)
+    try:
+        claim = observer._read_direct_cleanup_claim(observer._connection, "dispatch-job", {})
+        assert claim is not None and claim.phase == "finished"
+        stage = observer._get_staged_payload_binding("dispatch-job")
+        binding = observer._get_final_publication_binding("dispatch-job")
+        assert stage is not None and binding is not None
+        details = final.stat()
+        final_stat = (details.st_dev, details.st_ino, details.st_size, details.st_mode,
+            details.st_nlink, details.st_mtime_ns, details.st_ctime_ns)
+        assert final_stat == claim.certified_stat and details.st_nlink == 1
+        assert final_stat[:3] == claim.published_stat[:3] == (
+            stage.partial_device, stage.partial_inode, stage.logical_size) == (
+            binding.final_device, binding.final_inode, binding.logical_size)
+        assert final.read_bytes() == payload
+        assert hashlib.sha256(final.read_bytes()).hexdigest() == claim.attempt.prepared.sha256
+        assert not partial.exists() and not partial.with_name(".hermes-reservation").exists()
+        return dict(observer._connection.execute(
+            "SELECT * FROM direct_cleanup_claims WHERE job_id='dispatch-job'").fetchone())
+    finally:
+        observer.close()
+
+
 @pytest.mark.parametrize("mode,action", (
     ("observe", None), ("absent", None), ("verify", None), ("marker", None), ("late-success", "pause"),
     ("late-success", "remove"), ("late-failure", "pause"),
@@ -5485,13 +5519,17 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                     assert kinds.count("job_finalizing") == int(successful_publication)
                     assert kinds.count("job_completed") == int(successful_publication)
                     if successful_publication:
+                        _assert_finished_direct_cleanup(state_root / "state.db",
+                            root / ".incomplete" / "dispatch-job" / "dispatch.bin",
+                            root / "Other" / "dispatch.bin", origin.payload)
                         binding = observer._get_final_publication_binding("dispatch-job")
                         assert binding is not None
                         final = (root / "Other" / "dispatch.bin").stat()
-                        partial_details = (root / ".incomplete" / "dispatch-job" / "dispatch.bin").stat()
+                        stage = observer._get_staged_payload_binding("dispatch-job")
+                        assert stage is not None
                         assert (binding.final_device, binding.final_inode, binding.logical_size) == (
                             final.st_dev, final.st_ino, final.st_size) == (
-                            partial_details.st_dev, partial_details.st_ino, partial_details.st_size)
+                            stage.partial_device, stage.partial_inode, stage.logical_size)
                         assert tuple(observer._connection.execute(
                             "SELECT * FROM direct_dispatch_commands WHERE request_id='terminal-dispatch'").fetchone()) == original_started_receipt
                         assert observer._get_staged_payload_binding("dispatch-job") is not None
@@ -5503,9 +5541,12 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                 finally:
                     observer.close()
                 partial = root / ".incomplete" / "dispatch-job" / "dispatch.bin"
-                if mode != "error":
-                    assert partial.read_bytes() == origin.payload
-                assert (partial.parent / ".hermes-reservation").exists()
+                if successful_publication:
+                    assert not partial.exists() and not (partial.parent / ".hermes-reservation").exists()
+                else:
+                    if mode != "error":
+                        assert partial.read_bytes() == origin.payload
+                    assert (partial.parent / ".hermes-reservation").exists()
                 assert (root / "Other" / "dispatch.bin").exists() == successful_publication
                 shutdown.set()
                 assert stopped.wait(_WATCHDOG_SECONDS)

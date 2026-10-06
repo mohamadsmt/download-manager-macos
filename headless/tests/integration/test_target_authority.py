@@ -424,7 +424,7 @@ def v17_fixture(database):
     with closing(SQLiteStore(database)) as store:
         store.recover_cold_start();store.apply_add_batch(ipc.AddBatchCommand.from_record(envelope()))
     with sqlite3.connect(database,isolation_level=None) as connection:
-        for name in ('job_authorization_heads','target_members','authorization_rounds','target_commands'):
+        for name in ('direct_cleanup_claims','job_authorization_heads','target_members','authorization_rounds','target_commands'):
             assert connection.execute(f'SELECT count(*) FROM {name}').fetchone()[0]==0
             connection.execute(f'DROP TABLE {name}')
         registry=connection.execute('SELECT * FROM command_receipts').fetchall()
@@ -441,7 +441,7 @@ def v17_fixture(database):
 def test_populated_v17_migration_preserves_original_bytes_and_restores_fks(tmp_path):
     database=tmp_path/'v17.db';before=v17_fixture(database)
     with closing(SQLiteStore(database)) as store:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0]==18
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0]==19
         assert store._connection.execute('PRAGMA foreign_keys').fetchone()[0]==1
         assert store._connection.execute('PRAGMA foreign_key_check').fetchall()==[]
         for table,rows in before.items():assert [tuple(r) for r in store._connection.execute(f'SELECT * FROM {table}')]==rows

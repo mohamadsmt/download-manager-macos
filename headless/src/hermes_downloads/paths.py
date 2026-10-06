@@ -1,8 +1,8 @@
 """Safe, deterministic destination intent for Hermes downloads.
 
 This module owns pathname validation, reservation markers, and no-clobber
-publication of an already-attested staged payload. It does not write payload
-bytes or clean partials.
+publication and success-owned cleanup of an already-attested staged payload.
+It does not write payload bytes.
 """
 
 from __future__ import annotations
@@ -205,6 +205,54 @@ class PublicationCreationPermit:
     def _finish_creation(self) -> None:
         with self._mutex:
             self._in_flight = False
+
+
+@dataclass(frozen=True, slots=True)
+class _UnlinkPermitSnapshot:
+    revoked: bool
+    unlink_attempted: bool
+    in_flight: bool
+
+
+class _UnlinkPermit:
+    """One deletion syscall; the mutex never covers filesystem IO."""
+
+    def __init__(self) -> None:
+        self._mutex = Lock()
+        self._revoked = False
+        self._unlink_attempted = False
+        self._in_flight = False
+
+    def snapshot(self) -> _UnlinkPermitSnapshot:
+        with self._mutex:
+            return self._snapshot_locked()
+
+    def revoke(self) -> _UnlinkPermitSnapshot:
+        with self._mutex:
+            self._revoked = True
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> _UnlinkPermitSnapshot:
+        return _UnlinkPermitSnapshot(self._revoked, self._unlink_attempted, self._in_flight)
+
+    def _enter_unlink(self) -> None:
+        with self._mutex:
+            if self._revoked or self._unlink_attempted:
+                raise PathValidationError("cleanup unlink permit is unavailable")
+            self._unlink_attempted = True
+            self._in_flight = True
+
+    def _finish_unlink(self) -> None:
+        with self._mutex:
+            self._in_flight = False
+
+
+class _PartialUnlinkPermit(_UnlinkPermit):
+    """Delete authority only for the exact retained partial name."""
+
+
+class _MarkerUnlinkPermit(_UnlinkPermit):
+    """Delete authority only for the exact original reservation marker."""
 
 
 def resolve_destination(
@@ -2192,3 +2240,237 @@ def require_current_publication_payload(
     finally:
         for fd in reversed(descriptors):
             os.close(fd)
+
+
+def _validate_direct_cleanup_evidence(prepared, snapshot, *, links):
+    if type(prepared) is not PreparedPublicationPayload:
+        raise PathValidationError("cleanup publication evidence is invalid")
+    destination = prepared.destination
+    root, component = _validate_destination_intent(destination)
+    _validate_publication_reservation(destination, component, prepared.reservation)
+    _validate_strict_marker(destination, prepared.marker)
+    original = _strict_staged_metadata(destination, prepared.staged_payload)
+    if (type(snapshot) is not tuple or len(snapshot) != 7
+        or any(type(value) is not int or not 0 <= value <= 9223372036854775807 for value in snapshot)
+        or not stat.S_ISREG(snapshot[3]) or snapshot[4] != links
+        or snapshot[:4] != original[:4] or snapshot[5] != original[5]
+        or type(prepared.sha256) is not str or len(prepared.sha256) != 64
+        or any(value not in "0123456789abcdef" for value in prepared.sha256)
+        or type(prepared.directory_identities) is not tuple or len(prepared.directory_identities) != 4
+        or any(type(item) is not tuple or len(item) != 2
+               or any(type(value) is not int or not 0 <= value <= 9223372036854775807 for value in item)
+               for item in prepared.directory_identities)):
+        raise PathValidationError("cleanup snapshot does not match original publication")
+    return root, component
+
+
+def _fstat_direct_cleanup_payload(descriptor):
+    try:
+        details = os.fstat(descriptor)
+    except OSError as error:
+        raise PathValidationError("cleanup payload is inaccessible") from error
+    if type(details.st_uid) is not int or details.st_uid != os.getuid():
+        raise UnsafePathError("cleanup payload owner changed")
+    return _publication_payload_details(details)
+
+
+def _require_direct_cleanup_namespace(prepared, descriptor, snapshot, *, marker_present, partial_present):
+    destination = prepared.destination
+    root, component = _validate_destination_intent(destination)
+    _require_safe_writable_root(root)
+    fresh = _open_visible_publication_chain(root, component, destination.job_id,
+        prepared.directory_identities)
+    try:
+        if any(os.fstat(fd).st_uid != os.getuid() for fd in fresh):
+            raise UnsafePathError("cleanup directory owner changed")
+        if marker_present:
+            _verify_attested_reservation_marker(fresh[3],
+                _reservation_marker_bytes(prepared.reservation), prepared.marker)
+            if os.stat(_RESERVATION_MARKER, dir_fd=fresh[3], follow_symlinks=False).st_uid != os.getuid():
+                raise UnsafePathError("cleanup marker owner changed")
+        elif _entry_exists(fresh[3], _RESERVATION_MARKER):
+            raise UnsafePathError("cleanup marker is not absent")
+        if partial_present:
+            if _stat_visible_publication_payload(fresh[3], destination.partial_path.name) != snapshot:
+                raise UnsafePathError("cleanup partial changed")
+        elif _entry_exists(fresh[3], destination.partial_path.name):
+            raise UnsafePathError("cleanup partial is not absent")
+        if (_stat_visible_publication_payload(fresh[1], destination.final_path.name) != snapshot
+            or _fstat_direct_cleanup_payload(descriptor) != snapshot):
+            raise UnsafePathError("cleanup final changed")
+    finally:
+        for fd in reversed(fresh):
+            os.close(fd)
+
+
+def _require_cleanup_final_baseline(current, published_stat):
+    if (current[:4] != published_stat[:4] or current[5] != published_stat[5]
+        or current[4] != 1
+        or any(type(value) is not int or not 0 <= value <= 9223372036854775807 for value in current)):
+        raise UnsafePathError("cleanup final no longer matches publication")
+
+
+def _direct_cleanup_payload(prepared, snapshot):
+    return PublishedFinalPayload(path=prepared.destination.final_path,
+        st_dev=snapshot[0], st_ino=snapshot[1], logical_size=snapshot[2],
+        st_mode=snapshot[3], st_nlink=snapshot[4], mtime_ns=snapshot[5], ctime_ns=snapshot[6],
+        sha256=prepared.sha256, marker=prepared.marker,
+        directory_identities=prepared.directory_identities)
+
+
+def _require_cleanup_not_cancelled(cancelled, permit):
+    if permit.snapshot().revoked or (cancelled is not None and cancelled()):
+        raise PathValidationError("cleanup was cancelled")
+
+
+def require_direct_cleanup_namespace(prepared, stat_tuple, *, phase):
+    """Cheap phase-specific namespace evidence; missing partial is not a certificate."""
+    if type(phase) is not str or phase not in {"pending", "certified", "finished"}:
+        raise PathValidationError("cleanup phase is invalid")
+    root, component = _validate_direct_cleanup_evidence(prepared, stat_tuple,
+        links=2 if phase == "pending" else 1)
+    _require_safe_writable_root(root)
+    descriptors = _open_visible_publication_chain(root, component,
+        prepared.destination.job_id, prepared.directory_identities)
+    try:
+        fd = _open_publication_payload(descriptors[1], prepared.destination.final_path.name)
+        try:
+            current = _fstat_direct_cleanup_payload(fd)
+            partial_present = _entry_exists(descriptors[3], prepared.destination.partial_path.name)
+            marker_present = _entry_exists(descriptors[3], _RESERVATION_MARKER)
+            if phase == "pending":
+                if not marker_present:
+                    raise UnsafePathError("pending cleanup marker is missing")
+                if partial_present:
+                    if current != stat_tuple:
+                        raise UnsafePathError("pending cleanup publication changed")
+                else:
+                    _require_cleanup_final_baseline(current, stat_tuple)
+            elif current != stat_tuple or partial_present or (phase == "finished" and marker_present):
+                raise UnsafePathError("certified cleanup namespace changed")
+            _require_direct_cleanup_namespace(prepared, fd, current,
+                marker_present=marker_present, partial_present=partial_present)
+        finally:
+            os.close(fd)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def require_current_direct_cleanup_payload(prepared, published, *, marker_present):
+    """Owner check of a fresh final-only certificate without hashing or fsync."""
+    if type(published) is not PublishedFinalPayload or type(marker_present) is not bool:
+        raise PathValidationError("cleanup final evidence is invalid")
+    snapshot = (published.st_dev, published.st_ino, published.logical_size,
+        published.st_mode, published.st_nlink, published.mtime_ns, published.ctime_ns)
+    root, component = _validate_direct_cleanup_evidence(prepared, snapshot, links=1)
+    if (published.path != prepared.destination.final_path or published.sha256 != prepared.sha256
+        or published.marker != prepared.marker or published.directory_identities != prepared.directory_identities):
+        raise PathValidationError("cleanup final evidence does not match publication")
+    descriptors = _open_visible_publication_chain(root, component,
+        prepared.destination.job_id, prepared.directory_identities)
+    try:
+        fd = _open_publication_payload(descriptors[1], prepared.destination.final_path.name)
+        try:
+            _require_direct_cleanup_namespace(prepared, fd, snapshot,
+                marker_present=marker_present, partial_present=False)
+        finally:
+            os.close(fd)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def prepare_direct_cleanup_payload(prepared, published_stat, *, cancelled=None, partial_permit):
+    """Unlink only the original partial, then durably prove the retained final bytes."""
+    if type(partial_permit) is not _PartialUnlinkPermit or partial_permit.snapshot().unlink_attempted:
+        raise PathValidationError("exact partial unlink permit is required")
+    root, component = _validate_direct_cleanup_evidence(prepared, published_stat, links=2)
+    _require_cleanup_not_cancelled(cancelled, partial_permit)
+    _require_safe_writable_root(root)
+    descriptors = _open_visible_publication_chain(root, component,
+        prepared.destination.job_id, prepared.directory_identities)
+    try:
+        destination = prepared.destination
+        fd = _open_publication_payload(descriptors[1], destination.final_path.name)
+        try:
+            current = _fstat_direct_cleanup_payload(fd)
+            if _entry_exists(descriptors[3], destination.partial_path.name):
+                if current != published_stat:
+                    raise UnsafePathError("cleanup publication changed before partial unlink")
+                _require_direct_cleanup_namespace(prepared, fd, current,
+                    marker_present=True, partial_present=True)
+                _require_cleanup_not_cancelled(cancelled, partial_permit)
+                partial_permit._enter_unlink()
+                try:
+                    os.unlink(destination.partial_path.name, dir_fd=descriptors[3])
+                except OSError as error:
+                    raise PathValidationError("owned cleanup partial cannot be unlinked") from error
+                finally:
+                    partial_permit._finish_unlink()
+                current = _fstat_direct_cleanup_payload(fd)
+            _require_cleanup_final_baseline(current, published_stat)
+            _require_direct_cleanup_namespace(prepared, fd, current,
+                marker_present=True, partial_present=False)
+            _require_cleanup_not_cancelled(cancelled, partial_permit)
+            _fsync_staged_partial_directory(descriptors[3])
+            _require_cleanup_not_cancelled(cancelled, partial_permit)
+            # The original descriptor spans unlink; hashing uses a freshly opened one.
+            fresh_fd = _open_publication_payload(descriptors[1], destination.final_path.name)
+            try:
+                _require_direct_cleanup_namespace(prepared, fresh_fd, current,
+                    marker_present=True, partial_present=False)
+                digest = (_hash_publication_payload(fresh_fd, current) if cancelled is None else
+                    _hash_publication_payload(fresh_fd, current, cancelled=cancelled))
+                if digest != prepared.sha256:
+                    raise UnsafePathError("cleanup final byte commitment does not match")
+                _require_direct_cleanup_namespace(prepared, fresh_fd, current,
+                    marker_present=True, partial_present=False)
+                if _fstat_direct_cleanup_payload(fd) != current:
+                    raise UnsafePathError("retained cleanup final changed")
+                _require_cleanup_not_cancelled(cancelled, partial_permit)
+                return _direct_cleanup_payload(prepared, current)
+            finally:
+                os.close(fresh_fd)
+        finally:
+            os.close(fd)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def finish_direct_cleanup_payload(prepared, certified_stat, *, cancelled=None, marker_permit):
+    """Remove only the exact marker after the owner has committed its certificate."""
+    if type(marker_permit) is not _MarkerUnlinkPermit or marker_permit.snapshot().unlink_attempted:
+        raise PathValidationError("exact marker unlink permit is required")
+    root, component = _validate_direct_cleanup_evidence(prepared, certified_stat, links=1)
+    _require_cleanup_not_cancelled(cancelled, marker_permit)
+    _require_safe_writable_root(root)
+    descriptors = _open_visible_publication_chain(root, component,
+        prepared.destination.job_id, prepared.directory_identities)
+    try:
+        fd = _open_publication_payload(descriptors[1], prepared.destination.final_path.name)
+        try:
+            marker_present = _entry_exists(descriptors[3], _RESERVATION_MARKER)
+            _require_direct_cleanup_namespace(prepared, fd, certified_stat,
+                marker_present=marker_present, partial_present=False)
+            _require_cleanup_not_cancelled(cancelled, marker_permit)
+            if marker_present:
+                marker_permit._enter_unlink()
+                try:
+                    os.unlink(_RESERVATION_MARKER, dir_fd=descriptors[3])
+                except OSError as error:
+                    raise PathValidationError("owned cleanup marker cannot be unlinked") from error
+                finally:
+                    marker_permit._finish_unlink()
+            _require_cleanup_not_cancelled(cancelled, marker_permit)
+            _fsync_staged_partial_directory(descriptors[3])
+            _require_direct_cleanup_namespace(prepared, fd, certified_stat,
+                marker_present=False, partial_present=False)
+            _require_cleanup_not_cancelled(cancelled, marker_permit)
+            return _direct_cleanup_payload(prepared, certified_stat)
+        finally:
+            os.close(fd)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)

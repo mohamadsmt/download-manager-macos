@@ -51,6 +51,7 @@ from hermes_downloads.store import (
     _DirectStagePlan,
     _DirectPublicationAttempt,
     _DirectAttemptRecoveryPlan,
+    _DirectCleanupPlan,
 )
 
 if TYPE_CHECKING:
@@ -134,6 +135,13 @@ class _DirectStageObservation:
 @dataclass(frozen=True, slots=True, repr=False)
 class _PublicationObservation:
     plan: object
+    result: object
+    failed: bool
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _CleanupObservation:
+    plan: _DirectCleanupPlan
     result: object
     failed: bool
 
@@ -503,6 +511,11 @@ def run_worker(
     active_recovery: _DirectAttemptRecoveryPlan | None = None
     publication_observed = False
     publication_cancel = threading.Event()
+    active_cleanup: _DirectCleanupPlan | None = None
+    cleanup_activated = False
+    cleanup_cancel = threading.Event()
+    partial_unlink_permit = None
+    marker_unlink_permit = None
     observation_thread: threading.Thread | None = None
     observation_results: Queue = Queue(maxsize=1)
     try:
@@ -677,7 +690,7 @@ def run_worker(
                     worker_epoch=current_epoch, status="blocked"
                 )
             if direct_controller is None and (
-                observation_thread is not None or _direct_observation_busy()
+                active_cleanup is not None or observation_thread is not None or _direct_observation_busy()
             ):
                 return DirectEngineActivateResult(
                     worker_epoch=current_epoch, status="blocked"
@@ -823,6 +836,7 @@ def run_worker(
             """Run one bounded, marker-bound direct admission lifecycle."""
 
             nonlocal active_direct_plan, active_terminal_plan, active_recovery, active_publication, publication_observed, publication_cancel
+            nonlocal active_cleanup, cleanup_activated, cleanup_cancel
 
             controller = direct_controller
             controller_ready = (
@@ -830,6 +844,7 @@ def run_worker(
                 and direct_controller_ready
                 and not direct_recovery_blocked
                 and active_direct_plan is None
+                and active_cleanup is None
                 and observation_thread is None
                 and not _direct_observation_busy()
             )
@@ -849,6 +864,19 @@ def run_worker(
             except (TypeError, ValueError):
                 raise IPCError("invalid_request") from None
 
+            if type(prepared) is _DirectCleanupPlan:
+                result = prepared.download_result
+                if (direct_controller is None and direct_fence is None and direct_record is None
+                    and not direct_record_persisted and not direct_recovery_capability_persisted
+                    and not direct_recovery_blocked and active_direct_plan is None
+                    and active_preparation is None and active_publication is None
+                    and active_cleanup is None and observation_thread is None
+                    and not _direct_observation_busy()):
+                    active_cleanup = prepared
+                    cleanup_activated = False
+                    cleanup_cancel = threading.Event()
+                return DirectJobDispatchResult(result.status, result.job,
+                    result.generation, result.revision, result.state)
             if type(prepared) is DirectDispatchResult:
                 return DirectJobDispatchResult(
                     status=prepared.status,
@@ -859,7 +887,7 @@ def run_worker(
                 )
             if type(prepared) is _DirectAttemptRecoveryPlan:
                 if active_recovery != prepared:
-                    if (observation_thread is not None or active_publication is not None
+                    if (active_cleanup is not None or observation_thread is not None or active_publication is not None
                         or _direct_observation_busy()):
                         result = store.abort_exact_publication_recovery(prepared)
                         return DirectJobDispatchResult(result.status, result.job,
@@ -873,6 +901,11 @@ def run_worker(
                     attempt.generation, attempt.revision, attempt.state)
             if type(prepared) is _DirectPublicationReconciliationPlan:
                 reconciliation = prepared
+                if (active_cleanup is not None or observation_thread is not None
+                    or _direct_observation_busy()):
+                    result = store.abort_direct_publication_reconciliation(reconciliation)
+                    return DirectJobDispatchResult(result.status, result.job,
+                        result.generation, result.revision, result.state)
                 try:
                     from hermes_downloads.paths import (
                         StagedPartialPayload,
@@ -1031,10 +1064,28 @@ def run_worker(
             active_recovery = None
             return recoverable
 
+        def revoke_cleanup() -> None:
+            """Discard late evidence; an entered unlink must settle before ack."""
+            nonlocal active_cleanup, cleanup_activated
+            cleanup_cancel.set()
+            snapshots = [permit.revoke() for permit in (partial_unlink_permit, marker_unlink_permit)
+                if permit is not None]
+            if any(snapshot.in_flight for snapshot in snapshots):
+                raise IPCError('direct_dispatch_blocked')
+            active_cleanup = None
+            cleanup_activated = False
+
         def job_control(command: JobControlCommand) -> JobControlResult:
             """Contain the one active body before acknowledging pause/removal."""
 
             nonlocal active_publication
+            cleanup = active_cleanup
+            if (cleanup is not None and command.job == cleanup.claim.job_id
+                and command.action in {'pause', 'remove'}
+                and store.cleanup_control_is_current(job_id=command.job,
+                    action=command.action, request_id=command.request_id,
+                    payload_digest=command.payload_digest, expected_revision=command.expected_revision)):
+                revoke_cleanup()
             plan = active_direct_plan
             attempt = active_publication
             tracked_job = plan.job.job_id if plan is not None else (attempt.job.job_id if attempt else None)
@@ -1075,6 +1126,10 @@ def run_worker(
             """Contain the one active body before a durable queue pause reply."""
 
             nonlocal active_publication
+            if (active_cleanup is not None and command.gate == 'paused'
+                and store.publication_queue_control_is_current(request_id=command.request_id,
+                    payload_digest=command.payload_digest, expected_revision=command.expected_revision)):
+                revoke_cleanup()
             plan = active_direct_plan
             attempt = active_publication
             snapshot = store.queue_gate_snapshot()
@@ -1108,6 +1163,8 @@ def run_worker(
             nonlocal active_stage_plan
             nonlocal active_preparation, active_publication, publication_permit, publication_stage, active_recovery
             nonlocal publication_observed, publication_cancel
+            nonlocal active_cleanup, cleanup_activated, cleanup_cancel
+            nonlocal partial_unlink_permit, marker_unlink_permit
 
             if observation_thread is not None:
                 if observation_thread.is_alive():
@@ -1116,7 +1173,26 @@ def run_worker(
                 observation_thread = None
                 _direct_observation_busy()
                 observation = observation_results.get_nowait()
-                if type(observation) is _PublicationObservation:
+                if type(observation) is _CleanupObservation:
+                    cleanup = active_cleanup
+                    if (observation.plan is cleanup and not cleanup_cancel.is_set()
+                        and not observation.failed):
+                        try:
+                            if cleanup.claim.phase == 'pending':
+                                active_cleanup = store.certify_direct_cleanup(cleanup, observation.result)
+                            else:
+                                store.finish_direct_cleanup(cleanup, observation.result)
+                                active_cleanup = None
+                                cleanup_activated = False
+                        except Exception:
+                            active_cleanup = None
+                            cleanup_activated = False
+                    elif observation.plan is cleanup:
+                        active_cleanup = None
+                        cleanup_activated = False
+                    partial_unlink_permit = None
+                    marker_unlink_permit = None
+                elif type(observation) is _PublicationObservation:
                     if observation.plan is active_preparation:
                         preparation = active_preparation
                         active_preparation = None
@@ -1155,6 +1231,12 @@ def run_worker(
                                         revision=attempt.revision, _publication_recoverable=recoverable))
                             else:
                                 # Completion is durable before retiring corresponding engine claims.
+                                try:
+                                    active_cleanup = store.prepare_live_direct_cleanup(attempt, observation.result)
+                                except Exception:
+                                    active_cleanup = None
+                                cleanup_activated = False
+                                cleanup_cancel = threading.Event()
                                 close_owned_direct_controller()
                             active_publication = None
                             publication_stage = None
@@ -1230,6 +1312,57 @@ def run_worker(
                                 generation=plan.generation,
                                 revision=tracked.revision if tracked is not None else plan.revision,
                             ))
+
+            if active_cleanup is not None:
+                if (direct_controller is not None or direct_fence is not None or direct_record is not None
+                    or direct_record_persisted or direct_recovery_capability_persisted
+                    or direct_recovery_blocked or active_direct_plan is not None
+                    or active_preparation is not None or active_publication is not None
+                    or _direct_observation_busy()):
+                    return
+                try:
+                    if not cleanup_activated:
+                        active_cleanup = store.activate_direct_cleanup(active_cleanup)
+                        cleanup_activated = True
+                    from hermes_downloads.paths import _PartialUnlinkPermit, _MarkerUnlinkPermit
+                    if active_cleanup.claim.phase == 'pending':
+                        partial_unlink_permit = _PartialUnlinkPermit()
+                    elif active_cleanup.claim.phase == 'certified':
+                        marker_unlink_permit = _MarkerUnlinkPermit()
+                    else:
+                        raise ValueError('cleanup phase is not active')
+                except Exception:
+                    active_cleanup = None
+                    cleanup_activated = False
+                    return
+                if not _acquire_direct_observation():
+                    return
+                cleanup = active_cleanup
+                partial_permit, marker_permit = partial_unlink_permit, marker_unlink_permit
+                cancelled = cleanup_cancel.is_set
+                def cleanup_observe() -> None:
+                    try:
+                        from hermes_downloads.paths import (prepare_direct_cleanup_payload,
+                            finish_direct_cleanup_payload)
+                        if cleanup.claim.phase == 'pending':
+                            result = prepare_direct_cleanup_payload(cleanup.claim.attempt.prepared,
+                                cleanup.claim.published_stat, partial_permit=partial_permit, cancelled=cancelled)
+                        else:
+                            result = finish_direct_cleanup_payload(cleanup.claim.attempt.prepared,
+                                cleanup.claim.certified_stat, marker_permit=marker_permit, cancelled=cancelled)
+                        outcome = _CleanupObservation(cleanup, result, False)
+                    except BaseException:
+                        outcome = _CleanupObservation(cleanup, None, True)
+                    observation_results.put_nowait(outcome)
+                observation_thread = threading.Thread(target=cleanup_observe,
+                    name='direct-cleanup-observation', daemon=True)
+                try:
+                    _start_direct_observation(observation_thread)
+                except BaseException:
+                    observation_thread = None
+                    revoke_cleanup()
+                    raise
+                return
 
             if active_preparation is not None or (active_publication is not None and not publication_observed):
                 if not _acquire_direct_observation():
@@ -1370,6 +1503,8 @@ def run_worker(
     finally:
         try:
             try:
+                if active_cleanup is not None or partial_unlink_permit is not None or marker_unlink_permit is not None:
+                    revoke_cleanup()
                 publication_cancel.set()
                 recoverable = active_recovery is not None
                 if publication_permit is not None:

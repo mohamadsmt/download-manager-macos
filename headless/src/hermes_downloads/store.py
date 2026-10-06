@@ -471,7 +471,7 @@ CREATE TABLE closed_direct_publication_attempts (
     pending_request_id TEXT CHECK (pending_request_id IS NULL)
 );
 """
-_SUPPORTED_SCHEMA_VERSION: Final = 18
+_SUPPORTED_SCHEMA_VERSION: Final = 19
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -813,6 +813,46 @@ _V18_TABLE_SCHEMAS: Final = dict(_V17_TABLE_SCHEMAS,
 _V18_TABLE_SCHEMAS['command_receipts'] = _V18_TABLE_SCHEMAS['command_receipts'].replace(
     'CREATE TABLE COMMAND_RECEIPTS', 'CREATE TABLE "COMMAND_RECEIPTS"', 1)
 
+_DIRECT_CLEANUP_CLAIMS_SCHEMA: Final = """
+CREATE TABLE direct_cleanup_claims (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(job_id)
+        CHECK(typeof(job_id)='text' AND length(job_id) BETWEEN 1 AND 128
+              AND substr(job_id,1,1) GLOB '[A-Za-z0-9]'
+              AND job_id NOT GLOB '*[^A-Za-z0-9._:-]*'),
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES direct_publication_attempts(attempt_id)
+        CHECK(typeof(attempt_id)='text' AND length(attempt_id) BETWEEN 1 AND 128
+              AND substr(attempt_id,1,1) GLOB '[A-Za-z0-9]'
+              AND attempt_id NOT GLOB '*[^A-Za-z0-9._:-]*'),
+    completion_audit_id INTEGER NOT NULL REFERENCES events(event_id)
+        CHECK(typeof(completion_audit_id)='integer' AND completion_audit_id BETWEEN 1 AND 9223372036854775807),
+    completion_generation INTEGER NOT NULL
+        CHECK(typeof(completion_generation)='integer' AND completion_generation BETWEEN 0 AND 9223372036854775807),
+    completion_revision INTEGER NOT NULL
+        CHECK(typeof(completion_revision)='integer' AND completion_revision BETWEEN 0 AND 9223372036854775807),
+    completion_epoch INTEGER NOT NULL
+        CHECK(typeof(completion_epoch)='integer' AND completion_epoch BETWEEN 1 AND 9223372036854775807),
+    proof_sha256 TEXT NOT NULL
+        CHECK(typeof(proof_sha256)='text' AND length(proof_sha256)=64 AND proof_sha256 NOT GLOB '*[^0-9a-f]*'),
+    published_stat TEXT NOT NULL
+        CHECK(typeof(published_stat)='text' AND length(published_stat) BETWEEN 15 AND 141),
+    phase TEXT NOT NULL CHECK(typeof(phase)='text' AND phase IN ('pending','certified','finished')),
+    activation_epoch INTEGER
+        CHECK(activation_epoch IS NULL OR (typeof(activation_epoch)='integer' AND activation_epoch BETWEEN 1 AND 9223372036854775807)),
+    activation_request_id TEXT REFERENCES direct_dispatch_commands(request_id)
+        CHECK(activation_request_id IS NULL OR (typeof(activation_request_id)='text'
+              AND length(activation_request_id) BETWEEN 1 AND 128
+              AND substr(activation_request_id,1,1) GLOB '[A-Za-z0-9]'
+              AND activation_request_id NOT GLOB '*[^A-Za-z0-9._:-]*')),
+    certified_stat TEXT
+        CHECK(certified_stat IS NULL OR (typeof(certified_stat)='text' AND length(certified_stat) BETWEEN 15 AND 141)),
+    CHECK((phase='pending' AND certified_stat IS NULL) OR
+          (phase IN ('certified','finished') AND certified_stat IS NOT NULL)),
+    CHECK(activation_request_id IS NULL OR activation_epoch IS NOT NULL)
+) STRICT;
+"""
+_V19_TABLE_SCHEMAS: Final = dict(_V18_TABLE_SCHEMAS,
+    **_expected_table_schemas(_DIRECT_CLEANUP_CLAIMS_SCHEMA))
+
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _DIRECT_ENGINE_RECOVERY_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}\Z")
@@ -1134,6 +1174,69 @@ class _DirectAttemptRecoveryPlan:
     attempt: _DirectPublicationAttempt
     request_id: str
     payload_digest: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectCleanupClaim:
+    job_id: str
+    attempt_id: str
+    completion_audit_id: int
+    completion_generation: int
+    completion_revision: int
+    completion_epoch: int
+    proof_sha256: str
+    published_stat: tuple[int, ...]
+    phase: str
+    activation_epoch: int | None
+    activation_request_id: str | None
+    certified_stat: tuple[int, ...] | None
+    attempt: _DirectPublicationAttempt
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DirectCleanupPlan:
+    download_result: DirectDispatchResult
+    claim: _DirectCleanupClaim
+    worker_epoch: int
+    request_id: str | None
+    payload_digest: str | None
+
+
+class _PublicationChecksumMismatch(ValueError):
+    """A qualified immutable expected digest differs from the prepared bytes."""
+
+
+_CLEANUP_COLUMNS = tuple('job_id attempt_id completion_audit_id completion_generation '
+    'completion_revision completion_epoch proof_sha256 published_stat phase '
+    'activation_epoch activation_request_id certified_stat'.split())
+
+
+def _cleanup_stat(value, links):
+    if type(value) is not str or not 15 <= len(value) <= 141:
+        raise ValueError('cleanup stat encoding invalid')
+    values = json.loads(value)
+    if type(values) is not list or len(values) != 7:
+        raise ValueError('cleanup stat shape invalid')
+    for item in values:
+        _require_counter(item, 'cleanup stat')
+    if (json.dumps(values, separators=(',', ':')) != value
+        or not stat.S_ISREG(values[3]) or values[4] != links):
+        raise ValueError('cleanup stat invalid')
+    return tuple(values)
+
+
+def _published_cleanup_stat(published):
+    from hermes_downloads.paths import PublishedFinalPayload
+    if type(published) is not PublishedFinalPayload:
+        raise TypeError('cleanup payload invalid')
+    return (published.st_dev, published.st_ino, published.logical_size, published.st_mode,
+        published.st_nlink, published.mtime_ns, published.ctime_ns)
+
+
+def _cleanup_row_values(claim):
+    return tuple(json.dumps(list(value), separators=(',', ':')) if name in
+        {'published_stat','certified_stat'} and value is not None else value
+        for name in _CLEANUP_COLUMNS for value in (getattr(claim,name),))
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1524,6 +1627,7 @@ class SQLiteStore:
             16: _V16_TABLE_SCHEMAS,
             17: _V17_TABLE_SCHEMAS,
             18: _V18_TABLE_SCHEMAS,
+            19: _V19_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -1735,8 +1839,14 @@ class SQLiteStore:
                     raise RuntimeError('migration foreign key violation')
                 connection.execute('PRAGMA user_version = 18')
                 version = 18
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 18:
                 if not SQLiteStore._has_table_schemas(connection, _V18_TABLE_SCHEMAS):
+                    raise RuntimeError('database schema version is incomplete')
+                connection.execute(_DIRECT_CLEANUP_CLAIMS_SCHEMA)
+                connection.execute('PRAGMA user_version = 19')
+                version = 19
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V19_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -3351,6 +3461,13 @@ class SQLiteStore:
             return False
         return self.queue_gate_snapshot()[1] == expected_revision
 
+    def cleanup_control_is_current(self, *, job_id, action, request_id, payload_digest, expected_revision):
+        if self._match_command_receipt(self._connection,request_id=request_id,payload_digest=payload_digest,
+                scope=_JOB_CONTROL_COMMAND_SCOPE,action=action):
+            return False
+        current = self._read_job_control_projection(self._connection,job_id)
+        return current.revision == expected_revision and current.state == 'completed'
+
     def apply_queue_gate(
         self,
         *,
@@ -3947,6 +4064,22 @@ class SQLiteStore:
                 connection.commit()
                 return self._direct_dispatch_result_from_current(current, "blocked")
 
+            if (materialized.source_kind is SourceKind.DIRECT and current.state == 'completed'
+                and expected_worker_epoch == current_epoch
+                and (expected_generation,expected_revision) == (current.generation,current.revision)):
+                result = self._direct_dispatch_result_from_current(current,'blocked')
+                with self._batch_budget():
+                    try:
+                        claim = self._read_direct_cleanup_claim(connection,job_id,{})
+                    except (TypeError,ValueError):
+                        claim = None
+                self._insert_direct_dispatch_command(connection,request_id=request_id,payload_digest=payload_digest,
+                    job=job_id,status=result.status,generation=result.generation,revision=result.revision,state=result.state)
+                connection.commit()
+                if claim is not None and claim.phase in {'pending','certified'}:
+                    return _DirectCleanupPlan(result,claim,current_epoch,request_id,payload_digest)
+                return result
+
             if self._target_managed(connection,job_id,{}):
                 result = self._direct_dispatch_result_from_current(current,'blocked')
             elif expected_worker_epoch != current_epoch:
@@ -4529,6 +4662,8 @@ class SQLiteStore:
         connection.execute('BEGIN IMMEDIATE')
         try:
             self._require_direct_stage_authority(connection,stage)
+            with self._batch_budget():
+                self._qualify_publication_checksum(connection,stage.job.job_id,prepared.sha256,{})
             if (prepared.reservation != stage.terminal.dispatch.reservation
                 or (prepared.marker.st_dev,prepared.marker.st_ino) != (stage.terminal.marker.marker_device,stage.terminal.marker.marker_inode)):
                 raise ValueError('publication preparation authority changed')
@@ -4594,6 +4729,219 @@ class SQLiteStore:
             connection.rollback()
             raise
 
+    def _qualify_publication_checksum(self, connection, job_id, actual_sha256, cache):
+        _require_payload_digest(actual_sha256)
+        origin = self._read_creation_origin(connection,job_id,cache,target=False)
+        if origin.kind == 'batch':
+            expected = origin.batch.expected_sha256
+        elif origin.kind == 'unsupported_single':
+            expected = None
+        else:
+            raise ValueError('publication creation provenance invalid')
+        if expected is not None:
+            _require_payload_digest(expected)
+            if expected != actual_sha256:
+                raise _PublicationChecksumMismatch('publication checksum mismatch')
+            return CompletionVerification.CHECKSUM_VERIFIED
+        return CompletionVerification.TRANSPORT_VERIFIED
+
+    def _read_direct_cleanup_claim(self, connection, job_id, cache):
+        _require_identifier(job_id,'cleanup job')
+        row = connection.execute('SELECT * FROM direct_cleanup_claims WHERE job_id=?',(job_id,)).fetchone()
+        if row is None:
+            return None
+        if tuple(row.keys()) != _CLEANUP_COLUMNS:
+            raise ValueError('cleanup columns invalid')
+        for key in ('job_id','attempt_id'):
+            _require_identifier(_require_sqlite_text(row[key],key),key)
+        for key in ('completion_audit_id','completion_generation','completion_revision','completion_epoch'):
+            _require_counter(_require_sqlite_integer(row[key],key),key)
+        if row['completion_audit_id'] < 1 or row['completion_epoch'] < 1:
+            raise ValueError('cleanup completion fence invalid')
+        _require_payload_digest(row['proof_sha256'])
+        published = _cleanup_stat(row['published_stat'],2)
+        phase = row['phase']
+        if type(phase) is not str or phase not in {'pending','certified','finished'}:
+            raise ValueError('cleanup phase invalid')
+        certified = None if row['certified_stat'] is None else _cleanup_stat(row['certified_stat'],1)
+        if (phase == 'pending') != (certified is None):
+            raise ValueError('cleanup certificate phase invalid')
+        activation = row['activation_epoch']
+        request = row['activation_request_id']
+        epoch = self._current_worker_epoch(connection)
+        if activation is not None:
+            _require_worker_epoch(activation,'cleanup activation epoch')
+            if not row['completion_epoch'] <= activation <= epoch:
+                raise ValueError('cleanup activation epoch invalid')
+        if phase != 'pending' and activation is None:
+            raise ValueError('cleanup activation missing')
+        if request is not None:
+            _require_identifier(request,'cleanup activation request')
+            receipt = self._read_direct_dispatch_command(connection,request)
+            if activation is None or receipt is None or (receipt.job,receipt.status,
+                    receipt.generation,receipt.revision,receipt.state) != (job_id,'blocked',
+                    row['completion_generation'],row['completion_revision'],'completed'):
+                raise ValueError('cleanup activation receipt changed')
+        attempt = self._read_publication_attempt(connection,job_id,require_current=False)
+        status = connection.execute('SELECT status FROM direct_publication_attempts WHERE job_id=?',(job_id,)).fetchone()
+        current = self._read_job_control_projection(connection,job_id)
+        latest = connection.execute('SELECT event_id,kind,generation,revision FROM events WHERE job_id=? ORDER BY event_id DESC LIMIT 1',(job_id,)).fetchone()
+        if (row['job_id'] != job_id or attempt is None or status[0] != 'finished'
+            or attempt.attempt_id != row['attempt_id']
+            or hashlib.sha256(attempt.proof.encode('utf-8')).hexdigest() != row['proof_sha256']
+            or (attempt.audit_id,attempt.generation,attempt.revision,attempt.state,attempt.worker_epoch) !=
+                (row['completion_audit_id'],row['completion_generation'],row['completion_revision'],'completed',row['completion_epoch'])
+            or (current.generation,current.revision,current.state) !=
+                (row['completion_generation'],row['completion_revision'],'completed')
+            or latest is None or tuple(latest) != (row['completion_audit_id'],'job_completed',
+                row['completion_generation'],row['completion_revision']) or row['completion_epoch'] > epoch):
+            raise ValueError('cleanup completed authority changed')
+        binding = self._read_final_publication_binding(connection,job_id)
+        stage = json.loads(attempt.proof)['stage']
+        if (binding is None or published[:3] != (binding.final_device,binding.final_inode,binding.logical_size)
+            or published[:4] != tuple(stage[:4]) or published[5] != stage[5]
+            or certified is not None and (certified[:4] != published[:4] or certified[5] != published[5])):
+            raise ValueError('cleanup payload binding changed')
+        self._qualify_publication_checksum(connection,job_id,attempt.prepared.sha256,cache)
+        self._capture_target_head(connection,job_id,cache)
+        return _DirectCleanupClaim(row['job_id'],row['attempt_id'],row['completion_audit_id'],
+            row['completion_generation'],row['completion_revision'],row['completion_epoch'],
+            row['proof_sha256'],published,phase,activation,request,certified,attempt)
+
+    def _mint_direct_cleanup_claim(self, connection, finished, published, verification, cache):
+        from hermes_downloads.paths import require_current_publication_payload
+        if type(verification) is not CompletionVerification:
+            raise TypeError('cleanup verification invalid')
+        cache.clear()
+        if self._qualify_publication_checksum(connection,finished.job.job_id,published.sha256,cache) is not verification:
+            raise ValueError('cleanup verification changed')
+        require_current_publication_payload(finished.prepared,published)
+        values = _published_cleanup_stat(published)
+        encoded = json.dumps(list(values),separators=(',',':'))
+        _cleanup_stat(encoded,2)
+        connection.execute('INSERT INTO direct_cleanup_claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+            (finished.job.job_id,finished.attempt_id,finished.audit_id,finished.generation,
+             finished.revision,finished.worker_epoch,hashlib.sha256(finished.proof.encode('utf-8')).hexdigest(),
+             encoded,'pending',None,None,None))
+        self._require_one_changed_row(connection,'cleanup claim mint')
+        claim = self._read_direct_cleanup_claim(connection,finished.job.job_id,cache)
+        if claim is None or claim.attempt != finished or claim.published_stat != values:
+            raise ValueError('cleanup claim mint readback changed')
+        require_current_publication_payload(finished.prepared,published)
+
+    def prepare_live_direct_cleanup(self, attempt, published):
+        if type(attempt) is not _DirectPublicationAttempt:
+            raise TypeError('cleanup live attempt invalid')
+        connection = self._connection
+        with self._batch_budget():
+            connection.execute('BEGIN')
+            try:
+                claim = self._read_direct_cleanup_claim(connection,attempt.job.job_id,{})
+                if claim is None or claim.phase != 'pending':
+                    return None
+                if (claim.attempt_id != attempt.attempt_id or claim.attempt.proof != attempt.proof
+                    or claim.published_stat != _published_cleanup_stat(published)
+                    or claim.completion_epoch != self._current_worker_epoch(connection)
+                    or claim.activation_epoch is not None):
+                    raise ValueError('cleanup live completion changed')
+                result = self._direct_dispatch_result_from_current(
+                    self._read_job_control_projection(connection,claim.job_id),'blocked')
+                return _DirectCleanupPlan(result,claim,claim.completion_epoch,None,None)
+            finally:
+                connection.rollback()
+
+    def _require_cleanup_plan(self, connection, plan, cache):
+        if type(plan) is not _DirectCleanupPlan:
+            raise TypeError('cleanup plan invalid')
+        claim = self._read_direct_cleanup_claim(connection,plan.claim.job_id,cache)
+        if (claim != plan.claim or self._current_worker_epoch(connection) != plan.worker_epoch
+            or self.get_direct_engine_record() is not None or self.get_direct_engine_activation_fence() is not None):
+            raise ValueError('cleanup plan stale')
+        if plan.request_id is None:
+            if plan.payload_digest is not None or plan.worker_epoch != claim.completion_epoch:
+                raise ValueError('cleanup automatic epoch stale')
+        else:
+            receipt = self._read_direct_dispatch_command(connection,plan.request_id)
+            if (receipt is None or receipt.payload_digest != plan.payload_digest
+                or receipt.to_result() != plan.download_result or receipt.status != 'blocked'
+                or (receipt.job,receipt.generation,receipt.revision,receipt.state) !=
+                    (claim.job_id,claim.completion_generation,claim.completion_revision,'completed')):
+                raise ValueError('cleanup explicit receipt stale')
+        return claim
+
+    def _cas_direct_cleanup(self, connection, old, new, cache):
+        connection.execute('UPDATE direct_cleanup_claims SET phase=?,activation_epoch=?,activation_request_id=?,certified_stat=? WHERE '+
+            ' AND '.join(name+' IS ?' for name in _CLEANUP_COLUMNS),
+            (new.phase,new.activation_epoch,new.activation_request_id,
+             None if new.certified_stat is None else json.dumps(list(new.certified_stat),separators=(',',':')),
+             *_cleanup_row_values(old)))
+        self._require_one_changed_row(connection,'cleanup claim CAS')
+        cache.clear()
+        if self._read_direct_cleanup_claim(connection,old.job_id,cache) != new:
+            raise ValueError('cleanup claim CAS readback changed')
+
+    def activate_direct_cleanup(self, plan):
+        from hermes_downloads.paths import require_direct_cleanup_namespace
+        connection = self._connection
+        with self._batch_budget():
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                cache = {}; claim = self._require_cleanup_plan(connection,plan,cache)
+                if claim.phase not in {'pending','certified'}:
+                    raise ValueError('cleanup ownership not quiescent')
+                evidence = claim.published_stat if claim.phase == 'pending' else claim.certified_stat
+                require_direct_cleanup_namespace(claim.attempt.prepared,evidence,phase=claim.phase)
+                activated = replace(claim,activation_epoch=plan.worker_epoch,activation_request_id=plan.request_id)
+                self._cas_direct_cleanup(connection,claim,activated,cache)
+                require_direct_cleanup_namespace(claim.attempt.prepared,evidence,phase=claim.phase)
+                connection.commit()
+                return replace(plan,claim=activated)
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def certify_direct_cleanup(self, plan, published):
+        from hermes_downloads.paths import require_current_direct_cleanup_payload
+        connection = self._connection
+        with self._batch_budget():
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                cache = {}; claim = self._require_cleanup_plan(connection,plan,cache)
+                if (claim.phase != 'pending' or claim.activation_epoch != plan.worker_epoch
+                    or claim.activation_request_id != plan.request_id):
+                    raise ValueError('cleanup certification not activated')
+                require_current_direct_cleanup_payload(claim.attempt.prepared,published,marker_present=True)
+                certified = replace(claim,phase='certified',certified_stat=_cleanup_stat(
+                    json.dumps(list(_published_cleanup_stat(published)),separators=(',',':')),1))
+                self._cas_direct_cleanup(connection,claim,certified,cache)
+                require_current_direct_cleanup_payload(claim.attempt.prepared,published,marker_present=True)
+                connection.commit()
+                return replace(plan,claim=certified)
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def finish_direct_cleanup(self, plan, published):
+        from hermes_downloads.paths import require_current_direct_cleanup_payload
+        connection = self._connection
+        with self._batch_budget():
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                cache = {}; claim = self._require_cleanup_plan(connection,plan,cache)
+                if (claim.phase != 'certified' or claim.activation_epoch != plan.worker_epoch
+                    or claim.activation_request_id != plan.request_id
+                    or _published_cleanup_stat(published) != claim.certified_stat):
+                    raise ValueError('cleanup finish not certified')
+                require_current_direct_cleanup_payload(claim.attempt.prepared,published,marker_present=False)
+                finished = replace(claim,phase='finished')
+                self._cas_direct_cleanup(connection,claim,finished,cache)
+                require_current_direct_cleanup_payload(claim.attempt.prepared,published,marker_present=False)
+                connection.commit()
+                return replace(plan,claim=finished)
+            except BaseException:
+                connection.rollback()
+                raise
+
     def complete_direct_publication(self, attempt, published, *, initial_stage=None):
         from hermes_downloads.paths import require_current_publication_payload
         if type(attempt) is not _DirectPublicationAttempt:
@@ -4604,6 +4952,10 @@ class SQLiteStore:
             current_attempt = self._read_publication_attempt(connection,attempt.job.job_id)
             if current_attempt != attempt:
                 raise ValueError('publication completion plan is stale')
+            cache = {}
+            with self._batch_budget():
+                verification = self._qualify_publication_checksum(connection,attempt.job.job_id,
+                    attempt.prepared.sha256,cache)
             if initial_stage is not None:
                 self._require_direct_stage_authority(connection,initial_stage)
             if attempt.pending_request_id is not None:
@@ -4645,6 +4997,8 @@ class SQLiteStore:
                     raise ValueError('publication completed receipt changed')
             require_current_publication_payload(attempt.prepared,published)
             self._close_target_round(connection,completed.job)
+            with self._batch_budget():
+                self._mint_direct_cleanup_claim(connection,finished,published,verification,cache)
             connection.commit()
             return result
         except BaseException:
@@ -4659,6 +5013,8 @@ class SQLiteStore:
         if row is None or row['status'] != 'eligible':
             return None
         attempt = self._read_publication_attempt(connection,current.job)
+        with self._batch_budget():
+            self._qualify_publication_checksum(connection,current.job,attempt.prepared.sha256,{})
         if attempt.pending_request_id not in (None,request_id):
             raise ValueError('publication recovery already pending')
         if persist:

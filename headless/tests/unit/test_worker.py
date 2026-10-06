@@ -569,6 +569,43 @@ def test_explicit_dispatch_reconciles_a_published_final_without_transfer(
 
 
 
+def test_existing_publication_reconciliation_blocks_while_observation_lane_is_owned(short_state_root, monkeypatch):
+    destination, _ = _seed_published_finalization(short_state_root,
+        final_bound=False, mismatched_final=False, missing_final=False)
+    retained = {p: (p.lstat()[:7], p.read_bytes()) for p in (
+        destination.final_path, destination.partial_path,
+        destination.incomplete_dir / '.hermes-reservation')}
+    shutdown, stopped = threading.Event(), threading.Event()
+    results = []
+    monkeypatch.setattr(worker, '_direct_observation_busy', lambda: True)
+    def forbidden(*args, **kwargs):
+        pytest.fail('busy observation lane admitted publication filesystem effects')
+    monkeypatch.setattr(paths, 'publish_staged_partial_payload', forbidden)
+    class Server:
+        def __init__(self, path, **handlers):
+            self.dispatch = handlers['direct_job_dispatch']
+        def serve_once(self):
+            command = ipc.DirectJobDispatchCommand(job='reconcile-job',
+                expected_worker_epoch=1, expected_generation=1, expected_revision=2,
+                request_id='busy-reconcile-dispatch')
+            results.extend((self.dispatch(command), self.dispatch(command)))
+            shutdown.set()
+        def close(self):
+            return None
+    monkeypatch.setattr(worker, 'HealthServer', Server)
+    worker.run_worker(short_state_root, socket_path=short_state_root / 'worker.sock',
+        ready_event=threading.Event(), shutdown_event=shutdown, stopped_event=stopped)
+    expected = ipc.DirectJobDispatchResult('blocked', 'reconcile-job', 1, 2, 'paused')
+    assert results == [expected, expected] and stopped.is_set()
+    assert {p: (p.lstat()[:7], p.read_bytes()) for p in retained} == retained
+    store = SQLiteStore(short_state_root / 'state.db')
+    try:
+        assert 'job_completed' not in [event.kind for event in store.list_events()]
+        assert store._connection.execute('SELECT COUNT(*) FROM direct_cleanup_claims').fetchone()[0] == 0
+    finally:
+        store.close()
+
+
 def test_worker_without_dispatch_never_observes_or_verifies_terminal(private_roots, monkeypatch):
     calls = []
     def forbidden(*args, **kwargs):
@@ -578,12 +615,17 @@ def test_worker_without_dispatch_never_observes_or_verifies_terminal(private_roo
     monkeypatch.setattr(direct.DirectAria2Controller, "observe_terminal", forbidden)
     monkeypatch.setattr(paths, "attest_staged_partial_payload", forbidden)
     monkeypatch.setattr(direct.DirectAria2Controller, "_verify_completed_output", forbidden)
+    monkeypatch.setattr(paths, "prepare_direct_cleanup_payload", forbidden)
+    monkeypatch.setattr(paths, "finish_direct_cleanup_payload", forbidden)
+    monkeypatch.setattr(SQLiteStore, "prepare_live_direct_cleanup", forbidden)
+    monkeypatch.setattr(SQLiteStore, "activate_direct_cleanup", forbidden)
     assert worker.main() == 0
     assert calls == []
 
 
 
-@pytest.mark.parametrize("operation", ("terminal", "stage", "prepare", "post-link", "publication-exit"))
+@pytest.mark.parametrize("operation", ("terminal", "stage", "prepare", "post-link", "publication-exit",
+    "cleanup-prepare", "cleanup-finish", "cleanup-exit"))
 def test_held_observation_cannot_overlap_controller_after_same_process_worker_restart(short_state_root, monkeypatch, operation):
     from types import SimpleNamespace
     from hermes_downloads.processes import ProcessBirthIdentity
@@ -656,12 +698,24 @@ def test_held_observation_cannot_overlap_controller_after_same_process_worker_re
             finally:
                 returned.set()
         monkeypatch.setattr(paths, name, held_publication)
-    elif operation == 'publication-exit':
+    elif operation in {'cleanup-prepare', 'cleanup-finish'}:
+        name = 'prepare_direct_cleanup_payload' if operation == 'cleanup-prepare' else 'finish_direct_cleanup_payload'
+        original = getattr(paths, name)
+        def held_cleanup(*args, **kwargs):
+            entered.set()
+            assert release.wait(10)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                returned.set()
+        monkeypatch.setattr(paths, name, held_cleanup)
+    elif operation in {'publication-exit', 'cleanup-exit'}:
         original_thread = threading.Thread
         class HeldExitThread(original_thread):
             def run(self):
                 super().run()
-                if self.name == 'direct-publication-observation':
+                if self.name == ('direct-publication-observation' if operation == 'publication-exit'
+                    else 'direct-cleanup-observation'):
                     entered.set()
                     assert release.wait(10)
                     returned.set()
@@ -744,7 +798,7 @@ def test_certified_serving_reads_complete_schema16_without_history_effects(short
         assert json.loads(record)['schema'] == 1
         with sqlite3.connect((root / 'state.db').as_uri() + '?mode=ro', uri=True) as connection:
             before = tuple(connection.iterdump())
-            assert connection.execute('PRAGMA user_version').fetchone()[0] == 18
+            assert connection.execute('PRAGMA user_version').fetchone()[0] == 19
             assert connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
             assert connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
         certificate = ownership.preflight(root)
@@ -780,7 +834,7 @@ def test_schema16_certificate_refuses_before_lease_bootstrap_and_reclaim(short_s
         assert readback.database_identity == (database_details.st_dev, database_details.st_ino)
         with sqlite3.connect(root / 'state.db') as connection:
             if fault == 'newer':
-                connection.execute('PRAGMA user_version=19')
+                connection.execute('PRAGMA user_version=20')
             elif fault.endswith('archive'):
                 connection.execute('DROP TABLE closed_direct_publication_attempts')
                 if fault == 'malformed-archive':
