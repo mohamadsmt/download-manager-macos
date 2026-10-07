@@ -76,7 +76,7 @@ def _seed(store, *, state="queued", bindings=3, dispatch=False):
         store._bind_final_publication(job.job_id, claim_token=reservation.claim_token, final_device=13, final_inode=14, logical_size=15)
     connection = store._connection
     if dispatch:
-        connection.execute("INSERT INTO direct_dispatch_commands VALUES (?, ?, ?, 'pending', 4, 7, ?)",
+        connection.execute("INSERT INTO direct_dispatch_commands (request_id,payload_digest,job_id,status,generation,revision,state) VALUES (?, ?, ?, 'pending', 4, 7, ?)",
                            ("historical-dispatch", "c" * 64, job.job_id, state))
     if state == "finalizing":
         connection.execute("INSERT INTO events (kind, job_id, generation, revision) VALUES ('job_finalizing', ?, 4, 7)", (job.job_id,))

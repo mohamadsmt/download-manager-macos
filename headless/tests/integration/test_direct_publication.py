@@ -70,15 +70,23 @@ def _close_fixture_process(process, evidence, *, crash=False):
     """Signal only this newly recorded matching birth; reap waitable workers."""
     from hermes_downloads import processes
     ledger = evidence / f'fixture-{process.pid}.jsonl'
+    try:
+        if crash and process.is_alive():
+            rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+            identity = processes.ProcessBirthIdentity.from_record(next(
+                row['identity'] for row in rows if row['kind'] == 'worker-birth'))
+            assert processes.is_current_process_birth(identity)
+            assert os.getpgid(process.pid) == identity.process_group_id
+            os.killpg(identity.process_group_id, signal.SIGKILL)
+    finally:
+        process.join(8)
+        alive = process.is_alive()
+        _append_record(evidence / 'parent-closure.jsonl', 'worker-join-result',
+            pid=process.pid, exitcode=process.exitcode, alive=alive, waitable_child=True)
+        assert not alive, 'owned fixture child survived join8; closure uncertain'
     rows = [json.loads(line) for line in ledger.read_text().splitlines()]
     identity = processes.ProcessBirthIdentity.from_record(next(
         row['identity'] for row in rows if row['kind'] == 'worker-birth'))
-    if crash and process.is_alive():
-        assert processes.is_current_process_birth(identity)
-        assert os.getpgid(process.pid) == identity.process_group_id
-        os.killpg(identity.process_group_id, signal.SIGKILL)
-    process.join(8)
-    assert not process.is_alive()
     assert processes.reconcile_process_birth(identity) == 'absent'
     _append_record(evidence / 'parent-closure.jsonl', 'worker-reaped',
         identity=identity.to_record(), exitcode=process.exitcode, waitable_child=True,
@@ -473,9 +481,13 @@ def test_real_direct_initial_publication_and_exact_attempt_recovery(barrier, act
             finally:
                 release.set()
                 shutdown.set()
-                if process.is_alive():
-                    _helpers._join(process)
-                _close_fixture_process(process, publication_evidence)
+                try:
+                    _close_fixture_process(process, publication_evidence)
+                finally:
+                    try:
+                        results.close()
+                    finally:
+                        results.join_thread()
 
 
 def _spawn_publication_worker(state, origin, barrier, evidence, *, restart=False, recover_socket=False):
@@ -486,7 +498,19 @@ def _spawn_publication_worker(state, origin, barrier, evidence, *, restart=False
         ready, shutdown, stopped, results, origin.url(), barrier, entered, release, str(evidence),
         restarted if restart else None, recover_socket))
     process.start()
-    assert ready.wait(6)
+    try:
+        assert ready.wait(6)
+    except BaseException:
+        release.set()
+        shutdown.set()
+        try:
+            _close_fixture_process(process, evidence)
+        finally:
+            try:
+                results.close()
+            finally:
+                results.join_thread()
+        raise
     return dict(process=process, shutdown=shutdown, stopped=stopped, entered=entered,
         release=release, restarted=restarted, results=results)
 
@@ -497,22 +521,32 @@ def _finish_publication_worker(child, evidence):
         release_file.touch(mode=0o600)
         child['release'].set()
         child['shutdown'].set()
-    _close_fixture_process(child['process'], evidence)
+    try:
+        _close_fixture_process(child['process'], evidence)
+    finally:
+        try:
+            child['results'].close()
+        finally:
+            child['results'].join_thread()
 
 
 def _start_real_publication(state, origin, barrier, evidence, *, restart=False, recover_socket=False):
     _helpers._seed_local_direct_dispatch_job(state, origin.url('/range'))
     child = _spawn_publication_worker(state, origin, barrier, evidence, restart=restart,
         recover_socket=recover_socket)
-    sock = state / 'worker.sock'
-    assert ipc.set_queue_gate(sock, gate='running', request_id='publication-open', expected_revision=1).applied
-    assert ipc.control_job(sock, job='dispatch-job', action='start_now', request_id='publication-authorize', expected_revision=1).status == 'applied'
-    assert ipc.activate_direct_engine(sock, expected_worker_epoch=1).status == 'active'
-    started = ipc.dispatch_direct_job(sock, job='dispatch-job', expected_worker_epoch=1,
-        expected_generation=1, expected_revision=2, request_id='publication-start')
-    assert (started.status, started.state, started.revision) == ('started', 'downloading', 4)
-    assert child['entered'].wait(6)
-    return child, started, _receipt(state / 'state.db')
+    try:
+        sock = state / 'worker.sock'
+        assert ipc.set_queue_gate(sock, gate='running', request_id='publication-open', expected_revision=1).applied
+        assert ipc.control_job(sock, job='dispatch-job', action='start_now', request_id='publication-authorize', expected_revision=1).status == 'applied'
+        assert ipc.activate_direct_engine(sock, expected_worker_epoch=1).status == 'active'
+        started = ipc.dispatch_direct_job(sock, job='dispatch-job', expected_worker_epoch=1,
+            expected_generation=1, expected_revision=2, request_id='publication-start')
+        assert (started.status, started.state, started.revision) == ('started', 'downloading', 4)
+        assert child['entered'].wait(6)
+        return child, started, _receipt(state / 'state.db')
+    except BaseException:
+        _finish_publication_worker(child, evidence)
+        raise
 
 
 def test_real_same_job_closed_attempt_new_dispatch_transfers_and_publishes(publication_evidence):
@@ -817,7 +851,7 @@ def test_certified_restart_recovers_only_new_exact_direct_attempt_preserving_leg
                 assert legacy_snapshot() == history
                 assert _receipt(database) == original and origin.ledger == before_body
                 with sqlite3.connect(database) as connection:
-                    assert connection.execute('PRAGMA user_version').fetchone()[0] == 19
+                    assert connection.execute('PRAGMA user_version').fetchone()[0] == 20
                     assert connection.execute("SELECT manual_hold FROM materialized_jobs WHERE job_id='dispatch-job'").fetchone()[0] == int(retained_final)
                     assert connection.execute('SELECT COUNT(*) FROM final_publication_bindings WHERE job_id=\'dispatch-job\'').fetchone()[0] == 0
                     assert connection.execute("SELECT COUNT(*) FROM events WHERE kind='job_completed'").fetchone()[0] == 0

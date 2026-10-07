@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -19,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import uuid
 
@@ -31,10 +35,34 @@ TOOLS = ('downloads_add', 'downloads_query', 'downloads_control', 'downloads_edi
 LABEL = 'com.mohamadsmt.hermes-downloads.default'
 UV = Path('/opt/homebrew/bin/uv')
 MAX_BYTES = 1_048_576
+_PREFLIGHT_WORK_SECONDS = 12
+_WORK_DEADLINE = ContextVar('installer_work_deadline', default=None)
+_STOP_REASONS = {'PREFLIGHT_TIMEOUT', 'PROCESS_TIMEOUT', 'PROCESS_EXIT_UNCERTAIN',
+    'SDK_DISCOVERY_TIMEOUT'}
 
 
 class Blocked(ValueError):
     """Only fixed redacted codes may cross the CLI boundary."""
+
+
+@contextmanager
+def preflight_budget():
+    token = None
+    if _WORK_DEADLINE.get() is None:
+        token = _WORK_DEADLINE.set(time.monotonic() + _PREFLIGHT_WORK_SECONDS)
+    try:
+        work_remaining()
+        yield
+    finally:
+        if token is not None: _WORK_DEADLINE.reset(token)
+
+
+def work_remaining():
+    deadline = _WORK_DEADLINE.get()
+    if deadline is None: return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0: raise Blocked('PREFLIGHT_TIMEOUT')
+    return remaining
 
 
 @dataclass(frozen=True)
@@ -230,23 +258,52 @@ def clean_env(home):
 
 def bounded(argv, home, cwd, timeout=20):
     """One owned child/group; uncertainty is retained, never repeatedly signalled."""
+    remaining = work_remaining()
+    shared_limit = remaining is not None and remaining <= timeout
+    started = time.monotonic()
+    if remaining is not None: timeout = min(timeout, remaining)
     process = subprocess.Popen([str(x) for x in argv], cwd=cwd, env=clean_env(home),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    identity = {'pid': process.pid, 'pgid': os.getpgid(process.pid), 'argv': [str(x) for x in argv]}
+    identity = {'pid': process.pid, 'pgid': os.getpgid(process.pid), 'argv': [str(x) for x in argv],
+        'birth_monotonic': time.monotonic(), 'stage': ('sdk' if '--internal-discover' in argv
+            else 'physical' if '--internal-probe' in argv else Path(argv[0]).name)}
     try:
+        deadline = _WORK_DEADLINE.get()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            shared_limit = remaining <= timeout
+            if remaining <= 0: raise subprocess.TimeoutExpired(argv, 0)
+            timeout = min(timeout, remaining)
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        if process.poll() is None and os.getpgid(process.pid) == identity['pgid']:
-            os.killpg(identity['pgid'], signal.SIGTERM)
-        try: process.wait(timeout=3)
+        # The official SDK owns a separate nested group. Never kill its parent
+        # while that context's teardown/child wait may still be unfinished.
+        if '--internal-discover' not in argv and process.poll() is None:
+            try: current_group = os.getpgid(process.pid)
+            except ProcessLookupError: current_group = None
+            if current_group is not None:
+                if current_group != identity['pgid'] or current_group != process.pid:
+                    raise Blocked('PROCESS_EXIT_UNCERTAIN')
+                os.killpg(current_group, signal.SIGTERM)
+        try: identity['wait_returncode'] = process.wait(timeout=3)
         except subprocess.TimeoutExpired: raise Blocked('PROCESS_EXIT_UNCERTAIN')
-        raise Blocked('PROCESS_TIMEOUT')
+        try: os.killpg(identity['pgid'], 0)
+        except ProcessLookupError: identity['group_absent'] = True
+        else: raise Blocked('PROCESS_EXIT_UNCERTAIN')
+        raise Blocked('PREFLIGHT_TIMEOUT' if shared_limit else 'PROCESS_TIMEOUT')
+    else:
+        identity['wait_returncode'] = process.wait(timeout=0)
+        try: os.killpg(identity['pgid'], 0)
+        except ProcessLookupError: identity['group_absent'] = True
+        else: raise Blocked('PROCESS_EXIT_UNCERTAIN')
     finally:
-        identity.update(returncode=process.returncode, reaped=process.returncode is not None)
+        identity.update(returncode=process.returncode, reaped=process.returncode is not None,
+            elapsed_seconds=time.monotonic() - started)
         ledger = os.environ.get('T21A_PROCESS_LOG')
         if ledger:
             with open(ledger, 'a', encoding='utf-8') as stream: stream.write(json.dumps(identity) + '\n')
     if len(stdout) > 4 * MAX_BYTES or len(stderr) > MAX_BYTES: raise Blocked('PROCESS_OUTPUT_LIMIT')
+    work_remaining()
     return process.returncode, stdout, stderr
 
 
@@ -380,6 +437,7 @@ def physical_probe(layout, runtime, commit):
     if inventory != sorted(record['modules']): raise Blocked('MODULE_INVENTORY_MISMATCH')
     modules = {}
     for name in inventory:
+        work_remaining()
         path = source / name
         chain(path)
         source_hash = digest(path.read_bytes())
@@ -420,6 +478,7 @@ def physical_probe(layout, runtime, commit):
             if record['dependencies'].get(package['name']) != package['version']:
                 raise Blocked('LOCK_DEPENDENCY_MISMATCH')
     record['module_parity'] = modules; record['lock_sha256'] = digest((layout.source / 'headless/uv.lock').read_bytes())
+    work_remaining()
     return record
 
 
@@ -455,47 +514,84 @@ def internal_probe(runtime):
     print(json.dumps(record)); return 0
 
 
-async def sdk_tools(runtime, home):
+async def sdk_tools(runtime, home, deadline=None):
+    import anyio
     from mcp import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
     import mcp.client.stdio as transport
+    if deadline is None: deadline = time.monotonic() + 22
+    if (type(deadline) not in (int, float) or not math.isfinite(deadline)
+            or not 5 < deadline - time.monotonic() <= 22):
+        raise Blocked('SDK_DISCOVERY_TIMEOUT')
     original_create = transport._create_platform_compatible_process
     tracked = []
     async def record_create(*args, **kwargs):
+        if deadline - time.monotonic() <= 5: raise Blocked('SDK_DISCOVERY_TIMEOUT')
         child = await original_create(*args, **kwargs)
-        tracked.append((child, {'pid': child.pid, 'pgid': os.getpgid(child.pid), 'kind': 'official-sdk-stdio'}))
+        tracked.append((child, {'pid': child.pid, 'pgid': os.getpgid(child.pid),
+            'birth_monotonic': time.monotonic(), 'kind': 'official-sdk-stdio'}))
         return child
     transport._create_platform_compatible_process = record_create
     parameters = StdioServerParameters(command='/usr/bin/env',
         args=['-u', 'PYTHONPATH', '-u', 'PYTHONHOME', str(runtime / 'bin/python'), '-I', '-B', str(runtime / 'bin/hermes-downloads-mcp')],
         env=clean_env(home))
     try:
-        async with asyncio.timeout(15):
-            async with stdio_client(parameters) as (read, write):
+        async with stdio_client(parameters) as (read, write):
+            remaining = deadline - time.monotonic() - 5
+            if remaining <= 0: raise Blocked('SDK_DISCOVERY_TIMEOUT')
+            with anyio.fail_after(min(15, remaining)):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     result = await session.list_tools()
                     return [{'name': tool.name, 'description': tool.description, 'schema': tool.inputSchema} for tool in result.tools]
+    except* (TimeoutError, Blocked) as error:
+        raise Blocked('SDK_DISCOVERY_TIMEOUT') from error
     finally:
         transport._create_platform_compatible_process = original_create
+        uncertain = False
+        for child, identity in tracked:
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: raise TimeoutError
+                with anyio.fail_after(remaining):
+                    identity['wait_returncode'] = await child.wait()
+                try: os.killpg(identity['pgid'], 0)
+                except ProcessLookupError: identity['group_absent'] = True
+                else: uncertain = True
+            except (TimeoutError, OSError): uncertain = True
+            identity.update(returncode=child.returncode, reaped='wait_returncode' in identity,
+                elapsed_seconds=time.monotonic() - identity['birth_monotonic'])
         ledger = os.environ.get('T21A_PROCESS_LOG')
         if ledger:
             with open(ledger, 'a', encoding='utf-8') as stream:
                 for child, identity in tracked:
-                    identity.update(returncode=child.returncode, reaped=child.returncode is not None)
                     stream.write(json.dumps(identity) + '\n')
+        if uncertain: raise Blocked('PROCESS_EXIT_UNCERTAIN')
 
 
 def discover(layout, runtime):
+    remaining = work_remaining()
+    if remaining is not None and remaining <= 5: raise Blocked('PREFLIGHT_TIMEOUT')
+    deadline = _WORK_DEADLINE.get() or time.monotonic() + 22
     with tempfile.TemporaryDirectory(prefix='hermes-installer-sdk-') as directory:
         code, out, _ = bounded([runtime / 'bin/python', '-I', '-B', Path(__file__).absolute(),
-            '--internal-discover', str(runtime), str(layout.home)], layout.home, directory, 22)
-    if code: raise Blocked('SDK_DISCOVERY_FAILED')
+            '--internal-discover', str(runtime), str(layout.home), str(deadline)], layout.home, directory, 22)
+    if code:
+        try: failure = json.loads(out)
+        except (ValueError, UnicodeError): failure = None
+        for reason in _STOP_REASONS:
+            if failure == {'status': 'NOT_READY', 'reasons': [reason]}: raise Blocked(reason)
+        raise Blocked('SDK_DISCOVERY_FAILED')
     try: return json.loads(out)
     except Exception as error: raise Blocked('SDK_DISCOVERY_FAILED') from error
 
 
 def readiness(layout, expected=None):
+    with preflight_budget():
+        return _readiness(layout, expected)
+
+
+def _readiness(layout, expected):
     reasons = []; record = {'status': 'NOT_READY', 'reasons': reasons, 'commit': None, 'discovered_tools': [], 'parity': {}, 'bundle': {}}
     try:
         chain(layout.source); chain(layout.home)
@@ -522,14 +618,20 @@ def readiness(layout, expected=None):
         if not runtime.is_dir(): reasons.append('CANDIDATE_ENV_ABSENT')
         else:
             try: record['parity'] = physical_probe(layout, runtime, commit)
-            except Blocked as error: reasons.append(str(error))
+            except Blocked as error:
+                if str(error) in _STOP_REASONS: raise
+                reasons.append(str(error))
             try:
                 tools = discover(layout, runtime)
                 names = [tool['name'] for tool in tools]; record['discovered_tools'] = names
                 if sorted(names) != sorted(TOOLS): reasons.append('MISSING_TOOLS')
                 for tool in tools: check_tool(tool)
-            except Blocked as error: reasons.append(str(error))
+            except Blocked as error:
+                if str(error) in _STOP_REASONS: raise
+                reasons.append(str(error))
+        work_remaining()
     except (OSError, ValueError, KeyError, SyntaxError) as error:
+        if isinstance(error, Blocked) and str(error) in _STOP_REASONS: reasons.clear()
         reasons.append(str(error) if isinstance(error, Blocked) else 'PREFLIGHT_INVALID')
     record['reasons'] = sorted(set(reasons))
     if not record['reasons']: record['status'] = 'PLAN_READY'
@@ -555,6 +657,7 @@ def wiring(layout, commit):
 
 
 def pre_effect(layout, entry, bundle, executor, argv):
+    work_remaining()
     if len(os.fsencode(layout.socket)) > 103: raise Blocked('SOCKET_PATH_TOO_LONG')
     for path in (layout.config, layout.plist, layout.state, layout.output, *layout.files().values(), layout.evidence): chain(path)
     for path in (layout.state, layout.state / 'logs', layout.config.parent, layout.backend.parent, layout.backend, layout.renderer.parent, layout.evidence): private_dir(path)
@@ -566,7 +669,9 @@ def pre_effect(layout, entry, bundle, executor, argv):
     if before is not None and raw == after: raise Blocked('EXISTING_INSTALL_REQUIRES_MANIFEST')
     for path in (layout.plist, *layout.files().values()):
         if snapshot(path) is not None: raise Blocked('FILE_COLLISION')
+    work_remaining()
     if executor('inspect', layout, argv) is not None: raise Blocked('SERVICE_COLLISION')
+    work_remaining()
     return raw or b'', before, after, added
 
 
@@ -770,14 +875,15 @@ def run(layout, mode='dry-run', expected_commit=None, manifest=None, executor=la
         if mode == 'rollback':
             try: return rollback(layout, manifest, executor)
             except (Blocked, OSError, TypeError, KeyError): return {'status': 'ROLLBACK_BLOCKED', 'reasons': ['ROLLBACK_AUTHORITY_OR_OBJECT_CHANGED']}
-        plan = readiness(layout, expected_commit)
-        if plan['status'] != 'PLAN_READY': return public(plan)
-        if mode == 'apply':
+        with preflight_budget():
+            plan = readiness(layout, expected_commit)
+            if plan['status'] != 'PLAN_READY': return public(plan)
+            if mode != 'apply':
+                entry, argv, _ = wiring(layout, plan['commit'])
+                pre_effect(layout, entry, plan['bundle'], executor, argv)
+                return {**public(plan), 'renderer_decision': 'NOT_OBSERVED', 'live': 'LIVE_PENDING'}
             if expected_commit is None: raise Blocked('EXPECTED_COMMIT_REQUIRED')
-            return apply(layout, plan, executor)
-        entry, argv, _ = wiring(layout, plan['commit'])
-        pre_effect(layout, entry, plan['bundle'], executor, argv)
-        return {**public(plan), 'renderer_decision': 'NOT_OBSERVED', 'live': 'LIVE_PENDING'}
+        return apply(layout, plan, executor)
     except (Blocked, OSError, TypeError, ValueError) as error:
         return {'status': 'NOT_READY', 'reasons': [str(error) if isinstance(error, Blocked) else 'PREFLIGHT_INVALID']}
 
@@ -794,8 +900,12 @@ def main(argv=None):
         except Exception: return 1
     if arguments and arguments[0] == '--internal-discover':
         try:
-            if len(arguments) != 3: return 2
-            print(json.dumps(asyncio.run(sdk_tools(Path(arguments[1]), Path(arguments[2]))))); return 0
+            if (len(arguments) != 4 or not all(Path(x).is_absolute() for x in arguments[1:3])
+                    or re.fullmatch(r'[0-9]{1,16}(?:\.[0-9]{1,16})?', arguments[3]) is None): return 2
+            deadline = float(arguments[3])
+            print(json.dumps(asyncio.run(sdk_tools(Path(arguments[1]), Path(arguments[2]), deadline)))); return 0
+        except Blocked as error:
+            print(json.dumps({'status': 'NOT_READY', 'reasons': [str(error)]})); return 1
         except Exception: return 1
     try:
         parser = Parser(add_help=False, allow_abbrev=False)

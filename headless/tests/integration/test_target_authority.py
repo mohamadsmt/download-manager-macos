@@ -424,6 +424,10 @@ def v17_fixture(database):
     with closing(SQLiteStore(database)) as store:
         store.recover_cold_start();store.apply_add_batch(ipc.AddBatchCommand.from_record(envelope()))
     with sqlite3.connect(database,isolation_level=None) as connection:
+        assert connection.execute('SELECT count(*) FROM target_dispatch_causes').fetchone()[0]==0
+        assert connection.execute("SELECT count(*) FROM direct_dispatch_commands WHERE producer_kind!='legacy'").fetchone()[0]==0
+        connection.execute('DROP TABLE target_dispatch_causes')
+        connection.execute('ALTER TABLE direct_dispatch_commands DROP COLUMN producer_kind')
         for name in ('direct_cleanup_claims','job_authorization_heads','target_members','authorization_rounds','target_commands'):
             assert connection.execute(f'SELECT count(*) FROM {name}').fetchone()[0]==0
             connection.execute(f'DROP TABLE {name}')
@@ -441,10 +445,13 @@ def v17_fixture(database):
 def test_populated_v17_migration_preserves_original_bytes_and_restores_fks(tmp_path):
     database=tmp_path/'v17.db';before=v17_fixture(database)
     with closing(SQLiteStore(database)) as store:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0]==19
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0]==20
         assert store._connection.execute('PRAGMA foreign_keys').fetchone()[0]==1
         assert store._connection.execute('PRAGMA foreign_key_check').fetchall()==[]
-        for table,rows in before.items():assert [tuple(r) for r in store._connection.execute(f'SELECT * FROM {table}')]==rows
+        for table,rows in before.items():
+            columns='request_id,payload_digest,job_id,status,generation,revision,state' if table=='direct_dispatch_commands' else '*'
+            assert [tuple(r) for r in store._connection.execute(f'SELECT {columns} FROM {table}')]==rows
+        assert store._connection.execute("SELECT count(*) FROM direct_dispatch_commands WHERE producer_kind!='legacy'").fetchone()[0]==0
         for name in ('target_commands','target_members','authorization_rounds','job_authorization_heads'):
             assert store._connection.execute(f'SELECT count(*) FROM {name}').fetchone()[0]==0
         assert store.get_batch_creation_intent('batch-job-0') is not None

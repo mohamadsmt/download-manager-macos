@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 from dataclasses import dataclass, replace
 import os
+import json
 from pathlib import Path
 from queue import Queue
 import stat
@@ -516,6 +517,8 @@ def run_worker(
     cleanup_cancel = threading.Event()
     partial_unlink_permit = None
     marker_unlink_permit = None
+    cleanup_producer_request_id: str | None = None
+    private_queue_operation = None
     observation_thread: threading.Thread | None = None
     observation_results: Queue = Queue(maxsize=1)
     try:
@@ -594,6 +597,7 @@ def run_worker(
 
         def close_owned_direct_controller(
             persist_contained: Callable[[], object] | None = None,
+            *, _join_observer: bool = False,
         ) -> object:
             nonlocal active_terminal_plan, active_stage_plan, direct_controller_ready, direct_recovery_blocked
 
@@ -608,6 +612,8 @@ def run_worker(
             try:
                 controller.close()
                 result = None if persist_contained is None else persist_contained()
+                if _join_observer:
+                    join_owned_observation()
                 clear_owned_direct_claim()
                 clear_owned_direct_controller_state()
                 return result
@@ -616,6 +622,23 @@ def run_worker(
                     direct_recovery_blocked = True
                     raise IPCStateError("direct_dispatch_blocked") from None
                 raise
+
+        def join_owned_observation() -> None:
+            nonlocal observation_thread, direct_recovery_blocked
+            nonlocal partial_unlink_permit, marker_unlink_permit
+            if observation_thread is not None:
+                observation_thread.join(_OBSERVATION_JOIN_SECONDS)
+                if observation_thread.is_alive():
+                    direct_recovery_blocked = True
+                    raise IPCError('direct_dispatch_blocked')
+                observation_thread = None
+                while not observation_results.empty():
+                    observation_results.get_nowait()
+            if _direct_observation_busy():
+                direct_recovery_blocked = True
+                raise IPCError('direct_dispatch_blocked')
+            partial_unlink_permit = None
+            marker_unlink_permit = None
 
         def discard_absent_owned_direct_controller() -> None:
             nonlocal direct_controller_absent_discard_failed
@@ -864,6 +887,13 @@ def run_worker(
             except (TypeError, ValueError):
                 raise IPCError("invalid_request") from None
 
+            return execute_prepared_dispatch(prepared)
+
+        def execute_prepared_dispatch(prepared) -> DirectJobDispatchResult:
+            nonlocal active_direct_plan, active_terminal_plan, active_recovery, active_publication, publication_observed, publication_cancel
+            nonlocal active_cleanup, cleanup_activated, cleanup_cancel, cleanup_producer_request_id
+            controller = direct_controller
+
             if type(prepared) is _DirectCleanupPlan:
                 result = prepared.download_result
                 if (direct_controller is None and direct_fence is None and direct_record is None
@@ -873,6 +903,7 @@ def run_worker(
                     and active_cleanup is None and observation_thread is None
                     and not _direct_observation_busy()):
                     active_cleanup = prepared
+                    cleanup_producer_request_id = cleanup_producer(prepared)
                     cleanup_activated = False
                     cleanup_cancel = threading.Event()
                 return DirectJobDispatchResult(result.status, result.job,
@@ -997,6 +1028,8 @@ def run_worker(
                 source = validate_source_url(plan.job.intent.source_url)
                 if source.raw_url != plan.job.intent.source_url:
                     raise ValueError("persisted source bytes changed during validation")
+                store._require_pending_direct_dispatch_command(store._connection,plan,_effect=True)
+                require_first_private_body_absent(plan, destination)
                 paused_transfer = controller.add_paused(
                     job_id=plan.job.job_id,
                     generation=plan.generation,
@@ -1049,6 +1082,59 @@ def run_worker(
                 state=result.state,
             )
 
+        def private_dispatch(request_id) -> bool:
+            if store._read_direct_dispatch_command(store._connection,request_id) is None:
+                raise ValueError('owned dispatch receipt missing')
+            return store._read_target_dispatch_cause(store._connection,request_id,{}) is not None
+
+        def require_first_private_body_absent(plan, destination=None) -> None:
+            if not private_dispatch(plan.request_id):
+                return
+            cause = store._read_target_dispatch_cause(store._connection,plan.request_id,{})
+            if cause['kind'] != 'body' or cause['admission_serial'] != 1:
+                raise ValueError('first private body cause changed')
+            store._require_pending_direct_dispatch_command(store._connection,plan,_effect=True)
+            if destination is None:
+                from hermes_downloads.paths import rehydrate_destination
+                destination = rehydrate_destination(category=plan.job.category,
+                    collection=plan.job.destination_collection,partial_filename=plan.job.partial_filename,
+                    selected_final_filename=plan.job.selected_final_filename,job_id=plan.job.job_id)
+            for path in (destination.partial_path, destination.partial_path.with_name(destination.partial_path.name+'.aria2')):
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    continue
+                raise ValueError('first private body has unowned partial or control bytes')
+
+        def cleanup_producer(plan, captured=None):
+            """Route by the exact completion producer, independently of its BODY."""
+            claim = store._read_direct_cleanup_claim(store._connection,plan.claim.job_id,{})
+            if claim != plan.claim:
+                raise ValueError('cleanup claim changed')
+            original = json.loads(claim.attempt.proof)['request']
+            completed = []
+            for row in store._connection.execute('''SELECT request_id FROM target_dispatch_causes
+                WHERE kind='publication' AND job_id=? AND attempt_id=? AND original_body_request_id=?''',
+                (claim.job_id,claim.attempt_id,original)):
+                request = row[0]
+                store._read_target_dispatch_cause(store._connection,request,{})
+                receipt = store._read_direct_dispatch_command(store._connection,request)
+                if (receipt.status,receipt.generation,receipt.revision,receipt.state) == (
+                    'started',claim.completion_generation,claim.completion_revision,'completed'):
+                    completed.append(request)
+            if len(completed) > 1:
+                raise ValueError('ambiguous private cleanup completion')
+            request = captured or (completed[0] if completed else original)
+            receipt = store._read_direct_dispatch_command(store._connection,request)
+            private_dispatch(request)
+            if request != original:
+                if receipt.job != claim.job_id or (receipt.status,receipt.generation,receipt.revision,receipt.state) != (
+                    'started',claim.completion_generation,claim.completion_revision,'completed'):
+                    raise ValueError('cleanup completion receipt changed')
+                if completed and request != completed[0]:
+                    raise ValueError('cleanup completion producer changed')
+            return request
+
         def revoke_publication() -> bool:
             """Invalidate completion promptly; a syscall must quiesce before ack."""
             nonlocal active_preparation, publication_stage, active_recovery
@@ -1096,6 +1182,8 @@ def run_worker(
                     action=command.action, request_id=command.request_id,
                     payload_digest=command.payload_digest, expected_revision=command.expected_revision)
             ):
+                private_request = active_recovery.request_id if active_recovery is not None else (plan.request_id if plan is not None else None)
+                private = private_request is not None and store._read_target_dispatch_cause(store._connection,private_request,{}) is not None
                 recoverable = revoke_publication()
                 try:
                     result = close_owned_direct_controller(lambda: store.apply_job_control(
@@ -1106,12 +1194,14 @@ def run_worker(
                         expected_revision=command.expected_revision,
                         _contained_direct_transfer=True,
                         _publication_recoverable=recoverable,
-                    ))
+                    ),_join_observer=private)
                 except RequestConflictError:
                     raise
                 except (TypeError, ValueError):
                     raise IPCError("direct_dispatch_blocked") from None
                 active_publication = None
+                if private:
+                    join_owned_observation()
                 return JobControlResult(
                     status=result.status,
                     job=result.job,
@@ -1123,38 +1213,133 @@ def run_worker(
             return _job_control_from_store(store, command)
 
         def queue_gate(command: QueueGateCommand) -> QueueGateResult:
-            """Contain the one active body before a durable queue pause reply."""
-
-            nonlocal active_publication
-            if (active_cleanup is not None and command.gate == 'paused'
-                and store.publication_queue_control_is_current(request_id=command.request_id,
-                    payload_digest=command.payload_digest, expected_revision=command.expected_revision)):
-                revoke_cleanup()
-            plan = active_direct_plan
-            attempt = active_publication
-            snapshot = store.queue_gate_snapshot()
-            if (
-                command.gate == "paused"
-                and (plan is not None or attempt is not None)
-                and snapshot is not None
-                and store.publication_queue_control_is_current(request_id=command.request_id,
-                    payload_digest=command.payload_digest, expected_revision=command.expected_revision)
-            ):
+            """Retain legacy cancellation; private pause commits before containment."""
+            nonlocal active_publication, direct_recovery_blocked, private_queue_operation
+            nonlocal cleanup_producer_request_id
+            current = store.publication_queue_control_is_current(request_id=command.request_id,
+                payload_digest=command.payload_digest,expected_revision=command.expected_revision)
+            if command.gate != 'paused' or not current:
+                return _queue_gate_from_store(store,command)
+            operation = private_queue_operation or (active_direct_plan,active_publication,active_recovery,
+                active_cleanup,cleanup_producer_request_id if active_cleanup is not None else None)
+            plan,attempt,recovery,cleanup,producer = operation
+            try:
+                if cleanup is not None:
+                    producer = cleanup_producer(cleanup,producer)
+                elif recovery is not None:
+                    if store._read_publication_attempt(store._connection,recovery.attempt.job.job_id) != recovery.attempt:
+                        raise ValueError('owned recovery changed')
+                    producer = recovery.request_id
+                elif attempt is not None:
+                    producer = attempt.pending_request_id or json.loads(attempt.proof)['request']
+                    store._read_publication_attempt(store._connection,attempt.job.job_id)
+                elif plan is not None:
+                    producer = plan.request_id
+                    receipt = store._read_direct_dispatch_command(store._connection,producer)
+                    if receipt is None or (receipt.job,receipt.generation,receipt.payload_digest) != (
+                        plan.job.job_id,plan.generation,plan.payload_digest):
+                        raise ValueError('owned body changed')
+                private = producer is not None and private_dispatch(producer)
+            except (TypeError,ValueError,KeyError):
+                raise IPCError('direct_dispatch_blocked') from None
+            if not private:
+                # Accepted19: entered legacy syscalls refuse before any gate write.
+                if store._read_command_receipt(store._connection,command.request_id) is not None:
+                    return _queue_gate_from_store(store,command)
+                if cleanup is not None:
+                    revoke_cleanup()
+                if plan is not None or attempt is not None:
+                    recoverable = revoke_publication()
+                    job_id = plan.job.job_id if plan is not None else attempt.job.job_id
+                    generation = plan.generation if plan is not None else attempt.generation
+                    revision = plan.revision if plan is not None else attempt.revision
+                    try:
+                        result = close_owned_direct_controller(lambda: store.apply_queue_gate(
+                            gate=command.gate,request_id=command.request_id,payload_digest=command.payload_digest,
+                            expected_revision=command.expected_revision,
+                            _contained_direct_job=(job_id,generation,revision,recoverable)))
+                    except (TypeError,ValueError):
+                        raise IPCError('direct_dispatch_blocked') from None
+                    active_publication = None
+                    return QueueGateResult(applied=result.applied,queue_gate=result.gate,revision=result.revision)
+                return _queue_gate_from_store(store,command)
+            private_queue_operation = (plan,attempt,recovery,cleanup,producer)
+            result = _queue_gate_from_store(store,command)
+            try:
                 recoverable = revoke_publication()
-                job_id = plan.job.job_id if plan is not None else attempt.job.job_id
-                generation = plan.generation if plan is not None else attempt.generation
-                revision = plan.revision if plan is not None else attempt.revision
-                try:
-                    result = close_owned_direct_controller(lambda: store.apply_queue_gate(
-                        gate=command.gate, request_id=command.request_id,
-                        payload_digest=command.payload_digest, expected_revision=command.expected_revision,
-                        _contained_direct_job=(job_id,generation,revision,recoverable),
-                    ))
-                except (TypeError, ValueError):
-                    raise IPCError("direct_dispatch_blocked") from None
+                revoke_cleanup()
+                def contained():
+                    if recovery is not None:
+                        cause = store._read_target_dispatch_cause(store._connection,recovery.request_id,{})
+                        if cause is not None and cause['kind']=='publication' and recovery.attempt.state=='paused':
+                            # Park only unchanged durable work, never its observer/token.
+                            if store._read_publication_attempt(store._connection,recovery.attempt.job.job_id) != recovery.attempt:
+                                raise ValueError('private parked recovery changed')
+                            store._capture_target_head(store._connection,recovery.attempt.job.job_id)
+                        else:
+                            store.abort_exact_publication_recovery(recovery)
+                    elif plan is not None:
+                        receipt = store._read_direct_dispatch_command(store._connection,plan.request_id)
+                        if receipt is not None and receipt.status=='pending':
+                            store.abort_direct_dispatch(plan)
+                        else:
+                            job = store.get_job(plan.job.job_id)
+                            if job.state in {'downloading','finalizing'}:
+                                store.pause_active_direct_job(job_id=job.job,generation=job.generation,
+                                    revision=job.revision,_publication_recoverable=recoverable)
+                    elif attempt is not None and attempt.state in {'downloading','finalizing'}:
+                        store.pause_active_direct_job(job_id=attempt.job.job_id,generation=attempt.generation,
+                            revision=attempt.revision,_publication_recoverable=recoverable)
+                close_owned_direct_controller(contained,_join_observer=True)
                 active_publication = None
-                return QueueGateResult(applied=result.applied, queue_gate=result.gate, revision=result.revision)
-            return _queue_gate_from_store(store, command)
+                join_owned_observation()
+                if (direct_controller is None and direct_fence is None and direct_record is None
+                    and direct_recovery_capability is None and not direct_record_persisted
+                    and not direct_recovery_capability_persisted):
+                    direct_recovery_blocked = False
+                if direct_recovery_blocked:
+                    raise IPCError('direct_dispatch_blocked')
+                private_queue_operation = None
+                cleanup_producer_request_id = None
+            except BaseException:
+                direct_recovery_blocked = True
+                raise IPCError('direct_dispatch_blocked') from None
+            return result
+
+        def poll_target_dispatch() -> None:
+            nonlocal direct_recovery_blocked, private_queue_operation
+            ready = (direct_controller is None and direct_fence is None and direct_record is None
+                and direct_recovery_capability is None and not direct_record_persisted
+                and not direct_recovery_capability_persisted and not direct_recovery_blocked
+                and active_direct_plan is None and active_terminal_plan is None and active_stage_plan is None
+                and active_preparation is None and active_publication is None and active_recovery is None
+                and active_cleanup is None and partial_unlink_permit is None and marker_unlink_permit is None
+                and observation_thread is None and not _direct_observation_busy())
+            if not ready: return
+            epoch = store.worker_epoch()
+            try:
+                prepared = store._prepare_target_dispatch(expected_worker_epoch=epoch,
+                    owner_slot_ready=ready,now=datetime.now(UTC))
+            except (TypeError,ValueError,RuntimeError,OverflowError):
+                direct_recovery_blocked = True
+                return
+            if type(prepared) is _DirectDispatchPlan:
+                try:
+                    require_first_private_body_absent(prepared)
+                    activated = direct_engine_activate(DirectEngineActivateCommand(epoch))
+                    if activated.status != 'active': raise ValueError('private activation blocked')
+                except BaseException:
+                    try:
+                        close_owned_direct_controller(lambda: store.abort_direct_dispatch(prepared))
+                    except BaseException:
+                        direct_recovery_blocked = True
+                        private_queue_operation = (prepared,None,None,None,prepared.request_id)
+                    if direct_controller is not None or direct_fence is not None or direct_record is not None:
+                        direct_recovery_blocked = True
+                        private_queue_operation = (prepared,None,None,None,prepared.request_id)
+                    return
+            if prepared is not None and type(prepared) is not DirectDispatchResult:
+                execute_prepared_dispatch(prepared)
 
         def poll_direct_terminal() -> None:
             """Reap/launch one terminal or stage observation; persist on this thread."""
@@ -1163,7 +1348,7 @@ def run_worker(
             nonlocal active_stage_plan
             nonlocal active_preparation, active_publication, publication_permit, publication_stage, active_recovery
             nonlocal publication_observed, publication_cancel
-            nonlocal active_cleanup, cleanup_activated, cleanup_cancel
+            nonlocal active_cleanup, cleanup_activated, cleanup_cancel, cleanup_producer_request_id
             nonlocal partial_unlink_permit, marker_unlink_permit
 
             if observation_thread is not None:
@@ -1190,6 +1375,8 @@ def run_worker(
                     elif observation.plan is cleanup:
                         active_cleanup = None
                         cleanup_activated = False
+                    if active_cleanup is None:
+                        cleanup_producer_request_id = None
                     partial_unlink_permit = None
                     marker_unlink_permit = None
                 elif type(observation) is _PublicationObservation:
@@ -1231,8 +1418,11 @@ def run_worker(
                                         revision=attempt.revision, _publication_recoverable=recoverable))
                             else:
                                 # Completion is durable before retiring corresponding engine claims.
+                                producer = attempt.pending_request_id or json.loads(attempt.proof)['request']
                                 try:
                                     active_cleanup = store.prepare_live_direct_cleanup(attempt, observation.result)
+                                    cleanup_producer_request_id = (cleanup_producer(active_cleanup,producer)
+                                        if active_cleanup is not None else None)
                                 except Exception:
                                     active_cleanup = None
                                 cleanup_activated = False
@@ -1499,6 +1689,7 @@ def run_worker(
                 health_server.serve_once()
                 if not shutdown_event.wait(0):
                     poll_direct_terminal()
+                    poll_target_dispatch()
         return None
     finally:
         try:

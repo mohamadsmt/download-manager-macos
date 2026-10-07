@@ -104,6 +104,52 @@ def _assert_runtime_roots_are_isolated(private_roots: dict[str, Path]) -> None:
     assert stat.S_IMODE(lease_stat.st_mode) == 0o600
 
 
+def _create_wheel_venv(
+    uv: str, venv: Path, *, cwd: Path, environment: dict[str, str]
+) -> Path:
+    canonical_python = HEADLESS_ROOT / ".venv" / "bin" / "python"
+    assert canonical_python.lstat().st_uid == os.getuid()
+    assert stat.S_ISREG(canonical_python.stat().st_mode)
+    assert canonical_python.stat().st_uid == os.getuid()
+    assert os.access(canonical_python, os.X_OK)
+    _run(
+        [str(canonical_python), "-I", "-B", "-c",
+         "import sys; assert sys.version_info[:2] == (3, 12); "
+         f"assert sys.prefix == {str(canonical_python.parent.parent)!r}; "
+         f"assert sys.executable == {str(canonical_python)!r}"],
+        cwd=cwd,
+        environment=environment,
+    )
+    _run(
+        [uv, "venv", "--python", str(canonical_python), str(venv)],
+        cwd=cwd,
+        environment=environment,
+    )
+    return venv / "bin" / "python"
+
+
+def test_wheel_venv_uses_existing_python_without_discovery_or_downloads(
+    private_roots: dict[str, Path],
+) -> None:
+    uv = shutil.which("uv")
+    assert uv is not None
+    clean_environment = _environment(private_roots)
+    discovery_environment = dict(clean_environment)
+    discovery_environment.update(PATH="/usr/bin:/bin", UV_PYTHON_DOWNLOADS="never")
+    installed_python = _create_wheel_venv(
+        uv,
+        private_roots["artifact"] / "venv",
+        cwd=private_roots["artifact"],
+        environment=discovery_environment,
+    )
+    _run(
+        [str(installed_python), "-I", "-B", "-c",
+         "import sys; assert sys.version_info[:2] == (3, 12)"],
+        cwd=private_roots["artifact"],
+        environment=clean_environment,
+    )
+
+
 def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     private_roots: dict[str, Path],
 ) -> None:
@@ -142,12 +188,11 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
     assert len(wheels) == 1
     wheel = wheels[0]
 
-    _run(
-        [uv, "venv", "--python", "3.12", str(venv)],
+    installed_python = _create_wheel_venv(
+        uv, venv,
         cwd=artifact_root,
         environment=clean_environment,
     )
-    installed_python = venv / "bin" / "python"
     _run(
         [
             uv,

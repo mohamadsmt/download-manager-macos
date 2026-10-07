@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import signal
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -64,6 +65,47 @@ def test_cli_returns_redacted_report_without_effects(args, tmp_path):
     assert {str(p): p.stat().st_ino for p in tmp_path.rglob('*')} == before
 
 
+def test_preflight_deadline_reaps_delayed_child_and_refuses_later_probes(
+        installer, layout, monkeypatch, capsys):
+    # Shorten only this real preflight seam; the actual CLI still has its 20s limit.
+    monkeypatch.setattr(installer, '_PREFLIGHT_WORK_SECONDS', 0.25, raising=False)
+    original_popen = subprocess.Popen
+    owned = []; stages = []
+    def capture(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        owned.append((child, os.getpgid(child.pid)))
+        return child
+    monkeypatch.setattr(installer.subprocess, 'Popen', capture)
+    def delayed_git(source, *args):
+        stages.append('git')
+        return installer.bounded([sys.executable, '-I', '-B', '-c',
+            f'import time; time.sleep(1); print({BASE!r})'],
+            layout.home, source)[1]
+    monkeypatch.setattr(installer, 'git', delayed_git)
+    def later(*args):
+        stages.append('later'); return False
+    monkeypatch.setattr(installer, 'source_has_changes', later)
+    monkeypatch.setattr(installer, 'Layout', lambda *args: layout)
+    started = time.monotonic()
+    try:
+        assert installer.main([]) == 1
+        result = json.loads(capsys.readouterr().out)
+    finally:
+        for child, pgid in owned:
+            if child.poll() is None and os.getpgid(child.pid) == pgid:
+                os.killpg(pgid, signal.SIGTERM)
+            child.wait(timeout=3)
+    assert result['status'] == 'NOT_READY'
+    assert result['reasons'] == ['PREFLIGHT_TIMEOUT']
+    assert time.monotonic() - started < 0.85
+    assert stages == ['git']
+    assert len(owned) == 1
+    child, pgid = owned[0]
+    assert child.returncode == -signal.SIGTERM and child.wait(timeout=0) == child.returncode
+    with pytest.raises(ProcessLookupError): os.killpg(pgid, 0)
+    assert not list(layout.home.iterdir())
+
+
 def test_actual_candidate_is_not_ready_without_artifacts(installer, layout):
     actual = installer.Layout(layout.home, ROOT)
     result = installer.run(actual)
@@ -73,6 +115,181 @@ def test_actual_candidate_is_not_ready_without_artifacts(installer, layout):
     assert result['discovered_tools'] == ['downloads_query']
     assert not list(layout.home.iterdir())
     assert not actual.runtime(result['commit']).exists()
+
+
+def test_sdk_deadline_returns_fixed_timeout_and_reaps_original_child(
+        installer, tmp_path, monkeypatch, capfd):
+    import mcp.client.stdio as transport
+    runtime = tmp_path / 'sdk-runtime'; (runtime / 'bin').mkdir(parents=True)
+    home = tmp_path / 'sdk-home'; home.mkdir(mode=0o700)
+    (runtime / 'bin/python').symlink_to(sys.executable)
+    # A private silent MCP child exercises the official stdin-close/TERM lifecycle.
+    (runtime / 'bin/hermes-downloads-mcp').write_text('import time; time.sleep(30)\n')
+    original_create = transport._create_platform_compatible_process
+    owned = []
+    async def capture(*args, **kwargs):
+        child = await original_create(*args, **kwargs)
+        owned.append((child, os.getpgid(child.pid)))
+        return child
+    monkeypatch.setattr(transport, '_create_platform_compatible_process', capture)
+    original_tools = installer.sdk_tools
+    failures = []
+    async def observe(*args):
+        try: return await original_tools(*args)
+        except Exception as error:
+            failures.append(repr(error)); raise
+    monkeypatch.setattr(installer, 'sdk_tools', observe)
+    started = time.monotonic()
+    try:
+        assert installer.main(['--internal-discover', str(runtime), str(home),
+            str(started + 6)]) == 1
+        output = capfd.readouterr().out
+        assert output, failures
+        result = json.loads(output)
+        assert result == {'status': 'NOT_READY', 'reasons': ['SDK_DISCOVERY_TIMEOUT']}
+        assert time.monotonic() - started < 6
+        assert len(owned) == 1
+        child, pgid = owned[0]
+        assert child.returncode == -signal.SIGTERM
+        import asyncio
+        assert asyncio.run(child.wait()) == child.returncode
+        with pytest.raises(ProcessLookupError): os.killpg(pgid, 0)
+        assert not list(home.iterdir())
+    finally:
+        # The test owns these original objects even when its RED assertion fails.
+        import asyncio
+        for child, pgid in owned:
+            if child.returncode is None and os.getpgid(child.pid) == pgid:
+                os.killpg(pgid, signal.SIGTERM)
+            asyncio.run(child.wait())
+
+
+def test_dry_run_shares_readiness_budget_with_pre_effect_and_resets_afterward(
+        installer, layout, monkeypatch):
+    plan = ready_fixture(installer, layout, monkeypatch)
+    monkeypatch.setattr(installer, '_PREFLIGHT_WORK_SECONDS', 0.35)
+    stages = []
+    def delayed(stage):
+        stages.append(stage)
+        installer.bounded([sys.executable, '-I', '-B', '-c',
+            'import time; time.sleep(0.2)'], layout.home, layout.source)
+    def readiness(*args):
+        with installer.preflight_budget(): delayed('readiness')
+        return plan
+    def inspect(action, *args):
+        assert action == 'inspect'
+        delayed('inspect')
+    monkeypatch.setattr(installer, 'readiness', readiness)
+    started = time.monotonic()
+    result = installer.run(layout, executor=inspect)
+    assert result == {'status': 'NOT_READY', 'reasons': ['PREFLIGHT_TIMEOUT']}
+    assert stages == ['readiness', 'inspect']
+    assert time.monotonic() - started < 1
+    assert installer.work_remaining() is None
+    with installer.preflight_budget(): assert installer.work_remaining() > 0.3
+    assert not list(layout.home.iterdir()) and not layout.runtime(BASE).exists()
+
+
+@pytest.mark.parametrize('work_seconds, setup_seconds', [(0.25, 0), (None, 2.5)],
+    ids=['short-deadline', 'startup-budget'])
+def test_preflight_uncertain_child_blocks_later_probe_without_claiming_reap(
+        installer, layout, monkeypatch, capsys, work_seconds, setup_seconds):
+    if work_seconds is not None:
+        monkeypatch.setattr(installer, '_PREFLIGHT_WORK_SECONDS', work_seconds)
+    def setup(*args):
+        time.sleep(setup_seconds)
+        return layout
+    monkeypatch.setattr(installer, 'Layout', setup)
+    original_popen = subprocess.Popen
+    owned = []; stages = []
+    ready = layout.home / 'fixture-child-ready'
+    def capture(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        owned.append((child, os.getpgid(child.pid)))
+        deadline = time.monotonic() + 3
+        while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), 'fixture child did not install its TERM refusal'
+        return child
+    monkeypatch.setattr(installer.subprocess, 'Popen', capture)
+    def stalled(*args):
+        stages.append('git')
+        return installer.bounded([sys.executable, '-I', '-B', '-c',
+            'import signal,time; from pathlib import Path; '
+            f'signal.signal(signal.SIGTERM, signal.SIG_IGN); Path({str(ready)!r}).touch(); time.sleep(30)'],
+            layout.home, layout.source)[1]
+    monkeypatch.setattr(installer, 'git', stalled)
+    monkeypatch.setattr(installer, 'source_has_changes', lambda *args: stages.append('later'))
+    started = time.monotonic()
+    try:
+        assert installer.main([]) == 1
+        result = json.loads(capsys.readouterr().out)
+        assert result['status'] == 'NOT_READY' and result['reasons'] == ['PROCESS_EXIT_UNCERTAIN']
+        assert stages == ['git'] and len(owned) == 1
+        child, pgid = owned[0]
+        assert child.returncode is None and child.poll() is None
+        assert os.getpgid(child.pid) == pgid == child.pid
+        os.killpg(pgid, 0)
+        if setup_seconds:
+            # Startup plus real work and uncertain TERM/wait leaves JSON margin
+            # inside the unchanged external CLI's 20-second limit.
+            assert time.monotonic() - started < 19
+    finally:
+        for child, pgid in owned:
+            if child.poll() is None and os.getpgid(child.pid) == pgid:
+                os.killpg(pgid, signal.SIGKILL)
+            code = child.wait(timeout=3)
+            with pytest.raises(ProcessLookupError): os.killpg(pgid, 0)
+            ledger = os.environ.get('T21A_PROCESS_LOG')
+            if ledger:
+                with open(ledger, 'a') as stream:
+                    stream.write(json.dumps({'pid': child.pid, 'pgid': pgid,
+                        'kind': 'uncertain-child-fixture-final-reap', 'wait_returncode': code,
+                        'reaped': True, 'group_absent': True}) + '\n')
+        ready.unlink(missing_ok=True)
+    assert not list(layout.home.iterdir())
+
+
+def test_preflight_child_wait_uses_remaining_budget_after_actual_birth(
+        installer, layout, monkeypatch):
+    monkeypatch.setattr(installer, '_PREFLIGHT_WORK_SECONDS', 0.5)
+    original_popen = subprocess.Popen
+    owned = []; waits = []
+    def capture(*args, **kwargs):
+        child = original_popen(*args, **kwargs); owned.append(child)
+        original_communicate = child.communicate
+        def communicate(*args, **kwargs):
+            waits.append((kwargs['timeout'], installer._WORK_DEADLINE.get() - time.monotonic()))
+            return original_communicate(*args, **kwargs)
+        child.communicate = communicate
+        # Real owned birth precedes this bounded private readiness delay.
+        time.sleep(0.15)
+        return child
+    monkeypatch.setattr(installer.subprocess, 'Popen', capture)
+    try:
+        with installer.preflight_budget():
+            with pytest.raises(installer.Blocked, match='^PREFLIGHT_TIMEOUT$'):
+                installer.bounded([sys.executable, '-I', '-B', '-c',
+                    'import time; time.sleep(30)'], layout.home, layout.source)
+        assert len(waits) == 1 and waits[0][0] <= max(0, waits[0][1]) + 0.01
+        assert len(owned) == 1 and owned[0].wait(timeout=0) == -signal.SIGTERM
+        with pytest.raises(ProcessLookupError): os.killpg(owned[0].pid, 0)
+    finally:
+        for child in owned:
+            if child.poll() is None and os.getpgid(child.pid) == child.pid:
+                os.killpg(child.pid, signal.SIGTERM)
+            child.wait(timeout=3)
+    assert not list(layout.home.iterdir())
+
+
+def test_sdk_refuses_admission_without_cleanup_reserve(installer, layout, monkeypatch):
+    monkeypatch.setattr(installer, '_PREFLIGHT_WORK_SECONDS', 5)
+    def refused(*args, **kwargs): pytest.fail('SDK admitted without teardown reserve')
+    monkeypatch.setattr(installer.subprocess, 'Popen', refused)
+    with installer.preflight_budget():
+        with pytest.raises(installer.Blocked, match='^PREFLIGHT_TIMEOUT$'):
+            installer.discover(layout, ROOT / 'headless/.venv')
+    assert not list(layout.home.iterdir())
 
 
 def test_direct_requirements_do_not_require_media_helpers(installer):
@@ -421,6 +638,37 @@ def test_private_committed_module_mismatch_rejected(installer, committed_source_
     assert module.read_bytes() == (ROOT / relative).read_bytes() == site.read_bytes()
     with pytest.raises(installer.Blocked, match='MODULE_PARITY_MISMATCH'):
         installer.physical_probe(snapshot['layout'], ROOT / 'headless/.venv', commit)
+
+
+@pytest.mark.parametrize('damage,reason', [
+    ('lock', 'LOCK_DEPENDENCY_MISMATCH'), ('inode', 'MODULE_PARITY_MISMATCH'),
+    ('symlink', 'MODULE_PARITY_MISMATCH'), ('inventory', 'MODULE_INVENTORY_MISMATCH'),
+    ('entrypoint', 'PHYSICAL_RUNTIME_INVALID')])
+def test_private_physical_parity_refuses_lock_inode_inventory_and_entrypoint_damage(
+        installer, committed_source_snapshot, tmp_path, damage, reason):
+    import shutil
+    snapshot = committed_source_snapshot
+    actual = snapshot['layout']; runtime = tmp_path / 'damaged-runtime'
+    shutil.copytree(ROOT / 'headless/.venv', runtime, symlinks=True)
+    for name in ['hermes-downloads', 'hermes-downloads-worker', 'hermes-downloads-mcp']:
+        path = runtime / 'bin' / name
+        path.write_text(path.read_text().replace(str(ROOT / 'headless/.venv'), str(runtime)))
+    module = runtime / 'lib/python3.12/site-packages/hermes_downloads/models.py'
+    source = actual.source / 'headless/src/hermes_downloads/models.py'
+    original = source.read_bytes()
+    if damage == 'lock':
+        lock = actual.source / 'headless/uv.lock'
+        lock.write_text(lock.read_text().replace('version = "1.29.1"', 'version = "999.0.0"'))
+    elif damage == 'entrypoint':
+        path = runtime / 'bin/hermes-downloads-mcp'
+        path.write_text(path.read_text().replace('hermes_downloads.mcp_server', 'hermes_downloads.cli'))
+    else:
+        module.unlink()
+        if damage == 'inode': os.link(source, module)
+        elif damage == 'symlink': module.symlink_to(source)
+    with pytest.raises(installer.Blocked, match='^' + reason + '$'):
+        installer.physical_probe(actual, runtime, snapshot['commit'])
+    assert source.read_bytes() == original
 
 
 @pytest.mark.parametrize('schema', [None, {'type': 'object', 'properties': {}},
