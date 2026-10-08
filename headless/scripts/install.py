@@ -256,17 +256,21 @@ def clean_env(home):
     return env
 
 
-def bounded(argv, home, cwd, timeout=20):
+def bounded(argv, home, cwd, timeout=20, *, _input=None):
     """One owned child/group; uncertainty is retained, never repeatedly signalled."""
+    if _input is not None and (type(_input) is not bytes or len(_input) > MAX_BYTES):
+        raise Blocked('PROCESS_INPUT_LIMIT')
     remaining = work_remaining()
     shared_limit = remaining is not None and remaining <= timeout
     started = time.monotonic()
     if remaining is not None: timeout = min(timeout, remaining)
     process = subprocess.Popen([str(x) for x in argv], cwd=cwd, env=clean_env(home),
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        stdin=subprocess.DEVNULL if _input is None else subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     identity = {'pid': process.pid, 'pgid': os.getpgid(process.pid), 'argv': [str(x) for x in argv],
         'birth_monotonic': time.monotonic(), 'stage': ('sdk' if '--internal-discover' in argv
-            else 'physical' if '--internal-probe' in argv else Path(argv[0]).name)}
+            else 'physical' if '--internal-probe' in argv
+            else 'git-head-batch' if 'cat-file' in argv else Path(argv[0]).name)}
     try:
         deadline = _WORK_DEADLINE.get()
         if deadline is not None:
@@ -274,7 +278,8 @@ def bounded(argv, home, cwd, timeout=20):
             shared_limit = remaining <= timeout
             if remaining <= 0: raise subprocess.TimeoutExpired(argv, 0)
             timeout = min(timeout, remaining)
-        stdout, stderr = process.communicate(timeout=timeout)
+        if _input is None: stdout, stderr = process.communicate(timeout=timeout)
+        else: stdout, stderr = process.communicate(input=_input, timeout=timeout)
     except subprocess.TimeoutExpired:
         # The official SDK owns a separate nested group. Never kill its parent
         # while that context's teardown/child wait may still be unfinished.
@@ -311,6 +316,33 @@ def git(source, *args):
     code, out, _ = bounded(['/usr/bin/git', '--no-optional-locks', '-C', source, *args], source, source)
     if code: raise Blocked('SOURCE_UNAVAILABLE')
     return out
+
+
+def _committed_module_hashes(source, commit, names):
+    """Closed exact-commit module requests; Git's default ordered blob framing."""
+    if (re.fullmatch(r'[0-9a-f]{40}', commit) is None or len(names) != 16
+            or names != sorted(set(names)) or any(re.fullmatch(
+                r'(?:[A-Za-z_][A-Za-z0-9_]*/)*[A-Za-z_][A-Za-z0-9_]*\.py', name)
+                is None for name in names)):
+        raise Blocked('COMMITTED_MODULE_INVALID')
+    requests = ''.join(f'{commit}:headless/src/hermes_downloads/{name}\n'
+        for name in names).encode('ascii')
+    code, out, _ = bounded(['/usr/bin/git', '--no-optional-locks', '-C', source,
+        'cat-file', '--batch'], source, source, _input=requests)
+    if code or len(out) > 4 * MAX_BYTES: raise Blocked('COMMITTED_MODULE_INVALID')
+    hashes = {}; seen = set(); offset = 0
+    for name in names:
+        work_remaining()
+        end = out.find(b'\n', offset, offset + 64)
+        header = re.fullmatch(rb'([0-9a-f]{40}) blob (0|[1-9][0-9]{0,6})',
+            out[offset:end]) if end >= 0 else None
+        if header is None or header[1] in seen: raise Blocked('COMMITTED_MODULE_INVALID')
+        size = int(header[2]); start = end + 1; offset = start + size + 1
+        if size > MAX_BYTES or out[offset - 1:offset] != b'\n':
+            raise Blocked('COMMITTED_MODULE_INVALID')
+        hashes[name] = digest(out[start:offset - 1]); seen.add(header[1])
+    if offset != len(out): raise Blocked('COMMITTED_MODULE_INVALID')
+    return hashes
 
 
 def source_has_changes(source):
@@ -435,13 +467,14 @@ def physical_probe(layout, runtime, commit):
     source = layout.source / 'headless/src/hermes_downloads'
     inventory = sorted(path.relative_to(source).as_posix() for path in source.rglob('*.py'))
     if inventory != sorted(record['modules']): raise Blocked('MODULE_INVENTORY_MISMATCH')
+    committed_hashes = _committed_module_hashes(layout.source, commit, inventory)
     modules = {}
     for name in inventory:
         work_remaining()
         path = source / name
         chain(path)
         source_hash = digest(path.read_bytes())
-        committed = digest(git(layout.source, 'show', f'{commit}:headless/src/hermes_downloads/{name}'))
+        committed = committed_hashes[name]
         item = record['modules'][name]
         if source_hash != item['sha256'] or source_hash != committed or item['symlink'] or item['inode'] == [path.stat().st_dev, path.stat().st_ino]:
             raise Blocked('MODULE_PARITY_MISMATCH')

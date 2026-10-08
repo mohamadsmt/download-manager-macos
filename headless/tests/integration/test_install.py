@@ -106,15 +106,110 @@ def test_preflight_deadline_reaps_delayed_child_and_refuses_later_probes(
     assert not list(layout.home.iterdir())
 
 
-def test_actual_candidate_is_not_ready_without_artifacts(installer, layout):
+@pytest.fixture(params=['actual-host', 'resource-constrained'])
+def host_oracle(request, installer, layout, monkeypatch):
+    """Own the real invocation; private setup precedes its work clock."""
     actual = installer.Layout(layout.home, ROOT)
+    snapshot = None; wrapper = None
+    if request.param == 'resource-constrained':
+        import shutil
+        snapshot = request.getfixturevalue('committed_source_snapshot')
+        actual = snapshot['layout']; runtime = actual.source / 'headless/.venv'
+        shutil.copytree(ROOT / 'headless/.venv', runtime, symlinks=True)
+        for name in ['hermes-downloads', 'hermes-downloads-worker', 'hermes-downloads-mcp']:
+            path = runtime / 'bin' / name
+            path.write_text(path.read_text().replace(str(ROOT / 'headless/.venv'), str(runtime)))
+        (actual.source / '.git/info').mkdir(mode=0o700)
+        (actual.source / '.git/info/exclude').write_text('/headless/.venv/\n')
+        wrapper = actual.source.parent / 'reserve-delayed-git.py'
+        wrapper.write_text('import os, sys, time\ntime.sleep(0.2)\n'
+            "os.execv('/usr/bin/git', sys.argv[1:])\n")
+    managed = actual.source / '.artifacts/download-manager/runtime'
+    assert not managed.exists() and not managed.is_symlink()
+    assert not list(actual.home.iterdir())
+    original_popen = subprocess.Popen
+    owned = []; sdk_argv = []
+    observation = SimpleNamespace(layout=actual, result=None, sdk_argv=sdk_argv, children=owned)
+    def capture(argv, *args, **kwargs):
+        original_argv = list(map(str, argv))
+        if '--internal-discover' in original_argv: sdk_argv.append(original_argv)
+        if wrapper and original_argv[0] == '/usr/bin/git' and 'cat-file' in original_argv:
+            argv = [sys.executable, '-I', '-B', str(wrapper), *original_argv]
+        child = original_popen(argv, *args, **kwargs)
+        pgid = os.getpgid(child.pid)
+        record = {'pid': child.pid, 'pgid': pgid, 'birth_monotonic': time.monotonic(),
+            'argv': original_argv, 'launched_argv': list(map(str, argv)), 'original_waits': []}
+        owned.append((child, record))
+        assert pgid == child.pid
+        original_wait = child.wait
+        def wait(*args, **kwargs):
+            code = original_wait(*args, **kwargs)
+            record['original_waits'].append(code)
+            return code
+        child.wait = wait
+        return child
+    monkeypatch.setattr(installer.subprocess, 'Popen', capture)
+    def configure(module):
+        assert module._PREFLIGHT_WORK_SECONDS == 12
+        if snapshot: monkeypatch.setattr(module, '_PREFLIGHT_WORK_SECONDS', 4.0)
+    observation.configure = configure
+    def observe(result):
+        observation.result = result
+        if snapshot:
+            assert result['commit'] == snapshot['commit']
+            parity = result['parity']
+            assert parity['python'] == [3, 12] and parity['editable'] is False
+            assert parity['direct_url']['dir_info']['editable'] is False
+            assert len(parity['module_parity']) == 16
+            for name, item in parity['module_parity'].items():
+                expected = snapshot['hashes']['headless/src/hermes_downloads/' + name]
+                assert item['source'] == item['site'] == item['commit'] == expected
+            assert len(parity['dependencies']) == 43 and len(parity['entrypoints']) == 3
+            assert parity['lock_sha256'] == snapshot['hashes']['headless/uv.lock']
+            assert not sdk_argv and result['discovered_tools'] == []
+            assert any('cat-file' in record['argv'] for child, record in owned)
+            assert all(child.returncode == 0 for child, record in owned)
+    observation.observe = observe
+    try:
+        yield observation
+    finally:
+        for child, record in owned:
+            try:
+                if child.poll() is None and os.getpgid(child.pid) == record['pgid']:
+                    os.killpg(record['pgid'], signal.SIGTERM)
+                record['wait_returncode'] = child.wait(timeout=3)
+                with pytest.raises(ProcessLookupError): os.killpg(record['pgid'], 0)
+                record.update(reaped=True, group_absent=True)
+            finally:
+                ledger = os.environ.get('T21A_PROCESS_LOG')
+                if ledger:
+                    with open(ledger, 'a') as stream:
+                        stream.write(json.dumps({**record, 'kind': 'host-oracle-original-final-reap',
+                            'test': request.node.nodeid, 'mode': request.param}) + '\n')
+        no_effects = not list(actual.home.iterdir()) and not managed.exists() and not managed.is_symlink()
+        ledger = os.environ.get('T21A_PROCESS_LOG')
+        if ledger:
+            with open(ledger, 'a') as stream:
+                stream.write(json.dumps({'kind': 'host-oracle-result', 'test': request.node.nodeid,
+                    'mode': request.param, 'result': observation.result, 'sdk_argv': sdk_argv,
+                    'children': [record for child, record in owned], 'no_effects': no_effects}) + '\n')
+        assert no_effects
+
+
+def test_actual_candidate_is_not_ready_without_artifacts(installer, host_oracle):
+    actual = host_oracle.layout
+    host_oracle.configure(installer)
     result = installer.run(actual)
+    host_oracle.observe(result)
     assert result['status'] == 'NOT_READY'
-    assert 'MISSING_BUNDLE' in result['reasons']
-    assert 'MISSING_TOOLS' in result['reasons']
-    assert result['discovered_tools'] == ['downloads_query']
-    assert not list(layout.home.iterdir())
-    assert not actual.runtime(result['commit']).exists()
+    if 'PREFLIGHT_TIMEOUT' in result['reasons']:
+        assert result['reasons'] == ['PREFLIGHT_TIMEOUT']
+        assert result['discovered_tools'] == []
+        assert not host_oracle.sdk_argv and host_oracle.children
+    else:
+        assert 'MISSING_BUNDLE' in result['reasons']
+        assert 'MISSING_TOOLS' in result['reasons']
+        assert result['discovered_tools'] == ['downloads_query']
 
 
 def test_sdk_deadline_returns_fixed_timeout_and_reaps_original_child(
@@ -485,14 +580,21 @@ def test_strict_manifest_rejects_unknown_schema_fields(installer, tmp_path):
         with pytest.raises(installer.Blocked): installer.read_manifest(path)
 
 
-def test_verifier_actual_missing_bundle_fails_closed_without_effects(installer, layout):
+def test_verifier_actual_missing_bundle_fails_closed_without_effects(installer, host_oracle):
     assert VERIFY.is_file(), 'missing verifier observable CLI behavior'
     spec = importlib.util.spec_from_file_location('verify_installer', VERIFY)
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-    result = module.verify(installer.Layout(layout.home, ROOT))
+    host_oracle.configure(module.installer)
+    result = module.verify(host_oracle.layout)
+    host_oracle.observe(result)
     assert result['status'] == 'NOT_READY'
-    assert 'MISSING_BUNDLE' in result['reasons'] and 'MISSING_TOOLS' in result['reasons']
-    assert not list(layout.home.iterdir())
+    if 'PREFLIGHT_TIMEOUT' in result['reasons']:
+        assert result['reasons'] == ['PREFLIGHT_TIMEOUT']
+        assert result['discovered_tools'] == []
+        assert not host_oracle.sdk_argv and host_oracle.children
+    else:
+        assert 'MISSING_BUNDLE' in result['reasons'] and 'MISSING_TOOLS' in result['reasons']
+        assert result['discovered_tools'] == ['downloads_query']
 
 
 def test_long_socket_and_symlink_ancestors_block_without_artifacts(installer, tmp_path):
@@ -621,6 +723,60 @@ def test_private_committed_source_snapshot_parity_and_tampered_site_rejected(ins
     with pytest.raises(installer.Blocked, match='MODULE_PARITY_MISMATCH'): installer.physical_probe(actual, runtime, commit)
 
 
+def test_real_git_startup_latency_preserves_physical_parity_and_sdk_diagnostics(
+        installer, committed_source_snapshot, monkeypatch):
+    import shutil
+    snapshot = committed_source_snapshot
+    actual = snapshot['layout']; runtime = actual.source / 'headless/.venv'
+    shutil.copytree(ROOT / 'headless/.venv', runtime, symlinks=True)
+    for name in ['hermes-downloads', 'hermes-downloads-worker', 'hermes-downloads-mcp']:
+        path = runtime / 'bin' / name
+        path.write_text(path.read_text().replace(str(ROOT / 'headless/.venv'), str(runtime)))
+    (actual.source / '.git/info').mkdir(mode=0o700)
+    (actual.source / '.git/info/exclude').write_text('/headless/.venv/\n')
+    wrapper = actual.source.parent / 'delayed-git.py'
+    wrapper.write_text('import os, sys, time\ntime.sleep(0.6)\n'
+        "os.execv('/usr/bin/git', sys.argv[1:])\n")
+    original_popen = subprocess.Popen
+    owned = []
+    def capture(argv, *args, **kwargs):
+        if str(argv[0]) == '/usr/bin/git':
+            argv = [sys.executable, '-I', '-B', str(wrapper), *map(str, argv)]
+        child = original_popen(argv, *args, **kwargs)
+        owned.append((child, os.getpgid(child.pid)))
+        return child
+    monkeypatch.setattr(installer.subprocess, 'Popen', capture)
+    assert installer._PREFLIGHT_WORK_SECONDS == 12
+    started = time.monotonic()
+    try:
+        result = installer.run(actual)
+        assert result['status'] == 'NOT_READY'
+        assert result['reasons'] == ['MISSING_BUNDLE', 'MISSING_TOOLS'], result['reasons']
+        assert result['discovered_tools'] == ['downloads_query']
+        assert result['commit'] == snapshot['commit']
+        parity = result['parity']
+        assert parity['python'] == [3, 12] and parity['editable'] is False
+        assert len(parity['module_parity']) == 16
+        for name, item in parity['module_parity'].items():
+            expected = snapshot['hashes']['headless/src/hermes_downloads/' + name]
+            assert item['source'] == item['site'] == item['commit'] == expected
+        assert len(parity['dependencies']) == 43 and len(parity['entrypoints']) == 3
+        assert time.monotonic() - started < 12
+    finally:
+        for child, pgid in owned:
+            if child.poll() is None and os.getpgid(child.pid) == pgid:
+                os.killpg(pgid, signal.SIGTERM)
+            code = child.wait(timeout=3)
+            with pytest.raises(ProcessLookupError): os.killpg(pgid, 0)
+            ledger = os.environ.get('T21A_PROCESS_LOG')
+            if ledger:
+                with open(ledger, 'a') as stream:
+                    stream.write(json.dumps({'pid': child.pid, 'pgid': pgid,
+                        'kind': 'git-latency-fixture-final-reap', 'wait_returncode': code,
+                        'reaped': True, 'group_absent': True}) + '\n')
+        assert not list(actual.home.iterdir()) and not actual.runtime(snapshot['commit']).exists()
+
+
 def test_private_committed_module_mismatch_rejected(installer, committed_source_snapshot):
     snapshot = committed_source_snapshot
     relative = 'headless/src/hermes_downloads/models.py'
@@ -638,6 +794,81 @@ def test_private_committed_module_mismatch_rejected(installer, committed_source_
     assert module.read_bytes() == (ROOT / relative).read_bytes() == site.read_bytes()
     with pytest.raises(installer.Blocked, match='MODULE_PARITY_MISMATCH'):
         installer.physical_probe(snapshot['layout'], ROOT / 'headless/.venv', commit)
+
+
+@pytest.mark.parametrize('damage', ['missing', 'tree'])
+def test_actual_committed_module_missing_or_tree_refused(installer, committed_source_snapshot, damage):
+    snapshot = committed_source_snapshot
+    relative = 'headless/src/hermes_downloads/models.py'
+    path = snapshot['layout'].source / relative; original = path.read_bytes()
+    snapshot['git']('rm', '--quiet', '--', relative)
+    if damage == 'tree':
+        path.mkdir(mode=0o700); (path / 'anchor').write_bytes(b'actual private tree\n')
+        snapshot['git']('add', '--', relative)
+    snapshot['git']('commit', '--quiet', '-m', 'Private missing or tree module')
+    commit = snapshot['git']('rev-parse', 'HEAD').decode().strip()
+    if damage == 'tree':
+        (path / 'anchor').unlink(); path.rmdir()
+    path.write_bytes(original)
+    with pytest.raises(installer.Blocked, match='^COMMITTED_MODULE_INVALID$'):
+        installer.physical_probe(snapshot['layout'], ROOT / 'headless/.venv', commit)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize('damage', ['unsupported', 'oid', 'type', 'negative', 'decimal',
+    'oversized', 'truncated', 'terminator', 'malformed', 'duplicate', 'extra', 'output-limit'])
+def test_real_git_batch_framing_damage_refused(installer, committed_source_snapshot, monkeypatch, damage):
+    snapshot = committed_source_snapshot
+    names = sorted(path.relative_to(snapshot['layout'].source / 'headless/src/hermes_downloads').as_posix()
+        for path in (snapshot['layout'].source / 'headless/src/hermes_downloads').rglob('*.py'))
+    original_bounded = installer.bounded
+    observed = []
+    def corrupt(*args, **kwargs):
+        code, out, err = original_bounded(*args, **kwargs)
+        assert code == 0 and args[0][-2:] == ['cat-file', '--batch']
+        observed.append(out)
+        end = out.index(b'\n'); header = out[:end].split(b' ')
+        record_end = end + 1 + int(header[2]) + 1
+        if damage == 'unsupported': code = 129
+        elif damage == 'oid': out = b'g' + out[1:]
+        elif damage == 'type': out = out.replace(b' blob ', b' tree ', 1)
+        elif damage == 'negative': out = b' '.join([*header[:2], b'-1']) + out[end:]
+        elif damage == 'decimal': out = b' '.join([*header[:2], b'0' + header[2]]) + out[end:]
+        elif damage == 'oversized': out = b' '.join([*header[:2], str(installer.MAX_BYTES + 1).encode()]) + out[end:]
+        elif damage == 'truncated': out = out[:-2]
+        elif damage == 'terminator': out = out[:record_end - 1] + b'x' + out[record_end:]
+        elif damage == 'malformed': out = out[:end] + b' extra' + out[end:]
+        elif damage == 'duplicate': out = out[:record_end] * 2 + out[record_end:]
+        elif damage == 'extra': out += out[:record_end]
+        elif damage == 'output-limit': out += b'x' * (4 * installer.MAX_BYTES)
+        return code, out, err
+    monkeypatch.setattr(installer, 'bounded', corrupt)
+    with pytest.raises(installer.Blocked, match='^COMMITTED_MODULE_INVALID$'):
+        installer._committed_module_hashes(snapshot['layout'].source, snapshot['commit'], names)
+    assert len(observed) == 1  # Real Git bytes precede corruption at the private test seam.
+
+
+@pytest.mark.parametrize('damage', ['nul', 'lf', 'cr', 'space', 'duplicate', 'commit'])
+def test_batch_ambiguous_request_refused_before_child(installer, committed_source_snapshot, monkeypatch, damage):
+    snapshot = committed_source_snapshot
+    names = sorted(path.relative_to(snapshot['layout'].source / 'headless/src/hermes_downloads').as_posix()
+        for path in (snapshot['layout'].source / 'headless/src/hermes_downloads').rglob('*.py'))
+    commit = snapshot['commit']
+    if damage == 'commit': commit += '\n'
+    elif damage == 'duplicate': names[-1] = names[0]
+    else: names[-1] += {'nul': '\0', 'lf': '\n', 'cr': '\r', 'space': ' '}[damage]
+    def unexpected(*args, **kwargs): pytest.fail('invalid batch input spawned a child')
+    monkeypatch.setattr(installer.subprocess, 'Popen', unexpected)
+    with pytest.raises(installer.Blocked, match='^COMMITTED_MODULE_INVALID$'):
+        installer._committed_module_hashes(snapshot['layout'].source, commit, names)
+
+
+@pytest.mark.parametrize('raw', ['not bytes', b'x' * 1_048_577])
+def test_bounded_private_input_refused_before_child(installer, layout, monkeypatch, raw):
+    def unexpected(*args, **kwargs): pytest.fail('unbounded input spawned a child')
+    monkeypatch.setattr(installer.subprocess, 'Popen', unexpected)
+    with pytest.raises(installer.Blocked, match='^PROCESS_INPUT_LIMIT$'):
+        installer.bounded(['/usr/bin/git'], layout.home, layout.source, _input=raw)
 
 
 @pytest.mark.parametrize('damage,reason', [
