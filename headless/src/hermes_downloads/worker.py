@@ -30,6 +30,9 @@ from hermes_downloads.ipc import (
     JobControlCommand,
     JobControlResult,
     JobsPage,
+    QueryListPage,
+    QueryStatus,
+    QueryEventsPage,
     PublicJobRecord,
     QueueGateCommand,
     QueueGateResult,
@@ -336,6 +339,18 @@ def _jobs_page_from_store(store: SQLiteStore, cursor: str | None) -> JobsPage:
         jobs=jobs,
         next_cursor=jobs[-1].job if len(jobs) == 100 else None,
     )
+
+
+def _query_list_from_store(store: SQLiteStore, cursor: str | None, deadline: float) -> QueryListPage:
+    return store.read_query_list_page(cursor=cursor, deadline=deadline)
+
+
+def _query_status_from_store(store: SQLiteStore, id: str, deadline: float) -> QueryStatus:
+    return store.read_query_status(id=id, deadline=deadline)
+
+
+def _query_events_from_store(store: SQLiteStore, cursor: str | None, deadline: float) -> QueryEventsPage:
+    return store.read_query_events_page(cursor=cursor, deadline=deadline)
 
 
 def _queue_gate_from_store(
@@ -1666,6 +1681,9 @@ def run_worker(
                     requested_socket_path,
                     health=lambda: _health_from_store(store),
                     jobs_page=lambda cursor: _jobs_page_from_store(store, cursor),
+                    query_list=lambda cursor, deadline: _query_list_from_store(store, cursor, deadline),
+                    query_status=lambda id, deadline: _query_status_from_store(store, id, deadline),
+                    query_events=lambda cursor, deadline: _query_events_from_store(store, cursor, deadline),
                     queue_gate=queue_gate,
                     job_add=lambda command: _job_add_from_store(store, command),
                     add_batch=lambda command: _add_batch_from_store(store, command),

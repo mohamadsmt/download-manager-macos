@@ -31,19 +31,23 @@ _EXPECTED_INPUT_SCHEMA: dict[str, object] = {
     "additionalProperties": False,
     "required": ["scope"],
     "properties": {
-        "scope": {"type": "string", "enum": ["health", "list"]},
+        "scope": {"type": "string", "enum": ["health", "list", "status", "events"]},
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
         "cursor": {
             "anyOf": [
                 {"type": "null"},
                 {
                     "type": "string",
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                    "maxLength": 1024,
+                    "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|~q1:[A-Za-z0-9_-]+)$",
                 },
             ]
         },
     },
     "oneOf": [
         {
+            "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "scope": {"const": "health"},
                 "cursor": {"type": "null"},
@@ -51,7 +55,32 @@ _EXPECTED_INPUT_SCHEMA: dict[str, object] = {
             "required": ["scope"],
         },
         {
-            "properties": {"scope": {"const": "list"}},
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "scope": {"const": "list"},
+                "cursor": {"anyOf": [
+                    {"type": "null"},
+                    {"type": "string", "maxLength": 1024,
+                     "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|~q1:[A-Za-z0-9_-]+)$"},
+                ]},
+            },
+            "required": ["scope"],
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "scope": {"const": "status"},
+                "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+            },
+            "required": ["scope", "id"],
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"scope": {"const": "events"}, "cursor": {"anyOf": [
+                {"type": "null"}, {"type": "string", "maxLength": 1024, "pattern": "^~q1:[A-Za-z0-9_-]+$"}]}},
             "required": ["scope"],
         },
     ],
@@ -240,7 +269,7 @@ def test_downloads_query_server_factory_is_available() -> None:
 
 
 def test_downloads_query_stdio_round_trip_is_read_only_and_redacted() -> None:
-    """The official SDK client sees exactly one bounded query tool over real IPC."""
+    """The official SDK discovers exactly two tools and real redacted reads."""
 
     with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-mcp-") as temporary_root:
         state_root = Path(temporary_root) / "state"
@@ -286,8 +315,8 @@ def test_downloads_query_stdio_round_trip_is_read_only_and_redacted() -> None:
                 "experimental": {},
                 "tools": {"listChanged": False},
             }
-            assert len(listed.tools) == 1
-            tool = listed.tools[0]
+            assert sorted(tool.name for tool in listed.tools) == ['downloads_add', 'downloads_query']
+            tool = next(tool for tool in listed.tools if tool.name == 'downloads_query')
             assert tool.name == "downloads_query"
             assert tool.inputSchema == _EXPECTED_INPUT_SCHEMA
 
@@ -298,9 +327,10 @@ def test_downloads_query_stdio_round_trip_is_read_only_and_redacted() -> None:
 
             assert not first_page.isError
             assert first_page.structuredContent is not None
-            assert set(first_page.structuredContent) == {"jobs", "next_cursor"}
+            assert set(first_page.structuredContent) == {"jobs", "next_cursor", "has_more"}
             assert len(first_page.structuredContent["jobs"]) == 100
-            assert first_page.structuredContent["next_cursor"] == "job-099"
+            assert first_page.structuredContent["next_cursor"].startswith('~q1:')
+            assert first_page.structuredContent['has_more'] is True
             assert first_page.structuredContent["jobs"][0] == {
                 "job": "job-000",
                 "generation": 1,
@@ -326,6 +356,7 @@ def test_downloads_query_stdio_round_trip_is_read_only_and_redacted() -> None:
                     }
                 ],
                 "next_cursor": None,
+                "has_more": False,
             }
             assert json.loads(_result_text(second_page)) == second_page.structuredContent
             exposed = json.dumps(

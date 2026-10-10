@@ -13,6 +13,7 @@ import stat
 import secrets
 import sqlite3
 import time
+import math
 from typing import TYPE_CHECKING, Final
 
 from hermes_downloads.models import (
@@ -26,7 +27,8 @@ from hermes_downloads.models import (
 from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.ipc import (AddBatchCommand, AddBatchResult, AddBatchEntryResult,
     JobControlCommand, JobAddCommand, TargetAuthorizeCommand, TargetAuthorizeResult, _batch_entry, _batch_canonical, _batch_decode, _batch_collection_id,
-    _batch_component, _MAX_BATCH_REPLY)
+    _batch_component, _MAX_BATCH_REPLY, QueryCursor, QueryListPage, QueryStatus,
+    QueryEventsPage, QueryEventRecord, PublicJobRecord, validate_query_cursor, _query_counter)
 from hermes_downloads.network import validate_source_url, SourcePolicyError
 from hermes_downloads.retry import (
     CompletionVerification,
@@ -2140,11 +2142,14 @@ class SQLiteStore:
         return result
 
     @contextmanager
-    def _batch_budget(self):
+    def _batch_budget(self, *, deadline=None):
         connection = self._connection
-        deadline = time.monotonic() + 2.0
+        now = time.monotonic()
+        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= now):
+            raise TimeoutError('batch database deadline')
+        deadline = now + 2.0 if deadline is None else min(now + 2.0, deadline)
         previous = connection.execute('PRAGMA busy_timeout').fetchone()[0]
-        connection.execute('PRAGMA busy_timeout = 2000')
+        connection.execute(f'PRAGMA busy_timeout = {min(2000, max(0, int((deadline - now) * 1000)))}')
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
             yield deadline
@@ -7726,6 +7731,80 @@ class SQLiteStore:
             )
             for row in rows
         )
+
+    def read_query_list_page(self, *, cursor=None, deadline=None) -> QueryListPage:
+        """Finite live keyset, bounded by the first page's maximal ID and epoch."""
+        connection = self._connection
+        if connection.in_transaction:
+            raise ValueError('query cannot borrow a transaction')
+        selector = validate_query_cursor(cursor, 'list')
+        with self._batch_budget(deadline=deadline):
+            connection.execute('BEGIN')
+            try:
+                epoch = _query_counter(self._current_worker_epoch(connection), positive=True)
+                if type(selector) is QueryCursor:
+                    if selector.epoch != epoch:
+                        raise ValueError('query epoch changed')
+                    after, end = selector.after, selector.end
+                else:
+                    after = selector or ''
+                    end = connection.execute('SELECT MAX(job_id) FROM jobs').fetchone()[0]
+                    if end is not None:
+                        QueryCursor('list', epoch, end, end)
+                rows = connection.execute('''SELECT job_id, generation, revision, state FROM jobs
+                    WHERE job_id > ? AND job_id <= ? ORDER BY job_id LIMIT 101''', (after, end)).fetchall()
+                jobs = tuple(PublicJobRecord(row['job_id'],
+                    _query_counter(row['generation']), _query_counter(row['revision']), row['state']) for row in rows)
+                has_more = len(jobs) > 100
+                next_cursor = QueryCursor('list', epoch, jobs[99].job, end).encode() if has_more else None
+                return QueryListPage(jobs[:100], next_cursor, has_more)
+            finally:
+                connection.rollback()
+
+    def read_query_status(self, *, id, deadline=None) -> QueryStatus:
+        connection = self._connection
+        if connection.in_transaction:
+            raise ValueError('query cannot borrow a transaction')
+        QueryStatus(id, None)
+        with self._batch_budget(deadline=deadline):
+            connection.execute('BEGIN')
+            try:
+                _query_counter(self._current_worker_epoch(connection), positive=True)
+                row = connection.execute('''SELECT job_id, generation, revision, state
+                    FROM jobs WHERE job_id = ?''', (id,)).fetchone()
+                record = None if row is None else PublicJobRecord(row['job_id'],
+                    _query_counter(row['generation']), _query_counter(row['revision']), row['state'])
+                return QueryStatus(id, record)
+            finally:
+                connection.rollback()
+
+    def read_query_events_page(self, *, cursor=None, deadline=None) -> QueryEventsPage:
+        connection = self._connection
+        if connection.in_transaction:
+            raise ValueError('query cannot borrow a transaction')
+        selector = validate_query_cursor(cursor, 'events')
+        with self._batch_budget(deadline=deadline):
+            connection.execute('BEGIN')
+            try:
+                epoch = _query_counter(self._current_worker_epoch(connection), positive=True)
+                if selector is not None:
+                    if selector.epoch != epoch:
+                        raise ValueError('query epoch changed')
+                    after, end = selector.after, selector.end
+                else:
+                    after = 0
+                    end = connection.execute('SELECT MAX(event_id) FROM events').fetchone()[0]
+                    if end is not None:
+                        _query_counter(end, positive=True)
+                rows = connection.execute('''SELECT event_id, kind, job_id, generation, revision FROM events
+                    WHERE event_id > ? AND event_id <= ? ORDER BY event_id LIMIT 101''', (after, end)).fetchall()
+                events = tuple(QueryEventRecord(row['event_id'], row['kind'], row['job_id'],
+                    row['generation'], row['revision']) for row in rows)
+                has_more = len(events) > 100
+                next_cursor = QueryCursor('events', epoch, events[99].event_id, end).encode() if has_more else None
+                return QueryEventsPage(events[:100], next_cursor, has_more)
+            finally:
+                connection.rollback()
 
     def get_command(self, request_id: str) -> CommandRecord | None:
         """Read one idempotency ledger entry."""

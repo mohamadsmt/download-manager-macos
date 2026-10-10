@@ -908,6 +908,108 @@ def test_list_events_resumes_after_the_previous_page_cursor(tmp_path: Path) -> N
         store.close()
 
 
+@pytest.mark.parametrize('count', [0, 99, 100, 101, 200, 201])
+def test_query_pages_exact_has_more_and_select_only(tmp_path, count):
+    from hermes_downloads import ipc
+    with closing(SQLiteStore(tmp_path / 'query.db')) as store:
+        store.recover_cold_start()
+        for index in range(count):
+            store.apply_add(_intent(job_id=f'Q{index:03d}', request_id=f'R{index:03d}'))
+        before = store._connection.total_changes
+        def deny(action, table, column, *_):
+            if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
+                return sqlite3.SQLITE_DENY
+            if action == sqlite3.SQLITE_READ and table == 'jobs' and column == 'source_url':
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        store._connection.set_authorizer(deny)
+        try:
+            for view, read in [('list', store.read_query_list_page), ('events', store.read_query_events_page)]:
+                cursor = None; seen = []
+                while True:
+                    page = read(cursor=cursor)
+                    rows = page.jobs if view == 'list' else page.events
+                    seen.extend(rows)
+                    assert page.has_more is (count - len(seen) > 0)
+                    assert (page.next_cursor is not None) is page.has_more
+                    if not page.has_more:
+                        break
+                    decoded = ipc.QueryCursor.decode(page.next_cursor, view)
+                    assert decoded.epoch == 1
+                    cursor = page.next_cursor
+                assert len(seen) == count
+            assert store.read_query_status(id='absent').record is None
+            if count:
+                assert store.read_query_status(id='Q000').record.job == 'Q000'
+        finally:
+            store._connection.set_authorizer(None)
+        assert store._connection.total_changes == before
+        assert not store._connection.in_transaction
+
+
+def test_query_live_cutpoints_watermark_status_and_cold_epoch(tmp_path):
+    from hermes_downloads import ipc
+    with closing(SQLiteStore(tmp_path / 'query.db')) as store:
+        store.recover_cold_start(); _add_page_of_jobs(store)
+        first = store.read_query_list_page(); audit = store.read_query_events_page()
+        connection = store._connection
+        connection.execute("UPDATE jobs SET state='removed', generation=9, revision=10 WHERE job_id='job-100'")
+        # Remove only the cutpoint's immutable fixture history, with no product cleanup.
+        connection.execute("DELETE FROM events WHERE job_id='job-099'")
+        connection.execute("DELETE FROM commands WHERE job_id='job-099'")
+        connection.execute("DELETE FROM command_receipts WHERE request_id='request-099'")
+        connection.execute("DELETE FROM jobs WHERE job_id='job-099'")
+        store.apply_add(_intent(job_id='job-099a', request_id='inrange'))
+        store.apply_add(_intent(job_id='job-001a', request_id='behind'))
+        store.apply_add(_intent(job_id='job-999', request_id='above'))
+        page = store.read_query_list_page(cursor=first.next_cursor)
+        assert [row.job for row in page.jobs] == ['job-099a', 'job-100']
+        assert page.jobs[-1].state == 'removed' and page.jobs[-1].revision == 10
+        assert store.read_query_list_page(cursor='job-099').jobs[-1].job == 'job-999'
+        assert store.read_query_list_page(cursor='zzzz').jobs == ()
+        events = store.read_query_events_page(cursor=audit.next_cursor)
+        assert [row.event_id for row in events.events] == [101]
+        assert store.read_query_status(id='job-100').record.state == 'removed'
+        token = ipc.QueryCursor.decode(first.next_cursor, 'list')
+        assert store.read_query_list_page(cursor=ipc.QueryCursor('list', 1, token.end, token.end).encode()).jobs == ()
+        store.recover_cold_start()
+        with pytest.raises(ValueError, match='epoch'):
+            store.read_query_list_page(cursor=first.next_cursor)
+
+
+@pytest.mark.parametrize('view,column,value', [
+    ('list', 'generation', 9007199254740992), ('list', 'state', 'secret://poison'),
+    ('events', 'revision', 9007199254740992), ('events', 'kind', 'secret://poison'),
+])
+def test_query_poisoned_lookahead_blocks_whole_page_and_restores_budget(tmp_path, view, column, value):
+    with closing(SQLiteStore(tmp_path / 'query.db')) as store:
+        store.recover_cold_start(); _add_page_of_jobs(store)
+        connection = store._connection
+        table = 'jobs' if view == 'list' else 'events'
+        key = 'job_id' if view == 'list' else 'event_id'
+        connection.execute(f'UPDATE {table} SET {column}=? WHERE {key}=?', (value, 'job-100' if view == 'list' else 101))
+        connection.execute('PRAGMA busy_timeout = 37')
+        before = connection.total_changes
+        with pytest.raises((ValueError, RuntimeError)):
+            (store.read_query_list_page if view == 'list' else store.read_query_events_page)()
+        assert not connection.in_transaction
+        assert connection.execute('PRAGMA busy_timeout').fetchone()[0] == 37
+        assert connection.total_changes == before
+
+
+@pytest.mark.parametrize('deadline', [True, False, float('nan'), float('inf'), -1])
+def test_query_expired_or_invalid_deadline_and_foreign_transaction_are_inert(tmp_path, deadline):
+    with closing(SQLiteStore(tmp_path / 'query.db')) as store:
+        store.recover_cold_start()
+        with pytest.raises(TimeoutError):
+            store.read_query_list_page(deadline=deadline)
+        store._connection.execute('BEGIN')
+        with pytest.raises(ValueError, match='transaction'):
+            store.read_query_status(id='absent')
+        assert store._connection.in_transaction
+        store._connection.rollback()
+
+
 def test_failed_bootstrap_closes_the_connection_before_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

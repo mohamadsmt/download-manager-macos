@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import closing
 import importlib
 import importlib.util
 import json
@@ -46,6 +47,209 @@ from hermes_downloads.store import (
 
 
 _WATCHDOG_SECONDS = 5.0
+
+
+@pytest.mark.parametrize('counter', [0, 9007199254740991])
+def test_query_dtos_safe_integer_boundaries_and_exact_health_compatibility(counter):
+    row = ipc.PublicJobRecord('job', counter, counter, 'removed')
+    assert ipc.QueryStatus('job', row).to_record()['record']['revision'] == counter
+    assert ipc.WorkerHealth(9007199254740992, 'paused').worker_epoch == 9007199254740992
+    for bad in [True, False, -1, 9007199254740992, 1.0]:
+        with pytest.raises((TypeError, ValueError, ipc.IPCError)):
+            ipc.QueryStatus.from_record(dict(job='job', record=dict(job='job', generation=bad, revision=0, state='queued')))
+
+
+def test_query_cursors_canonical_closed_disjoint_and_bounded():
+    import base64
+    good = ipc.QueryCursor('events', 1, 1, 1).encode()
+    assert ipc.QueryCursor.decode(good, 'events').after == 1
+    invalid = [good + '=', '~q1:' + 'x' * 1021, '~q1:bad', 'legacy',
+        ipc.QueryCursor('list', 1, 'a', 'z').encode()]
+    raw_records = [
+        '{"v":1,"view":"events","epoch":1,"after":1,"end":1,"extra":0}',
+        '{"v":1,"v":1,"view":"events","epoch":1,"after":1,"end":1}',
+        '{"v":true,"view":"events","epoch":1,"after":1,"end":1}',
+        '{"v":1,"view":"events","epoch":NaN,"after":1,"end":1}',
+        '{"v":1,"view":"events","epoch":1,"after":2,"end":1}',
+        '{"v":1,"view":"events","epoch":1,"after":0,"end":1}',
+    ]
+    invalid += ['~q1:' + base64.urlsafe_b64encode(raw.encode()).decode().rstrip('=') for raw in raw_records]
+    for token in invalid:
+        with pytest.raises(ValueError):
+            ipc.QueryCursor.decode(token, 'events')
+    assert ipc.validate_query_cursor('deleted-cutpoint', 'list') == 'deleted-cutpoint'
+
+
+def test_query_event_whitelist_is_exact_and_closed():
+    kinds = {'job_added', 'job_target_authorized', 'job_paused', 'job_resumed',
+        'job_start_now_requested', 'job_removed', 'job_resolving', 'job_downloading', 'job_finalizing', 'job_completed'}
+    assert ipc._QUERY_EVENT_KINDS == kinds
+    for kind in kinds:
+        event = ipc.QueryEventRecord(1, kind, 'job', 0, 0)
+        assert set(event.to_record()) == {'event_id', 'kind', 'job', 'generation', 'revision'}
+    for change in [dict(kind='https://secret.invalid/?password=x'), dict(event_id=True),
+            dict(event_id=0), dict(generation=9007199254740992), dict(job='secret/path')]:
+        with pytest.raises((TypeError, ValueError)):
+            ipc.QueryEventRecord.from_record(dict(event_id=1, kind='job_added', job='job', generation=0, revision=0, **{}) | change)
+    with pytest.raises(ValueError):
+        ipc.QueryEventRecord.from_record(dict(event_id=1, kind='job_added', job='job', generation=0, revision=0, payload='secret'))
+
+
+def test_query_real_owner_doors_redact_poison_and_keep_health(short_socket_root):
+    with closing(SQLiteStore(short_socket_root / 'state.db')) as store:
+        store.recover_cold_start()
+        store.apply_add(DownloadIntent(job_id='job', request_id='request', payload_digest='0'*64,
+            source_url=b'https://secret.invalid/?token=private', generation=0, revision=0))
+        socket_path = short_socket_root / 'worker.sock'
+        with closing(ipc.HealthServer(socket_path, health=lambda: ipc.WorkerHealth(1, 'paused'),
+                query_list=lambda cursor, deadline: store.read_query_list_page(cursor=cursor, deadline=deadline),
+                query_status=lambda id, deadline: store.read_query_status(id=id, deadline=deadline),
+                query_events=lambda cursor, deadline: store.read_query_events_page(cursor=cursor, deadline=deadline))) as server:
+            page = _serve_one(server, lambda: ipc.request_query_list(socket_path))
+            assert page.has_more is False and page.next_cursor is None
+            assert _serve_one(server, lambda: ipc.request_query_status(socket_path, id='unknown')).record is None
+            assert _serve_one(server, lambda: ipc.request_query_events(socket_path)).events[0].kind == 'job_added'
+            store._connection.execute("UPDATE jobs SET generation=9007199254740992 WHERE job_id='job'")
+            with pytest.raises(ipc.IPCError, match='^downloads_query_unavailable$'):
+                _serve_one(server, lambda: ipc.request_query_list(socket_path))
+            assert _serve_one(server, lambda: ipc.request_health(socket_path)).queue_gate == 'paused'
+
+
+@pytest.mark.parametrize('reply', [
+    {'jobs': [], 'next_cursor': None, 'has_more': 0},
+    {'jobs': [], 'next_cursor': 'secret', 'has_more': False},
+    {'jobs': [], 'next_cursor': None, 'has_more': False, 'raw': 'secret'},
+    {'jobs': [{'job': 'job', 'generation': 9007199254740992, 'revision': 0, 'state': 'queued'}], 'next_cursor': None, 'has_more': False},
+])
+def test_query_client_rejects_closed_or_poisoned_real_responses(short_socket_root, reply):
+    path = short_socket_root / 'fake.sock'; requests = []
+    thread, errors = _start_response_server(path, json.dumps(reply).encode() + b'\n', requests)
+    try:
+        with pytest.raises(ipc.IPCError, match='^downloads_query_unavailable$'):
+            ipc.request_query_list(path)
+    finally:
+        thread.join(_WATCHDOG_SECONDS)
+    assert not thread.is_alive() and not errors
+    assert json.loads(requests[0]) == {'op': 'query_list', 'protocol_version': 1, 'cursor': None}
+
+
+def test_v1_slow_drip_spends_one_owner_deadline_and_recovers(short_socket_root):
+    path = short_socket_root / 'worker.sock'; calls = []
+    with closing(ipc.HealthServer(path, health=lambda: calls.append('health') or ipc.WorkerHealth(1, 'paused'))) as server:
+        def drip():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(path))
+                try:
+                    for byte in b'{"op":"health"}\n':
+                        client.sendall(bytes([byte])); time.sleep(0.15)
+                    client.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+        observer = threading.Thread(target=drip); observer.start()
+        started = time.monotonic()
+        try:
+            server.serve_once()
+            assert time.monotonic() - started < 2.5
+        finally:
+            observer.join(_WATCHDOG_SECONDS)
+        assert not observer.is_alive() and calls == []
+        assert _serve_one(server, lambda: ipc.request_health(path)).queue_gate == 'paused'
+
+
+def test_query_client_fragments_share_original_five_second_budget(short_socket_root):
+    path = short_socket_root / 'slow.sock'
+    requests = []; fragments = []; errors = []; stop = threading.Event()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(path)); listener.listen(1); listener.settimeout(_WATCHDOG_SECONDS)
+        def respond():
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(_WATCHDOG_SECONDS)
+                    requests.append(ipc._read_line(connection))
+                    for fragment in [b'{', b'"jobs":[],', b'"next_cursor":null,', b'"has_more":false}\n']:
+                        connection.sendall(fragment); fragments.append(time.monotonic())
+                        if stop.wait(2):
+                            break
+            except BaseException as error:
+                errors.append(error)
+        observer = threading.Thread(target=respond); observer.start()
+        started = time.monotonic()
+        try:
+            assert ipc._CLIENT_TIMEOUT_SECONDS == 5
+            with pytest.raises(ipc.IPCError, match='^downloads_query_unavailable$'):
+                ipc.request_query_list(path)
+            elapsed = time.monotonic() - started
+            assert 4.8 <= elapsed < 5.5
+        finally:
+            stop.set(); observer.join(_WATCHDOG_SECONDS)
+        assert not observer.is_alive() and not errors
+        assert len(fragments) == 3
+        assert json.loads(requests[0]) == {'op': 'query_list', 'protocol_version': 1, 'cursor': None}
+        if directory := os.environ.get('T18_IMPLEMENTATION_RUN'):
+            with (Path(directory) / 'query-deadlines.jsonl').open('a') as stream:
+                stream.write(json.dumps(dict(kind='query-client-aggregate-budget', elapsed=elapsed,
+                    fragments=len(fragments), observer_joined=not observer.is_alive(), closed_error=True)) + '\n')
+
+
+def test_query_sql_contention_uses_remaining_transport_budget_and_recovers(short_socket_root):
+    database = short_socket_root / 'state.db'; path = short_socket_root / 'worker.sock'
+    with closing(SQLiteStore(database)) as store, closing(sqlite3.connect(database)) as blocker:
+        store.recover_cold_start()
+        connection = store._connection
+        connection.execute('PRAGMA busy_timeout = 37')
+        assert blocker.execute('PRAGMA journal_mode').fetchone()[0] == 'delete'
+        blocker.execute('BEGIN EXCLUSIVE')
+        traces = []; calls = []; responses = []; errors = []
+        connection.set_trace_callback(traces.append)
+        def query(cursor, deadline):
+            started = time.monotonic()
+            remaining = deadline - started
+            try:
+                return store.read_query_list_page(cursor=cursor, deadline=deadline)
+            except sqlite3.OperationalError as error:
+                calls.append(dict(remaining=remaining, sql_elapsed=time.monotonic() - started,
+                    error=str(error), transaction_released=not connection.in_transaction,
+                    busy_timeout=connection.execute('PRAGMA busy_timeout').fetchone()[0]))
+                raise
+        with closing(ipc.HealthServer(path, health=lambda: ipc.WorkerHealth(1, 'paused'), query_list=query)) as server:
+            def slow_request():
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.settimeout(_WATCHDOG_SECONDS); client.connect(str(path))
+                        client.sendall(b'{'); time.sleep(1.4)
+                        client.sendall(b'"op":"query_list","protocol_version":1,"cursor":null}\n')
+                        client.shutdown(socket.SHUT_WR)
+                        responses.append(client.recv(4096))
+                except BaseException as error:
+                    errors.append(error)
+            observer = threading.Thread(target=slow_request); observer.start()
+            started = time.monotonic()
+            try:
+                server.serve_once()
+                elapsed = time.monotonic() - started
+            finally:
+                observer.join(_WATCHDOG_SECONDS)
+                blocker.rollback(); connection.set_trace_callback(None)
+            assert not observer.is_alive() and not errors
+            assert 1.8 <= elapsed < 2.5
+            call, = calls
+            assert 0 < call['remaining'] < 0.8 and call['sql_elapsed'] < 1
+            assert call['error'] == 'database is locked'
+            assert call['transaction_released'] and call['busy_timeout'] == 37
+            assert 'BEGIN' in traces and 'ROLLBACK' in traces
+            assert any(statement.startswith('PRAGMA busy_timeout = ') and
+                0 <= int(statement.rsplit(' ', 1)[1]) < 800 for statement in traces)
+            assert responses in ([b''], [b'{"error":"downloads_query_unavailable"}\n'])
+            assert _serve_one(server, lambda: ipc.request_health(path)).queue_gate == 'paused'
+            assert _serve_one(server, lambda: ipc.request_query_list(path)).jobs == ()
+            assert not connection.in_transaction
+            assert connection.execute('PRAGMA busy_timeout').fetchone()[0] == 37
+            if directory := os.environ.get('T18_IMPLEMENTATION_RUN'):
+                with (Path(directory) / 'query-deadlines.jsonl').open('a') as stream:
+                    stream.write(json.dumps(dict(kind='shared-transport-sql-budget', elapsed=elapsed,
+                        **call, observer_joined=not observer.is_alive(), later_health_usable=True,
+                        later_query_usable=True, lock_released=not blocker.in_transaction)) + '\n')
 
 _FIXTURE_SPEC = importlib.util.spec_from_file_location(
     "_ipc_http_origin",

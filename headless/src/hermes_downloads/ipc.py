@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import base64
 import hashlib
 import json
 import os
@@ -31,6 +32,11 @@ __all__ = [
     "JobsPage",
     "MAX_MESSAGE_BYTES",
     "PublicJobRecord",
+    "QueryCursor",
+    "QueryEventRecord",
+    "QueryEventsPage",
+    "QueryListPage",
+    "QueryStatus",
     "QueueGateCommand",
     "QueueGateResult",
     "WorkerHealth",
@@ -40,6 +46,9 @@ __all__ = [
     "dispatch_direct_job",
     "request_health",
     "request_jobs_page",
+    "request_query_list",
+    "request_query_status",
+    "request_query_events",
     "set_queue_gate",
     "validate_available_socket_path",
 ]
@@ -1368,6 +1377,190 @@ class JobsPage:
             raise IPCError("ipc_response_invalid") from None
 
 
+_QUERY_MAX_SAFE: Final = (1 << 53) - 1
+_QUERY_EVENT_KINDS: Final = frozenset({
+    'job_added', 'job_target_authorized', 'job_paused', 'job_resumed',
+    'job_start_now_requested', 'job_removed', 'job_resolving', 'job_downloading',
+    'job_finalizing', 'job_completed',
+})
+
+
+def _query_counter(value: object, *, positive: bool = False) -> int:
+    if type(value) is not int or not int(positive) <= value <= _QUERY_MAX_SAFE:
+        raise ValueError('invalid query counter')
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class QueryCursor:
+    view: str
+    epoch: int
+    after: str | int
+    end: str | int
+
+    def __post_init__(self):
+        _query_counter(self.epoch, positive=True)
+        if self.view == 'list':
+            _require_identifier(self.after, 'after'); _require_identifier(self.end, 'end')
+        elif self.view == 'events':
+            _query_counter(self.after, positive=True); _query_counter(self.end, positive=True)
+        else:
+            raise ValueError('invalid query view')
+        if self.after > self.end:
+            raise ValueError('invalid query range')
+
+    def encode(self) -> str:
+        raw = _batch_canonical(dict(v=1, view=self.view, epoch=self.epoch,
+            after=self.after, end=self.end), 768)
+        token = '~q1:' + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+        if len(token.encode('utf-8')) > 1024:
+            raise ValueError('invalid query cursor')
+        return token
+
+    @classmethod
+    def decode(cls, token: object, view: str) -> 'QueryCursor':
+        if type(token) is not str or len(token.encode('utf-8')) > 1024 or not token.startswith('~q1:'):
+            raise ValueError('invalid query cursor')
+        encoded = token[4:]
+        if re.fullmatch('[A-Za-z0-9_-]+', encoded, flags=re.ASCII) is None:
+            raise ValueError('invalid query cursor')
+        try:
+            raw = base64.b64decode(encoded + '=' * (-len(encoded) % 4), altchars=b'-_', validate=True)
+            record = _batch_decode(raw)
+            if (type(record) is not dict or set(record) != {'v', 'view', 'epoch', 'after', 'end'}
+                    or type(record['v']) is not int or record['v'] != 1 or record['view'] != view):
+                raise ValueError('invalid query cursor')
+            value = cls(record['view'], record['epoch'], record['after'], record['end'])
+            if value.encode() != token:
+                raise ValueError('noncanonical query cursor')
+            return value
+        except (UnicodeError, TypeError, RecursionError):
+            raise ValueError('invalid query cursor') from None
+
+
+def validate_query_cursor(cursor: object, view: str) -> QueryCursor | str | None:
+    if cursor is None:
+        return None
+    if type(cursor) is str and cursor.startswith('~q1:'):
+        return QueryCursor.decode(cursor, view)
+    if view == 'list':
+        return _require_identifier(cursor, 'cursor')
+    raise ValueError('invalid query cursor')
+
+
+def _query_job(record: object) -> PublicJobRecord:
+    job = PublicJobRecord.from_record(record)
+    _query_counter(job.generation); _query_counter(job.revision)
+    return job
+
+
+@dataclass(frozen=True, slots=True)
+class QueryEventRecord:
+    event_id: int
+    kind: str
+    job: str
+    generation: int
+    revision: int
+
+    def __post_init__(self):
+        _query_counter(self.event_id, positive=True)
+        if type(self.kind) is not str or self.kind not in _QUERY_EVENT_KINDS:
+            raise ValueError('invalid query event')
+        _require_identifier(self.job, 'job')
+        _query_counter(self.generation); _query_counter(self.revision)
+
+    def to_record(self):
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+    @classmethod
+    def from_record(cls, record):
+        if type(record) is not dict or set(record) != set(cls.__dataclass_fields__):
+            raise ValueError('invalid query event')
+        return cls(**record)
+
+
+def _validate_query_page(rows, cursor, has_more, view):
+    if type(rows) is not tuple or len(rows) > 100 or type(has_more) is not bool:
+        raise ValueError('invalid query page')
+    keys = []
+    for row in rows:
+        if view == 'list':
+            if type(row) is not PublicJobRecord:
+                raise ValueError('invalid query job')
+            _query_job(row.to_record()); keys.append(row.job)
+        else:
+            if type(row) is not QueryEventRecord:
+                raise ValueError('invalid query event')
+            keys.append(row.event_id)
+    if any(left >= right for left, right in zip(keys, keys[1:])):
+        raise ValueError('invalid query order')
+    if has_more:
+        token = QueryCursor.decode(cursor, view)
+        if len(rows) != 100 or token.after != keys[-1] or token.after >= token.end or any(key > token.end for key in keys):
+            raise ValueError('invalid query continuation')
+    elif cursor is not None:
+        raise ValueError('invalid query continuation')
+
+
+@dataclass(frozen=True, slots=True)
+class QueryListPage:
+    jobs: tuple[PublicJobRecord, ...]
+    next_cursor: str | None
+    has_more: bool
+
+    def __post_init__(self):
+        _validate_query_page(self.jobs, self.next_cursor, self.has_more, 'list')
+
+    def to_record(self):
+        return dict(jobs=[job.to_record() for job in self.jobs], next_cursor=self.next_cursor, has_more=self.has_more)
+
+    @classmethod
+    def from_record(cls, record):
+        if type(record) is not dict or set(record) != {'jobs', 'next_cursor', 'has_more'} or type(record['jobs']) is not list:
+            raise ValueError('invalid query page')
+        return cls(tuple(_query_job(row) for row in record['jobs']), record['next_cursor'], record['has_more'])
+
+
+@dataclass(frozen=True, slots=True)
+class QueryEventsPage:
+    events: tuple[QueryEventRecord, ...]
+    next_cursor: str | None
+    has_more: bool
+
+    def __post_init__(self):
+        _validate_query_page(self.events, self.next_cursor, self.has_more, 'events')
+
+    def to_record(self):
+        return dict(events=[event.to_record() for event in self.events], next_cursor=self.next_cursor, has_more=self.has_more)
+
+    @classmethod
+    def from_record(cls, record):
+        if type(record) is not dict or set(record) != {'events', 'next_cursor', 'has_more'} or type(record['events']) is not list:
+            raise ValueError('invalid query page')
+        return cls(tuple(QueryEventRecord.from_record(row) for row in record['events']), record['next_cursor'], record['has_more'])
+
+
+@dataclass(frozen=True, slots=True)
+class QueryStatus:
+    job: str
+    record: PublicJobRecord | None
+
+    def __post_init__(self):
+        _require_identifier(self.job, 'job')
+        if self.record is not None:
+            if type(self.record) is not PublicJobRecord or _query_job(self.record.to_record()).job != self.job:
+                raise ValueError('invalid query status')
+
+    def to_record(self):
+        return dict(job=self.job, record=None if self.record is None else self.record.to_record())
+
+    @classmethod
+    def from_record(cls, record):
+        if type(record) is not dict or set(record) != {'job', 'record'}:
+            raise ValueError('invalid query status')
+        return cls(record['job'], None if record['record'] is None else _query_job(record['record']))
+
+
 def _require_socket_path(value: object) -> Path:
     if not isinstance(value, Path) or not value.is_absolute():
         raise IPCStateError("ipc_socket_invalid")
@@ -1408,11 +1601,17 @@ def _encoded_record(
 
 
 def _read_line(
-    connection: socket.socket, *, maximum_bytes: int = MAX_MESSAGE_BYTES, initial: bytes = b''
+    connection: socket.socket, *, maximum_bytes: int = MAX_MESSAGE_BYTES, initial: bytes = b'',
+    deadline: float | None = None,
 ) -> bytes | None:
     received = bytearray(initial)
     while True:
         try:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                connection.settimeout(remaining)
             chunk = connection.recv(maximum_bytes + 1 - len(received))
         except (OSError, TimeoutError):
             return None
@@ -1513,6 +1712,9 @@ class HealthServer:
         *,
         health: Callable[[], WorkerHealth],
         jobs_page: Callable[[str | None], JobsPage] | None = None,
+        query_list: Callable[[str | None, float], QueryListPage] | None = None,
+        query_status: Callable[[str, float], QueryStatus] | None = None,
+        query_events: Callable[[str | None, float], QueryEventsPage] | None = None,
         queue_gate: Callable[[QueueGateCommand], QueueGateResult] | None = None,
         job_control: Callable[[JobControlCommand], JobControlResult] | None = None,
         job_add: Callable[[JobAddCommand], JobAddResult] | None = None,
@@ -1532,6 +1734,9 @@ class HealthServer:
             raise TypeError("health must be callable")
         if jobs_page is not None and not callable(jobs_page):
             raise TypeError("jobs_page must be callable")
+        for callback in (query_list, query_status, query_events):
+            if callback is not None and not callable(callback):
+                raise TypeError('query callback must be callable')
         if queue_gate is not None and not callable(queue_gate):
             raise TypeError("queue_gate must be callable")
         if job_control is not None and not callable(job_control):
@@ -1567,6 +1772,9 @@ class HealthServer:
             raise
         self._health = health
         self._jobs_page = jobs_page
+        self._query_list = query_list
+        self._query_status = query_status
+        self._query_events = query_events
         self._queue_gate = queue_gate
         self._job_control = job_control
         self._job_add = job_add
@@ -1603,9 +1811,14 @@ class HealthServer:
                 else:
                     self._serve_add_batch(connection, deadline, preamble)
                 return
-            payload = _read_line(connection, initial=first)
+            payload = _read_line(connection, initial=first, deadline=deadline)
             request = _decode_request(payload)
+            if type(request) is dict and request.get('op') in ('query_list', 'query_status', 'query_events'):
+                self._serve_query(connection, request, deadline)
+                return
             try:
+                if time.monotonic() >= deadline:
+                    return
                 if _is_health_request(request):
                     response = _encoded_record(self._health().to_record())
                 else:
@@ -1712,9 +1925,46 @@ class HealthServer:
             except (IPCStateError, TypeError, ValueError):
                 response = _encoded_record(_INVALID_REQUEST)
             try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                connection.settimeout(remaining)
                 connection.sendall(response)
             except (OSError, TimeoutError):
                 return
+
+    def _serve_query(self, connection, request, deadline):
+        try:
+            op = request['op']
+            selector = 'id' if op == 'query_status' else 'cursor'
+            if (set(request) != {'op', 'protocol_version', selector}
+                    or type(request['protocol_version']) is not int or request['protocol_version'] != 1
+                    or time.monotonic() >= deadline):
+                raise ValueError('invalid query request')
+            if op == 'query_status':
+                value = _require_identifier(request['id'], 'id')
+                callback, expected = self._query_status, QueryStatus
+            else:
+                validate_query_cursor(request['cursor'], 'list' if op == 'query_list' else 'events')
+                value = request['cursor']
+                callback, expected = ((self._query_list, QueryListPage) if op == 'query_list'
+                    else (self._query_events, QueryEventsPage))
+            if callback is None:
+                raise ValueError('query unavailable')
+            result = callback(value, deadline)
+            if type(result) is not expected:
+                raise ValueError('invalid query result')
+            response = _encoded_record(result.to_record(), maximum_bytes=_MAX_RESPONSE_BYTES)
+        except Exception:
+            response = _encoded_record({'error': 'downloads_query_unavailable'})
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            connection.settimeout(remaining)
+            connection.sendall(response)
+        except (OSError, TimeoutError):
+            return
 
     def _serve_add_batch(self, connection, deadline, preamble):
         try:
@@ -1845,6 +2095,65 @@ def request_jobs_page(socket_path: Path, *, cursor: str | None = None) -> JobsPa
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
         raise IPCError("ipc_response_invalid") from None
     return JobsPage.from_record(record)
+
+
+def _request_query(socket_path, op, selector, expected):
+    deadline = time.monotonic() + _CLIENT_TIMEOUT_SECONDS
+    path = _require_socket_path(socket_path)
+    field = 'id' if op == 'query_status' else 'cursor'
+    if field == 'id':
+        _require_identifier(selector, 'id')
+        cutpoint = None
+    else:
+        cutpoint = validate_query_cursor(selector, 'list' if op == 'query_list' else 'events')
+    request = _encoded_record(dict(op=op, protocol_version=1, **{field: selector}))
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            client.settimeout(remaining)
+            client.connect(str(path))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            client.settimeout(remaining)
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            payload = _read_line(client, maximum_bytes=_MAX_RESPONSE_BYTES, deadline=deadline)
+            if payload is None or time.monotonic() >= deadline:
+                raise ValueError('query unavailable')
+            result = expected.from_record(_decode_request(payload))
+            if op == 'query_status':
+                if result.job != selector:
+                    raise ValueError('query ID mismatch')
+            else:
+                keys = [row.job for row in result.jobs] if op == 'query_list' else [row.event_id for row in result.events]
+                after = cutpoint.after if type(cutpoint) is QueryCursor else cutpoint
+                if after is not None and any(key <= after for key in keys):
+                    raise ValueError('query cutpoint mismatch')
+                if type(cutpoint) is QueryCursor:
+                    if any(key > cutpoint.end for key in keys):
+                        raise ValueError('query watermark mismatch')
+                    if result.next_cursor is not None:
+                        following = QueryCursor.decode(result.next_cursor, cutpoint.view)
+                        if (following.epoch, following.end) != (cutpoint.epoch, cutpoint.end):
+                            raise ValueError('query continuation mismatch')
+            return result
+        except (OSError, TimeoutError, TypeError, ValueError, IPCError, RecursionError):
+            raise IPCError('downloads_query_unavailable') from None
+
+
+def request_query_list(socket_path: Path, *, cursor: str | None = None) -> QueryListPage:
+    return _request_query(socket_path, 'query_list', cursor, QueryListPage)
+
+
+def request_query_status(socket_path: Path, *, id: str) -> QueryStatus:
+    return _request_query(socket_path, 'query_status', id, QueryStatus)
+
+
+def request_query_events(socket_path: Path, *, cursor: str | None = None) -> QueryEventsPage:
+    return _request_query(socket_path, 'query_events', cursor, QueryEventsPage)
 
 
 def add_job(

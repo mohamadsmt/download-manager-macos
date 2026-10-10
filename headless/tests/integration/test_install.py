@@ -209,7 +209,7 @@ def test_actual_candidate_is_not_ready_without_artifacts(installer, host_oracle)
     else:
         assert 'MISSING_BUNDLE' in result['reasons']
         assert 'MISSING_TOOLS' in result['reasons']
-        assert result['discovered_tools'] == ['downloads_query']
+        assert sorted(result['discovered_tools']) == ['downloads_add', 'downloads_query']
 
 
 def test_sdk_deadline_returns_fixed_timeout_and_reaps_original_child(
@@ -594,7 +594,7 @@ def test_verifier_actual_missing_bundle_fails_closed_without_effects(installer, 
         assert not host_oracle.sdk_argv and host_oracle.children
     else:
         assert 'MISSING_BUNDLE' in result['reasons'] and 'MISSING_TOOLS' in result['reasons']
-        assert result['discovered_tools'] == ['downloads_query']
+        assert sorted(result['discovered_tools']) == ['downloads_add', 'downloads_query']
 
 
 def test_long_socket_and_symlink_ancestors_block_without_artifacts(installer, tmp_path):
@@ -752,7 +752,7 @@ def test_real_git_startup_latency_preserves_physical_parity_and_sdk_diagnostics(
         result = installer.run(actual)
         assert result['status'] == 'NOT_READY'
         assert result['reasons'] == ['MISSING_BUNDLE', 'MISSING_TOOLS'], result['reasons']
-        assert result['discovered_tools'] == ['downloads_query']
+        assert sorted(result['discovered_tools']) == ['downloads_add', 'downloads_query']
         assert result['commit'] == snapshot['commit']
         parity = result['parity']
         assert parity['python'] == [3, 12] and parity['editable'] is False
