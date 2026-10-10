@@ -420,7 +420,7 @@ def test_sdk_exact_page_endings_status_audit_and_no_writes(private_worker, sdk_l
         async with stdio_client(parameters(root)) as (read, write):
             async with ClientSession(read, write, sampling_capabilities=None) as session:
                 initialized = await session.initialize(); tools = await session.list_tools()
-                assert sorted(tool.name for tool in tools.tools) == ['downloads_add', 'downloads_query']
+                assert sorted(tool.name for tool in tools.tools) == ['downloads_add', 'downloads_control', 'downloads_query']
                 assert initialized.capabilities.model_dump(by_alias=True, exclude_none=True) == {'experimental': {}, 'tools': {'listChanged': False}}
                 for scope, field in [('list', 'jobs'), ('events', 'events')]:
                     cursor = None; seen = []

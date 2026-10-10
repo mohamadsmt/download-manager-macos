@@ -37,6 +37,7 @@ from hermes_downloads.ipc import (
     QueueGateCommand,
     QueueGateResult,
     WorkerHealth,
+    WorkerQueueSnapshot,
     validate_available_socket_path,
 )
 from hermes_downloads.models import Admission, DownloadIntent, MaterializedJob, SourceKind
@@ -339,6 +340,20 @@ def _jobs_page_from_store(store: SQLiteStore, cursor: str | None) -> JobsPage:
         jobs=jobs,
         next_cursor=jobs[-1].job if len(jobs) == 100 else None,
     )
+
+
+def _queue_snapshot_from_store(store: SQLiteStore, deadline: float) -> WorkerQueueSnapshot:
+    connection = store._connection
+    if connection.in_transaction:
+        raise ValueError('queue snapshot cannot borrow a transaction')
+    with store._batch_budget(deadline=deadline):
+        connection.execute('BEGIN')
+        try:
+            epoch = store._current_worker_epoch(connection)
+            gate, revision = store.queue_gate_snapshot()
+            return WorkerQueueSnapshot(epoch, gate, revision)
+        finally:
+            connection.rollback()
 
 
 def _query_list_from_store(store: SQLiteStore, cursor: str | None, deadline: float) -> QueryListPage:
@@ -1684,6 +1699,7 @@ def run_worker(
                     query_list=lambda cursor, deadline: _query_list_from_store(store, cursor, deadline),
                     query_status=lambda id, deadline: _query_status_from_store(store, id, deadline),
                     query_events=lambda cursor, deadline: _query_events_from_store(store, cursor, deadline),
+                    queue_snapshot=lambda deadline: _queue_snapshot_from_store(store, deadline),
                     queue_gate=queue_gate,
                     job_add=lambda command: _job_add_from_store(store, command),
                     add_batch=lambda command: _add_batch_from_store(store, command),

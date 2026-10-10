@@ -8,12 +8,92 @@ from pathlib import Path
 import stat
 import tempfile
 import threading
+import sqlite3
+import time
 
 import pytest
 
 from hermes_downloads import direct, ipc, paths, worker
 from hermes_downloads.models import DownloadIntent, MaterializedJob, SourceKind
 from hermes_downloads.store import SQLiteStore
+
+
+def test_queue_snapshot_owned_two_settings_reads_and_foreign_transaction(short_state_root):
+    store = SQLiteStore(short_state_root / 'state.db')
+    try:
+        store.recover_cold_start()
+        connection = store._connection
+        connection.execute('PRAGMA busy_timeout = 37')
+        before = tuple(connection.iterdump())
+        traces = []
+        connection.set_trace_callback(traces.append)
+        result = worker._queue_snapshot_from_store(store, time.monotonic() + 1)
+        connection.set_trace_callback(None)
+        assert result == ipc.WorkerQueueSnapshot(1, 'paused', 1)
+        reads = [' '.join(sql.split()) for sql in traces if sql.lstrip().upper().startswith('SELECT')]
+        assert len(reads) == 2 and all('FROM settings' in sql for sql in reads)
+        assert 'BEGIN' in traces and 'ROLLBACK' in traces
+        assert not connection.in_transaction
+        assert connection.execute('PRAGMA busy_timeout').fetchone()[0] == 37
+        assert tuple(connection.iterdump()) == before
+        connection.execute('BEGIN')
+        connection.execute("UPDATE settings SET revision=2 WHERE key='queue_gate'")
+        with pytest.raises(ValueError, match='cannot borrow'):
+            worker._queue_snapshot_from_store(store, time.monotonic() + 1)
+        assert connection.in_transaction and store.queue_gate_snapshot() == ('paused', 2)
+        connection.rollback()
+        with pytest.raises(TimeoutError):
+            worker._queue_snapshot_from_store(store, time.monotonic() - 1)
+        assert connection.execute('PRAGMA busy_timeout').fetchone()[0] == 37
+        assert not connection.in_transaction
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('key,column,value', [
+    ('worker_epoch', 'value', '01'), ('worker_epoch', 'value', '+1'),
+    ('worker_epoch', 'value', '١'), ('worker_epoch', 'value', '0'),
+    ('worker_epoch', 'value', '9223372036854775808'), ('worker_epoch', 'value', b'1'),
+    ('queue_gate', 'value', 'corrupt'), ('queue_gate', 'value', b'paused'),
+    ('queue_gate', 'revision', -1), ('queue_gate', 'revision', 1.5),
+    ('queue_gate', 'revision', '9223372036854775808'),
+])
+def test_queue_snapshot_refuses_corrupt_settings_without_repair(short_state_root, key, column, value):
+    store = SQLiteStore(short_state_root / 'state.db')
+    try:
+        store.recover_cold_start()
+        connection = store._connection
+        connection.execute(f'UPDATE settings SET {column}=? WHERE key=?', (value, key))
+        connection.commit()
+        before = tuple(connection.iterdump())
+        with pytest.raises((TypeError, ValueError)):
+            worker._queue_snapshot_from_store(store, time.monotonic() + 1)
+        assert not connection.in_transaction and tuple(connection.iterdump()) == before
+    finally:
+        store.close()
+
+
+def test_queue_snapshot_progress_interrupt_restores_budget(short_state_root, monkeypatch):
+    store = SQLiteStore(short_state_root / 'state.db')
+    try:
+        store.recover_cold_start()
+        connection = store._connection
+        connection.execute('PRAGMA busy_timeout = 37')
+        original = store.queue_gate_snapshot
+        def exhausted():
+            connection.execute('WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n').fetchone()
+            return original()
+        monkeypatch.setattr(store, 'queue_gate_snapshot', exhausted)
+        with pytest.raises(sqlite3.OperationalError, match='interrupted'):
+            worker._queue_snapshot_from_store(store, time.monotonic() + .03)
+        assert not connection.in_transaction
+        assert connection.execute('PRAGMA busy_timeout').fetchone()[0] == 37
+        # A query exceeding 1000 VM steps proves the expired progress handler was removed.
+        assert connection.execute('WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<2000) SELECT max(x) FROM n').fetchone()[0] == 2000
+        monkeypatch.setattr(store, 'queue_gate_snapshot', original)
+        assert worker._queue_snapshot_from_store(store, time.monotonic() + 1).revision == 1
+    finally:
+        store.close()
 
 
 def test_worker_entrypoint_persists_paused_gate_in_configured_state_root(

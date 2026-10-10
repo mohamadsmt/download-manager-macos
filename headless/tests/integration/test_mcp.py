@@ -31,7 +31,7 @@ _EXPECTED_INPUT_SCHEMA: dict[str, object] = {
     "additionalProperties": False,
     "required": ["scope"],
     "properties": {
-        "scope": {"type": "string", "enum": ["health", "list", "status", "events"]},
+        "scope": {"type": "string", "enum": ["health", "list", "status", "events", "queue"]},
         "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
         "cursor": {
             "anyOf": [
@@ -45,6 +45,10 @@ _EXPECTED_INPUT_SCHEMA: dict[str, object] = {
         },
     },
     "oneOf": [
+        {
+            "type": "object", "additionalProperties": False,
+            "properties": {"scope": {"const": "queue"}}, "required": ["scope"],
+        },
         {
             "type": "object",
             "additionalProperties": False,
@@ -269,7 +273,7 @@ def test_downloads_query_server_factory_is_available() -> None:
 
 
 def test_downloads_query_stdio_round_trip_is_read_only_and_redacted() -> None:
-    """The official SDK discovers exactly two tools and real redacted reads."""
+    """The official SDK discovers exactly three tools and real redacted reads."""
 
     with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-mcp-") as temporary_root:
         state_root = Path(temporary_root) / "state"
@@ -315,7 +319,7 @@ def test_downloads_query_stdio_round_trip_is_read_only_and_redacted() -> None:
                 "experimental": {},
                 "tools": {"listChanged": False},
             }
-            assert sorted(tool.name for tool in listed.tools) == ['downloads_add', 'downloads_query']
+            assert sorted(tool.name for tool in listed.tools) == ['downloads_add', 'downloads_control', 'downloads_query']
             tool = next(tool for tool in listed.tools if tool.name == 'downloads_query')
             assert tool.name == "downloads_query"
             assert tool.inputSchema == _EXPECTED_INPUT_SCHEMA

@@ -182,7 +182,8 @@ def test_v1_mutation_conflict_survives_callback_after_read_deadline(short_socket
                 later_health_usable=True)) + '\n')
 
 
-def test_query_client_fragments_share_original_five_second_budget(short_socket_root):
+@pytest.mark.parametrize('queue_snapshot', [False, True])
+def test_query_client_fragments_share_original_five_second_budget(short_socket_root, queue_snapshot):
     path = short_socket_root / 'slow.sock'
     requests = []; fragments = []; errors = []; stop = threading.Event()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
@@ -193,7 +194,9 @@ def test_query_client_fragments_share_original_five_second_budget(short_socket_r
                 with connection:
                     connection.settimeout(_WATCHDOG_SECONDS)
                     requests.append(ipc._read_line(connection))
-                    for fragment in [b'{', b'"jobs":[],', b'"next_cursor":null,', b'"has_more":false}\n']:
+                    chunks = ([b'{', b'"protocol_version":1,"worker_epoch":1,', b'"queue_gate":"paused","revision":1}\n', b'']
+                        if queue_snapshot else [b'{', b'"jobs":[],', b'"next_cursor":null,', b'"has_more":false}\n'])
+                    for fragment in chunks:
                         connection.sendall(fragment); fragments.append(time.monotonic())
                         if stop.wait(2):
                             break
@@ -204,21 +207,24 @@ def test_query_client_fragments_share_original_five_second_budget(short_socket_r
         try:
             assert ipc._CLIENT_TIMEOUT_SECONDS == 5
             with pytest.raises(ipc.IPCError, match='^downloads_query_unavailable$'):
-                ipc.request_query_list(path)
+                (ipc.request_queue_snapshot if queue_snapshot else ipc.request_query_list)(path)
             elapsed = time.monotonic() - started
             assert 4.8 <= elapsed < 5.5
         finally:
             stop.set(); observer.join(_WATCHDOG_SECONDS)
         assert not observer.is_alive() and not errors
         assert len(fragments) == 3
-        assert json.loads(requests[0]) == {'op': 'query_list', 'protocol_version': 1, 'cursor': None}
+        assert json.loads(requests[0]) == ({'op': 'queue_snapshot'} if queue_snapshot
+            else {'op': 'query_list', 'protocol_version': 1, 'cursor': None})
         if directory := os.environ.get('T18_IMPLEMENTATION_RUN'):
             with (Path(directory) / 'query-deadlines.jsonl').open('a') as stream:
                 stream.write(json.dumps(dict(kind='query-client-aggregate-budget', elapsed=elapsed,
-                    fragments=len(fragments), observer_joined=not observer.is_alive(), closed_error=True)) + '\n')
+                    fragments=len(fragments), queue_snapshot=queue_snapshot,
+                    observer_joined=not observer.is_alive(), closed_error=True)) + '\n')
 
 
-def test_query_sql_contention_uses_remaining_transport_budget_and_recovers(short_socket_root):
+@pytest.mark.parametrize('queue_snapshot', [False, True])
+def test_query_sql_contention_uses_remaining_transport_budget_and_recovers(short_socket_root, queue_snapshot):
     database = short_socket_root / 'state.db'; path = short_socket_root / 'worker.sock'
     with closing(SQLiteStore(database)) as store, closing(sqlite3.connect(database)) as blocker:
         store.recover_cold_start()
@@ -232,19 +238,24 @@ def test_query_sql_contention_uses_remaining_transport_budget_and_recovers(short
             started = time.monotonic()
             remaining = deadline - started
             try:
-                return store.read_query_list_page(cursor=cursor, deadline=deadline)
+                return (worker._queue_snapshot_from_store(store, deadline) if queue_snapshot
+                    else store.read_query_list_page(cursor=cursor, deadline=deadline))
             except sqlite3.OperationalError as error:
                 calls.append(dict(remaining=remaining, sql_elapsed=time.monotonic() - started,
                     error=str(error), transaction_released=not connection.in_transaction,
                     busy_timeout=connection.execute('PRAGMA busy_timeout').fetchone()[0]))
                 raise
-        with closing(ipc.HealthServer(path, health=lambda: ipc.WorkerHealth(1, 'paused'), query_list=query)) as server:
+        with closing(ipc.HealthServer(path, health=lambda: ipc.WorkerHealth(1, 'paused'),
+                query_list=(lambda cursor, deadline: store.read_query_list_page(cursor=cursor, deadline=deadline)) if queue_snapshot else query,
+                queue_snapshot=(lambda deadline: query(None, deadline)) if queue_snapshot
+                    else lambda deadline: worker._queue_snapshot_from_store(store, deadline))) as server:
             def slow_request():
                 try:
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                         client.settimeout(_WATCHDOG_SECONDS); client.connect(str(path))
                         client.sendall(b'{'); time.sleep(1.4)
-                        client.sendall(b'"op":"query_list","protocol_version":1,"cursor":null}\n')
+                        client.sendall(b'"op":"queue_snapshot"}\n' if queue_snapshot
+                            else b'"op":"query_list","protocol_version":1,"cursor":null}\n')
                         client.shutdown(socket.SHUT_WR)
                         responses.append(client.recv(4096))
                 except BaseException as error:
@@ -269,13 +280,55 @@ def test_query_sql_contention_uses_remaining_transport_budget_and_recovers(short
             assert responses in ([b''], [b'{"error":"downloads_query_unavailable"}\n'])
             assert _serve_one(server, lambda: ipc.request_health(path)).queue_gate == 'paused'
             assert _serve_one(server, lambda: ipc.request_query_list(path)).jobs == ()
+            assert _serve_one(server, lambda: ipc.request_queue_snapshot(path)) == ipc.WorkerQueueSnapshot(1, 'paused', 1)
             assert not connection.in_transaction
             assert connection.execute('PRAGMA busy_timeout').fetchone()[0] == 37
             if directory := os.environ.get('T18_IMPLEMENTATION_RUN'):
                 with (Path(directory) / 'query-deadlines.jsonl').open('a') as stream:
                     stream.write(json.dumps(dict(kind='shared-transport-sql-budget', elapsed=elapsed,
-                        **call, observer_joined=not observer.is_alive(), later_health_usable=True,
+                        **call, queue_snapshot=queue_snapshot, observer_joined=not observer.is_alive(), later_health_usable=True,
                         later_query_usable=True, lock_released=not blocker.in_transaction)) + '\n')
+
+
+@pytest.mark.parametrize('changes', [
+    {'worker_epoch': True}, {'worker_epoch': 0}, {'worker_epoch': '1'},
+    {'worker_epoch': 9223372036854775808}, {'revision': True}, {'revision': -1},
+    {'revision': 1.0}, {'revision': '0'}, {'revision': 9223372036854775808},
+    {'queue_gate': True}, {'queue_gate': 'pausing'}, {'protocol_version': True},
+    {'protocol_version': 1.0}, {'protocol_version': 2}, {'extra': 'private'},
+])
+def test_queue_snapshot_strict_closed_dto_and_client(short_socket_root, changes):
+    good = dict(protocol_version=1, worker_epoch=9223372036854775807, queue_gate='paused', revision=9223372036854775807)
+    assert ipc.WorkerQueueSnapshot.from_record(good).to_record() == good
+    bad = good | changes
+    with pytest.raises(ipc.IPCError, match='^ipc_response_invalid$'):
+        ipc.WorkerQueueSnapshot.from_record(bad)
+    path = short_socket_root / 'fake.sock'; requests = []
+    observer, errors = _start_response_server(path, json.dumps(bad).encode() + b'\n', requests)
+    try:
+        with pytest.raises(ipc.IPCError, match='^downloads_query_unavailable$'):
+            ipc.request_queue_snapshot(path)
+    finally:
+        observer.join(_WATCHDOG_SECONDS)
+    assert not observer.is_alive() and not errors
+    assert json.loads(requests[0]) == {'op': 'queue_snapshot'}
+
+
+def test_queue_snapshot_exact_request_callback_and_original_deadline(short_socket_root):
+    path = short_socket_root / 'worker.sock'; calls = []
+    def read(deadline):
+        calls.append(deadline - time.monotonic())
+        return ipc.WorkerQueueSnapshot(1, 'paused', 0)
+    with pytest.raises(TypeError):
+        ipc.HealthServer(path, health=lambda: ipc.WorkerHealth(1, 'paused'), queue_snapshot=1)
+    with closing(ipc.HealthServer(path, health=lambda: ipc.WorkerHealth(1, 'paused'), queue_snapshot=read)) as server:
+        for request in [dict(op='queue_snapshot', protocol_version=1), dict(op='queue_snapshot', cursor=None)]:
+            assert _serve_one(server, lambda: _raw_request(path, json.dumps(request).encode()+b'\n')) == {'error': 'downloads_query_unavailable'}
+        assert calls == []
+        result = _serve_one(server, lambda: ipc.request_queue_snapshot(path))
+        assert result == ipc.WorkerQueueSnapshot(1, 'paused', 0)
+        assert len(calls) == 1 and 1.5 < calls[0] <= 2
+    assert not path.exists()
 
 _FIXTURE_SPEC = importlib.util.spec_from_file_location(
     "_ipc_http_origin",

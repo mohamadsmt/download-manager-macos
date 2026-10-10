@@ -40,11 +40,13 @@ __all__ = [
     "QueueGateCommand",
     "QueueGateResult",
     "WorkerHealth",
+    "WorkerQueueSnapshot",
     "add_job",
     "activate_direct_engine",
     "control_job",
     "dispatch_direct_job",
     "request_health",
+    "request_queue_snapshot",
     "request_jobs_page",
     "request_query_list",
     "request_query_status",
@@ -723,6 +725,34 @@ class WorkerHealth:
             return cls(worker_epoch=worker_epoch, queue_gate=queue_gate)
         except (TypeError, ValueError):
             raise IPCError("ipc_response_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerQueueSnapshot:
+    """One strict owner snapshot of the queue's persisted control fences."""
+
+    worker_epoch: int
+    queue_gate: str
+    revision: int
+
+    def __post_init__(self) -> None:
+        _require_positive_counter(self.worker_epoch, 'worker_epoch')
+        _require_queue_gate(self.queue_gate)
+        _require_counter(self.revision, 'revision')
+
+    def to_record(self):
+        return dict(protocol_version=1, worker_epoch=self.worker_epoch,
+            queue_gate=self.queue_gate, revision=self.revision)
+
+    @classmethod
+    def from_record(cls, record):
+        if (type(record) is not dict or set(record) != {'protocol_version', 'worker_epoch', 'queue_gate', 'revision'}
+                or type(record['protocol_version']) is not int or record['protocol_version'] != 1):
+            raise IPCError('ipc_response_invalid')
+        try:
+            return cls(record['worker_epoch'], record['queue_gate'], record['revision'])
+        except (TypeError, ValueError):
+            raise IPCError('ipc_response_invalid') from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1715,6 +1745,7 @@ class HealthServer:
         query_list: Callable[[str | None, float], QueryListPage] | None = None,
         query_status: Callable[[str, float], QueryStatus] | None = None,
         query_events: Callable[[str | None, float], QueryEventsPage] | None = None,
+        queue_snapshot: Callable[[float], WorkerQueueSnapshot] | None = None,
         queue_gate: Callable[[QueueGateCommand], QueueGateResult] | None = None,
         job_control: Callable[[JobControlCommand], JobControlResult] | None = None,
         job_add: Callable[[JobAddCommand], JobAddResult] | None = None,
@@ -1734,7 +1765,7 @@ class HealthServer:
             raise TypeError("health must be callable")
         if jobs_page is not None and not callable(jobs_page):
             raise TypeError("jobs_page must be callable")
-        for callback in (query_list, query_status, query_events):
+        for callback in (query_list, query_status, query_events, queue_snapshot):
             if callback is not None and not callable(callback):
                 raise TypeError('query callback must be callable')
         if queue_gate is not None and not callable(queue_gate):
@@ -1775,6 +1806,7 @@ class HealthServer:
         self._query_list = query_list
         self._query_status = query_status
         self._query_events = query_events
+        self._queue_snapshot = queue_snapshot
         self._queue_gate = queue_gate
         self._job_control = job_control
         self._job_add = job_add
@@ -1813,7 +1845,7 @@ class HealthServer:
                 return
             payload = _read_line(connection, initial=first, deadline=deadline)
             request = _decode_request(payload)
-            if type(request) is dict and request.get('op') in ('query_list', 'query_status', 'query_events'):
+            if type(request) is dict and request.get('op') in ('query_list', 'query_status', 'query_events', 'queue_snapshot'):
                 self._serve_query(connection, request, deadline)
                 return
             mutation_response = False
@@ -1943,22 +1975,28 @@ class HealthServer:
     def _serve_query(self, connection, request, deadline):
         try:
             op = request['op']
-            selector = 'id' if op == 'query_status' else 'cursor'
-            if (set(request) != {'op', 'protocol_version', selector}
+            if op == 'queue_snapshot':
+                if set(request) != {'op'} or self._queue_snapshot is None or time.monotonic() >= deadline:
+                    raise ValueError('invalid queue snapshot request')
+                result = self._queue_snapshot(deadline)
+                expected = WorkerQueueSnapshot
+            else:
+                selector = 'id' if op == 'query_status' else 'cursor'
+                if (set(request) != {'op', 'protocol_version', selector}
                     or type(request['protocol_version']) is not int or request['protocol_version'] != 1
                     or time.monotonic() >= deadline):
-                raise ValueError('invalid query request')
-            if op == 'query_status':
-                value = _require_identifier(request['id'], 'id')
-                callback, expected = self._query_status, QueryStatus
-            else:
-                validate_query_cursor(request['cursor'], 'list' if op == 'query_list' else 'events')
-                value = request['cursor']
-                callback, expected = ((self._query_list, QueryListPage) if op == 'query_list'
-                    else (self._query_events, QueryEventsPage))
-            if callback is None:
-                raise ValueError('query unavailable')
-            result = callback(value, deadline)
+                    raise ValueError('invalid query request')
+                if op == 'query_status':
+                    value = _require_identifier(request['id'], 'id')
+                    callback, expected = self._query_status, QueryStatus
+                else:
+                    validate_query_cursor(request['cursor'], 'list' if op == 'query_list' else 'events')
+                    value = request['cursor']
+                    callback, expected = ((self._query_list, QueryListPage) if op == 'query_list'
+                        else (self._query_events, QueryEventsPage))
+                if callback is None:
+                    raise ValueError('query unavailable')
+                result = callback(value, deadline)
             if type(result) is not expected:
                 raise ValueError('invalid query result')
             response = _encoded_record(result.to_record(), maximum_bytes=_MAX_RESPONSE_BYTES)
@@ -2108,12 +2146,15 @@ def _request_query(socket_path, op, selector, expected):
     deadline = time.monotonic() + _CLIENT_TIMEOUT_SECONDS
     path = _require_socket_path(socket_path)
     field = 'id' if op == 'query_status' else 'cursor'
-    if field == 'id':
+    if op == 'queue_snapshot':
+        request = _encoded_record({'op': op})
+    elif field == 'id':
         _require_identifier(selector, 'id')
         cutpoint = None
     else:
         cutpoint = validate_query_cursor(selector, 'list' if op == 'query_list' else 'events')
-    request = _encoded_record(dict(op=op, protocol_version=1, **{field: selector}))
+    if op != 'queue_snapshot':
+        request = _encoded_record(dict(op=op, protocol_version=1, **{field: selector}))
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         try:
             remaining = deadline - time.monotonic()
@@ -2131,6 +2172,8 @@ def _request_query(socket_path, op, selector, expected):
             if payload is None or time.monotonic() >= deadline:
                 raise ValueError('query unavailable')
             result = expected.from_record(_decode_request(payload))
+            if op == 'queue_snapshot':
+                return result
             if op == 'query_status':
                 if result.job != selector:
                     raise ValueError('query ID mismatch')
@@ -2153,6 +2196,10 @@ def _request_query(socket_path, op, selector, expected):
 
 def request_query_list(socket_path: Path, *, cursor: str | None = None) -> QueryListPage:
     return _request_query(socket_path, 'query_list', cursor, QueryListPage)
+
+
+def request_queue_snapshot(socket_path: Path) -> WorkerQueueSnapshot:
+    return _request_query(socket_path, 'queue_snapshot', None, WorkerQueueSnapshot)
 
 
 def request_query_status(socket_path: Path, *, id: str) -> QueryStatus:

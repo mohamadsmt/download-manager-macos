@@ -1,4 +1,4 @@
-"""Add-only and bounded redacted queries through the existing owner worker."""
+"""Add, fenced controls and bounded redacted queries through the owner worker."""
 
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ else:
     _MCP_SDK_AVAILABLE = True
 
 from hermes_downloads.ipc import (AddBatchCommand, add_batch, request_health,
-    request_query_list, request_query_status, request_query_events, validate_query_cursor)
+    request_query_list, request_query_status, request_query_events, validate_query_cursor,
+    QueueGateCommand, JobControlCommand, TargetAuthorizeCommand, IPCError,
+    set_queue_gate, control_job, target_authorize, request_queue_snapshot)
 
 
 _SERVER_NAME: Final = "hermes-downloads-query"
@@ -39,7 +41,7 @@ _QUERY_INPUT_SCHEMA: Final[dict[str, object]] = {
     "additionalProperties": False,
     "required": ["scope"],
     "properties": {
-        "scope": {"type": "string", "enum": ["health", "list", "status", "events"]},
+        "scope": {"type": "string", "enum": ["health", "list", "status", "events", "queue"]},
         "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
         "cursor": {
             "anyOf": [
@@ -53,6 +55,10 @@ _QUERY_INPUT_SCHEMA: Final[dict[str, object]] = {
         },
     },
     "oneOf": [
+        {
+            "type": "object", "additionalProperties": False,
+            "properties": {"scope": {"const": "queue"}}, "required": ["scope"],
+        },
         {
             "type": "object",
             "additionalProperties": False,
@@ -112,6 +118,38 @@ _ADD_INPUT_SCHEMA: Final = {
     },
 }
 
+_ID_SCHEMA: Final = {'type': 'string', 'pattern': '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'}
+_DECIMAL_SCHEMA: Final = {'type': 'string', 'pattern': '^(0|[1-9][0-9]{0,18})$', 'maxLength': 19,
+    'description': 'Canonical ASCII decimal 0..9223372036854775807; larger values are refused.'}
+_EPOCH_SCHEMA: Final = {'type': 'string', 'pattern': '^[1-9][0-9]{0,18}$', 'maxLength': 19,
+    'description': 'Canonical ASCII decimal 1..9223372036854775807; larger values are refused.'}
+_TARGETS_SCHEMA: Final = {'type': 'array', 'minItems': 1, 'maxItems': 500, 'items': {
+    'type': 'object', 'additionalProperties': False, 'required': ['job', 'expected_revision'],
+    'properties': {'job': _ID_SCHEMA, 'expected_revision': _DECIMAL_SCHEMA}}}
+_CONTROL_INPUT_SCHEMA: Final = {
+    'type': 'object', 'additionalProperties': False, 'required': ['scope', 'action', 'request_id'],
+    'properties': {
+        'scope': {'type': 'string', 'enum': ['queue', 'job', 'targets']},
+        'action': {'type': 'string', 'enum': ['pause', 'resume', 'remove', 'start']},
+        'request_id': _ID_SCHEMA, 'job': _ID_SCHEMA, 'expected_revision': _DECIMAL_SCHEMA,
+        'expected_worker_epoch': _EPOCH_SCHEMA, 'targets': _TARGETS_SCHEMA,
+    },
+    'oneOf': [
+        {'type': 'object', 'additionalProperties': False,
+         'required': ['scope', 'action', 'request_id', 'expected_revision'],
+         'properties': {'scope': {'const': 'queue'}, 'action': {'type': 'string', 'enum': ['pause', 'resume']},
+            'request_id': _ID_SCHEMA, 'expected_revision': _DECIMAL_SCHEMA}},
+        {'type': 'object', 'additionalProperties': False,
+         'required': ['scope', 'action', 'request_id', 'job', 'expected_revision'],
+         'properties': {'scope': {'const': 'job'}, 'action': {'type': 'string', 'enum': ['pause', 'remove']},
+            'request_id': _ID_SCHEMA, 'job': _ID_SCHEMA, 'expected_revision': _DECIMAL_SCHEMA}},
+        {'type': 'object', 'additionalProperties': False,
+         'required': ['scope', 'action', 'request_id', 'expected_worker_epoch', 'targets'],
+         'properties': {'scope': {'const': 'targets'}, 'action': {'const': 'start'},
+            'request_id': _ID_SCHEMA, 'expected_worker_epoch': _EPOCH_SCHEMA, 'targets': _TARGETS_SCHEMA}},
+    ],
+}
+
 
 def _error_result(code: str) -> types.CallToolResult:
     return types.CallToolResult(
@@ -138,8 +176,10 @@ def _parse_query_arguments(arguments: object) -> tuple[str, str | None] | None:
     if type(arguments) is not dict:
         return None
     scope = arguments.get("scope")
-    if type(scope) is not str or scope not in {"health", "list", "status", "events"}:
+    if type(scope) is not str or scope not in {"health", "list", "status", "events", "queue"}:
         return None
+    if scope == 'queue':
+        return (scope, None) if set(arguments) == {'scope'} else None
     if scope == 'status':
         id = arguments.get('id')
         return (scope, id) if set(arguments) == {'scope', 'id'} and type(id) is str and _IDENTIFIER.fullmatch(id) else None
@@ -173,6 +213,42 @@ def _parse_add_arguments(arguments):
     return items
 
 
+def _decimal(value):
+    if (type(value) is not str or len(value) > 19
+            or re.fullmatch(r'0|[1-9][0-9]*', value) is None):
+        raise ValueError('invalid decimal fence')
+    counter = int(value)
+    if counter > 9223372036854775807:
+        raise ValueError('decimal fence overflow')
+    return counter
+
+
+def _parse_control_arguments(arguments):
+    if type(arguments) is not dict:
+        raise ValueError('invalid control envelope')
+    scope, action = arguments.get('scope'), arguments.get('action')
+    if type(scope) is not str or type(action) is not str:
+        raise ValueError('invalid control action')
+    if scope == 'queue' and action in {'pause', 'resume'} and set(arguments) == {'scope', 'action', 'request_id', 'expected_revision'}:
+        return QueueGateCommand('paused' if action == 'pause' else 'running',
+            arguments['request_id'], _decimal(arguments['expected_revision']))
+    if scope == 'job' and action in {'pause', 'remove'} and set(arguments) == {'scope', 'action', 'request_id', 'job', 'expected_revision'}:
+        return JobControlCommand(arguments['job'], action, arguments['request_id'],
+            _decimal(arguments['expected_revision']))
+    if scope == 'targets' and action == 'start' and set(arguments) == {'scope', 'action', 'request_id', 'expected_worker_epoch', 'targets'}:
+        targets = arguments['targets']
+        if type(targets) is not list or not 1 <= len(targets) <= 500:
+            raise ValueError('invalid target count')
+        parsed = []
+        for item in targets:
+            if type(item) is not dict or set(item) != {'job', 'expected_revision'}:
+                raise ValueError('invalid target')
+            parsed.append({'job': item['job'], 'expected_revision': _decimal(item['expected_revision'])})
+        return TargetAuthorizeCommand(arguments['request_id'], _decimal(arguments['expected_worker_epoch']),
+            'start', {'kind': 'jobs', 'targets': parsed})
+    raise ValueError('invalid control envelope')
+
+
 def _worker_socket_from_environment() -> Path | None:
     """Accept only the existing owner-only absolute worker endpoint."""
 
@@ -196,7 +272,7 @@ def _worker_socket_from_environment() -> Path | None:
 
 
 def create_server() -> Server:
-    """Register exactly the two implemented tools through the official SDK."""
+    """Register exactly the three implemented tools through the official SDK."""
 
     if not _MCP_SDK_AVAILABLE:
         raise ModuleNotFoundError("No module named 'mcp'", name="mcp")
@@ -204,12 +280,14 @@ def create_server() -> Server:
         _SERVER_NAME,
         version=_SERVER_VERSION,
         instructions=(
-            "Version 1 add-only creation and redacted health/list/status/audit queries. "
+            "Add-only creation, fenced queue pause/resume, job pause/remove and explicit target start authorization. "
             "Add requires stable explicit IDs and managed filenames; semantic refusals are ordered per item. "
-            "Successful direct entries accept optional lowercase SHA256; no start or transfer is supported. "
+            "Successful direct entries accept optional lowercase SHA256; add never starts a transfer. "
             "List pages are finite live keysets bounded by a captured maximum, not immutable membership. "
-            "List/events use fixed 100 pages and cold-sensitive cursors; new counters are JSON safe integers. "
-            "Creation receipt order_key is always a decimal string or null. Other five tools remain unavailable."
+            "List/events use fixed 100 pages and cold-sensitive cursors with JSON safe integer counters. "
+            "Queue query and control fences/counters are canonical signed64 decimal strings. "
+            "Authorization receipts describe captured intent, not execution; replay preserves the original capture. "
+            "Creation receipt order_key is a decimal string or null. Other four tools remain unavailable."
         ),
     )
 
@@ -219,11 +297,14 @@ def create_server() -> Server:
             types.Tool(name='downloads_add', title='Add downloads',
                 description='Atomically create 1..500 inactive direct jobs with stable replay; never authorize or start.',
                 inputSchema=_ADD_INPUT_SCHEMA),
+            types.Tool(name='downloads_control', title='Control downloads',
+                description='Fenced queue pause/resume, job pause/remove, and ordered 1..500 target start authorization; other actions are unavailable.',
+                inputSchema=_CONTROL_INPUT_SCHEMA),
             types.Tool(
                 name=_TOOL_NAME,
                 title="Downloads query",
                 description=(
-                    "Read compatible health, a v1 lifecycle page/status, or whitelisted audit events; no private source fields."
+                    "Read compatible health, queue fences, a v1 lifecycle page/status, or whitelisted audit events; no private source fields."
                 ),
                 inputSchema=_QUERY_INPUT_SCHEMA,
             )
@@ -231,6 +312,39 @@ def create_server() -> Server:
 
     @server.call_tool(validate_input=False)
     async def call_tool(name: str, arguments: dict[str, object]) -> types.CallToolResult:
+        if name == 'downloads_control':
+            try:
+                command = _parse_control_arguments(arguments)
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                return _error_result('downloads_control_invalid_input')
+            try:
+                socket_path = _worker_socket_from_environment()
+                if socket_path is None:
+                    return _error_result('downloads_control_unavailable')
+                if type(command) is QueueGateCommand:
+                    receipt = set_queue_gate(socket_path, gate=command.gate,
+                        request_id=command.request_id, expected_revision=command.expected_revision).to_record()
+                    receipt['revision'] = str(receipt['revision'])
+                elif type(command) is JobControlCommand:
+                    receipt = control_job(socket_path, job=command.job, action=command.action,
+                        request_id=command.request_id, expected_revision=command.expected_revision).to_record()
+                    for key in ('generation', 'revision'):
+                        receipt[key] = str(receipt[key])
+                else:
+                    receipt = target_authorize(socket_path, command).to_record()
+                    receipt['worker_epoch'] = str(receipt['worker_epoch'])
+                    for member in receipt['results']:
+                        for key in ('round_generation', 'captured_generation', 'captured_revision'):
+                            if member[key] is not None:
+                                member[key] = str(member[key])
+                if len(json.dumps(receipt, separators=(',', ':'), sort_keys=True, allow_nan=False).encode('utf-8')) > 512 * 1024:
+                    return _error_result('downloads_control_unavailable')
+                return _success_result(receipt)
+            except IPCError as error:
+                return _error_result('downloads_control_command_conflict' if str(error) == 'command_conflict'
+                    else 'downloads_control_unavailable')
+            except Exception:
+                return _error_result('downloads_control_unavailable')
         if name == 'downloads_add':
             try:
                 items = _parse_add_arguments(arguments)
@@ -275,6 +389,10 @@ def create_server() -> Server:
                         "queue_gate": health.queue_gate,
                     }
                 )
+            if scope == 'queue':
+                result = request_queue_snapshot(socket_path)
+                return _success_result({'worker_epoch': str(result.worker_epoch),
+                    'queue_gate': result.queue_gate, 'revision': str(result.revision)})
             if scope == 'status':
                 result = request_query_status(socket_path, id=cursor)
             elif scope == 'events':
@@ -322,7 +440,7 @@ async def _serve_stdio() -> None:
 
 
 def main() -> int:
-    """Run the read-only adapter over the official SDK stdio transport."""
+    """Run the owner-worker adapter over the official SDK stdio transport."""
 
     try:
         asyncio.run(_serve_stdio())
