@@ -156,6 +156,32 @@ def test_v1_slow_drip_spends_one_owner_deadline_and_recovers(short_socket_root):
         assert _serve_one(server, lambda: ipc.request_health(path)).queue_gate == 'paused'
 
 
+def test_v1_mutation_conflict_survives_callback_after_read_deadline(short_socket_root):
+    path = short_socket_root / 'worker.sock'; commands = []
+
+    def queue_gate(command):
+        commands.append(command)
+        time.sleep(2.1)
+        raise ipc.IPCError('direct_dispatch_blocked')
+
+    started = time.monotonic()
+    with closing(ipc.HealthServer(path, health=lambda: ipc.WorkerHealth(1, 'paused'),
+            queue_gate=queue_gate)) as server:
+        with pytest.raises(ipc.IPCError, match='^command_conflict$'):
+            _serve_one(server, lambda: ipc.set_queue_gate(path, gate='paused',
+                request_id='hold', expected_revision=2))
+        elapsed = time.monotonic() - started
+        assert elapsed >= 2.1
+        assert commands == [ipc.QueueGateCommand(gate='paused', request_id='hold', expected_revision=2)]
+        assert _serve_one(server, lambda: ipc.request_health(path)).queue_gate == 'paused'
+    assert not path.exists()
+    if directory := os.environ.get('T18_IMPLEMENTATION_RUN'):
+        with (Path(directory) / 'mutation-deadline.jsonl').open('a') as stream:
+            stream.write(json.dumps(dict(kind='legacy-mutation-conflict-after-read-deadline',
+                elapsed=elapsed, observer_joined=True, server_closed=True,
+                later_health_usable=True)) + '\n')
+
+
 def test_query_client_fragments_share_original_five_second_budget(short_socket_root):
     path = short_socket_root / 'slow.sock'
     requests = []; fragments = []; errors = []; stop = threading.Event()

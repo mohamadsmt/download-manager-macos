@@ -1816,6 +1816,7 @@ class HealthServer:
             if type(request) is dict and request.get('op') in ('query_list', 'query_status', 'query_events'):
                 self._serve_query(connection, request, deadline)
                 return
+            mutation_response = False
             try:
                 if time.monotonic() >= deadline:
                     return
@@ -1837,6 +1838,7 @@ class HealthServer:
                                 response = _encoded_record(_INVALID_REQUEST)
                             else:
                                 try:
+                                    mutation_response = True
                                     result = self._job_add(job_add_command)
                                     if type(result) is not JobAddResult:
                                         raise TypeError("job_add result is invalid")
@@ -1857,6 +1859,7 @@ class HealthServer:
                                     response = _encoded_record(_INVALID_REQUEST)
                                 else:
                                     try:
+                                        mutation_response = True
                                         result = self._direct_engine_activate(
                                             direct_engine_command
                                         )
@@ -1876,6 +1879,7 @@ class HealthServer:
                                         response = _encoded_record(_INVALID_REQUEST)
                                     else:
                                         try:
+                                            mutation_response = True
                                             result = self._direct_job_dispatch(
                                                 direct_job_command
                                             )
@@ -1898,6 +1902,7 @@ class HealthServer:
                                             response = _encoded_record(_INVALID_REQUEST)
                                         else:
                                             try:
+                                                mutation_response = True
                                                 result = self._job_control(job_control_command)
                                                 if type(result) is not JobControlResult:
                                                     raise TypeError(
@@ -1917,6 +1922,7 @@ class HealthServer:
                                             response = _encoded_record(_INVALID_REQUEST)
                                         else:
                                             try:
+                                                mutation_response = True
                                                 response = _encoded_record(
                                                     self._queue_gate(command).to_record()
                                                 )
@@ -1925,7 +1931,8 @@ class HealthServer:
             except (IPCStateError, TypeError, ValueError):
                 response = _encoded_record(_INVALID_REQUEST)
             try:
-                remaining = deadline - time.monotonic()
+                # Containment can outlast input; legacy mutations retain their bounded write allowance.
+                remaining = _CONNECTION_TIMEOUT_SECONDS if mutation_response else deadline - time.monotonic()
                 if remaining <= 0:
                     return
                 connection.settimeout(remaining)
