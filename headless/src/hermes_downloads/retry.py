@@ -93,6 +93,7 @@ class RetryAuditKind(str, Enum):
     PAUSED = "paused"
     FENCED = "fenced"
     EXPLICIT_RESUME = "explicit_resume"
+    ORDINARY_REOPEN = "ordinary_reopen"
 
 
 class SourceReplacementAction(str, Enum):
@@ -155,10 +156,11 @@ class RetryPolicy:
         jitter = _require_jitter(
             jitter_seconds, maximum=backoff * self.max_jitter_fraction
         )
-        requested = backoff + jitter
+        requested = min(self.max_delay_seconds, backoff + jitter)
         if retry_after is not None:
             requested = max(requested, retry_after)
-        return float(min(self.max_delay_seconds, requested))
+        delay = float(requested)
+        return math.nextafter(delay, math.inf) if delay < requested else delay
 
     def _backoff_seconds(self, attempt: int) -> int:
         delay = self.base_delay_seconds
@@ -394,14 +396,24 @@ class RetryAuthority:
             )
             return self._budget
 
+    def reopen_ordinary(self, *, generation: int) -> RetryBudget:
+        """Reopen a current paused budget without another attempt or generation."""
+        with self._lock:
+            budget = _revalidate_retry_budget(self._budget)
+            _require_current_generation(budget,generation)
+            if budget.exhausted or not budget.paused:
+                raise ValueError('ordinary retry reopen unavailable')
+            self._budget = _transition_budget(budget,kind=RetryAuditKind.ORDINARY_REOPEN,
+                generation=generation,budget_number=budget.budget_number,
+                ordinary_attempts=budget.ordinary_attempts,paused=False,exhausted=False)
+            return self._budget
+
     def fence_cold_start(self, *, new_generation: int) -> RetryBudget:
         """Close the restored budget before any callback from its prior life runs."""
 
         with self._lock:
             budget = _revalidate_retry_budget(self._budget)
             _require_generation(new_generation)
-            if budget.exhausted:
-                raise ValueError("an exhausted retry budget cannot be cold-start fenced")
             if new_generation <= budget.generation:
                 raise ValueError("new_generation must advance the retry generation")
             fenced = _transition_budget(
@@ -411,7 +423,7 @@ class RetryAuthority:
                 budget_number=budget.budget_number,
                 ordinary_attempts=budget.ordinary_attempts,
                 paused=True,
-                exhausted=False,
+                exhausted=budget.exhausted,
             )
             self._budget = fenced
             return fenced
@@ -685,8 +697,7 @@ def _validate_retry_audit(budget: RetryBudget) -> None:
             continue
         if event.kind is RetryAuditKind.FENCED:
             if (
-                exhausted
-                or event.generation <= generation
+                event.generation <= generation
                 or event.budget_number != budget_number
                 or event.ordinary_attempts != ordinary_attempts
             ):
@@ -706,10 +717,15 @@ def _validate_retry_audit(budget: RetryBudget) -> None:
             generation = event.generation
             paused = True
             continue
+        if event.kind is RetryAuditKind.ORDINARY_REOPEN:
+            if (not paused or exhausted or event.generation!=generation
+                or event.budget_number!=budget_number or event.ordinary_attempts!=ordinary_attempts):
+                raise ValueError('audit contains an invalid ordinary reopen')
+            paused = False
+            continue
         if event.kind is RetryAuditKind.EXPLICIT_RESUME:
             if (
-                paused
-                or not exhausted
+                not exhausted
                 or event.generation <= generation
                 or event.budget_number != budget_number + 1
                 or event.ordinary_attempts != 0
@@ -718,6 +734,7 @@ def _validate_retry_audit(budget: RetryBudget) -> None:
             generation = event.generation
             budget_number = event.budget_number
             ordinary_attempts = 0
+            paused = False
             exhausted = False
             continue
         raise ValueError("audit contains an unexpected opening")

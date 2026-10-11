@@ -85,7 +85,7 @@ function notification(event, action) {
 export default {
   id: ID,
   name: 'اعلان دانلودهای هرمس',
-  description: 'اعلان‌های دانلود محلی؛ نیازمند پل رویداد آینده.',
+  description: 'اعلان‌های دانلود محلی و نمایش صریح فایل در پوشه.',
   defaultEnabled: false,
   register(ctx) {
     const instance = crypto.randomUUID();
@@ -182,13 +182,54 @@ export default {
         if (!guard(scope)) cleanQuery(scope);
       }
     }
+    async function reconcileFiles(scope) {
+      if (!guard(scope)) return;
+      try {
+        const pending = await ctx.rest('/files/reveals', { method: 'GET', timeoutMs: 5000 });
+        if (!guard(scope)) return;
+        requireValid(exact(pending, ['request']));
+        if (pending.request === null) return;
+        requireValid(exact(pending.request, ['request_id', 'job_id']) &&
+          typeof pending.request.request_id === 'string' && IDENTIFIER.test(pending.request.request_id) &&
+          typeof pending.request.job_id === 'string' && IDENTIFIER.test(pending.request.job_id));
+        const body = pending.request;
+        const offered = await ctx.rest('/files/reveals/offer', { method: 'POST', body, timeoutMs: 5000 });
+        if (!guard(scope)) return;
+        requireValid(exact(offered, ['status', 'path', 'token']));
+        if (offered.status !== 'offered') return;
+        requireValid(validPath(offered.path) && typeof offered.token === 'string' && /^[0-9a-f]{64}$/.test(offered.token));
+        let used = false;
+        const authority = { ...body, token: offered.token };
+        const action = { label: 'نمایش در پوشه', onClick: async () => {
+          if (used || !guard(scope)) return;
+          used = true;
+          try {
+            const current = await ctx.rest('/files/reveals/click', { method: 'POST', body: authority, timeoutMs: 5000 });
+            if (!guard(scope)) return;
+            requireValid(exact(current, ['status', 'path', 'token']));
+            if (current.status !== 'issued') return;
+            requireValid(current.path === offered.path && current.token === offered.token && validPath(current.path));
+            let success = false;
+            try { success = (await ctx.os.revealPath(current.path)) !== false; } catch { /* actual SDK failure */ }
+            if (!guard(scope)) return;
+            await ctx.rest('/files/reveals/settle', { method: 'POST', body: { ...authority, success }, timeoutMs: 5000 });
+          } catch { /* lost acknowledgement consumes this action; no implicit OS retry */ }
+        } };
+        if (!guard(scope)) return;
+        const inserted = host.notify({ id: `${ID}:reveal:${body.request_id}:${body.job_id}`, title: 'فایل دانلود آماده است', message: 'برای نمایش فایل در پوشه کلیک کنید.', kind: 'info', durationMs: 0, action });
+        if (!guard(scope) || !receipt(inserted)) return;
+        await ctx.rest('/files/reveals/presented', { method: 'POST', body: { ...authority, notification_id: inserted }, timeoutMs: 5000 });
+      } catch { /* unsupported, offline or lost acknowledgement stays durable and unknown */ }
+    }
     async function lane() {
       if (running) return;
       running = true;
       try {
         while (requested && active && !disposed) {
           requested = false;
-          await reconcile(active);
+          const scope = active;
+          await reconcile(scope);
+          if (guard(scope)) await reconcileFiles(scope);
         }
       } finally { running = false; }
     }

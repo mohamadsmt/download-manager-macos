@@ -424,6 +424,9 @@ def v17_fixture(database):
     with closing(SQLiteStore(database)) as store:
         store.recover_cold_start();store.apply_add_batch(ipc.AddBatchCommand.from_record(envelope()))
     with sqlite3.connect(database,isolation_level=None) as connection:
+        for name in (*[name for name in store_module._V24_TABLE_SCHEMAS if name not in store_module._V23_TABLE_SCHEMAS],'saved_cleanup_requests','saved_body_owners','saved_retained_cleanup','saved_cold_fences','saved_resume_bindings','saved_direct_cycles','stopped_direct_cycles','saved_direct_continuations','stopped_direct_bodies','notification_claims','notification_outbox'):
+            assert connection.execute(f'SELECT count(*) FROM {name}').fetchone()[0]==0
+            connection.execute(f'DROP TABLE {name}')
         assert connection.execute('SELECT count(*) FROM target_dispatch_causes').fetchone()[0]==0
         assert connection.execute("SELECT count(*) FROM direct_dispatch_commands WHERE producer_kind!='legacy'").fetchone()[0]==0
         connection.execute('DROP TABLE target_dispatch_causes')
@@ -445,7 +448,7 @@ def v17_fixture(database):
 def test_populated_v17_migration_preserves_original_bytes_and_restores_fks(tmp_path):
     database=tmp_path/'v17.db';before=v17_fixture(database)
     with closing(SQLiteStore(database)) as store:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0]==20
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0]==24
         assert store._connection.execute('PRAGMA foreign_keys').fetchone()[0]==1
         assert store._connection.execute('PRAGMA foreign_key_check').fetchall()==[]
         for table,rows in before.items():

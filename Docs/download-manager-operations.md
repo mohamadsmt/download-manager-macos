@@ -9,7 +9,7 @@ env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 headless/.venv/bin/pyt
 env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 headless/.venv/bin/python -I -B headless/scripts/verify-install.py
 ```
 
-The installer defaults to a read-only dry run. `NOT_READY` and nonzero exit mean prerequisites or ownership checks failed. The current one-tool candidate and absent integration bundle are NOT_READY even if synthetic installer tests pass. `PLAN_READY` means the local plan is ready, not live acceptance. Source must be clean and the exact commit must have independent specification PASS followed by quality/security APPROVED, including backend profile/auth behavior and the renderer SDK contract. Untracked regular, owner-owned, single-link Markdown documents directly under `.hermes/handoffs/` are retained as history and do not count as source changes. Tracked changes, all other untracked paths and linked or nested handoffs still block. Presence and schemas cannot prove runtime behavior.
+The installer defaults to a read-only dry run. `NOT_READY` and nonzero exit mean prerequisites or ownership checks failed. The author candidate contains seven implemented tools and the integration bundle; independent exact-commit reviews and installation prerequisites still govern readiness. Synthetic installer tests do not establish a default installation. `PLAN_READY` means the local plan is ready, not live acceptance. Source must be clean and the exact commit must have independent specification PASS followed by quality/security APPROVED, including backend profile/auth behavior and the renderer SDK contract. Untracked regular, owner-owned, single-link Markdown documents directly under `.hermes/handoffs/` are retained as history and do not count as source changes. Tracked changes, all other untracked paths and linked or nested handoffs still block. Presence and schemas cannot prove runtime behavior.
 
 After independent review and separately authorized real application, add `--apply --profile default --expected-commit <full-reviewed-HEAD>` to the installer command. Other profiles, root overrides, contradictory modes and unknown arguments are rejected. HOME comes from the current account database, not the process environment. Unit/integration callers use private fixture layouts; they do not change this CLI boundary.
 
@@ -32,3 +32,55 @@ await window.hermesDesktop.recycleBackend('default')
 ```
 
 It tears down the primary default backend and can interrupt active Desktop turns. Installer and verifier never call it. A successful `{ok:true}` proves teardown only: verify old owned backend exit, new owned backend PID/port, authenticated plugin route and renderer profile/source scope afterward. `host.restartGateway` concerns a different gateway and is not this operation. Start a fresh Hermes session or explicitly rediscover MCP, enable/read back the renderer through its official toggle, and record actual direct-file calls, notification paint, user acknowledgement and reveal independently. No installation report completes A01–A14.
+
+
+## Core control contract
+
+Creation, reconnect, listing and replay do not authorize BODY. A restarted worker
+is globally paused. Explicit queue/collection `start` captures membership in
+transactional cohorts of at most 500; cohort count is not a queue-size limit.
+Queue `resume` lifts only the global gate, and collection `resume` lifts only
+its collection hold. Per-job manual holds survive both. Query `queue` for the
+current worker epoch and gate revision, `status` for the job revision, `detail`
+for effective settings, collection and retry facts, and `control` with the
+request ID for a pending operation's outcome.
+
+`downloads_edit` accepts selected IDs and a closed patch for priority, decimal
+order, an explicitly zoned schedule, destination or per-item cap. Schedules
+are stored as UTC and read back in Asia/Tehran. Explicit job `start_now` bypasses
+the selected schedule; `preempt` first stops and seals a lower-priority owning
+slot. An active edit or source replacement quiesces its owning slot first.
+Destination successors preserve original creation/reservation facts and the
+original incomplete workspace; completed files are not moved by an edit.
+Unknown saved identity blocks with files preserved and a separate-download
+alternative. A matching trusted original SHA permits an isolated continuation
+candidate and requires that same final digest.
+
+`downloads_configure` uses decimal concurrency/connections and global speed in
+**bytes per second**. The default is one active job and stock 4/4 connections.
+Per-item caps use the same units. Null removes a cap; zero means WAIT, never
+aria2's unlimited zero. Desired settings and their revision are separate from
+applied readback. Reductions precede increases, and connection changes use an
+owned stop/restart that preserves saved work and retry counters.
+
+Stock max-tries is one; the host budget permits at most five ordinary attempts.
+Only typed stock codes and captured framed HTTP facts determine disposition.
+Retry-After is a floor, including values beyond local exponential backoff.
+Due work must still pass global, collection, manual, slot and lineage fences.
+Cold startup preserves exhaustion. A fresh explicit job `retry` opens an
+audited new budget; old replay cannot do so. HTTP 403 alone does not establish
+an expired link or a login requirement.
+
+`downloads_files` with `action: "purge"` requires `confirmed: true` and explicit
+selected IDs. It deletes only recorded, qualified owned artifacts after
+containment, with durable per-artifact unlink authority and absence readback.
+Unknown sidecars and job directories are retained; pause/remove do not purge.
+`action: "reveal"` certifies a completed path and offers a normal Desktop action.
+The explicit click freshly certifies the request/output before SDK reveal;
+presentation and actual SDK outcome are separate, and uncertain/lost acknowledgements
+do not silently repeat an OS invocation. Same-user namespace races at OS
+invocation remain a stated boundary.
+
+All of these are author source/fixture contracts, not final A01–A14 acceptance.
+The final default install, independent reviews, numerical cap/disk measurements,
+authorized official direct-file SHA, Desktop toast and Finder gates remain for ROOT.

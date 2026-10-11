@@ -129,7 +129,8 @@ def host_oracle(request, installer, layout, monkeypatch):
     assert not list(actual.home.iterdir())
     original_popen = subprocess.Popen
     owned = []; sdk_argv = []
-    observation = SimpleNamespace(layout=actual, result=None, sdk_argv=sdk_argv, children=owned)
+    observation = SimpleNamespace(layout=actual, result=None, sdk_argv=sdk_argv, children=owned,
+        bundle_expected=snapshot is None)
     def capture(argv, *args, **kwargs):
         original_argv = list(map(str, argv))
         if '--internal-discover' in original_argv: sdk_argv.append(original_argv)
@@ -196,20 +197,18 @@ def host_oracle(request, installer, layout, monkeypatch):
         assert no_effects
 
 
-def test_actual_candidate_is_not_ready_without_artifacts(installer, host_oracle):
-    actual = host_oracle.layout
-    host_oracle.configure(installer)
-    result = installer.run(actual)
-    host_oracle.observe(result)
-    assert result['status'] == 'NOT_READY'
+def test_actual_candidate_dry_run_certifies_seven_tools_without_install_effects(installer, host_oracle):
+    actual=host_oracle.layout;host_oracle.configure(installer)
+    result=installer.run(actual);host_oracle.observe(result)
     if 'PREFLIGHT_TIMEOUT' in result['reasons']:
-        assert result['reasons'] == ['PREFLIGHT_TIMEOUT']
-        assert result['discovered_tools'] == []
-        assert not host_oracle.sdk_argv and host_oracle.children
+        assert result['status']=='NOT_READY' and result['reasons']==['PREFLIGHT_TIMEOUT']
+        assert result['discovered_tools']==[] and not host_oracle.sdk_argv and host_oracle.children
     else:
-        assert 'MISSING_BUNDLE' in result['reasons']
-        assert 'MISSING_TOOLS' in result['reasons']
-        assert sorted(result['discovered_tools']) == ['downloads_add', 'downloads_control', 'downloads_query']
+        assert sorted(result['discovered_tools'])==['downloads_add', 'downloads_configure', 'downloads_control', 'downloads_edit', 'downloads_files', 'downloads_query', 'downloads_replace_source']
+        assert 'MISSING_TOOLS' not in result['reasons']
+        if not host_oracle.bundle_expected:assert result['status']=='NOT_READY' and result['reasons']==['MISSING_BUNDLE']
+        elif result['reasons']:assert result['status']=='NOT_READY' and result['reasons']==['MODULE_PARITY_MISMATCH','SOURCE_DIRTY']
+        else:assert result['status']=='PLAN_READY'
 
 
 def test_sdk_deadline_returns_fixed_timeout_and_reaps_original_child(
@@ -580,21 +579,20 @@ def test_strict_manifest_rejects_unknown_schema_fields(installer, tmp_path):
         with pytest.raises(installer.Blocked): installer.read_manifest(path)
 
 
-def test_verifier_actual_missing_bundle_fails_closed_without_effects(installer, host_oracle):
-    assert VERIFY.is_file(), 'missing verifier observable CLI behavior'
-    spec = importlib.util.spec_from_file_location('verify_installer', VERIFY)
-    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+def test_verifier_actual_uninstalled_candidate_fails_closed_without_effects(installer, host_oracle):
+    spec=importlib.util.spec_from_file_location('verify_installer',VERIFY)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     host_oracle.configure(module.installer)
-    result = module.verify(host_oracle.layout)
-    host_oracle.observe(result)
-    assert result['status'] == 'NOT_READY'
-    if 'PREFLIGHT_TIMEOUT' in result['reasons']:
-        assert result['reasons'] == ['PREFLIGHT_TIMEOUT']
-        assert result['discovered_tools'] == []
+    result=module.verify(host_oracle.layout);host_oracle.observe(result)
+    assert result['status']=='NOT_READY'
+    if result['reasons']==['INSTALL_MANIFEST_REQUIRED']:
+        assert host_oracle.bundle_expected and 'discovered_tools' not in result
+    elif 'PREFLIGHT_TIMEOUT' in result['reasons']:
+        assert result['reasons']==['PREFLIGHT_TIMEOUT'] and result['discovered_tools']==[]
         assert not host_oracle.sdk_argv and host_oracle.children
     else:
-        assert 'MISSING_BUNDLE' in result['reasons'] and 'MISSING_TOOLS' in result['reasons']
-        assert sorted(result['discovered_tools']) == ['downloads_add', 'downloads_control', 'downloads_query']
+        assert sorted(result['discovered_tools'])==['downloads_add', 'downloads_configure', 'downloads_control', 'downloads_edit', 'downloads_files', 'downloads_query', 'downloads_replace_source']
+        assert result['reasons']==(['MODULE_PARITY_MISMATCH','SOURCE_DIRTY'] if host_oracle.bundle_expected else ['MISSING_BUNDLE'])
 
 
 def test_long_socket_and_symlink_ancestors_block_without_artifacts(installer, tmp_path):
@@ -751,8 +749,8 @@ def test_real_git_startup_latency_preserves_physical_parity_and_sdk_diagnostics(
     try:
         result = installer.run(actual)
         assert result['status'] == 'NOT_READY'
-        assert result['reasons'] == ['MISSING_BUNDLE', 'MISSING_TOOLS'], result['reasons']
-        assert sorted(result['discovered_tools']) == ['downloads_add', 'downloads_control', 'downloads_query']
+        assert result['reasons'] == ['MISSING_BUNDLE'], result['reasons']
+        assert sorted(result['discovered_tools']) == ['downloads_add', 'downloads_configure', 'downloads_control', 'downloads_edit', 'downloads_files', 'downloads_query', 'downloads_replace_source']
         assert result['commit'] == snapshot['commit']
         parity = result['parity']
         assert parity['python'] == [3, 12] and parity['editable'] is False

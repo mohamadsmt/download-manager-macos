@@ -330,7 +330,9 @@ def test_backoff_uses_bounded_jitter_retry_after_and_five_minute_cap() -> None:
     assert policy.delay_for_attempt(1, jitter_seconds=0.5) == 5.5
     assert policy.delay_for_attempt(2, jitter_seconds=1.0) == 11.0
     assert policy.delay_for_attempt(1, retry_after_seconds=7, jitter_seconds=0) == 7
-    assert policy.delay_for_attempt(8, retry_after_seconds=999, jitter_seconds=0) == 300
+    assert policy.delay_for_attempt(8, retry_after_seconds=999, jitter_seconds=0) == 999
+    assert policy.delay_for_attempt(8, jitter_seconds=30) == 300
+    assert policy.delay_for_attempt(1, retry_after_seconds=2**53+1) >= 2**53+1
     with pytest.raises(ValueError):
         policy.delay_for_attempt(1, jitter_seconds=0.51)
 
@@ -932,7 +934,7 @@ def test_cold_start_fence_rejects_nonadvancing_generation_without_mutation(
     assert authority.budget is before
 
 
-def test_cold_start_fence_rejects_exhausted_and_audit_capacity_budgets_without_mutation() -> None:
+def test_cold_start_fence_preserves_exhaustion_and_rejects_audit_capacity() -> None:
     retry = _retry()
     policy = retry.RetryPolicy()
     exhausted_authority = _authority(retry, policy=policy)
@@ -944,9 +946,12 @@ def test_cold_start_fence_rejects_exhausted_and_audit_capacity_budgets_without_m
         )
     exhausted = exhausted_authority.budget
 
-    with pytest.raises(ValueError, match="exhausted"):
-        exhausted_authority.fence_cold_start(new_generation=exhausted.generation + 1)
-    assert exhausted_authority.budget is exhausted
+    fenced = exhausted_authority.fence_cold_start(new_generation=exhausted.generation + 1)
+    assert fenced.generation == exhausted.generation + 1
+    assert fenced.exhausted and fenced.paused
+    assert fenced.ordinary_attempts == exhausted.ordinary_attempts
+    assert fenced.budget_number == exhausted.budget_number
+    assert fenced.audit[:-1] == exhausted.audit
 
     audit, generation, budget_number, ordinary_attempts, exhausted = _valid_retry_audit(
         retry, event_count=_RETRY_AUDIT_CAPACITY
@@ -987,3 +992,24 @@ def test_retry_authority_restore_and_fence_reject_malformed_snapshot_without_rep
     with pytest.raises(ValueError, match="audit"):
         authority.fence_cold_start(new_generation=8)
     assert authority.budget is malformed
+
+
+def test_ordinary_reopen_preserves_current_budget_generation_and_attempts():
+    retry = _retry()
+    authority = retry.RetryAuthority.open(policy=retry.RetryPolicy(),job_id='saved',generation=7)
+    authority.decide(_failure(retry,retry.FailureKind.TRANSIENT_HOST),generation=7,jitter_seconds=0)
+    paused = authority.pause(generation=7).budget
+    reopened = authority.reopen_ordinary(generation=paused.generation)
+    assert (reopened.generation,reopened.budget_number,reopened.ordinary_attempts)==(paused.generation,paused.budget_number,paused.ordinary_attempts)
+    assert not reopened.paused and not reopened.exhausted
+    assert reopened.audit[:-1]==paused.audit and reopened.audit[-1].kind is retry.RetryAuditKind.ORDINARY_REOPEN
+    with pytest.raises(ValueError): authority.reopen_ordinary(generation=reopened.generation)
+
+
+def test_exhausted_cold_fence_accepts_only_a_fresh_explicit_budget():
+    retry=_retry();authority=_authority(retry)
+    for _ in range(5):authority.decide(_failure(retry,retry.FailureKind.TRANSIENT_HOST),generation=authority.budget.generation)
+    exhausted=authority.budget;fenced=authority.fence_cold_start(new_generation=exhausted.generation+1)
+    reopened=authority.resume_after_exhaustion(new_generation=fenced.generation+1)
+    assert reopened.audit[:-1]==fenced.audit and reopened.ordinary_attempts==0 and not reopened.paused and not reopened.exhausted
+    assert reopened.budget_number==exhausted.budget_number+1

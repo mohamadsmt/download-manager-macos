@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -1398,7 +1399,7 @@ def test_v8_migrates_v1_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert connection.execute(
             """
             SELECT job_id, source_url, generation, revision, state
@@ -1522,7 +1523,7 @@ def test_v8_migrates_v3_database_without_changing_legacy_job_data(tmp_path: Path
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         schema = connection.execute(
             """
             SELECT sql
@@ -1733,13 +1734,13 @@ def test_v15_rejects_newer_schema_without_creating_legacy_tables(tmp_path: Path)
     database_path = tmp_path / "queue.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE future_jobs (job_id TEXT PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 21")
+        connection.execute("PRAGMA user_version = 25")
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
     assert _table_names(database_path) == {"future_jobs"}
 
 
@@ -1898,7 +1899,7 @@ def test_direct_engine_record_crud_is_exact_and_durable(tmp_path: Path) -> None:
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert [
             row[1]
             for row in connection.execute("PRAGMA table_info(engine_instances)").fetchall()
@@ -1983,14 +1984,14 @@ def test_v8_migrates_every_supported_legacy_schema_to_the_exact_catalog(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> None:
@@ -2034,7 +2035,7 @@ def test_v8_migration_preserves_a_v5_direct_engine_record(tmp_path: Path) -> Non
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert [
             row[1]
             for row in connection.execute(
@@ -3257,14 +3258,14 @@ def test_v8_migrates_v6_database_to_the_exact_command_receipt_catalog(tmp_path: 
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_v7_migration_rolls_back_job_control_ddl_when_creation_fails(
@@ -3527,7 +3528,7 @@ def test_v8_migrates_v7_receipts_to_the_shared_global_registry(tmp_path: Path) -
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
     assert "command_receipts" in _table_names(database_path)
 
 
@@ -4026,14 +4027,14 @@ def test_v9_migrates_v8_job_control_constraints_without_losing_receipts(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_v9_receipt_rebuild_failure_restores_v8_database(
@@ -4272,7 +4273,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         projection_after = connection.execute(
             """
             SELECT
@@ -4305,7 +4306,7 @@ def test_v11_migrates_v9_materialized_projection_without_inventing_a_receipt(
         }
     assert projection_after == projection_before
     assert receipts == []
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_v10_migration_rolls_back_publication_receipt_ddl_when_version_bump_fails(
@@ -4388,19 +4389,19 @@ def test_fresh_v11_bootstrap_retries_after_publication_receipt_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 24
     finally:
         recovered.close()
 
     with original_connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         table_schemas = {
             row[0]: store_module._normalize_table_schema(row[1])
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -4649,7 +4650,7 @@ def test_publication_marker_binding_is_narrow_durable_and_exactly_idempotent(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert [
             row[1]
             for row in connection.execute(
@@ -4980,7 +4981,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert connection.execute(
             "SELECT job_id, marker_device, marker_inode FROM publication_marker_bindings"
         ).fetchall() == []
@@ -4990,7 +4991,7 @@ def test_v11_migrates_v10_without_backfilling_marker_bindings(tmp_path: Path) ->
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_v11_migration_ddl_failure_leaves_the_exact_v10_database(
@@ -5068,7 +5069,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 24
     finally:
         recovered.close()
 
@@ -5079,7 +5080,7 @@ def test_fresh_v11_bootstrap_retries_after_marker_binding_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_v15_rejects_unknown_current_table_without_bootstrap_writes(
@@ -5089,16 +5090,16 @@ def test_v15_rejects_unknown_current_table_without_bootstrap_writes(
     store = SQLiteStore(database_path)
     store.close()
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         connection.execute("CREATE TABLE unexpected_v12_table (value TEXT NOT NULL)")
 
     with pytest.raises(RuntimeError, match="incomplete"):
         SQLiteStore(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
     assert _table_names(database_path) == {
-        *store_module._V20_TABLE_SCHEMAS,
+        *store_module._V24_TABLE_SCHEMAS,
         "unexpected_v12_table",
     }
 
@@ -5218,7 +5219,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert connection.execute(
             "SELECT COUNT(*) FROM direct_engine_recovery_capabilities"
         ).fetchone()[0] == 0
@@ -5228,7 +5229,7 @@ def test_v12_migrates_v11_direct_record_without_backfilling_a_recovery_capabilit
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
@@ -5269,7 +5270,7 @@ def test_v12_recovery_capability_migration_rolls_back_and_retries_from_v11(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 24
     finally:
         recovered.close()
 
@@ -6171,7 +6172,7 @@ def test_v14_migrates_v13_owner_chain_without_backfilling_a_staged_payload_bindi
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert connection.execute(
             """
             SELECT job_id, partial_device, partial_inode, logical_size
@@ -6184,7 +6185,7 @@ def test_v14_migrates_v13_owner_chain_without_backfilling_a_staged_payload_bindi
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_v14_migration_rolls_back_and_retries_from_v13(
@@ -6225,7 +6226,7 @@ def test_v14_migration_rolls_back_and_retries_from_v13(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 24
     finally:
         recovered.close()
 
@@ -6266,7 +6267,7 @@ def test_fresh_v14_bootstrap_retries_after_staged_payload_ddl_failure(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 24
     finally:
         recovered.close()
 
@@ -6277,7 +6278,7 @@ def test_fresh_v14_bootstrap_retries_after_staged_payload_ddl_failure(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 def test_private_staged_payload_binding_is_exactly_idempotent_and_durable(
@@ -6791,7 +6792,7 @@ def test_private_final_publication_binding_is_exactly_idempotent_and_durable(
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert [
             row[1]
             for row in connection.execute(
@@ -6881,7 +6882,7 @@ def test_v15_migrates_v14_owner_chain_without_backfilling_final_publication_bind
         store.close()
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 24
         assert connection.execute(
             """
             SELECT job_id, final_device, final_inode, logical_size
@@ -6894,7 +6895,7 @@ def test_v15_migrates_v14_owner_chain_without_backfilling_final_publication_bind
                 "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert table_schemas == store_module._V20_TABLE_SCHEMAS
+    assert table_schemas == store_module._V24_TABLE_SCHEMAS
 
 
 @pytest.mark.parametrize(
@@ -6944,7 +6945,7 @@ def test_v15_migration_rolls_back_and_retries_from_v14(
     monkeypatch.setattr(store_module.sqlite3, "connect", original_connect)
     recovered = SQLiteStore(database_path)
     try:
-        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 24
     finally:
         recovered.close()
 
@@ -7806,7 +7807,7 @@ def test_stage_producer_prepare_rejects_intervening_same_cutpoint_audit(tmp_path
 def test_exact_publication_attempt_schema_has_no_historical_backfill(tmp_path):
     store = SQLiteStore(tmp_path / 'attempt.db')
     try:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 20
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 24
         assert store._connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
         assert store._connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
         columns = {row[1] for row in store._connection.execute('PRAGMA table_info(direct_publication_attempts)')}
@@ -8066,7 +8067,7 @@ def test_exact_attempt_v16_migration_is_atomic_and_has_no_backfill(tmp_path, mon
         assert connection.execute('PRAGMA user_version').fetchone()[0] == 15
     monkeypatch.setattr(store_module.sqlite3,'connect',connect)
     with closing(SQLiteStore(database)) as store:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 20
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 24
         assert store._connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
 
 
@@ -8074,6 +8075,9 @@ def _retain_actual_v19_fixture(database):
     """Retain genuine old producer/proof bytes; remove only the empty append."""
     with closing(SQLiteStore(database)) as store:
         _exact_attempt_fixture(store)
+        for table in ('saved_cleanup_activations','direct_saved_purge_successors','stopped_absent_bodies','direct_preemptions','direct_retry_reopens','direct_control_members','direct_control_cohorts','direct_control_requests','direct_saved_purge_artifacts','direct_saved_purge','direct_file_artifacts','direct_file_outcomes','direct_file_requests','direct_destination_final','direct_destination_staged','direct_attempt_destinations','direct_destination_markers','direct_destinations','direct_job_edits','direct_edit_outcomes','direct_edit_requests','direct_sources','direct_source_requests','direct_job_engines','direct_configurations','stopped_control_bodies','stopped_failed_bodies','direct_stock_bindings','direct_retry_fresh','direct_failures','saved_cleanup_requests','saved_body_owners','saved_retained_cleanup','saved_cold_fences','saved_resume_bindings','saved_direct_cycles','stopped_direct_cycles','saved_direct_continuations','stopped_direct_bodies','notification_claims','notification_outbox'):
+            assert store._connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 0
+            store._connection.execute(f'DROP TABLE {table}')
         connection=store._connection
         assert connection.execute('SELECT count(*) FROM target_dispatch_causes').fetchone()[0]==0
         assert connection.execute("SELECT count(*) FROM direct_dispatch_commands WHERE producer_kind!='legacy'").fetchone()[0]==0
@@ -8084,6 +8088,69 @@ def _retain_actual_v19_fixture(database):
         assert connection.execute('PRAGMA foreign_key_check').fetchall()==[]
         return {name:[tuple(r) for r in connection.execute(f'SELECT * FROM {name}')]
             for name in store_module._V19_TABLE_SCHEMAS}
+
+
+@pytest.mark.parametrize('fault', ['CREATE TABLE notification_outbox',
+    'CREATE TABLE notification_claims', 'PRAGMA user_version = 21', 'COMMIT', None])
+def test_notification_v21_migration_preserves_exact_v20_and_never_backfills(tmp_path, monkeypatch, fault):
+    database = tmp_path / 'notification-migration.db'
+    with closing(SQLiteStore(database)) as store:
+        _exact_attempt_fixture(store)
+        for table in ('saved_cleanup_activations','direct_saved_purge_successors','stopped_absent_bodies','direct_preemptions','direct_retry_reopens','direct_control_members','direct_control_cohorts','direct_control_requests','direct_saved_purge_artifacts','direct_saved_purge','direct_file_artifacts','direct_file_outcomes','direct_file_requests','direct_destination_final','direct_destination_staged','direct_attempt_destinations','direct_destination_markers','direct_destinations','direct_job_edits','direct_edit_outcomes','direct_edit_requests','direct_sources','direct_source_requests','direct_job_engines','direct_configurations','stopped_control_bodies','stopped_failed_bodies','direct_stock_bindings','direct_retry_fresh','direct_failures','saved_cleanup_requests','saved_body_owners','saved_retained_cleanup','saved_cold_fences','saved_resume_bindings','saved_direct_cycles','stopped_direct_cycles','saved_direct_continuations','stopped_direct_bodies','notification_claims','notification_outbox'):
+            assert store._connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 0
+            store._connection.execute(f'DROP TABLE {table}')
+        store._connection.execute('PRAGMA user_version=20')
+        assert store._has_table_schemas(store._connection, store_module._V20_TABLE_SCHEMAS)
+        old = {name:[tuple(r) for r in store._connection.execute(f'SELECT * FROM {name}')]
+            for name in store_module._V20_TABLE_SCHEMAS}
+        before = tuple(store._connection.iterdump())
+    connect = sqlite3.connect
+    if fault:
+        class Fault(_MigrationFailureConnection):
+            def commit(self):
+                if fault == 'COMMIT': raise sqlite3.OperationalError('injected commit failure')
+                return self._connection.commit()
+        monkeypatch.setattr(store_module.sqlite3, 'connect', lambda *a,**k: Fault(connect(*a,**k), fault))
+        with pytest.raises(sqlite3.OperationalError): SQLiteStore(database)
+        with connect(database) as connection:
+            assert tuple(connection.iterdump()) == before
+            assert connection.execute('PRAGMA user_version').fetchone()[0] == 20
+        monkeypatch.setattr(store_module.sqlite3, 'connect', connect)
+    with closing(SQLiteStore(database)) as store:
+        assert store._has_table_schemas(store._connection, store_module._V24_TABLE_SCHEMAS)
+        for name, rows in old.items():
+            assert [tuple(r) for r in store._connection.execute(f'SELECT * FROM {name}')] == rows
+        assert store._connection.execute('SELECT count(*) FROM notification_outbox').fetchone()[0] == 0
+        assert store._connection.execute('SELECT count(*) FROM notification_claims').fetchone()[0] == 0
+        assert store._connection.execute("SELECT * FROM settings WHERE key='notification_store_uuid'").fetchall() == []
+        assert store._connection.execute('PRAGMA foreign_key_check').fetchall() == []
+
+
+def test_notification_provenance_bound_covers_500_maximal_native_members(tmp_path):
+    """Schema capacity only; real completion producers are exercised in test_events."""
+    native = (1 << 63) - 1
+    fact = dict(job_id='j'*128, generation=native, revision=native, audit_id=native,
+        creation_audit_id=native, final_device=native, final_inode=native, logical_size=native)
+    provenance = dict(kind='round', cohort_kind='batch', cohort_request_id='r'*128,
+        round_generation=native, owner_request_id='r'*128,
+        members=[dict(job_id='j'*128, creation_kind='batch', creation_request_id='r'*128,
+            creation_index=499, completion=fact)]*500)
+    with closing(SQLiteStore(tmp_path/'capacity.db')) as store:
+        store._connection.execute('BEGIN IMMEDIATE')
+        store._enqueue_completion(store._connection, semantic_key='capacity-fixture', job_id=None,
+            collection_id=None, generation=native, count=500, provenance=provenance)
+        store._connection.commit()
+        assert store._connection.execute('SELECT count FROM notification_outbox').fetchone()[0] == 500
+
+
+def test_notification_schema_poison_is_refused_without_repair(tmp_path):
+    database = tmp_path / 'poison.db'
+    with closing(SQLiteStore(database)) as store:
+        store._connection.execute('ALTER TABLE notification_outbox ADD COLUMN poison TEXT')
+        before = tuple(store._connection.iterdump())
+    with pytest.raises(RuntimeError, match='incomplete'): SQLiteStore(database)
+    with sqlite3.connect(database) as connection:
+        assert tuple(connection.iterdump()) == before
 
 
 @pytest.mark.parametrize('fault', ['ALTER TABLE direct_dispatch_commands ADD COLUMN',
@@ -8106,8 +8173,8 @@ def test_actual_v19_causal_migration_is_atomic_empty_and_preserves_seven_scalars
         monkeypatch.setattr(store_module.sqlite3,'connect',connect)
     with closing(SQLiteStore(database)) as store:
         connection=store._connection
-        assert connection.execute('PRAGMA user_version').fetchone()[0]==20
-        assert store._has_table_schemas(connection,store_module._V20_TABLE_SCHEMAS)
+        assert connection.execute('PRAGMA user_version').fetchone()[0]==24
+        assert store._has_table_schemas(connection,store_module._V24_TABLE_SCHEMAS)
         assert connection.execute('PRAGMA foreign_key_check').fetchall()==[]
         table=next(r for r in connection.execute('PRAGMA table_list') if r['name']=='target_dispatch_causes')
         assert table['ncol']==11 and table['strict']==1
@@ -8125,6 +8192,9 @@ def _retain_actual_v16_fixture(database):
     """Actual g4b producer rows, with the accepted verbatim v16 catalog."""
     with closing(SQLiteStore(database)) as store:
         _exact_attempt_fixture(store)
+        for table in ('saved_cleanup_activations','direct_saved_purge_successors','stopped_absent_bodies','direct_preemptions','direct_retry_reopens','direct_control_members','direct_control_cohorts','direct_control_requests','direct_saved_purge_artifacts','direct_saved_purge','direct_file_artifacts','direct_file_outcomes','direct_file_requests','direct_destination_final','direct_destination_staged','direct_attempt_destinations','direct_destination_markers','direct_destinations','direct_job_edits','direct_edit_outcomes','direct_edit_requests','direct_sources','direct_source_requests','direct_job_engines','direct_configurations','stopped_control_bodies','stopped_failed_bodies','direct_stock_bindings','direct_retry_fresh','direct_failures','saved_cleanup_requests','saved_body_owners','saved_retained_cleanup','saved_cold_fences','saved_resume_bindings','saved_direct_cycles','stopped_direct_cycles','saved_direct_continuations','stopped_direct_bodies','notification_claims','notification_outbox'):
+            assert store._connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 0
+            store._connection.execute(f'DROP TABLE {table}')
         assert store._connection.execute('SELECT count(*) FROM target_dispatch_causes').fetchone()[0] == 0
         assert store._connection.execute("SELECT count(*) FROM direct_dispatch_commands WHERE producer_kind!='legacy'").fetchone()[0] == 0
         store._connection.execute('DROP TABLE target_dispatch_causes')
@@ -8147,12 +8217,12 @@ def _retain_actual_v16_fixture(database):
 def test_t17_actual_g4b_migration_preserves_every_old_row_and_sql(tmp_path):
     database=tmp_path/'g4b.db'; before=_retain_actual_v16_fixture(database)
     with closing(SQLiteStore(database)) as store:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 20
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 24
         for name, rows in before.items():
             columns = 'request_id,payload_digest,job_id,status,generation,revision,state' if name=='direct_dispatch_commands' else '*'
             assert [tuple(row) for row in store._connection.execute(f'SELECT {columns} FROM {name}')] == rows
         assert store._connection.execute("SELECT count(*) FROM direct_dispatch_commands WHERE producer_kind!='legacy'").fetchone()[0] == 0
-        assert store._has_table_schemas(store._connection,store_module._V20_TABLE_SCHEMAS)
+        assert store._has_table_schemas(store._connection,store_module._V24_TABLE_SCHEMAS)
         assert store._connection.execute('SELECT count(*) FROM add_batch_commands').fetchone()[0] == 0
         assert store._connection.execute('SELECT count(*) FROM add_batch_entries').fetchone()[0] == 0
 
@@ -8632,6 +8702,9 @@ def test_cleanup_v19_migration_is_atomic_empty_and_preserves_v18(tmp_path, monke
     database = tmp_path / 'cleanup-migration.db'
     with closing(SQLiteStore(database)) as store:
         _exact_attempt_fixture(store)
+        for table in ('saved_cleanup_activations','direct_saved_purge_successors','stopped_absent_bodies','direct_preemptions','direct_retry_reopens','direct_control_members','direct_control_cohorts','direct_control_requests','direct_saved_purge_artifacts','direct_saved_purge','direct_file_artifacts','direct_file_outcomes','direct_file_requests','direct_destination_final','direct_destination_staged','direct_attempt_destinations','direct_destination_markers','direct_destinations','direct_job_edits','direct_edit_outcomes','direct_edit_requests','direct_sources','direct_source_requests','direct_job_engines','direct_configurations','stopped_control_bodies','stopped_failed_bodies','direct_stock_bindings','direct_retry_fresh','direct_failures','saved_cleanup_requests','saved_body_owners','saved_retained_cleanup','saved_cold_fences','saved_resume_bindings','saved_direct_cycles','stopped_direct_cycles','saved_direct_continuations','stopped_direct_bodies','notification_claims','notification_outbox'):
+            assert store._connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 0
+            store._connection.execute(f'DROP TABLE {table}')
         assert store._connection.execute('SELECT count(*) FROM target_dispatch_causes').fetchone()[0] == 0
         assert store._connection.execute("SELECT count(*) FROM direct_dispatch_commands WHERE producer_kind!='legacy'").fetchone()[0] == 0
         store._connection.execute('DROP TABLE target_dispatch_causes')
@@ -8652,7 +8725,7 @@ def test_cleanup_v19_migration_is_atomic_empty_and_preserves_v18(tmp_path, monke
         assert tuple(connection.iterdump()) == before
     monkeypatch.setattr(store_module.sqlite3,'connect',connect)
     with closing(SQLiteStore(database)) as store:
-        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 20
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0] == 24
         assert store._connection.execute('PRAGMA foreign_keys').fetchone()[0] == 1
         assert store._connection.execute('PRAGMA foreign_key_check').fetchall() == []
         assert store._connection.execute('SELECT count(*) FROM direct_cleanup_claims').fetchone()[0] == 0
@@ -8716,3 +8789,183 @@ def test_cleanup_claim_insertion_fault_rolls_back_new_real_completion(tmp_path):
         assert tuple(store._connection.iterdump()) == before
         assert store.get_job('job-1').state == 'finalizing'
         assert destination.partial_path.stat().st_nlink == destination.final_path.stat().st_nlink == 2
+
+
+@pytest.mark.parametrize('fault',['CREATE TABLE stopped_direct_bodies','CREATE TABLE saved_direct_continuations','PRAGMA user_version = 22','COMMIT',None])
+def test_saved_v22_additive_migration_preserves_v21_and_never_backfills(tmp_path,monkeypatch,fault):
+    from hermes_downloads import paths
+    database=tmp_path/'saved-migration.db'
+    with closing(SQLiteStore(database)) as store:
+        stage,attempt,destination,_ = _exact_attempt_fixture(store)
+        published=paths.publish_staged_partial_payload(destination,attempt.prepared.reservation,
+            attempt.prepared.staged_payload,prepared=attempt.prepared,creation_permit=paths.PublicationCreationPermit())
+        store.complete_direct_publication(attempt,published,initial_stage=stage)
+        for table in ('saved_cleanup_activations','direct_saved_purge_successors','stopped_absent_bodies','direct_preemptions','direct_retry_reopens','direct_control_members','direct_control_cohorts','direct_control_requests','direct_saved_purge_artifacts','direct_saved_purge','direct_file_artifacts','direct_file_outcomes','direct_file_requests','direct_destination_final','direct_destination_staged','direct_attempt_destinations','direct_destination_markers','direct_destinations','direct_job_edits','direct_edit_outcomes','direct_edit_requests','direct_sources','direct_source_requests','direct_job_engines','direct_configurations','stopped_control_bodies','stopped_failed_bodies','direct_stock_bindings','direct_retry_fresh','direct_failures','saved_cleanup_requests','saved_body_owners','saved_retained_cleanup','saved_cold_fences','saved_resume_bindings','saved_direct_cycles','stopped_direct_cycles','saved_direct_continuations','stopped_direct_bodies'):
+            assert store._connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0]==0
+            store._connection.execute(f'DROP TABLE {table}')
+        store._connection.execute('PRAGMA user_version=21')
+        assert store._has_table_schemas(store._connection,store_module._V21_TABLE_SCHEMAS)
+        old={name:[tuple(row) for row in store._connection.execute(f'SELECT * FROM {name}')] for name in store_module._V21_TABLE_SCHEMAS}
+        before=tuple(store._connection.iterdump())
+    connect=sqlite3.connect
+    if fault:
+        class Fault(_MigrationFailureConnection):
+            def commit(self):
+                if fault=='COMMIT': raise sqlite3.OperationalError('synthetic commit failure')
+                return self._connection.commit()
+        monkeypatch.setattr(store_module.sqlite3,'connect',lambda *a,**k:Fault(connect(*a,**k),fault))
+        with pytest.raises(sqlite3.OperationalError): SQLiteStore(database)
+        with connect(database) as connection: assert tuple(connection.iterdump())==before
+        monkeypatch.setattr(store_module.sqlite3,'connect',connect)
+    with closing(SQLiteStore(database)) as store:
+        assert store._has_table_schemas(store._connection,store_module._V24_TABLE_SCHEMAS)
+        assert store._connection.execute('PRAGMA user_version').fetchone()[0]==24
+        for name,expected in old.items(): assert [tuple(row) for row in store._connection.execute(f'SELECT * FROM {name}')]==expected
+        for table in ('saved_cleanup_activations','direct_saved_purge_successors','stopped_absent_bodies','direct_preemptions','direct_retry_reopens','direct_control_members','direct_control_cohorts','direct_control_requests','direct_saved_purge_artifacts','direct_saved_purge','direct_file_artifacts','direct_file_outcomes','direct_file_requests','direct_destination_final','direct_destination_staged','direct_attempt_destinations','direct_destination_markers','direct_destinations','direct_job_edits','direct_edit_outcomes','direct_edit_requests','direct_sources','direct_source_requests','direct_job_engines','direct_configurations','stopped_control_bodies','stopped_failed_bodies','direct_stock_bindings','direct_retry_fresh','direct_failures','saved_cleanup_requests','saved_body_owners','saved_retained_cleanup','saved_cold_fences','saved_resume_bindings','saved_direct_cycles','stopped_direct_cycles','saved_direct_continuations','stopped_direct_bodies'):
+            assert store._connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0]==0
+
+
+@pytest.mark.parametrize('damage',['record','capability','owner','reservation','marker','path'])
+def test_typed_failure_rejects_other_terminal_owner_without_any_write(tmp_path,damage):
+    from hermes_downloads.direct import _StockResult
+    with closing(SQLiteStore(tmp_path/'failure-fence.db')) as store:
+        terminal,_,_= _started_terminal_fixture(store)
+        closure=dict(process=terminal.record.identity.to_record(),returncode=0,group_absent=True,
+            observer_joined=True,reader_joined=True,eof=True,gid=terminal.gid)
+        owner=('job-1',terminal.dispatch.generation,terminal.gid,terminal.record.worker_epoch,terminal.dispatch.request_id,hashlib.sha256(json.dumps(terminal.record.identity.to_record(),sort_keys=True,separators=(',',':')).encode()).hexdigest(),'c'*64)
+        store._connection.execute('INSERT INTO direct_stock_bindings VALUES (?,?)',(terminal.dispatch.request_id,json.dumps(owner)))
+        if damage=='record':store._connection.execute('UPDATE engine_instances SET started_unix_us=started_unix_us+1')
+        elif damage=='capability':store._connection.execute('DELETE FROM direct_engine_recovery_capabilities')
+        elif damage=='owner':store._connection.execute("UPDATE materialized_jobs SET partial_filename='changed.bin'")
+        elif damage=='reservation':store._connection.execute("UPDATE publication_reservations SET final_filename='changed.bin'")
+        elif damage=='marker':store._connection.execute('DELETE FROM publication_marker_bindings')
+        elif damage=='path':terminal=replace(terminal,partial_path=terminal.partial_path.with_name('other.bin'))
+        before=tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):
+            store.fail_direct_terminal(terminal,error_code=3,stock=_StockResult(True,404,owner=owner),closure=closure,now=datetime(2032,1,2,tzinfo=UTC))
+        assert tuple(store._connection.iterdump())==before
+
+
+@pytest.mark.parametrize('fault',['CREATE TABLE saved_cleanup_activations','CREATE TABLE stopped_absent_bodies','CREATE TABLE direct_saved_purge_successors','CREATE TABLE direct_failures','CREATE TABLE direct_retry_fresh','CREATE TABLE direct_stock_bindings','CREATE TABLE stopped_failed_bodies','CREATE TABLE stopped_control_bodies','CREATE TABLE direct_configurations','CREATE TABLE direct_job_engines','CREATE TABLE direct_source_requests','CREATE TABLE direct_sources','CREATE TABLE direct_edit_requests','CREATE TABLE direct_edit_outcomes','CREATE TABLE direct_job_edits','CREATE TABLE direct_destinations','CREATE TABLE direct_destination_markers','CREATE TABLE direct_attempt_destinations','CREATE TABLE direct_destination_staged','CREATE TABLE direct_destination_final','CREATE TABLE direct_file_requests','CREATE TABLE direct_file_outcomes','CREATE TABLE direct_file_artifacts','CREATE TABLE direct_saved_purge','CREATE TABLE direct_saved_purge_artifacts','CREATE TABLE direct_control_requests','CREATE TABLE direct_control_cohorts','CREATE TABLE direct_control_members','CREATE TABLE direct_retry_reopens','CREATE TABLE direct_preemptions','PRAGMA user_version = 24','COMMIT',None])
+def test_v24_additive_migration_preserves_every_v23_row_definition_and_digest(tmp_path,monkeypatch,fault):
+    database=tmp_path/'v24.db'
+    with closing(SQLiteStore(database)) as store:
+        _started_terminal_fixture(store)
+        for table in ('saved_cleanup_activations','direct_saved_purge_successors','stopped_absent_bodies','direct_preemptions','direct_retry_reopens','direct_control_members','direct_control_cohorts','direct_control_requests','direct_saved_purge_artifacts','direct_saved_purge','direct_file_artifacts','direct_file_outcomes','direct_file_requests','direct_destination_final','direct_destination_staged','direct_attempt_destinations','direct_destination_markers','direct_destinations','direct_job_edits','direct_edit_outcomes','direct_edit_requests','direct_sources','direct_source_requests','direct_job_engines','direct_configurations','stopped_control_bodies','stopped_failed_bodies','direct_stock_bindings','direct_retry_fresh','direct_failures'):
+            assert store._connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0]==0
+            store._connection.execute(f'DROP TABLE {table}')
+        store._connection.execute('PRAGMA user_version=23')
+        assert store._has_table_schemas(store._connection,store_module._V23_TABLE_SCHEMAS)
+        old={name:[tuple(r) for r in store._connection.execute(f'SELECT * FROM {name}')] for name in store_module._V23_TABLE_SCHEMAS}
+        definitions={r[0]:r[1] for r in store._connection.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+        before=tuple(store._connection.iterdump())
+    connect=sqlite3.connect
+    if fault:
+        class Fault(_MigrationFailureConnection):
+            def commit(self):
+                if fault=='COMMIT':raise sqlite3.OperationalError('synthetic v24 commit failure')
+                return self._connection.commit()
+        monkeypatch.setattr(store_module.sqlite3,'connect',lambda *a,**k:Fault(connect(*a,**k),fault))
+        with pytest.raises(sqlite3.OperationalError):SQLiteStore(database)
+        with connect(database) as c:assert tuple(c.iterdump())==before
+        monkeypatch.setattr(store_module.sqlite3,'connect',connect)
+    with closing(SQLiteStore(database)) as store:
+        assert store._has_table_schemas(store._connection,store_module._V24_TABLE_SCHEMAS)
+        for name,expected in old.items():
+            assert [tuple(r) for r in store._connection.execute(f'SELECT * FROM {name}')]==expected
+            assert store._connection.execute('SELECT sql FROM sqlite_master WHERE name=?',(name,)).fetchone()[0]==definitions[name]
+        assert store._connection.execute('PRAGMA foreign_key_check').fetchall()==[]
+
+
+def test_failure_immutable_observation_rebound_blocks_reuse(tmp_path):
+    from hermes_downloads.direct import _StockResult
+    with closing(SQLiteStore(tmp_path/'failure-rebound.db')) as store:
+        terminal,_,_=_started_terminal_fixture(store)
+        owner=('job-1',terminal.dispatch.generation,terminal.gid,terminal.record.worker_epoch,terminal.dispatch.request_id,hashlib.sha256(json.dumps(terminal.record.identity.to_record(),sort_keys=True,separators=(',',':')).encode()).hexdigest(),'c'*64)
+        store._connection.execute('INSERT INTO direct_stock_bindings VALUES (?,?)',(terminal.dispatch.request_id,json.dumps(owner)))
+        closure=dict(process=terminal.record.identity.to_record(),returncode=0,group_absent=True,observer_joined=True,reader_joined=True,eof=True,gid=terminal.gid)
+        result=store.fail_direct_terminal(terminal,error_code=3,stock=_StockResult(True,404,owner=owner),closure=closure,now=datetime(2032,1,2,tzinfo=UTC))
+        failure=store._connection.execute('SELECT * FROM direct_failures').fetchone()
+        observation=json.loads(failure['observation']);observation['resource_digest']='f'*64
+        store._connection.execute('UPDATE direct_failures SET observation=?',(json.dumps(observation),))
+        before=tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):store._failure_state_for_audit(store._connection,'job-1',result.generation,result.revision,failure['audit_id'])
+        assert tuple(store._connection.iterdump())==before
+
+
+def test_fresh_retry_namespace_rebound_cannot_reseal_current_projection(tmp_path):
+    from hermes_downloads.direct import _StockResult
+    with closing(SQLiteStore(tmp_path/'retry-rebound.db')) as store:
+        terminal,_,_=_started_terminal_fixture(store)
+        owner=('job-1',terminal.dispatch.generation,terminal.gid,terminal.record.worker_epoch,terminal.dispatch.request_id,hashlib.sha256(json.dumps(terminal.record.identity.to_record(),sort_keys=True,separators=(',',':')).encode()).hexdigest(),'c'*64)
+        store._connection.execute('INSERT INTO direct_stock_bindings VALUES (?,?)',(terminal.dispatch.request_id,json.dumps(owner)))
+        closure=dict(process=terminal.record.identity.to_record(),returncode=0,group_absent=True,observer_joined=True,reader_joined=True,eof=True,gid=terminal.gid)
+        result=store.fail_direct_terminal(terminal,error_code=29,stock=_StockResult(True,503,0,owner=owner),closure=closure,now=datetime(2032,1,2,tzinfo=UTC))
+        failure=store._connection.execute('SELECT * FROM direct_failures').fetchone()
+        command=store_module.TargetAuthorizeCommand('retry-fixture',1,'resume',dict(kind='jobs',targets=[dict(job='job-1',expected_revision=result.revision)]))
+        store._connection.execute('BEGIN IMMEDIATE')
+        store._insert_fresh_retry(store._connection,command,failure,[[1,2]]*4,[3,4],failure['retry_due_ms'])
+        store._connection.commit()
+        assert store._fresh_retry(store._connection,'job-1','retry-fixture') is not None
+        store._connection.execute('UPDATE direct_retry_fresh SET marker=?',(json.dumps([3,5]),))
+        before=tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):store._fresh_retry(store._connection,'job-1','retry-fixture')
+        assert tuple(store._connection.iterdump())==before
+
+
+@pytest.mark.parametrize('state',['blocked','needs_auth','needs_link'])
+def test_cold_failure_budget_fences_without_unpausing_or_losing_exhaustion(tmp_path,state):
+    with closing(SQLiteStore(tmp_path/'cold-failure.db')) as store:
+        store.recover_cold_start()
+        store.apply_add(_intent())
+        authority=retry_module.RetryAuthority.open(policy=retry_module.RetryPolicy(),job_id='job-1',generation=4)
+        for _ in range(5):authority.decide(retry_module.RetryFailure(retry_module.FailureKind.TRANSIENT_HOST),generation=4)
+        assert authority.budget.exhausted and authority.budget.ordinary_attempts==5
+        store.set_retry_budget(authority.budget)
+        store._connection.execute('UPDATE jobs SET state=? WHERE job_id=?',(state,'job-1'))
+        before=store.get_retry_budget('job-1')
+        assert store.recover_cold_start()==2
+        after=store.get_retry_budget('job-1');job=store.get_job('job-1')
+        assert (job.state,job.generation,job.revision)==('paused',5,8)
+        assert (after.generation,after.ordinary_attempts,after.exhausted,after.paused)==(5,5,True,True)
+        assert after.audit[:-1]==before.audit and after.audit[-1].kind is retry_module.RetryAuditKind.FENCED
+        assert store.queue_gate()=='paused'
+
+
+@pytest.mark.parametrize('damage',['target-gap','receipt-overflow','wire-request'])
+def test_captured_control_rejects_structural_poison_before_readback(tmp_path,damage):
+    import hashlib,json,time
+    from hermes_downloads import ipc,worker
+    with closing(SQLiteStore(tmp_path/'capture-poison.db')) as store:
+        store.recover_cold_start()
+        for index in range(2):
+            worker._job_add_from_store(store,ipc.JobAddCommand('capture-'+str(index),'add-'+str(index),'https://example.test/file',0,index,'Other',str(index)+'.bin',str(index)+'.bin'))
+        command=ipc.ControlIntentCommand('queue','start','capture-poison',1)
+        store.accept_control_intent(command,deadline=time.monotonic()+2)
+        db=store._connection
+        if damage=='target-gap':db.execute('UPDATE direct_control_members SET target_index=3 WHERE target_index=1')
+        else:
+            row=db.execute('SELECT * FROM direct_control_requests').fetchone();wire=row['wire'];receipt=row['receipt']
+            if damage=='receipt-overflow':
+                value=json.loads(receipt);value['revision']='9223372036854775808';receipt=json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+            else:
+                wire=ipc.ControlIntentCommand('queue','start','another-request',1)._wire_request
+            seal=hashlib.sha256(wire+receipt+row['membership_digest'].encode()).hexdigest()
+            db.execute('UPDATE direct_control_requests SET wire=?,receipt=?,seal=?',(wire,receipt,seal))
+        before=tuple(db.iterdump())
+        with pytest.raises(ValueError):store.control_snapshot(command.request_id)
+        assert tuple(db.iterdump())==before
+
+
+def test_public_detail_has_current_collection_and_retry_decision_facts(tmp_path):
+    import time
+    from hermes_downloads import ipc,retry,worker
+    with closing(SQLiteStore(tmp_path/'decision-detail.db')) as store:
+        store.recover_cold_start()
+        worker._job_add_from_store(store,ipc.JobAddCommand('detail-job','detail-add','https://example.test/file',0,0,'Other','f.bin','f.bin'))
+        assert store.source_detail('detail-job')['collection'] is None
+        assert store.source_detail('detail-job')['retry'] is None
+        authority=retry.RetryAuthority.open(policy=retry.RetryPolicy(),job_id='detail-job',generation=0)
+        for _ in range(5):authority.decide(retry.RetryFailure(retry.FailureKind.TRANSIENT_HOST),generation=0)
+        store.set_retry_budget(authority.budget)
+        assert store.source_detail('detail-job')['retry']==dict(generation='0',budget_number='1',ordinary_attempts='5',paused=False,exhausted=True,due_at=None)

@@ -151,10 +151,11 @@ def _publication_worker(state, sock, ready, shutdown, stopped, results, origin, 
         original_init(self, *args, **kwargs)
     direct.DirectAria2Controller.__init__ = init
     original_close = direct.DirectAria2Controller.close
-    def close(self):
+    def close(self,**kwargs):
         child = self._process
-        original_close(self)
+        original_close(self,**kwargs)
         for identity in engine_births:
+            if child is None or identity.leader_pid != child.pid:continue
             absence = processes.reconcile_process_birth(identity)
             record('engine-closure', identity=identity.to_record(), reconciliation=absence,
                 leader_reaped=self._process is None)
@@ -175,9 +176,14 @@ def _publication_worker(state, sock, ready, shutdown, stopped, results, origin, 
             raise
     SQLiteStore.apply_queue_gate = gate
     owner = threading.get_ident()
-    grant = network.LocalOriginGrant.for_url(origin)
+    grants = [network.LocalOriginGrant.for_url(value) for value in (origin if type(origin) is tuple else (origin,))]
     validate = worker.validate_source_url
-    worker.validate_source_url = lambda value: validate(value, local_origin_grant=grant)
+    def validate_fixture_origin(value):
+        for grant in grants:
+            try:return validate(value,local_origin_grant=grant)
+            except ValueError:pass
+        return validate(value)
+    worker.validate_source_url = validate_fixture_origin
     def hold(*, owner_allowed=False):
         assert owner_allowed or threading.get_ident() != owner
         record('phase-entered', phase=barrier, owner_thread=threading.get_ident() == owner)
@@ -409,6 +415,11 @@ def test_real_direct_initial_publication_and_exact_attempt_recovery(barrier, act
                                     raise
                                 time.sleep(.01)
                         assert getattr(result, 'status', 'applied') == 'applied'
+                        if barrier in {'prepare','post-link'}:
+                            with sqlite3.connect(state/'state.db') as held:
+                                assert held.execute('SELECT count(*) FROM engine_instances').fetchone()[0]==1
+                                assert held.execute('SELECT count(*) FROM direct_engine_recovery_capabilities').fetchone()[0]==1
+                            assert process.is_alive() and not release.is_set()
                         release.set()
                         _wait_state(sock, 'removed' if action == 'remove' else 'paused')
                     if barrier == 'prepare':
@@ -636,13 +647,20 @@ def test_controller_absent_held_recovery_hash_controls_cancel_without_late_compl
                 before = time.monotonic()
                 if action == 'shutdown':
                     recovery['shutdown'].set()
+                    assert not recovery['stopped'].wait(1.7) and recovery['process'].is_alive()
+                    import fcntl
+                    with (state/'.worker.lock').open('rb') as lease:
+                        with pytest.raises(BlockingIOError):
+                            fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    (publication_evidence/f"release-hash-{recovery['process'].pid}").touch(mode=0o600)
+                    recovery['release'].set()
                     assert recovery['stopped'].wait(3)
                 elif action == 'queue':
                     assert ipc.set_queue_gate(sock, gate='paused', request_id='cancel-held', expected_revision=gate_revision).applied
                 else:
                     assert ipc.control_job(sock, job='dispatch-job', action=action, request_id='cancel-held', expected_revision=current.revision).status == 'applied'
-                assert time.monotonic() - before < 3
-                assert not recovery['release'].is_set()
+                assert time.monotonic() - before < (5 if action=='shutdown' else 3)
+                assert recovery['release'].is_set() == (action=='shutdown')
                 if action != 'shutdown':
                     assert ipc.activate_direct_engine(sock, expected_worker_epoch=epoch).status == 'blocked'
                     result = ipc.dispatch_direct_job(sock, **arguments)
@@ -652,9 +670,8 @@ def test_controller_absent_held_recovery_hash_controls_cancel_without_late_compl
                     _wait_state(sock, 'removed' if action == 'remove' else 'paused')
                 _finish_publication_worker(recovery, publication_evidence)
                 rows = [json.loads(line) for line in (publication_evidence / f"fixture-{recovery['process'].pid}.jsonl").read_text().splitlines()]
-                if action != 'shutdown':
-                    hashed = next(r for r in rows if r['kind'] == 'recovery-hash-exit')
-                    assert hashed['reads'] == [[1024*1024, 0]] and hashed['cancelled']
+                hashed = next(r for r in rows if r['kind'] == 'recovery-hash-exit')
+                assert hashed['reads'] == [[1024*1024, 0]] and hashed['cancelled']
                 assert origin.ledger == before_body
                 assert _receipt(state / 'state.db') == original
                 with sqlite3.connect(state / 'state.db') as connection:
@@ -686,20 +703,29 @@ def test_real_shutdown_same_process_restart_activation_waits_for_publisher_exit(
             try:
                 body_before = origin.ledger
                 child['shutdown'].set()
-                assert child['restarted'].wait(6)
+                assert not child['restarted'].wait(1.7) and child['process'].is_alive()
+                import fcntl
+                with (state/'.worker.lock').open('rb') as lease:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                with sqlite3.connect(state/'state.db') as held:
+                    assert held.execute('SELECT count(*) FROM engine_instances').fetchone()[0]==1
+                    assert held.execute('SELECT count(*) FROM direct_engine_recovery_capabilities').fetchone()[0]==1
                 assert not child['release'].is_set()
+                child['release'].set()
+                assert child['restarted'].wait(6)
                 assert ipc.request_health(sock).worker_epoch == 2
                 assert ipc.request_jobs_page(sock).jobs[0].state == 'paused'
-                assert ipc.activate_direct_engine(sock, expected_worker_epoch=2).status == 'blocked'
+                assert ipc.activate_direct_engine(sock, expected_worker_epoch=2).status == 'active'
                 assert origin.ledger == body_before
                 rows = [json.loads(line) for line in (publication_evidence / f"fixture-{child['process'].pid}.jsonl").read_text().splitlines()]
                 drain = next(row for row in rows if row['kind'] == 'shutdown-drain')
-                assert drain['gate_locked'] and drain['surviving_threads'] == ['direct-publication-observation']
+                assert not drain['gate_locked'] and drain['surviving_threads'] == []
                 if recover_socket:
                     assert drain['socket_absent'] and drain['certificate_absent']
                     assert json.loads((state / '.worker-endpoint.json').read_bytes())['worker_epoch'] == 2
                 first_result = child['results'].get(timeout=2)
-                assert first_result == (('error', 'IPCStateError', 'direct_dispatch_blocked') if barrier == 'link' else ('result', None))
+                assert first_result == ('result',None)
                 child['release'].set()
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
@@ -851,7 +877,7 @@ def test_certified_restart_recovers_only_new_exact_direct_attempt_preserving_leg
                 assert legacy_snapshot() == history
                 assert _receipt(database) == original and origin.ledger == before_body
                 with sqlite3.connect(database) as connection:
-                    assert connection.execute('PRAGMA user_version').fetchone()[0] == 20
+                    assert connection.execute('PRAGMA user_version').fetchone()[0] == 24
                     assert connection.execute("SELECT manual_hold FROM materialized_jobs WHERE job_id='dispatch-job'").fetchone()[0] == int(retained_final)
                     assert connection.execute('SELECT COUNT(*) FROM final_publication_bindings WHERE job_id=\'dispatch-job\'').fetchone()[0] == 0
                     assert connection.execute("SELECT COUNT(*) FROM events WHERE kind='job_completed'").fetchone()[0] == 0

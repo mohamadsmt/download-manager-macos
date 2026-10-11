@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
@@ -14,6 +14,8 @@ import secrets
 import sqlite3
 import time
 import math
+import os
+import uuid
 from typing import TYPE_CHECKING, Final
 
 from hermes_downloads.models import (
@@ -28,7 +30,9 @@ from hermes_downloads.processes import ProcessBirthIdentity
 from hermes_downloads.ipc import (AddBatchCommand, AddBatchResult, AddBatchEntryResult,
     JobControlCommand, JobAddCommand, TargetAuthorizeCommand, TargetAuthorizeResult, _batch_entry, _batch_canonical, _batch_decode, _batch_collection_id,
     _batch_component, _MAX_BATCH_REPLY, QueryCursor, QueryListPage, QueryStatus,
-    QueryEventsPage, QueryEventRecord, PublicJobRecord, validate_query_cursor, _query_counter)
+    QueryEventsPage, QueryEventRecord, PublicJobRecord, validate_query_cursor, _query_counter,
+    NotificationPendingCommand, NotificationClaimCommand, NotificationPresentedCommand,
+    NotificationReleaseCommand, NotificationResult, validate_notification_event, _notification_uuid)
 from hermes_downloads.network import validate_source_url, SourcePolicyError
 from hermes_downloads.retry import (
     CompletionVerification,
@@ -36,7 +40,7 @@ from hermes_downloads.retry import (
     RetryAuditKind,
     RetryAuthority,
     RetryBudget,
-    RetryPolicy,
+    RetryPolicy, FailureKind, RetryFailure, RetryAction, failure_from_http_status,
 )
 
 if TYPE_CHECKING:
@@ -473,7 +477,7 @@ CREATE TABLE closed_direct_publication_attempts (
     pending_request_id TEXT CHECK (pending_request_id IS NULL)
 );
 """
-_SUPPORTED_SCHEMA_VERSION: Final = 20
+_SUPPORTED_SCHEMA_VERSION: Final = 24
 _RETRY_AUDIT_CAPACITY: Final = 256
 _MAX_COUNTER: Final = (1 << 63) - 1
 _V1_TABLE_SCHEMAS: Final = _expected_table_schemas(_SCHEMA)
@@ -894,6 +898,242 @@ _V20_TABLE_SCHEMAS['direct_dispatch_commands'] = (
     _V19_TABLE_SCHEMAS['direct_dispatch_commands'][:-1] + ', '
     + _normalize_table_schema(_TARGET_DISPATCH_MARKER) + ')')
 
+_NOTIFICATION_OUTBOX_SCHEMA: Final = """
+CREATE TABLE notification_outbox (
+    sequence INTEGER PRIMARY KEY CHECK(sequence BETWEEN 1 AND 9223372036854775807),
+    store_uuid TEXT NOT NULL CHECK(length(store_uuid)=36),
+    semantic_key TEXT NOT NULL UNIQUE CHECK(length(semantic_key) BETWEEN 1 AND 384),
+    type TEXT NOT NULL CHECK(type IN ('completion','needs_link','needs_login','needs_space','persistent_error')),
+    job_id TEXT REFERENCES jobs(job_id),
+    collection_id TEXT,
+    generation INTEGER NOT NULL CHECK(generation BETWEEN 0 AND 9223372036854775807),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9223372036854775807),
+    count INTEGER NOT NULL CHECK(count BETWEEN 1 AND 500),
+    reason_code TEXT CHECK(reason_code IN ('link_expired','login_required','insufficient_space','retry_exhausted','download_failed')),
+    provenance TEXT NOT NULL CHECK(length(provenance) BETWEEN 1 AND 524288),
+    presentation_state TEXT NOT NULL DEFAULT 'pending' CHECK(presentation_state IN ('pending','claimed','presented')),
+    consumer_id TEXT,
+    claim_token TEXT,
+    lease_expires_at_ms INTEGER CHECK(lease_expires_at_ms BETWEEN 0 AND 9223372036854775807),
+    deliverable INTEGER GENERATED ALWAYS AS (presentation_state!='presented') STORED,
+    delivery_priority INTEGER GENERATED ALWAYS AS (type='completion') STORED,
+    UNIQUE(deliverable,delivery_priority,sequence),
+    CHECK((consumer_id IS NULL AND claim_token IS NULL AND lease_expires_at_ms IS NULL AND presentation_state='pending')
+        OR (consumer_id IS NOT NULL AND length(consumer_id)=36 AND claim_token IS NOT NULL
+            AND length(claim_token)=64 AND lease_expires_at_ms IS NOT NULL AND presentation_state IN ('claimed','presented')))
+) STRICT;
+"""
+_NOTIFICATION_CLAIMS_SCHEMA: Final = """
+CREATE TABLE notification_claims (
+    sequence INTEGER NOT NULL REFERENCES notification_outbox(sequence),
+    claim_token TEXT NOT NULL CHECK(length(claim_token)=64 AND claim_token NOT GLOB '*[^0-9a-f]*'),
+    consumer_id TEXT NOT NULL CHECK(length(consumer_id)=36),
+    lease_expires_at_ms INTEGER NOT NULL CHECK(lease_expires_at_ms BETWEEN 0 AND 9223372036854775807),
+    outcome TEXT NOT NULL CHECK(outcome IN ('claimed','released','presented')),
+    notification_id TEXT CHECK(length(notification_id) BETWEEN 1 AND 256),
+    CHECK((outcome='presented' AND notification_id IS NOT NULL) OR (outcome!='presented' AND notification_id IS NULL)),
+    PRIMARY KEY(sequence,claim_token)
+) STRICT;
+"""
+_V21_TABLE_SCHEMAS: Final = dict(_V20_TABLE_SCHEMAS,
+    **_expected_table_schemas(_NOTIFICATION_OUTBOX_SCHEMA, _NOTIFICATION_CLAIMS_SCHEMA))
+
+_STOPPED_BODIES_SCHEMA = """
+CREATE TABLE stopped_direct_bodies (
+ job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(job_id),
+ source_request_id TEXT NOT NULL UNIQUE REFERENCES direct_dispatch_commands(request_id),
+ pause_request_id TEXT NOT NULL REFERENCES job_control_commands(request_id),
+ pause_audit_id INTEGER NOT NULL REFERENCES events(event_id),
+ worker_epoch INTEGER NOT NULL CHECK(worker_epoch>=1),
+ generation INTEGER NOT NULL CHECK(generation>=0),
+ revision INTEGER NOT NULL CHECK(revision>=0),
+ checkpoint_digest TEXT NOT NULL CHECK(length(checkpoint_digest)=64),
+ facts TEXT NOT NULL,
+ closure TEXT NOT NULL
+) STRICT;
+"""
+_SAVED_CONTINUATIONS_SCHEMA = """
+CREATE TABLE saved_direct_continuations (
+ job_id TEXT PRIMARY KEY NOT NULL REFERENCES stopped_direct_bodies(job_id),
+ request_id TEXT NOT NULL UNIQUE REFERENCES target_commands(request_id),
+ payload_digest TEXT NOT NULL CHECK(length(payload_digest)=64),
+ checkpoint_digest TEXT NOT NULL CHECK(length(checkpoint_digest)=64),
+ worker_epoch INTEGER NOT NULL CHECK(worker_epoch>=1),
+ generation INTEGER NOT NULL CHECK(generation>=0),
+ revision INTEGER NOT NULL CHECK(revision>=0),
+ phase TEXT NOT NULL CHECK(phase IN ('intent','linked','retired','ready','admitted','failed')),
+ facts TEXT NOT NULL,
+ body_request_id TEXT UNIQUE REFERENCES direct_dispatch_commands(request_id)
+) STRICT;
+"""
+_V22_TABLE_SCHEMAS = dict(_V21_TABLE_SCHEMAS,
+ **_expected_table_schemas(_STOPPED_BODIES_SCHEMA, _SAVED_CONTINUATIONS_SCHEMA))
+
+_STOPPED_CYCLES_SCHEMA = _STOPPED_BODIES_SCHEMA.replace('stopped_direct_bodies','stopped_direct_cycles').replace(
+ 'job_id TEXT PRIMARY KEY NOT NULL','job_id TEXT NOT NULL').replace(
+ 'source_request_id TEXT NOT NULL UNIQUE','source_request_id TEXT PRIMARY KEY NOT NULL').replace(
+ 'pause_request_id TEXT NOT NULL REFERENCES job_control_commands(request_id)',
+ 'pause_request_id TEXT NOT NULL').replace(' closure TEXT NOT NULL',
+ " closure TEXT NOT NULL,\n stop_kind TEXT NOT NULL CHECK(stop_kind IN ('pause','queue','shutdown','cold'))")
+_SAVED_CYCLES_SCHEMA = _SAVED_CONTINUATIONS_SCHEMA.replace('saved_direct_continuations','saved_direct_cycles').replace(
+ 'job_id TEXT PRIMARY KEY NOT NULL REFERENCES stopped_direct_bodies(job_id)',
+ 'job_id TEXT NOT NULL REFERENCES jobs(job_id)').replace('request_id TEXT NOT NULL UNIQUE',
+ 'request_id TEXT PRIMARY KEY NOT NULL',1)
+_SAVED_BINDINGS_SCHEMA = '''CREATE TABLE saved_resume_bindings (
+ request_id TEXT PRIMARY KEY NOT NULL REFERENCES target_commands(request_id),
+ source_request_id TEXT NOT NULL REFERENCES direct_dispatch_commands(request_id),
+ retained_names TEXT NOT NULL,
+ drained INTEGER NOT NULL CHECK(drained IN (0,1)),
+ prepared_from TEXT REFERENCES target_commands(request_id)
+) STRICT;'''
+_SAVED_BODY_OWNERS_SCHEMA = '''CREATE TABLE saved_body_owners (
+ request_id TEXT PRIMARY KEY NOT NULL REFERENCES direct_dispatch_commands(request_id),
+ process TEXT NOT NULL, gid TEXT NOT NULL, worker_epoch INTEGER NOT NULL
+) STRICT;'''
+_SAVED_CLEANUP_REQUESTS_SCHEMA = '''CREATE TABLE saved_cleanup_requests (
+ request_id TEXT PRIMARY KEY NOT NULL REFERENCES target_commands(request_id),
+ job_id TEXT NOT NULL REFERENCES jobs(job_id), worker_epoch INTEGER NOT NULL,
+ armed INTEGER NOT NULL CHECK(armed IN (0,1))
+) STRICT;'''
+_COLD_FENCES_SCHEMA = '''CREATE TABLE saved_cold_fences (
+ audit_id INTEGER PRIMARY KEY NOT NULL REFERENCES events(event_id),
+ job_id TEXT NOT NULL REFERENCES jobs(job_id),
+ old_epoch INTEGER NOT NULL, new_epoch INTEGER NOT NULL,
+ old_generation INTEGER NOT NULL, old_revision INTEGER NOT NULL, old_state TEXT NOT NULL,
+ generation INTEGER NOT NULL, revision INTEGER NOT NULL,
+ UNIQUE(job_id,new_epoch)
+) STRICT;'''
+_RETAINED_CLEANUP_SCHEMA = '''CREATE TABLE saved_retained_cleanup (
+ request_id TEXT NOT NULL REFERENCES target_commands(request_id),
+ role INTEGER NOT NULL CHECK(role IN (0,1)),
+ attempt_id TEXT NOT NULL REFERENCES direct_publication_attempts(attempt_id),
+ basename TEXT NOT NULL, facts TEXT NOT NULL,
+ phase TEXT NOT NULL CHECK(phase IN ('authorized','absent')),
+ PRIMARY KEY(request_id,role)
+) STRICT;'''
+_V23_DDLS = (_STOPPED_CYCLES_SCHEMA,_SAVED_CYCLES_SCHEMA,_SAVED_BINDINGS_SCHEMA,
+ _COLD_FENCES_SCHEMA,_RETAINED_CLEANUP_SCHEMA,_SAVED_BODY_OWNERS_SCHEMA,_SAVED_CLEANUP_REQUESTS_SCHEMA)
+_V23_TABLE_SCHEMAS = dict(_V22_TABLE_SCHEMAS,**_expected_table_schemas(*_V23_DDLS))
+
+_DIRECT_FAILURES_SCHEMA = """CREATE TABLE direct_failures (
+ body_request_id TEXT PRIMARY KEY REFERENCES direct_dispatch_commands(request_id),
+ job_id TEXT NOT NULL REFERENCES jobs(job_id), worker_epoch INTEGER NOT NULL,
+ generation INTEGER NOT NULL, revision INTEGER NOT NULL, audit_id INTEGER NOT NULL UNIQUE REFERENCES events(event_id),
+ http_status INTEGER, error_code INTEGER NOT NULL CHECK(error_code BETWEEN 1 AND 32),
+ observation_known INTEGER NOT NULL CHECK(observation_known IN (0,1)),
+ action TEXT NOT NULL, state TEXT NOT NULL, observed_at_ms INTEGER NOT NULL,
+ retry_due_ms INTEGER, observation TEXT NOT NULL, closure TEXT NOT NULL, budget TEXT NOT NULL, seal TEXT NOT NULL
+) STRICT;"""
+_DIRECT_RETRY_FRESH_SCHEMA = """CREATE TABLE direct_retry_fresh (
+ request_id TEXT PRIMARY KEY, source_request_id TEXT NOT NULL REFERENCES direct_failures(body_request_id),
+ job_id TEXT NOT NULL REFERENCES jobs(job_id), worker_epoch INTEGER NOT NULL,
+ generation INTEGER NOT NULL, revision INTEGER NOT NULL, authorized_at_ms INTEGER NOT NULL,
+ chain TEXT NOT NULL, marker TEXT NOT NULL, body_request_id TEXT UNIQUE REFERENCES direct_dispatch_commands(request_id),
+ payload_digest TEXT NOT NULL, seal TEXT NOT NULL
+) STRICT;"""
+_DIRECT_STOCK_BINDINGS_SCHEMA = """CREATE TABLE direct_stock_bindings (
+ body_request_id TEXT PRIMARY KEY REFERENCES direct_dispatch_commands(request_id),
+ owner TEXT NOT NULL
+) STRICT;"""
+_STOPPED_FAILED_SCHEMA = _STOPPED_CYCLES_SCHEMA.replace('stopped_direct_cycles','stopped_failed_bodies').replace(
+ "stop_kind IN ('pause','queue','shutdown','cold')","stop_kind='failure'")
+_STOPPED_CONTROL_SCHEMA = _STOPPED_CYCLES_SCHEMA.replace('stopped_direct_cycles','stopped_control_bodies').replace(
+ "stop_kind IN ('pause','queue','shutdown','cold')","stop_kind IN ('configure','replace_source','edit','purge','collection','preempt')")
+_CONFIGURATION_SCHEMA = '''CREATE TABLE direct_configurations (
+ request_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL, wire BLOB NOT NULL,
+ receipt BLOB NOT NULL, revision INTEGER NOT NULL UNIQUE, worker_epoch INTEGER NOT NULL
+) STRICT;'''
+_JOB_ENGINES_SCHEMA = '''CREATE TABLE direct_job_engines (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+ dispatch_request_id TEXT NOT NULL UNIQUE REFERENCES direct_dispatch_commands(request_id),
+ worker_epoch INTEGER NOT NULL, reservation_token TEXT NOT NULL UNIQUE,
+ phase TEXT NOT NULL CHECK(phase IN ('reserved','bound','ready')),
+ process TEXT, rpc_port INTEGER, rpc_secret TEXT, owner_digest TEXT NOT NULL,
+ CHECK((phase='reserved' AND process IS NULL AND rpc_port IS NULL AND rpc_secret IS NULL)
+ OR (phase='bound' AND process IS NOT NULL AND rpc_port IS NULL AND rpc_secret IS NULL)
+ OR (phase='ready' AND process IS NOT NULL AND rpc_port IS NOT NULL AND rpc_secret IS NOT NULL))
+) STRICT;'''
+_SOURCE_REQUESTS_SCHEMA = "CREATE TABLE direct_source_requests (\n request_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(job_id),\n worker_epoch INTEGER NOT NULL, generation INTEGER NOT NULL, revision INTEGER NOT NULL,\n wire BLOB NOT NULL, receipt BLOB NOT NULL, seal TEXT NOT NULL,\n status TEXT NOT NULL CHECK(status IN ('pending','applied','blocked'))\n) STRICT;"
+_SOURCES_SCHEMA = 'CREATE TABLE direct_sources (\n request_id TEXT PRIMARY KEY REFERENCES direct_source_requests(request_id), job_id TEXT NOT NULL REFERENCES jobs(job_id),\n generation INTEGER NOT NULL, revision INTEGER NOT NULL, source_request_id TEXT,\n checkpoint_digest TEXT, expected_sha256 TEXT NOT NULL, seal TEXT NOT NULL\n) STRICT;'
+_EDIT_REQUESTS_SCHEMA = 'CREATE TABLE direct_edit_requests (\n request_id TEXT PRIMARY KEY, worker_epoch INTEGER NOT NULL, wire BLOB NOT NULL,\n capture TEXT NOT NULL, receipt BLOB NOT NULL, seal TEXT NOT NULL\n) STRICT;'
+_EDIT_OUTCOMES_SCHEMA = "CREATE TABLE direct_edit_outcomes (\n request_id TEXT NOT NULL REFERENCES direct_edit_requests(request_id), job_id TEXT NOT NULL REFERENCES jobs(job_id),\n status TEXT NOT NULL CHECK(status IN ('pending','applied','blocked')), reason TEXT,\n PRIMARY KEY(request_id,job_id)\n) STRICT;"
+_JOB_EDITS_SCHEMA = 'CREATE TABLE direct_job_edits (\n request_id TEXT NOT NULL REFERENCES direct_edit_requests(request_id), job_id TEXT NOT NULL REFERENCES jobs(job_id),\n generation INTEGER NOT NULL, revision INTEGER NOT NULL, audit_id INTEGER NOT NULL UNIQUE REFERENCES events(event_id),\n previous_revision INTEGER NOT NULL, source_request_id TEXT, settings TEXT NOT NULL, prior_request_id TEXT, seal TEXT NOT NULL,\n PRIMARY KEY(request_id,job_id)\n) STRICT;'
+_DESTINATIONS_SCHEMA = 'CREATE TABLE direct_destinations (\n request_id TEXT NOT NULL REFERENCES direct_edit_requests(request_id), job_id TEXT NOT NULL REFERENCES jobs(job_id),\n category TEXT NOT NULL, collection TEXT, claim_token TEXT NOT NULL UNIQUE, seal TEXT NOT NULL,\n PRIMARY KEY(request_id,job_id)\n) STRICT;'
+_DESTINATION_MARKERS_SCHEMA = 'CREATE TABLE direct_destination_markers (\n request_id TEXT NOT NULL, job_id TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL,\n PRIMARY KEY(request_id,job_id), FOREIGN KEY(request_id,job_id) REFERENCES direct_destinations(request_id,job_id)\n) STRICT;'
+_ATTEMPT_DESTINATIONS_SCHEMA = 'CREATE TABLE direct_attempt_destinations (\n attempt_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, job_id TEXT NOT NULL,\n FOREIGN KEY(request_id,job_id) REFERENCES direct_destinations(request_id,job_id)\n) STRICT;'
+_DESTINATION_STAGED_SCHEMA = 'CREATE TABLE direct_destination_staged (\n request_id TEXT NOT NULL, job_id TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL, size INTEGER NOT NULL,\n PRIMARY KEY(request_id,job_id), FOREIGN KEY(request_id,job_id) REFERENCES direct_destination_markers(request_id,job_id)\n) STRICT;'
+_DESTINATION_FINAL_SCHEMA = 'CREATE TABLE direct_destination_final (\n request_id TEXT NOT NULL, job_id TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL, size INTEGER NOT NULL,\n PRIMARY KEY(request_id,job_id), FOREIGN KEY(request_id,job_id) REFERENCES direct_destination_staged(request_id,job_id)\n) STRICT;'
+_FILE_REQUESTS_SCHEMA = """CREATE TABLE direct_file_requests (
+ request_id TEXT PRIMARY KEY, worker_epoch INTEGER NOT NULL, wire BLOB NOT NULL,
+ receipt BLOB NOT NULL, seal TEXT NOT NULL
+) STRICT;"""
+_FILE_OUTCOMES_SCHEMA = """CREATE TABLE direct_file_outcomes (
+ request_id TEXT NOT NULL REFERENCES direct_file_requests(request_id), job_id TEXT NOT NULL REFERENCES jobs(job_id),
+ status TEXT NOT NULL CHECK(status IN ('pending','blocked','reveal_pending','reveal_offered','reveal_issued','revealed','reveal_failed','purge_authorized','saved_purge_authorized','purged')),
+ reason TEXT, token TEXT, presentation TEXT,
+ PRIMARY KEY(request_id,job_id)
+) STRICT;"""
+_FILE_ARTIFACTS_SCHEMA = """CREATE TABLE direct_file_artifacts (
+ request_id TEXT NOT NULL, job_id TEXT NOT NULL, attempt_id TEXT NOT NULL REFERENCES direct_publication_attempts(attempt_id),
+ facts TEXT NOT NULL, seal TEXT NOT NULL, absence_observed INTEGER NOT NULL CHECK(absence_observed IN (0,1)),
+ FOREIGN KEY(request_id,job_id) REFERENCES direct_file_outcomes(request_id,job_id), PRIMARY KEY(request_id,job_id)
+) STRICT;"""
+_SAVED_PURGE_SCHEMA = """CREATE TABLE direct_saved_purge (
+ request_id TEXT NOT NULL, job_id TEXT NOT NULL, source_request_id TEXT NOT NULL REFERENCES direct_dispatch_commands(request_id),
+ checkpoint_digest TEXT NOT NULL, records TEXT NOT NULL, seal TEXT NOT NULL,
+ FOREIGN KEY(request_id,job_id) REFERENCES direct_file_outcomes(request_id,job_id), PRIMARY KEY(request_id,job_id)
+) STRICT;"""
+_SAVED_PURGE_SUCCESSORS_SCHEMA = """CREATE TABLE direct_saved_purge_successors (
+ request_id TEXT NOT NULL, job_id TEXT NOT NULL, prior_request_id TEXT NOT NULL,
+ PRIMARY KEY(request_id,job_id), UNIQUE(prior_request_id,job_id), CHECK(request_id!=prior_request_id),
+ FOREIGN KEY(request_id,job_id) REFERENCES direct_saved_purge(request_id,job_id),
+ FOREIGN KEY(prior_request_id,job_id) REFERENCES direct_saved_purge(request_id,job_id)
+) STRICT;"""
+_SAVED_PURGE_ARTIFACTS_SCHEMA = """CREATE TABLE direct_saved_purge_artifacts (
+ request_id TEXT NOT NULL, job_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+ phase TEXT NOT NULL CHECK(phase IN ('authorized','absent')), observation TEXT,
+ FOREIGN KEY(request_id,job_id) REFERENCES direct_saved_purge(request_id,job_id), PRIMARY KEY(request_id,job_id,ordinal)
+) STRICT;"""
+_CONTROL_REQUESTS_SCHEMA = """CREATE TABLE direct_control_requests (
+ request_id TEXT PRIMARY KEY, worker_epoch INTEGER NOT NULL, wire BLOB NOT NULL, receipt BLOB NOT NULL,
+ membership_digest TEXT NOT NULL, seal TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','applied','blocked')),
+ completion_closed INTEGER NOT NULL CHECK(completion_closed IN (0,1))
+) STRICT;"""
+_CONTROL_COHORTS_SCHEMA = """CREATE TABLE direct_control_cohorts (
+ request_id TEXT NOT NULL REFERENCES direct_control_requests(request_id), cohort_index INTEGER NOT NULL,
+ child_request_id TEXT NOT NULL UNIQUE, members TEXT NOT NULL, digest TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('pending','applied','blocked')), receipt BLOB,
+ PRIMARY KEY(request_id,cohort_index)
+) STRICT;"""
+_CONTROL_MEMBERS_SCHEMA = """CREATE TABLE direct_control_members (
+ request_id TEXT NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(job_id), cohort_index INTEGER NOT NULL,
+ target_index INTEGER NOT NULL CHECK(target_index BETWEEN 0 AND 499), generation INTEGER NOT NULL, revision INTEGER NOT NULL,
+ PRIMARY KEY(request_id,job_id), UNIQUE(request_id,cohort_index,target_index),
+ FOREIGN KEY(request_id,cohort_index) REFERENCES direct_control_cohorts(request_id,cohort_index)
+) STRICT;"""
+_RETRY_REOPEN_SCHEMA = """CREATE TABLE direct_retry_reopens (
+ request_id TEXT PRIMARY KEY REFERENCES direct_control_requests(request_id), job_id TEXT NOT NULL REFERENCES jobs(job_id),
+ worker_epoch INTEGER NOT NULL, old_generation INTEGER NOT NULL, old_revision INTEGER NOT NULL,
+ generation INTEGER NOT NULL, revision INTEGER NOT NULL, audit_id INTEGER NOT NULL UNIQUE REFERENCES events(event_id),
+ source_request_id TEXT NOT NULL, resume_request_id TEXT NOT NULL UNIQUE, before_budget TEXT NOT NULL, after_budget TEXT NOT NULL,
+ seal TEXT NOT NULL
+) STRICT;"""
+_PREEMPTIONS_SCHEMA = """CREATE TABLE direct_preemptions (
+ request_id TEXT PRIMARY KEY REFERENCES direct_control_requests(request_id), job_id TEXT NOT NULL REFERENCES jobs(job_id),
+ source_request_id TEXT NOT NULL, worker_epoch INTEGER NOT NULL, generation INTEGER NOT NULL, revision INTEGER NOT NULL,
+ process TEXT NOT NULL, seal TEXT NOT NULL
+) STRICT;"""
+_STOPPED_ABSENT_SCHEMA = _STOPPED_CYCLES_SCHEMA.replace('stopped_direct_cycles','stopped_absent_bodies').replace(
+ "stop_kind IN ('pause','queue','shutdown','cold')","stop_kind='cold_absent'")
+_CLEANUP_ACTIVATIONS_SCHEMA = """CREATE TABLE saved_cleanup_activations (
+ job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, worker_epoch INTEGER NOT NULL CHECK(worker_epoch>0),
+ request_id TEXT NOT NULL REFERENCES saved_cleanup_requests(request_id),
+ PRIMARY KEY(job_id,attempt_id,worker_epoch), UNIQUE(request_id)
+) STRICT;"""
+_V24_DDLS = (_SAVED_PURGE_SUCCESSORS_SCHEMA,_STOPPED_ABSENT_SCHEMA,_CLEANUP_ACTIVATIONS_SCHEMA,_DIRECT_FAILURES_SCHEMA,_DIRECT_RETRY_FRESH_SCHEMA,_DIRECT_STOCK_BINDINGS_SCHEMA,_STOPPED_FAILED_SCHEMA,_STOPPED_CONTROL_SCHEMA,_CONFIGURATION_SCHEMA,_JOB_ENGINES_SCHEMA,_SOURCE_REQUESTS_SCHEMA,_SOURCES_SCHEMA,_EDIT_REQUESTS_SCHEMA,_EDIT_OUTCOMES_SCHEMA,_JOB_EDITS_SCHEMA,_DESTINATIONS_SCHEMA,_DESTINATION_MARKERS_SCHEMA,_ATTEMPT_DESTINATIONS_SCHEMA,_DESTINATION_STAGED_SCHEMA,_DESTINATION_FINAL_SCHEMA,_FILE_REQUESTS_SCHEMA,_FILE_OUTCOMES_SCHEMA,_FILE_ARTIFACTS_SCHEMA,_SAVED_PURGE_SCHEMA,_SAVED_PURGE_ARTIFACTS_SCHEMA,_CONTROL_REQUESTS_SCHEMA,_CONTROL_COHORTS_SCHEMA,_CONTROL_MEMBERS_SCHEMA,_RETRY_REOPEN_SCHEMA,_PREEMPTIONS_SCHEMA)
+_V24_TABLE_SCHEMAS = dict(_V23_TABLE_SCHEMAS,**_expected_table_schemas(*_V24_DDLS))
+
+
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_DIGEST: Final = re.compile(r"[0-9a-f]{64}\Z")
 _DIRECT_ENGINE_RECOVERY_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}\Z")
@@ -929,6 +1169,9 @@ _RECOVERABLE_COLD_START_STATES: Final = (
     "paused",
     "retry_wait",
     "finalizing",
+    "blocked",
+    "needs_auth",
+    "needs_link",
 )
 
 
@@ -1168,6 +1411,19 @@ class _DirectDispatchPlan:
     revision: int
     request_id: str
     payload_digest: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _SavedResumePlan:
+    job_id: str
+    request_id: str
+    checkpoint_digest: str
+    worker_epoch: int
+    generation: int
+    revision: int
+    source_request_id: str
+    retained_names: tuple[str, str]
+    source_serial: int
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1670,6 +1926,10 @@ class SQLiteStore:
             18: _V18_TABLE_SCHEMAS,
             19: _V19_TABLE_SCHEMAS,
             20: _V20_TABLE_SCHEMAS,
+            21: _V21_TABLE_SCHEMAS,
+            22: _V22_TABLE_SCHEMAS,
+            23: _V23_TABLE_SCHEMAS,
+            24: _V24_TABLE_SCHEMAS,
         }[row[0]]
         if not SQLiteStore._has_table_schemas(connection, expected_schemas):
             raise RuntimeError("database schema version is incomplete")
@@ -1896,8 +2156,38 @@ class SQLiteStore:
                     raise RuntimeError('migration foreign key violation')
                 connection.execute('PRAGMA user_version = 20')
                 version = 20
-            if version == _SUPPORTED_SCHEMA_VERSION:
+            if version == 20:
                 if not SQLiteStore._has_table_schemas(connection, _V20_TABLE_SCHEMAS):
+                    raise RuntimeError('database schema version is incomplete')
+                connection.execute(_NOTIFICATION_OUTBOX_SCHEMA)
+                connection.execute(_NOTIFICATION_CLAIMS_SCHEMA)
+                connection.execute('PRAGMA user_version = 21')
+                version = 21
+            if version == 21:
+                if not SQLiteStore._has_table_schemas(connection, _V21_TABLE_SCHEMAS):
+                    raise RuntimeError('database schema version is incomplete')
+                connection.execute(_STOPPED_BODIES_SCHEMA)
+                connection.execute(_SAVED_CONTINUATIONS_SCHEMA)
+                connection.execute('PRAGMA user_version = 22')
+                version = 22
+            if version == 22:
+                if not SQLiteStore._has_table_schemas(connection, _V22_TABLE_SCHEMAS):
+                    raise RuntimeError('database schema version is incomplete')
+                if connection.execute('PRAGMA foreign_key_check').fetchone() is not None:
+                    raise RuntimeError('migration foreign key violation')
+                for ddl in _V23_DDLS: connection.execute(ddl)
+                connection.execute('PRAGMA user_version = 23')
+                version = 23
+            if version == 23:
+                if not SQLiteStore._has_table_schemas(connection, _V23_TABLE_SCHEMAS):
+                    raise RuntimeError('database schema version is incomplete')
+                if connection.execute('PRAGMA foreign_key_check').fetchone() is not None:
+                    raise RuntimeError('migration foreign key violation')
+                for ddl in _V24_DDLS: connection.execute(ddl)
+                connection.execute('PRAGMA user_version = 24')
+                version = 24
+            if version == _SUPPORTED_SCHEMA_VERSION:
+                if not SQLiteStore._has_table_schemas(connection, _V24_TABLE_SCHEMAS):
                     raise RuntimeError("database schema version is incomplete")
             elif version > _SUPPORTED_SCHEMA_VERSION:
                 raise RuntimeError("database schema version is newer than supported")
@@ -1985,6 +2275,9 @@ class SQLiteStore:
     ) -> tuple[str, str, str] | None:
         """Read one exact shared receipt or fail closed on malformed state."""
 
+        for table in ('direct_configurations','direct_source_requests','direct_edit_requests','direct_file_requests','direct_control_requests'):
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone() is not None and connection.execute(f'SELECT 1 FROM {table} WHERE request_id=?',(request_id,)).fetchone() is not None:
+                raise RequestConflictError('request belongs to another typed command')
         rows = connection.execute(
             """
             SELECT request_id, payload_digest, scope, action
@@ -2477,7 +2770,7 @@ class SQLiteStore:
     @staticmethod
     def _target_transform(action, current, preserved):
         state = current.state
-        if action in {'resume','start_now'} and state == 'paused' and not preserved: state = 'queued'
+        if action in {'resume','start_now'} and state in {'paused','retry_wait','blocked','needs_auth','needs_link'} and not preserved: state = 'queued'
         return replace(current, state=state, authorized=True,
             manual_hold=current.manual_hold if action == 'start' else False,
             start_now_requested=True if action == 'start_now' else current.start_now_requested)
@@ -2584,7 +2877,7 @@ class SQLiteStore:
                         raise ValueError('target intent counters changed')
                     if (member['intent_state'],member['intent_authorized'],member['intent_manual_hold'],member['intent_start_now_requested']) != (wanted.state,int(wanted.authorized),int(wanted.manual_hold),int(wanted.start_now_requested)):
                         raise ValueError('target intent transform changed')
-                    if current.state not in {'queued','paused'} or wanted == current: raise ValueError('target unsafe intent')
+                    if (current.state not in {'queued','paused'} and not (command.action=='resume' and (self._fresh_retry(connection,current.job,command.request_id) or self._resumable_failure_capture(connection,member)))) or wanted == current: raise ValueError('target unsafe intent')
                     audit = connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?', (member['intent_audit_id'],)).fetchone()
                     if audit is None or tuple(audit) != ('job_target_authorized',member['job_id'],member['intent_generation'],member['intent_revision']):
                         raise ValueError('target intent audit changed')
@@ -2709,6 +3002,10 @@ class SQLiteStore:
             if audit['generation'] == generation + 1 and audit['kind'] == 'job_paused':
                 if state not in _RECOVERABLE_COLD_START_STATES: raise ValueError('target cold predecessor changed')
                 state = 'paused'; cold_successors += 1
+            elif audit['kind']=='job_retry_opened' and audit['generation']==generation+1:
+                reopened=self._retry_reopen(connection,audit['event_id'])
+                if (reopened['old_generation'],reopened['old_revision'])!=(generation,revision) or state not in {'blocked','paused'}:raise ValueError('retry head predecessor changed')
+                state='paused'
             elif audit['generation'] != generation: raise ValueError('target head generation changed')
             elif audit['kind'] in {'job_resolving','job_downloading'}:
                 expected = 'queued' if audit['kind']=='job_resolving' else 'resolving'
@@ -2722,6 +3019,11 @@ class SQLiteStore:
                 if len(producers) != 1 or self._read_target_dispatch_cause(connection,producers[0][0],cache) is None:
                     raise ValueError('target finalizing producer missing')
                 state = 'finalizing'
+            elif audit['kind']=='job_edited':
+                self._effective_settings(connection,self.get_materialized_job(job_id))
+            elif audit['kind'] == 'job_failure':
+                if state != 'downloading': raise ValueError('failure head predecessor changed')
+                state = self._failure_state_for_audit(connection,job_id,generation,audit['revision'],audit['event_id'])
             elif audit['kind'] == 'job_paused':
                 if self._batch_control_corroborated(job_id,'pause',generation,audit['revision'],'paused',flags[0]):
                     flags = (flags[0],True,flags[2])
@@ -2804,8 +3106,110 @@ class SQLiteStore:
         for member in selected:
             terminal = self._capture_target_head(connection,member['job_id'],cache)
             if terminal is None or terminal.intent_status != 'terminal': raise ValueError('target terminal authority changed')
-        connection.execute("UPDATE authorization_rounds SET status='terminal' WHERE cohort_kind=? AND cohort_request_id=? AND round_generation=? AND status='open'",
+        closed = connection.execute("UPDATE authorization_rounds SET status='terminal' WHERE cohort_kind=? AND cohort_request_id=? AND round_generation=? AND status='open'",
             (head.cohort_kind,head.cohort_request_id,head.round_generation))
+        if closed.rowcount != 1:
+            return
+        captured=connection.execute('SELECT request_id FROM direct_control_cohorts WHERE child_request_id=?',(head.owner_request_id,)).fetchone()
+        if captured is not None:
+            self._close_captured_completion(connection,captured[0]);return
+        facts = [self._notification_completion_fact(connection, m['job_id']) for m in selected]
+        completed = [fact for fact in facts if fact is not None]
+        if not completed:
+            return
+        collections = {self.get_materialized_job(m['job_id']).queue_collection_id for m in selected}
+        collection = next(iter(collections)) if len(collections) == 1 else None
+        provenance = dict(kind='round', cohort_kind=head.cohort_kind,
+            cohort_request_id=head.cohort_request_id, round_generation=head.round_generation,
+            owner_request_id=head.owner_request_id,
+            members=[dict(job_id=m['job_id'], creation_kind=m['creation_kind'],
+                creation_request_id=m['creation_request_id'], creation_index=m['creation_index'],
+                completion=fact) for m, fact in zip(selected, facts)])
+        self._enqueue_completion(connection,
+            semantic_key=f'round:{head.cohort_kind}:{head.cohort_request_id}:{head.round_generation}',
+            job_id=completed[0]['job_id'] if len(completed) == 1 else None,
+            collection_id=collection, generation=head.round_generation, count=len(completed), provenance=provenance)
+
+    def _close_captured_completion(self,connection,request):
+        row,command,cohorts=self._control_request(request)
+        if command.action!='start' or row['completion_closed'] or row['status']!='applied':return
+        groups=[];cache={}
+        for cohort in cohorts:
+            _,_,members=self._read_target_command(connection,cohort['child_request_id'],cache)
+            selected=[member for member in members if member['outcome']=='new_authority']
+            for member in selected:
+                head=self._capture_target_head(connection,member['job_id'],cache)
+                if head is None or (head.owner_request_id,head.owner_target_index)!=(member['owner_request_id'],member['owner_target_index']):raise ValueError('captured completion owner changed')
+                if head.intent_status!='terminal':return
+            groups.append((cohort,selected))
+        connection.execute("UPDATE direct_control_requests SET completion_closed=1 WHERE request_id=? AND status='applied' AND completion_closed=0",(request,))
+        self._require_one_changed_row(connection,'captured completion CAS')
+        for cohort,members in groups:
+            facts=[self._notification_completion_fact(connection,member['job_id']) for member in members]
+            completed=[fact for fact in facts if fact is not None]
+            if not completed:continue
+            collections={self.get_materialized_job(member['job_id']).queue_collection_id for member in members}
+            provenance=dict(kind='captured',parent_request_id=request,parent_seal=row['seal'],child_request_id=cohort['child_request_id'],cohort_index=cohort['cohort_index'],
+                members=[dict(job_id=member['job_id'],creation_kind=member['creation_kind'],creation_request_id=member['creation_request_id'],creation_index=member['creation_index'],completion=fact) for member,fact in zip(members,facts)])
+            self._enqueue_completion(connection,semantic_key='captured:'+request+':'+str(cohort['cohort_index']),job_id=completed[0]['job_id'] if len(completed)==1 else None,
+                collection_id=next(iter(collections)) if len(collections)==1 else None,generation=command.expected_worker_epoch,count=len(completed),provenance=provenance)
+
+    def _notification_completion_fact(self, connection, job_id):
+        current = self._read_job_control_projection(connection, job_id)
+        if current.state != 'completed':
+            return None
+        job = self.get_materialized_job(job_id)
+        audit = self._target_latest(connection, job_id)
+        binding = self._read_final_publication_binding(connection, job_id)
+        if (job is None or job.source_kind is not SourceKind.DIRECT or binding is None
+            or (audit['kind'], audit['generation'], audit['revision']) != ('job_completed', current.generation, current.revision)):
+            return None
+        creation = connection.execute("SELECT event_id FROM events WHERE job_id=? AND kind='job_added' ORDER BY event_id LIMIT 1", (job_id,)).fetchone()
+        if creation is None:
+            raise ValueError('notification creation audit missing')
+        return dict(job_id=job_id, generation=current.generation, revision=current.revision,
+            audit_id=audit['event_id'], creation_audit_id=creation[0],
+            final_device=binding.final_device, final_inode=binding.final_inode, logical_size=binding.logical_size)
+
+    def _notification_store_uuid(self, connection, *, create=False):
+        row = connection.execute("SELECT value,revision FROM settings WHERE key='notification_store_uuid'").fetchone()
+        if row is None:
+            if not create:
+                return None
+            value = str(uuid.uuid4())
+            connection.execute("INSERT INTO settings VALUES ('notification_store_uuid',?,0)", (value,))
+            return value
+        _notification_uuid(row['value'])
+        if type(row['revision']) is not int or row['revision'] != 0:
+            raise ValueError('notification identity changed')
+        return row['value']
+
+    def _enqueue_completion(self, connection, *, semantic_key, job_id, collection_id, generation, count, provenance):
+        """Only the publication/round transaction owns completion production."""
+        if not connection.in_transaction:
+            raise ValueError('notification producer requires owner transaction')
+        store_uuid = self._notification_store_uuid(connection, create=True)
+        encoded = json.dumps(provenance, separators=(',', ':'), sort_keys=True, allow_nan=False)
+        old = connection.execute('SELECT * FROM notification_outbox WHERE semantic_key=?', (semantic_key,)).fetchone()
+        creation = time.time_ns() // 1_000_000 if old is None else old['created_at_ms']
+        values = (store_uuid, semantic_key, 'completion', job_id, collection_id,
+            generation, creation, count, None, encoded)
+        fields = 'store_uuid semantic_key type job_id collection_id generation created_at_ms count reason_code provenance'.split()
+        if old is not None:
+            if tuple(old[key] for key in fields) != values:
+                raise ValueError('notification immutable payload changed')
+            return
+        connection.execute('INSERT INTO notification_outbox (' + ','.join(fields) + ') VALUES (?,?,?,?,?,?,?,?,?,?)', values)
+
+    def _enqueue_standalone_completion(self, connection, job_id):
+        if self._capture_target_head(connection, job_id) is not None:
+            return
+        fact = self._notification_completion_fact(connection, job_id)
+        if fact is None:
+            raise ValueError('notification completion not corroborated')
+        self._enqueue_completion(connection, semantic_key=f"job:{job_id}:{fact['generation']}:{fact['audit_id']}",
+            job_id=job_id, collection_id=self.get_materialized_job(job_id).queue_collection_id,
+            generation=fact['generation'], count=1, provenance=dict(kind='job', completion=fact))
 
     def apply_target_authorize(self, command: TargetAuthorizeCommand) -> TargetAuthorizeResult:
         """Seal explicit metadata intent; no execution or filesystem entry point."""
@@ -2863,6 +3267,14 @@ class SQLiteStore:
                                 head = self._read_target_head(connection,job_id,origin,cache)
                                 if expected_revision is not None and expected_revision != current.revision:
                                     member.update(outcome='stale',reason='stale_revision')
+                                elif (current.state=='completed' and command.action=='resume' and head is not None
+                                    and len(selection)==1 and selector['kind']=='jobs'):
+                                    claim=self._read_direct_cleanup_claim(connection,job_id,{})
+                                    if claim is None or claim.phase=='finished': member['reason']='terminal'
+                                    else:
+                                        wanted=current
+                                        member.update(outcome='existing_authority',reason=None,round_generation=head.round_generation,
+                                            owner_request_id=head.owner_request_id,owner_target_index=head.owner_target_index)
                                 elif current.state in _TERMINAL_JOB_CONTROL_STATES: member['reason'] = 'terminal'
                                 elif origin.kind == 'unsupported_single': member['reason'] = 'incompatible_authority'
                                 elif command.action == 'resume' and head is None: member['reason'] = 'incompatible_authority'
@@ -2871,9 +3283,13 @@ class SQLiteStore:
                                     if attempt is not None:
                                         if not self._publication_predecessor_matches(connection,current): raise ValueError('target publication predecessor changed')
                                         if current.state == 'paused': preserved = attempt[0]
+                                    saved_ok = (command.action not in {'resume','start_now'} or preserved is not None or (head is None and current.state=='queued')
+                                        or (head is not None and (head.last_admission_serial==0 or (len(selection)==1 and selector['kind']=='jobs'))
+                                            and self._saved_resume_eligible(connection,origin,current,head,command)))
                                     wanted = self._target_transform(command.action,current,preserved is not None)
-                                    if current.state not in {'queued','paused'} and (head is None or wanted != current): member['reason'] = 'busy'
-                                    elif current.state not in {'queued','paused',*_ACTIVE_JOB_CONTROL_STATES}: member['reason'] = 'busy'
+                                    if not saved_ok: member['reason'] = 'incompatible_authority'
+                                    elif current.state not in {'queued','paused','retry_wait','blocked','needs_auth','needs_link'} and (head is None or wanted != current): member['reason'] = 'busy'
+                                    elif current.state not in {'queued','paused','retry_wait','blocked','needs_auth','needs_link',*_ACTIVE_JOB_CONTROL_STATES}: member['reason'] = 'busy'
                                     else:
                                         member.update(outcome='existing_authority' if head else 'new_authority',reason=None,
                                             preserved_publication_attempt_id=preserved)
@@ -2885,7 +3301,7 @@ class SQLiteStore:
                                             new_groups.setdefault(cohort,[]).append(member)
                         if current is not None:
                             after = wanted if member['outcome'] in {'new_authority','existing_authority'} else current
-                            due = after.start_now_requested or origin.job.scheduled_for is None or origin.job.scheduled_for <= now
+                            due = (after.start_now_requested or origin.job.scheduled_for is None or origin.job.scheduled_for <= now) and not self._retry_not_due(connection,job_id,now)
                             collection = origin.job.queue_collection_id
                             held = (int(self._current_queue_gate(connection) != 'running')
                                 | (2 if collection is not None and self.collection_hold(collection) else 0)
@@ -2906,6 +3322,7 @@ class SQLiteStore:
                             _target_vector_digest(group,('request_id','target_index','job_id')),'open'))
                     for member,(origin,current,head,wanted) in zip(members,captures):
                         if member['outcome'] not in {'new_authority','existing_authority'}: continue
+                        if current.state=='completed': continue
                         if wanted != current:
                             if current.revision == _MAX_COUNTER: raise OverflowError('target revision overflow')
                             wanted = replace(wanted,revision=current.revision+1)
@@ -2941,6 +3358,14 @@ class SQLiteStore:
                     placeholders = ','.join('?' for _ in _TARGET_MEMBER_COLUMNS)
                     connection.executemany(f'INSERT INTO target_members VALUES ({placeholders})', [tuple(m[n] for n in _TARGET_MEMBER_COLUMNS) for m in members])
                     self._read_target_command(connection,command.request_id,cache)
+                    if command.action in {'resume','start_now'}:
+                        for member in members:
+                            if (member['outcome'] == 'existing_authority' and member['preserved_publication_attempt_id'] is None
+                                and member['captured_state']!='completed'
+                                and self._capture_target_head(connection,member['job_id']).last_admission_serial>0):
+                                self._create_saved_continuation(connection,command,member['job_id'])
+                            elif member['outcome']=='existing_authority' and member['captured_state']=='completed':
+                                connection.execute('INSERT INTO saved_cleanup_requests VALUES (?,?,?,1)',(command.request_id,member['job_id'],command.expected_worker_epoch))
                     if time.monotonic() >= deadline: raise TimeoutError('target deadline')
                     connection.commit()
                     return result
@@ -3024,7 +3449,7 @@ class SQLiteStore:
         return any(self._batch_control_corroborated(row['job_id'],action,row['generation'],row['revision'],'queued',authorized)
             for authorized in ((False,True) if action == 'resume' else (True,)))
 
-    def _batch_publication_record(self, row, captured, *, archived):
+    def _batch_publication_record(self, row, captured, *, archived, cache):
         """Strict database-only qualification of one explicitly named attempt, never a permit."""
         connection = self._connection
         keys = ('job_id','attempt_id','original_request_id','proof','status','audit_id','generation','revision','state','worker_epoch','pending_request_id')
@@ -3066,7 +3491,7 @@ class SQLiteStore:
         if captured.expected_sha256 is not None and captured.expected_sha256 != proof['sha256']:
             raise ValueError('publication expected checksum metadata changed')
         receipt = self._read_direct_dispatch_command(connection, proof['request'])
-        self._read_target_dispatch_cause(connection,proof['request'],{})
+        self._read_target_dispatch_cause(connection,proof['request'],cache)
         if receipt != _DirectDispatchCommand(proof['request'], proof['digest'], captured.original_job.job_id,
                 'started', proof['generation'], proof['downloading_revision'], 'downloading'):
             raise ValueError('publication original dispatch changed')
@@ -3136,6 +3561,10 @@ class SQLiteStore:
             if kind == 'job_paused' and next_generation == generation + 1:
                 if state not in _RECOVERABLE_COLD_START_STATES: raise ValueError('batch cold predecessor invalid')
                 successors = flags; next_state = 'paused'; direct_lineage = False
+            elif kind=='job_retry_opened' and next_generation==generation+1:
+                reopened=self._retry_reopen(connection,audit)
+                if (reopened['old_generation'],reopened['old_revision'])!=(generation,revision) or state not in {'blocked','paused'}:raise ValueError('retry lifecycle predecessor changed')
+                next_state='paused';successors=flags
             elif next_generation != generation:
                 raise ValueError('batch unsupported generation jump')
             elif kind == 'job_target_authorized':
@@ -3150,6 +3579,13 @@ class SQLiteStore:
                     raise ValueError('batch target predecessor changed')
                 next_state = member['intent_state']
                 successors = {tuple(bool(member['intent_'+n]) for n in ('authorized','manual_hold','start_now_requested'))}
+            elif kind=='job_edited':
+                self._effective_settings(connection,current)
+                next_state=state;successors=flags
+            elif kind == 'job_failure':
+                if state != 'downloading' or not direct_lineage: raise ValueError('failure predecessor changed')
+                next_state = self._failure_state_for_audit(connection,job_id,generation,next_revision,audit)
+                successors = flags
             elif kind == 'job_paused':
                 next_state = 'paused'
                 for authorized, hold, start in flags:
@@ -3186,7 +3622,7 @@ class SQLiteStore:
                     raise ValueError('batch completion predecessor invalid')
                 attempt = connection.execute('SELECT * FROM direct_publication_attempts WHERE job_id=?', (job_id,)).fetchone()
                 if attempt is None or attempt['status'] != 'finished': raise ValueError('batch completed attempt missing')
-                proof = self._batch_publication_record(attempt,captured,archived=False)
+                proof = self._batch_publication_record(attempt,captured,archived=False,cache=parent_cache)
                 if proof['finalizing_audit'] != finalizing_event[0]: raise ValueError('batch completed original audit changed')
                 if (attempt['audit_id'],attempt['generation'],attempt['revision']) != (audit,generation,next_revision):
                     raise ValueError('batch completed audit pointer changed')
@@ -3202,7 +3638,7 @@ class SQLiteStore:
             raise ValueError('batch lifecycle terminal tuple changed')
         attempt = connection.execute('SELECT * FROM direct_publication_attempts WHERE job_id=?', (job_id,)).fetchone()
         if attempt is not None:
-            self._batch_publication_record(attempt,captured,archived=False)
+            self._batch_publication_record(attempt,captured,archived=False,cache=parent_cache)
         # Qualify only named archived proofs associated with actual finalizing audits in this lineage.
         audits = connection.execute("SELECT event_id,generation,revision FROM events WHERE job_id=? AND kind='job_finalizing' ORDER BY event_id", (job_id,))
         for event in audits:
@@ -3210,7 +3646,7 @@ class SQLiteStore:
             for receipt in receipts:
                 archived = connection.execute('SELECT * FROM closed_direct_publication_attempts WHERE original_request_id=?', (receipt[0],)).fetchone()
                 if archived is not None:
-                    proof = self._batch_publication_record(archived,captured,archived=True)
+                    proof = self._batch_publication_record(archived,captured,archived=True,cache=parent_cache)
                     if proof['finalizing_audit'] != event['event_id']: raise ValueError('batch archive original audit changed')
 
     def _apply_add_in_transaction(self, connection, intent, materialized, *, scope, action):
@@ -4075,6 +4511,17 @@ class SQLiteStore:
         if kind == 'body':
             for name in ('admission_serial','resolving_audit_id'):
                 if _require_counter(cause[name],name) < 1: raise ValueError('private body counter invalid')
+            if cause['admission_serial'] > 1:
+                continuation = connection.execute('SELECT * FROM saved_direct_continuations WHERE body_request_id=? UNION ALL SELECT * FROM saved_direct_cycles WHERE body_request_id=?',(request_id,request_id)).fetchone()
+                fresh=self._fresh_retry(connection,cause['job_id'],cause['activation_request_id'])
+                if continuation is None:
+                    if fresh is None or fresh['body_request_id']!=request_id: raise ValueError('retry BODY lineage changed')
+                    source=connection.execute('SELECT admission_serial FROM target_dispatch_causes WHERE request_id=?',(fresh['source_request_id'],)).fetchone()
+                    if source is None or cause['admission_serial']!=source[0]+1: raise ValueError('retry serial changed')
+                else:
+                    if fresh is not None or continuation['phase'] != 'admitted' or (continuation['job_id'],continuation['request_id']) != (cause['job_id'],cause['activation_request_id']):
+                        raise ValueError('saved BODY lineage changed')
+                    self._saved_continuation(connection,cause['job_id'],continuation['request_id'])
             if cause['attempt_id'] is not None or cause['original_body_request_id'] is not None:
                 raise ValueError('private body null shape changed')
         else:
@@ -4107,6 +4554,9 @@ class SQLiteStore:
             or predecessor['generation'] != activation[prefix+'_generation']):
             raise ValueError('private predecessor changed')
         if kind == 'body':
+            if cause['admission_serial']>1 and continuation is not None and (continuation['generation'],continuation['revision'],continuation['worker_epoch']) != (
+                predecessor['generation'],predecessor['revision'],activation_command.expected_worker_epoch):
+                raise ValueError('saved BODY predecessor changed')
             successor = connection.execute('SELECT event_id,kind,generation,revision FROM events WHERE job_id=? AND event_id>? ORDER BY event_id LIMIT 1',
                 (cause['job_id'],cause['predecessor_audit_id'])).fetchone()
             if successor is None or tuple(successor) != (cause['resolving_audit_id'],'job_resolving',predecessor['generation'],predecessor['revision']+1):
@@ -4162,22 +4612,39 @@ class SQLiteStore:
         connection = self._connection
         connection.execute('BEGIN IMMEDIATE')
         try:
+            if owner_slot_ready and expected_worker_epoch==self._current_worker_epoch(connection):
+                carrier=connection.execute('SELECT * FROM saved_cleanup_requests WHERE worker_epoch=? AND armed=1 ORDER BY request_id LIMIT 1',(expected_worker_epoch,)).fetchone()
+                if carrier is not None:
+                    command=self._qualify_cleanup_target(connection,carrier['request_id'],carrier['job_id'],expected_worker_epoch)
+                    claim=self._read_direct_cleanup_claim(connection,carrier['job_id'],{})
+                    connection.execute('UPDATE saved_cleanup_requests SET armed=0 WHERE request_id=? AND armed=1',(carrier['request_id'],))
+                    self._require_one_changed_row(connection,'cleanup target consume')
+                    result=self._direct_dispatch_result_from_current(self._read_job_control_projection(connection,carrier['job_id']),'blocked')
+                    connection.commit()
+                    return _DirectCleanupPlan(result,claim,expected_worker_epoch,command.request_id,command.payload_digest)
             if (not owner_slot_ready or expected_worker_epoch != self._current_worker_epoch(connection)
                 or self._current_queue_gate(connection) != 'running'
+                or self.configuration_snapshot()['desired']['global_limit_bps']=='0'
                 or self.get_direct_engine_record() is not None or self.get_direct_engine_activation_fence() is not None):
                 connection.commit(); return None
-            if (connection.execute("SELECT 1 FROM jobs JOIN materialized_jobs USING(job_id) WHERE source_kind='direct' AND state IN ('resolving','downloading','pausing','finalizing') LIMIT 1").fetchone() is not None
-                or connection.execute("SELECT 1 FROM direct_cleanup_claims WHERE phase!='finished' LIMIT 1").fetchone() is not None):
+            if (connection.execute("SELECT 1 FROM jobs JOIN materialized_jobs USING(job_id) WHERE source_kind='direct' AND state='resolving' LIMIT 1").fetchone() is not None
+                or connection.execute("SELECT count(*) FROM (SELECT job_id FROM direct_job_engines UNION SELECT job_id FROM direct_cleanup_claims WHERE phase!='finished')").fetchone()[0]>=int(self.configuration_snapshot()['desired']['concurrency'])):
                 connection.commit(); return None
             cache = {}
             with self._batch_budget():
-                candidates = connection.execute('''SELECT job.job_id FROM jobs AS job
+                candidates = list(connection.execute('''SELECT job.job_id FROM jobs AS job
                     JOIN job_authorization_heads AS head ON head.job_id=job.job_id
                     JOIN materialized_jobs AS domain ON domain.job_id=job.job_id
                     WHERE head.intent_status='current' AND job.state IN ('queued','paused')
-                    ORDER BY domain.start_now_requested DESC,domain.priority DESC,domain.order_key,job.job_id''')
+                    ORDER BY domain.start_now_requested DESC,domain.priority DESC,domain.order_key,job.job_id'''))
+                ordering={}
+                for candidate in candidates:
+                    item=self.get_materialized_job(candidate[0]);effective=self._effective_settings(connection,item)
+                    ordering[candidate[0]]=(-int(item.start_now_requested),-effective['priority'],int(effective['order_key']),candidate[0])
+                candidates.sort(key=lambda row:ordering[row[0]])
                 for candidate in candidates:
                     job_id = candidate[0]
+                    if connection.execute("SELECT 1 FROM direct_source_requests WHERE job_id=? AND status='pending' UNION ALL SELECT 1 FROM direct_edit_outcomes WHERE job_id=? AND status='pending'",(job_id,job_id)).fetchone():continue
                     origin = self._read_creation_origin(connection,job_id,cache)
                     head = self._read_target_head(connection,job_id,origin,cache)
                     if origin.kind not in {'supported_single','batch'}: raise ValueError('private creation invalid')
@@ -4203,8 +4670,23 @@ class SQLiteStore:
                         scalars.update(attempt_id=attempt.attempt_id,original_body_request_id=row['original_request_id'])
                         kind = 'publication'
                     else:
-                        # A second body is retry/resume work, outside this queued-only slice.
-                        if head.last_admission_serial != 0: continue
+                        continuation = None
+                        if head.last_admission_serial != 0:
+                            continuation = self._saved_continuation(connection,job_id)
+                            if continuation is None:
+                                fresh=self._fresh_retry(connection,job_id,head.activation_request_id)
+                                if fresh is None or fresh['body_request_id'] is not None or (fresh['worker_epoch'],fresh['generation'],fresh['revision']+1)!=(expected_worker_epoch,current.generation,current.revision): continue
+                            else:
+                                if (continuation.request_id,continuation.worker_epoch,continuation.generation,continuation.revision) != (head.activation_request_id,expected_worker_epoch,current.generation,current.revision): continue
+                                phase = self._continuation_row(connection,job_id,continuation.request_id)['phase']
+                                if phase == 'intent':
+                                    connection.commit(); return continuation
+                                if phase != 'ready': continue
+                                drain=connection.execute('SELECT drained FROM saved_resume_bindings WHERE request_id=?',(continuation.request_id,)).fetchone()
+                                if drain is None or drain[0]!=1:continue
+                                self._require_ready_saved_pair(connection,job_id,continuation.request_id)
+                        else:
+                            continuation = None
                         scalars['admission_serial'] = head.last_admission_serial + 1
                         kind = 'body'
                     request,digest = self._target_dispatch_identity(kind,scalars)
@@ -4229,6 +4711,13 @@ class SQLiteStore:
                     connection.execute('INSERT INTO target_dispatch_causes VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                         (request,kind,*(scalars[n] for n in ('job_id','owner_request_id','owner_target_index','activation_request_id',
                             'admission_serial','predecessor_audit_id','resolving_audit_id','attempt_id','original_body_request_id'))))
+                    if kind == 'body' and scalars['admission_serial'] > 1 and continuation is None:
+                        connection.execute('UPDATE direct_retry_fresh SET body_request_id=? WHERE request_id=? AND body_request_id IS NULL',(request,head.activation_request_id))
+                        self._require_one_changed_row(connection,'retry BODY CAS')
+                    if kind == 'body' and scalars['admission_serial'] > 1 and continuation is not None:
+                        table = self._continuation_table(connection,continuation.request_id)
+                        connection.execute(f"UPDATE {table} SET phase='admitted',body_request_id=? WHERE request_id=? AND phase='ready' AND body_request_id IS NULL",(request,continuation.request_id))
+                        self._require_one_changed_row(connection,'saved BODY admission CAS')
                     self._read_target_dispatch_cause(connection,request,cache)
                     if kind == 'body':
                         self._advance_target_head(connection,head)
@@ -4236,7 +4725,7 @@ class SQLiteStore:
                             (scalars['admission_serial'],job_id,head.last_admission_serial))
                         self._require_one_changed_row(connection,'target admission serial CAS')
                         result = _DirectDispatchPlan(replace(materialized,intent=replace(materialized.intent,
-                            generation=current.generation,revision=current.revision)),origin.reservation,admission,
+                            generation=current.generation,revision=current.revision)),self._effective_reservation(connection,job_id),admission,
                             current.generation,current.revision,request,digest)
                     else:
                         connection.execute('UPDATE direct_publication_attempts SET pending_request_id=? WHERE job_id=? AND attempt_id=? AND pending_request_id IS NULL',
@@ -4561,6 +5050,45 @@ class SQLiteStore:
             connection.rollback()
             raise
 
+    def _require_terminal_owner(self, connection, terminal):
+        if type(terminal) is not _DirectTerminalPlan or type(terminal.dispatch) is not _DirectDispatchPlan:
+            raise ValueError('terminal owner invalid')
+        plan=terminal.dispatch;current=self._read_job_control_projection(connection,plan.job.job_id)
+        command=self._read_direct_dispatch_command(connection,plan.request_id)
+        cause=self._read_target_dispatch_cause(connection,plan.request_id,{})
+        if cause is not None:
+            head=self._capture_target_head(connection,current.job)
+            if head.intent_status!='current' or head.last_admission_serial!=cause['admission_serial'] or not self._direct_dispatch_admission(connection,materialized=self.get_materialized_job(current.job),now=datetime.now(UTC)).allowed:
+                raise ValueError('private terminal authority changed')
+        if (type(terminal.record) is not DirectEngineRecord or type(terminal.marker) is not PublicationMarkerBinding
+            or self._current_worker_epoch(connection)!=terminal.record.worker_epoch or self._engine_record_for_dispatch(plan)!=terminal.record
+            or self.get_direct_engine_activation_fence() is not None or self._get_direct_engine_recovery_capability(terminal.record) is None
+            or (terminal.capability is not None and self._get_direct_engine_recovery_capability(terminal.record)!=terminal.capability)
+            or (current.generation,current.revision,current.state)!=(plan.generation,plan.revision,'downloading')
+            or self.get_materialized_job(current.job)!=plan.job or plan.job.source_kind is not SourceKind.DIRECT
+            or command!=_DirectDispatchCommand(plan.request_id,plan.payload_digest,current.job,'started',plan.generation,plan.revision,'downloading')
+            or self._effective_reservation(connection,current.job)!=plan.reservation
+            or self._read_publication_marker_binding(connection,current.job)!=terminal.marker
+            or not isinstance(terminal.partial_path,Path) or terminal.partial_path.name!=plan.job.partial_filename
+            or terminal.partial_path.parent.name!=current.job
+            or type(terminal.gid) is not str or re.fullmatch('[0-9a-fA-F]{16}',terminal.gid) is None):
+            raise ValueError('terminal owner stale')
+        return current
+
+    def bind_stock_owner(self, plan, record, gid, owner):
+        expected=(plan.job.job_id,plan.generation,gid,record.worker_epoch,plan.request_id,
+            hashlib.sha256(json.dumps(record.identity.to_record(),sort_keys=True,separators=(',',':')).encode()).hexdigest())
+        if type(owner) is not tuple or len(owner)!=7 or owner[:6]!=expected or _SHA256_DIGEST.fullmatch(owner[6]) is None:
+            raise ValueError('stock owner producer changed')
+        connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+        try:
+            self._require_pending_direct_dispatch_command(connection,plan,_effect=True)
+            if self._engine_record_for_dispatch(plan)!=record or self.get_direct_engine_activation_fence() is not None:
+                raise ValueError('stock owner process changed')
+            connection.execute('INSERT INTO direct_stock_bindings VALUES (?,?)',(plan.request_id,json.dumps(owner,separators=(',',':'))))
+            connection.commit()
+        except BaseException:connection.rollback();raise
+
     def finalize_direct_terminal(
         self, terminal: _DirectTerminalPlan, observed: object
     ) -> DirectDispatchResult:
@@ -4610,40 +5138,7 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
-            current = self._read_job_control_projection(connection, plan.job.job_id)
-            command = self._read_direct_dispatch_command(connection, plan.request_id)
-            cause = self._read_target_dispatch_cause(connection,plan.request_id,{})
-            if cause is not None:
-                with self._batch_budget():
-                    head = self._capture_target_head(connection,current.job)
-                if (head.intent_status != 'current' or head.last_admission_serial != cause['admission_serial']
-                    or not self._direct_dispatch_admission(connection,materialized=self.get_materialized_job(current.job),now=datetime.now(UTC)).allowed):
-                    raise ValueError('private terminal authority changed')
-            if (
-                self._current_worker_epoch(connection) != terminal.record.worker_epoch
-                or self.get_direct_engine_record() != terminal.record
-                or self.get_direct_engine_activation_fence() is not None
-                or self._get_direct_engine_recovery_capability(terminal.record) is None
-                or (terminal.capability is not None and
-                    self._get_direct_engine_recovery_capability(terminal.record) != terminal.capability)
-                or current.generation != plan.generation
-                or current.revision != plan.revision
-                or current.state != JobState.DOWNLOADING.value
-                or self.get_materialized_job(current.job) != plan.job
-                or plan.job.source_kind is not SourceKind.DIRECT
-                or command != _DirectDispatchCommand(
-                    request_id=plan.request_id,
-                    payload_digest=plan.payload_digest,
-                    job=current.job,
-                    status="started",
-                    generation=plan.generation,
-                    revision=plan.revision,
-                    state=JobState.DOWNLOADING.value,
-                )
-                or self._read_publication_reservation(connection, current.job) != plan.reservation
-                or self._read_publication_marker_binding(connection, current.job) != terminal.marker
-            ):
-                raise ValueError("direct terminal state is stale")
+            current=self._require_terminal_owner(connection,terminal)
             finalizing = self._persist_direct_dispatch_lifecycle(
                 connection,
                 current=current,
@@ -4756,11 +5251,11 @@ class SQLiteStore:
             or stage.receipt != expected_receipt
             or self._read_direct_dispatch_command(connection, dispatch.request_id) != stage.receipt
             or self._current_worker_epoch(connection) != terminal.record.worker_epoch
-            or self.get_direct_engine_record() != terminal.record
+            or self._engine_record_for_dispatch(dispatch) != terminal.record
             or self.get_direct_engine_activation_fence() is not None
             or terminal.capability != stage.capability
             or self._get_direct_engine_recovery_capability(terminal.record) != stage.capability
-            or self._read_publication_reservation(connection, current.job) != dispatch.reservation
+            or self._effective_reservation(connection, current.job) != dispatch.reservation
             or self._read_publication_marker_binding(connection, current.job) != terminal.marker
             or observed.job_id != current.job or observed.generation != dispatch.generation
             or type(terminal.gid) is not str or re.fullmatch(r"[0-9a-fA-F]{16}", terminal.gid) is None
@@ -4800,11 +5295,7 @@ class SQLiteStore:
             ):
                 raise ValueError("attested payload differs from original verification")
             job = stage.job
-            destination = rehydrate_destination(
-                category=job.category, collection=job.destination_collection,
-                partial_filename=job.partial_filename,
-                selected_final_filename=job.selected_final_filename, job_id=job.job_id,
-            )
+            destination = self.runtime_destination(job.job_id)
             if destination.partial_path != stage.terminal.partial_path:
                 raise ValueError("stage path differs from original verification")
             marker = PublicationReservationMarker(
@@ -4907,12 +5398,16 @@ class SQLiteStore:
         expected = _DirectDispatchCommand(proof['request'], proof['digest'], job_id, 'started',
             proof['generation'], proof['downloading_revision'], 'downloading')
         job = self.get_materialized_job(job_id)
-        reservation = self._read_publication_reservation(connection, job_id)
+        destination_link=connection.execute('SELECT request_id,job_id FROM direct_attempt_destinations WHERE attempt_id=?',(row['attempt_id'],)).fetchone()
+        version=None if destination_link is None else self._destination_version(connection,job_id,destination_link[0])
+        if destination_link is not None and (destination_link[1]!=job_id or version is None):raise ValueError('attempt destination changed')
+        if destination_link is None and self._destination_version(connection,job_id) is not None:raise ValueError('attempt destination receipt missing')
+        reservation=self._read_publication_reservation(connection,job_id) if version is None else self._effective_reservation(connection,job_id,version['request_id'])
         marker = self._read_publication_marker_binding(connection, job_id)
         staged = self._read_staged_payload_binding(connection, job_id)
         if (receipt != expected or job is None or job.source_kind is not SourceKind.DIRECT
             or reservation is None or marker is None or staged is None
-            or self._publication_ownership(job,reservation) != proof['ownership']
+            or self._publication_ownership(job,self._read_publication_reservation(connection,job_id)) != proof['ownership']
             or (marker.marker_device,marker.marker_inode) != tuple(proof['marker'])
             or (not _retiring_closed and (staged.partial_device,staged.partial_inode,staged.logical_size) != tuple(proof['stage'][:3]))):
             raise ValueError('publication immutable authority changed')
@@ -4928,8 +5423,7 @@ class SQLiteStore:
                 or counters[1] > current.generation or counters[2] >= current.revision
                 or counters[3] > self._current_worker_epoch(connection)):
                 raise ValueError('closed publication attempt authority is invalid')
-        destination = rehydrate_destination(category=job.category, collection=job.destination_collection,
-            partial_filename=job.partial_filename, selected_final_filename=job.selected_final_filename, job_id=job_id)
+        destination = self.runtime_destination(job_id,None if version is None else version['request_id'])
         dev,ino,size,mode,nlink,mtime,ctime = proof['stage']
         prepared = PreparedPublicationPayload(destination,reservation,
             PublicationReservationMarker(destination.incomplete_dir / '.hermes-reservation', *proof['marker']),
@@ -5001,7 +5495,7 @@ class SQLiteStore:
             proof = json.dumps(dict(request=dispatch.request_id,digest=dispatch.payload_digest,
                 generation=dispatch.generation,downloading_revision=dispatch.revision,
                 finalizing_revision=stage.revision,finalizing_audit=stage.audit_id,
-                epoch=stage.terminal.record.worker_epoch,ownership=self._publication_ownership(stage.job,prepared.reservation),
+                epoch=stage.terminal.record.worker_epoch,ownership=self._publication_ownership(stage.job,self._read_publication_reservation(connection,stage.job.job_id)),
                 marker=[prepared.marker.st_dev,prepared.marker.st_ino],stage=original,
                 chain=prepared.directory_identities,sha256=prepared.sha256),sort_keys=True,separators=(',',':'))
             closed = connection.execute('SELECT * FROM direct_publication_attempts WHERE job_id=?',
@@ -5022,6 +5516,10 @@ class SQLiteStore:
             connection.execute('INSERT INTO direct_publication_attempts VALUES (?,?,?,?,?,?,?,?,?,?,NULL)',
                 (stage.job.job_id,secrets.token_hex(32),dispatch.request_id,proof,'eligible',stage.audit_id,
                  dispatch.generation,stage.revision,'finalizing',stage.terminal.record.worker_epoch))
+            version=self._destination_version(connection,stage.job.job_id)
+            if version is not None:
+                attempt_id=connection.execute('SELECT attempt_id FROM direct_publication_attempts WHERE job_id=?',(stage.job.job_id,)).fetchone()[0]
+                connection.execute('INSERT INTO direct_attempt_destinations VALUES (?,?,?)',(attempt_id,version['request_id'],stage.job.job_id))
             attempt = self._read_publication_attempt(connection,stage.job.job_id)
             if attempt is None:
                 raise ValueError('publication attempt insert did not persist')
@@ -5091,10 +5589,16 @@ class SQLiteStore:
         if request is not None:
             _require_identifier(request,'cleanup activation request')
             receipt = self._read_direct_dispatch_command(connection,request)
-            if activation is None or receipt is None or (receipt.job,receipt.status,
+            if receipt is None:
+                self._qualify_cleanup_target(connection,request,job_id,activation)
+            elif activation is None or (receipt.job,receipt.status,
                     receipt.generation,receipt.revision,receipt.state) != (job_id,'blocked',
                     row['completion_generation'],row['completion_revision'],'completed'):
                 raise ValueError('cleanup activation receipt changed')
+        if activation is not None and request is None and activation>row['completion_epoch']:
+            target=connection.execute('SELECT request_id FROM saved_cleanup_activations WHERE job_id=? AND attempt_id=? AND worker_epoch=?',(job_id,row['attempt_id'],activation)).fetchone()
+            if target is None:raise ValueError('cleanup target activation missing')
+            self._qualify_cleanup_target(connection,target[0],job_id,activation)
         attempt = self._read_publication_attempt(connection,job_id,require_current=False)
         status = connection.execute('SELECT status FROM direct_publication_attempts WHERE job_id=?',(job_id,)).fetchone()
         current = self._read_job_control_projection(connection,job_id)
@@ -5168,14 +5672,20 @@ class SQLiteStore:
             raise TypeError('cleanup plan invalid')
         claim = self._read_direct_cleanup_claim(connection,plan.claim.job_id,cache)
         if (claim != plan.claim or self._current_worker_epoch(connection) != plan.worker_epoch
-            or self.get_direct_engine_record() is not None or self.get_direct_engine_activation_fence() is not None):
+            or self.get_direct_engine_record() is not None or self.get_direct_engine_activation_fence() is not None
+            or connection.execute('SELECT 1 FROM direct_job_engines WHERE job_id=?',(plan.claim.job_id,)).fetchone() is not None):
             raise ValueError('cleanup plan stale')
         if plan.request_id is None:
             if plan.payload_digest is not None or plan.worker_epoch != claim.completion_epoch:
                 raise ValueError('cleanup automatic epoch stale')
         else:
             receipt = self._read_direct_dispatch_command(connection,plan.request_id)
-            if (receipt is None or receipt.payload_digest != plan.payload_digest
+            if receipt is None:
+                command=self._qualify_cleanup_target(connection,plan.request_id,claim.job_id,plan.worker_epoch)
+                if command.payload_digest!=plan.payload_digest or plan.download_result!=self._direct_dispatch_result_from_current(
+                    self._read_job_control_projection(connection,claim.job_id),'blocked'):
+                    raise ValueError('cleanup target receipt stale')
+            elif (receipt.payload_digest != plan.payload_digest
                 or receipt.to_result() != plan.download_result or receipt.status != 'blocked'
                 or (receipt.job,receipt.generation,receipt.revision,receipt.state) !=
                     (claim.job_id,claim.completion_generation,claim.completion_revision,'completed')):
@@ -5189,7 +5699,7 @@ class SQLiteStore:
              None if new.certified_stat is None else json.dumps(list(new.certified_stat),separators=(',',':')),
              *_cleanup_row_values(old)))
         self._require_one_changed_row(connection,'cleanup claim CAS')
-        cache.clear()
+        # This CAS changes no creation, target or lifecycle facts cached in this transaction.
         if self._read_direct_cleanup_claim(connection,old.job_id,cache) != new:
             raise ValueError('cleanup claim CAS readback changed')
 
@@ -5204,7 +5714,14 @@ class SQLiteStore:
                     raise ValueError('cleanup ownership not quiescent')
                 evidence = claim.published_stat if claim.phase == 'pending' else claim.certified_stat
                 require_direct_cleanup_namespace(claim.attempt.prepared,evidence,phase=claim.phase)
-                activated = replace(claim,activation_epoch=plan.worker_epoch,activation_request_id=plan.request_id)
+                request=plan.request_id
+                if request is not None and self._read_direct_dispatch_command(connection,request) is None:
+                    self._qualify_cleanup_target(connection,request,claim.job_id,plan.worker_epoch)
+                    old=connection.execute('SELECT request_id FROM saved_cleanup_activations WHERE job_id=? AND attempt_id=? AND worker_epoch=?',(claim.job_id,claim.attempt_id,plan.worker_epoch)).fetchone()
+                    if old is None:connection.execute('INSERT INTO saved_cleanup_activations VALUES (?,?,?,?)',(claim.job_id,claim.attempt_id,plan.worker_epoch,request))
+                    elif old[0]!=request:raise ValueError('cleanup activation already owned')
+                    request=None
+                activated = replace(claim,activation_epoch=plan.worker_epoch,activation_request_id=request)
                 self._cas_direct_cleanup(connection,claim,activated,cache)
                 require_direct_cleanup_namespace(claim.attempt.prepared,evidence,phase=claim.phase)
                 connection.commit()
@@ -5212,6 +5729,12 @@ class SQLiteStore:
             except BaseException:
                 connection.rollback()
                 raise
+
+    @staticmethod
+    def _cleanup_activation_request(connection,claim):
+        if claim.activation_request_id is not None:return claim.activation_request_id
+        row=connection.execute('SELECT request_id FROM saved_cleanup_activations WHERE job_id=? AND attempt_id=? AND worker_epoch=?',(claim.job_id,claim.attempt_id,claim.activation_epoch)).fetchone()
+        return None if row is None else row[0]
 
     def certify_direct_cleanup(self, plan, published):
         from hermes_downloads.paths import require_current_direct_cleanup_payload
@@ -5221,7 +5744,7 @@ class SQLiteStore:
             try:
                 cache = {}; claim = self._require_cleanup_plan(connection,plan,cache)
                 if (claim.phase != 'pending' or claim.activation_epoch != plan.worker_epoch
-                    or claim.activation_request_id != plan.request_id):
+                    or self._cleanup_activation_request(connection,claim) != plan.request_id):
                     raise ValueError('cleanup certification not activated')
                 require_current_direct_cleanup_payload(claim.attempt.prepared,published,marker_present=True)
                 certified = replace(claim,phase='certified',certified_stat=_cleanup_stat(
@@ -5242,10 +5765,14 @@ class SQLiteStore:
             try:
                 cache = {}; claim = self._require_cleanup_plan(connection,plan,cache)
                 if (claim.phase != 'certified' or claim.activation_epoch != plan.worker_epoch
-                    or claim.activation_request_id != plan.request_id
+                    or self._cleanup_activation_request(connection,claim) != plan.request_id
                     or _published_cleanup_stat(published) != claim.certified_stat):
                     raise ValueError('cleanup finish not certified')
                 require_current_direct_cleanup_payload(claim.attempt.prepared,published,marker_present=False)
+                from hermes_downloads.paths import _require_retained_absence
+                aliases=self.retained_cleanup_records(plan)
+                if any(row['phase']!='absent' for row in aliases): raise ValueError('retained cleanup not acknowledged')
+                _require_retained_absence(claim.attempt.prepared,aliases,marker_present=False)
                 finished = replace(claim,phase='finished')
                 self._cas_direct_cleanup(connection,claim,finished,cache)
                 require_current_direct_cleanup_payload(claim.attempt.prepared,published,marker_present=False)
@@ -5319,6 +5846,7 @@ class SQLiteStore:
                     raise ValueError('publication completed receipt changed')
             require_current_publication_payload(attempt.prepared,published)
             self._close_target_round(connection,completed.job)
+            self._enqueue_standalone_completion(connection,completed.job)
             with self._batch_budget():
                 self._mint_direct_cleanup_claim(connection,finished,published,verification,cache)
             connection.commit()
@@ -5492,6 +6020,7 @@ class SQLiteStore:
                 connection, request_id=plan.request_id, result=result
             )
             self._close_target_round(connection,completed.job)
+            self._enqueue_standalone_completion(connection,completed.job)
             connection.commit()
             return result
         except BaseException:
@@ -5529,8 +6058,216 @@ class SQLiteStore:
             connection.rollback()
             raise
 
+    def _resumable_failure_capture(self, connection, member):
+        failure=connection.execute('SELECT * FROM direct_failures WHERE audit_id=?',(member['captured_audit_id'],)).fetchone()
+        if failure is None or (failure['job_id'],failure['generation'],failure['revision'],failure['state'])!=(member['job_id'],member['captured_generation'],member['captured_revision'],member['captured_state']): return False
+        return self._saved_checkpoint(connection,member['job_id'],failure['body_request_id']) is not None
+
+    @staticmethod
+    def _retry_not_due(connection, job_id, now):
+        row=connection.execute("SELECT retry_due_ms FROM direct_failures WHERE body_request_id=(SELECT request_id FROM target_dispatch_causes WHERE job_id=? AND kind='body' ORDER BY admission_serial DESC LIMIT 1) AND action='retry_wait'",(job_id,)).fetchone()
+        return row is not None and row[0] is not None and row[0]>SQLiteStore._utc_microseconds(now.astimezone(UTC))//1000
+
+    def _fresh_retry(self, connection, job_id, request):
+        row=connection.execute('SELECT * FROM direct_retry_fresh WHERE request_id=?',(request,)).fetchone()
+        if row is None: return None
+        failure=connection.execute('SELECT * FROM direct_failures WHERE body_request_id=?',(row['source_request_id'],)).fetchone()
+        explicit=connection.execute('SELECT audit_id FROM direct_retry_reopens WHERE resume_request_id=?',(request,)).fetchone()
+        if explicit is not None:
+            reopened=self._retry_reopen(connection,explicit[0])
+            if failure is None or failure['body_request_id']!=reopened['source_request_id'] or failure['action']!='exhausted' or (row['job_id'],row['worker_epoch'],row['generation'],row['revision'])!=(job_id,reopened['worker_epoch'],reopened['generation'],reopened['revision']):raise ValueError('explicit retry namespace changed')
+            self._failure_state_for_audit(connection,job_id,failure['generation'],failure['revision'],failure['audit_id'])
+        else:
+            if (row['job_id']!=job_id or failure is None or
+                (failure['job_id'],failure['worker_epoch'],failure['generation'],failure['revision'],failure['action'])!=(job_id,row['worker_epoch'],row['generation'],row['revision'],'retry_wait')
+                or failure['retry_due_ms'] is None or row['authorized_at_ms']<failure['retry_due_ms']):raise ValueError('fresh retry failure fence changed')
+            self._failure_state_for_audit(connection,job_id,row['generation'],row['revision'],failure['audit_id'])
+        value=dict(row);seal=value.pop('seal');value.pop('body_request_id')
+        if seal!=hashlib.sha256(b'hermes-downloads:fresh-retry:v1\0'+failure['seal'].encode()+_batch_canonical(value,16384)).hexdigest(): raise ValueError('retry namespace seal changed')
+        chain=json.loads(row['chain']);marker=json.loads(row['marker'])
+        if len(chain)!=4 or any(type(pair) is not list or len(pair)!=2 or any(type(x) is not int or x<0 for x in pair) for pair in chain) or len(marker)!=2 or any(type(x) is not int or x<0 for x in marker): raise ValueError('retry namespace proof changed')
+        command=connection.execute('SELECT * FROM target_commands WHERE request_id=?',(request,)).fetchone()
+        if command is not None:
+            member=connection.execute('SELECT * FROM target_members WHERE request_id=? AND job_id=?',(request,job_id)).fetchall()
+            if (command['action']!='resume' or command['worker_epoch']!=row['worker_epoch'] or command['payload_digest']!=row['payload_digest'] or len(member)!=1
+                or (member[0]['captured_generation'],member[0]['captured_revision'],member[0]['captured_state'])!=(row['generation'],row['revision'],'paused' if explicit is not None else 'retry_wait')): raise ValueError('retry resume carrier changed')
+        return row
+
+    def _insert_fresh_retry(self, connection, command, failure, chain, marker, authorized_at_ms):
+        if not connection.in_transaction: raise ValueError('retry intent requires owner transaction')
+        value=dict(request_id=command.request_id,source_request_id=failure['body_request_id'],job_id=failure['job_id'],
+            worker_epoch=command.expected_worker_epoch,generation=failure['generation'],revision=failure['revision'],
+            authorized_at_ms=authorized_at_ms,chain=json.dumps(chain),marker=json.dumps(marker),payload_digest=command.payload_digest)
+        seal=hashlib.sha256(b'hermes-downloads:fresh-retry:v1\0'+failure['seal'].encode()+_batch_canonical(value,16384)).hexdigest()
+        fields=tuple(value)
+        connection.execute('INSERT INTO direct_retry_fresh ('+','.join(fields)+',seal) VALUES (?,?,?,?,?,?,?,?,?,?,?)',(*value.values(),seal))
+
+    def require_fresh_retry_absence(self, plan):
+        from hermes_downloads.paths import _saved_open_chain
+        cause=self._read_target_dispatch_cause(self._connection,plan.request_id,{})
+        row=self._fresh_retry(self._connection,plan.job.job_id,cause['activation_request_id'])
+        if row is None or row['body_request_id']!=plan.request_id: raise ValueError('retry absence carrier missing')
+        destination=self._saved_destination(plan.job.job_id)
+        descriptors,chain,marker=_saved_open_chain(destination,plan.reservation)
+        try:
+            if json.loads(row['chain'])!=[list(pair) for pair in chain] or json.loads(row['marker'])!=list(marker): raise ValueError('retry namespace rebound')
+            for name in (destination.partial_path.name,destination.partial_path.name+'.aria2'):
+                try: os.stat(name,dir_fd=descriptors[3],follow_symlinks=False)
+                except FileNotFoundError: continue
+                raise ValueError('retry requires exact payload absence')
+        finally:
+            for fd in reversed(descriptors): os.close(fd)
+
+    def prepare_due_retry(self, *, now):
+        now_ms=self._utc_microseconds(now.astimezone(UTC))//1000
+        connection=self._connection
+        rows=connection.execute("SELECT f.* FROM direct_failures f JOIN jobs j USING(job_id) WHERE j.state='retry_wait' AND f.generation=j.generation AND f.revision=j.revision AND f.retry_due_ms<=? ORDER BY f.retry_due_ms,f.job_id",(now_ms,)).fetchall()
+        for failure in rows:
+            job=failure['job_id'];epoch=self.worker_epoch()
+            if failure['worker_epoch']!=epoch or self._latest_body_source(connection,job)!=failure['body_request_id']: continue
+            head=self._capture_target_head(connection,job)
+            if head is None or head.intent_status!='current': continue
+            budget=self.get_retry_budget(job)
+            if budget is None or budget.paused or budget.exhausted: continue
+            if not self._direct_dispatch_admission(connection,materialized=self.get_materialized_job(job),now=now).allowed: continue
+            request='retry:'+hashlib.sha256((failure['body_request_id']+':'+str(failure['audit_id'])).encode()).hexdigest()
+            if connection.execute('SELECT 1 FROM target_commands WHERE request_id=?',(request,)).fetchone(): continue
+            command=TargetAuthorizeCommand(request,epoch,'resume',dict(kind='jobs',targets=[dict(job=job,expected_revision=failure['revision'])]))
+            if self._saved_checkpoint(connection,job,failure['body_request_id']) is not None:
+                return self.apply_target_authorize(command)
+            from hermes_downloads.paths import _saved_open_chain
+            destination=self._saved_destination(job);reservation=self._effective_reservation(connection,job)
+            try:
+                descriptors,chain,marker=_saved_open_chain(destination,reservation)
+                try:
+                    for name in (destination.partial_path.name,destination.partial_path.name+'.aria2'):
+                        try: os.stat(name,dir_fd=descriptors[3],follow_symlinks=False)
+                        except FileNotFoundError: continue
+                        raise ValueError('saved bytes require checkpoint')
+                finally:
+                    for fd in reversed(descriptors):os.close(fd)
+            except (OSError,ValueError): continue
+            command=TargetAuthorizeCommand(request,epoch,'resume',dict(kind='jobs',targets=[dict(job=job,expected_revision=failure['revision'])]))
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                old=connection.execute('SELECT * FROM direct_retry_fresh WHERE request_id=?',(request,)).fetchone()
+                if old is None:
+                    self._insert_fresh_retry(connection,command,failure,chain,marker,now_ms)
+                self._fresh_retry(connection,job,request);connection.commit()
+            except BaseException: connection.rollback();raise
+            return self.apply_target_authorize(command)
+        return None
+
+    def _failure_state_for_audit(self, connection, job, generation, revision, audit):
+        row=connection.execute('SELECT * FROM direct_failures WHERE audit_id=?',(audit,)).fetchone()
+        if row is None or (row['job_id'],row['generation'],row['revision'])!=(job,generation,revision):
+            raise ValueError('failure audit missing')
+        receipt=connection.execute('SELECT * FROM direct_dispatch_commands WHERE request_id=?',(row['body_request_id'],)).fetchone()
+        if receipt is None or (receipt['job_id'],receipt['generation'],receipt['revision'],receipt['state'],receipt['status'])!=(job,generation,revision-1,'downloading','started'):
+            raise ValueError('failure BODY changed')
+        value=dict(row);seal=value.pop('seal')
+        if seal!=hashlib.sha256(b'hermes-downloads:typed-failure:v1\0'+_batch_canonical(value,32768)).hexdigest(): raise ValueError('failure immutable seal changed')
+        observation=json.loads(row['observation']);closure=json.loads(row['closure'])
+        if (type(observation) is not dict or observation.get('known') is not bool(row['observation_known'])
+            or observation.get('http_status')!=row['http_status'] or row['error_code'] not in range(1,33)
+            or closure.get('group_absent') is not True or closure.get('observer_joined') is not True
+            or closure.get('reader_joined') is not True or closure.get('eof') is not True
+            or type(closure.get('returncode')) is not int): raise ValueError('failure observation changed')
+        ProcessBirthIdentity.from_record(closure['process'])
+        binding=connection.execute('SELECT owner FROM direct_stock_bindings WHERE body_request_id=?',(row['body_request_id'],)).fetchone()
+        if binding is None or json.loads(binding[0])!=observation.get('owner'): raise ValueError('failure binding changed')
+        owner=tuple(observation['owner'])
+        if owner[:6]!=(job,generation,closure['gid'],row['worker_epoch'],row['body_request_id'],hashlib.sha256(json.dumps(closure['process'],sort_keys=True,separators=(',',':')).encode()).hexdigest()): raise ValueError('failure origin changed')
+        action=RetryAction(row['action'])
+        expected={RetryAction.RETRY_WAIT:'retry_wait',RetryAction.OFFLINE_WAIT:'retry_wait',
+            RetryAction.NEEDS_AUTH:'needs_auth',RetryAction.NEEDS_LINK:'needs_link'}.get(action,'blocked')
+        cause=self._read_target_dispatch_cause(connection,row['body_request_id'],{})
+        if row['error_code']==8 and action is RetryAction.NEEDS_DECISION and cause is not None and cause['admission_serial']>1:
+            expected='paused'
+        if expected!=row['state'] or (row['retry_due_ms'] is not None and
+            (action not in {RetryAction.RETRY_WAIT,RetryAction.OFFLINE_WAIT} or row['retry_due_ms']<row['observed_at_ms'])):
+            raise ValueError('failure disposition changed')
+        return expected
+
+    def _enqueue_actionable(self, connection, failure, *, kind, reason):
+        if not connection.in_transaction: raise ValueError('actionable producer requires owner transaction')
+        key='failure:'+failure['body_request_id']+':'+str(failure['audit_id'])
+        provenance=json.dumps(dict(kind='failure',body_request_id=failure['body_request_id'],audit_id=failure['audit_id'],
+            action=failure['action'],observation_sha256=hashlib.sha256(failure['observation'].encode()).hexdigest()),sort_keys=True,separators=(',',':'))
+        values=(self._notification_store_uuid(connection,create=True),key,kind,failure['job_id'],
+            self.get_materialized_job(failure['job_id']).queue_collection_id,failure['generation'],failure['observed_at_ms'],1,reason,provenance)
+        fields='store_uuid semantic_key type job_id collection_id generation created_at_ms count reason_code provenance'.split()
+        old=connection.execute('SELECT * FROM notification_outbox WHERE semantic_key=?',(key,)).fetchone()
+        if old is not None:
+            if tuple(old[k] for k in fields)!=values: raise ValueError('actionable immutable payload changed')
+            return
+        connection.execute('INSERT INTO notification_outbox ('+','.join(fields)+') VALUES (?,?,?,?,?,?,?,?,?,?)',values)
+
+    def fail_direct_terminal(self, terminal, *, error_code, stock, closure, now):
+        from hermes_downloads.direct import _StockResult
+        if type(terminal) is not _DirectTerminalPlan or type(stock) is not _StockResult:
+            raise ValueError('invalid typed terminal failure')
+        if (type(error_code) is not int or error_code not in range(1,33) or now.tzinfo is None
+            or closure.get('process')!=terminal.record.identity.to_record() or closure.get('gid')!=terminal.gid
+            or any(closure.get(k) is not True for k in ('group_absent','observer_joined','reader_joined','eof'))
+            or type(closure.get('returncode')) is not int): raise ValueError('terminal failure drain incomplete')
+        connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+        try:
+            plan=terminal.dispatch;current=self._require_terminal_owner(connection,terminal)
+            binding=connection.execute('SELECT owner FROM direct_stock_bindings WHERE body_request_id=?',(plan.request_id,)).fetchone()
+            expected=(current.job,current.generation,terminal.gid,terminal.record.worker_epoch,plan.request_id,
+                hashlib.sha256(json.dumps(terminal.record.identity.to_record(),sort_keys=True,separators=(',',':')).encode()).hexdigest())
+            if (binding is None or type(stock.owner) is not tuple or len(stock.owner)!=7 or stock.owner[:6]!=expected
+                or tuple(json.loads(binding[0]))!=stock.owner): raise ValueError('terminal stock observation unbound')
+            if connection.execute('SELECT 1 FROM direct_failures WHERE body_request_id=?',(plan.request_id,)).fetchone():
+                raise ValueError('terminal failure already settled')
+            if stock.known and stock.http_status is not None and stock.http_status>=400:
+                failure=failure_from_http_status(stock.http_status,retry_after_seconds=stock.retry_after_seconds)
+            elif error_code==9: failure=RetryFailure(FailureKind.DISK_FULL)
+            elif error_code in {2,5,6,19,29}: failure=RetryFailure(FailureKind.TRANSIENT_HOST)
+            elif error_code in {10,11,12,13,14,15,16,17,18,20,21,23,25,26,27,28,30,31}: failure=RetryFailure(FailureKind.PERMANENT_HOST)
+            else: failure=RetryFailure(FailureKind.FORBIDDEN)
+            budget=self.get_retry_budget(current.job)
+            authority=RetryAuthority.open(policy=RetryPolicy(),job_id=current.job,generation=current.generation) if budget is None else RetryAuthority.restore(policy=RetryPolicy(),budget=budget)
+            policy=RetryPolicy()
+            jitter=policy._backoff_seconds(authority.budget.ordinary_attempts+1)*policy.max_jitter_fraction*(secrets.randbelow(1001)/1000)
+            decision=authority.decide(failure,generation=current.generation,jitter_seconds=jitter)
+            action=decision.action
+            state={RetryAction.RETRY_WAIT:'retry_wait',RetryAction.OFFLINE_WAIT:'retry_wait',
+                RetryAction.NEEDS_AUTH:'needs_auth',RetryAction.NEEDS_LINK:'needs_link'}.get(action,'blocked')
+            cause=self._read_target_dispatch_cause(connection,plan.request_id,{})
+            if error_code==8 and action is RetryAction.NEEDS_DECISION and cause is not None and cause['admission_serial']>1:
+                state='paused'
+            observed=self._utc_microseconds(now.astimezone(UTC))//1000
+            due=None if decision.delay_seconds is None else observed+math.ceil(decision.delay_seconds*1000)
+            if due is not None and due>_MAX_COUNTER:
+                action=RetryAction.NEEDS_DECISION;state='blocked';due=None
+            observation=json.dumps(dict(known=stock.known,http_status=stock.http_status,retry_after_seconds=stock.retry_after_seconds,
+                resource_digest=stock.resource_digest,strong_validator=stock.strong_validator,total_length=stock.total_length,contributors=stock.contributors,owner=stock.owner),sort_keys=True,separators=(',',':'))
+            head=self._capture_target_head(connection,current.job)
+            updated=self._persist_direct_dispatch_lifecycle(connection,current=current,state=state,event_kind='job_failure',_qualified_head=head)
+            audit=self._target_latest(connection,current.job)['event_id']
+            encoded_budget=json.dumps(dict(generation=authority.budget.generation,budget_number=authority.budget.budget_number,
+                ordinary_attempts=authority.budget.ordinary_attempts,exhausted=authority.budget.exhausted),sort_keys=True,separators=(',',':'))
+            values=(plan.request_id,current.job,terminal.record.worker_epoch,current.generation,updated.revision,audit,stock.http_status,error_code,
+                 int(stock.known),action.value,state,observed,due,observation,json.dumps(closure,sort_keys=True,separators=(',',':')),encoded_budget)
+            fields='body_request_id job_id worker_epoch generation revision audit_id http_status error_code observation_known action state observed_at_ms retry_due_ms observation closure budget'.split()
+            seal=hashlib.sha256(b'hermes-downloads:typed-failure:v1\0'+_batch_canonical(dict(zip(fields,values)),32768)).hexdigest()
+            connection.execute('INSERT INTO direct_failures VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(*values,seal))
+            self._replace_retry_budget(connection,authority.budget)
+            fact=dict(connection.execute('SELECT * FROM direct_failures WHERE body_request_id=?',(plan.request_id,)).fetchone())
+            event={RetryAction.NEEDS_AUTH:('needs_login','login_required'),RetryAction.NEEDS_LINK:('needs_link','link_expired'),
+                RetryAction.EXHAUSTED:('persistent_error','retry_exhausted')}.get(action)
+            if failure.kind is FailureKind.DISK_FULL:event=('needs_space','insufficient_space')
+            elif failure.kind is FailureKind.PERMANENT_HOST:event=('persistent_error','download_failed')
+            if event:self._enqueue_actionable(connection,fact,kind=event[0],reason=event[1])
+            self._failure_state_for_audit(connection,current.job,current.generation,updated.revision,audit)
+            connection.commit();return updated.to_result('applied')
+        except BaseException:
+            connection.rollback();raise
+
     def pause_active_direct_job(
-        self, *, job_id: str, generation: int, revision: int, _publication_recoverable: bool = False
+        self, *, job_id: str, generation: int, revision: int, _publication_recoverable: bool = False, _filesystem_errno: int | None = None
     ) -> JobControlResult:
         """Persist a contained active direct job as paused without a new request."""
 
@@ -5552,6 +6289,16 @@ class SQLiteStore:
                 connection, current=current, state=JobState.PAUSED.value, event_kind="job_paused")
             self._advance_publication_pointer(connection,current,
                 preserve=predecessor and _publication_recoverable)
+            if _filesystem_errno is not None:
+                import errno
+                if type(_filesystem_errno) is not int or _filesystem_errno<1:raise ValueError('invalid filesystem errno')
+                if _filesystem_errno in {errno.ENOSPC,errno.EDQUOT,errno.EACCES,errno.EPERM,errno.EROFS,errno.EIO}:
+                    body=self._latest_body_source(connection,job_id)
+                    if body is None:raise ValueError('filesystem failure BODY missing')
+                    fact=dict(body_request_id=body,audit_id=self._target_latest(connection,job_id)['event_id'],action='filesystem_failure',
+                        observation=json.dumps(dict(errno=_filesystem_errno),sort_keys=True,separators=(',',':')),job_id=job_id,generation=generation,observed_at_ms=time.time_ns()//1_000_000)
+                    self._enqueue_actionable(connection,fact,kind='needs_space' if _filesystem_errno in {errno.ENOSPC,errno.EDQUOT} else 'persistent_error',
+                        reason='insufficient_space' if _filesystem_errno in {errno.ENOSPC,errno.EDQUOT} else 'download_failed')
             connection.commit()
             return paused.to_result("applied")
         except BaseException:
@@ -5670,9 +6417,11 @@ class SQLiteStore:
             ).fetchone()
             is not None
         )
-        due = materialized.start_now_requested or (
-            materialized.scheduled_for is None or materialized.scheduled_for <= now
-        )
+        effective=SQLiteStore._effective_settings(connection,materialized)
+        scheduled=None if effective['scheduled_for'] is None else datetime.fromisoformat(effective['scheduled_for'])
+        due = (materialized.start_now_requested or scheduled is None or scheduled<=now) and effective['limit_bps']!='0'
+        due = due and not connection.execute("SELECT 1 FROM direct_file_outcomes JOIN direct_file_requests USING(request_id) WHERE job_id=? AND status IN ('pending','purge_authorized','saved_purge_authorized','purged') LIMIT 1",(materialized.job_id,)).fetchone()
+        due = due and not SQLiteStore._retry_not_due(connection,materialized.job_id,now)
         return Admission(
             queue_running=SQLiteStore._current_queue_gate(connection) == "running",
             collection_held=collection_held,
@@ -5951,7 +6700,7 @@ class SQLiteStore:
                 """
                 SELECT job_id, generation, revision, state
                 FROM jobs
-                WHERE state IN (?, ?, ?, ?, ?, ?, ?)
+                WHERE state IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                   AND NOT EXISTS (
                       SELECT 1 FROM materialized_jobs AS domain
                       WHERE domain.job_id = jobs.job_id AND domain.source_kind != 'direct'
@@ -5962,6 +6711,12 @@ class SQLiteStore:
             ).fetchall()
             for job in jobs:
                 job_id = _require_sqlite_text(job["job_id"], "job_id")
+                if job['state'] in {'blocked','needs_auth','needs_link'}:
+                    failure=connection.execute('SELECT audit_id FROM direct_failures WHERE job_id=? AND generation=? AND revision=? AND state=?',(job_id,job['generation'],job['revision'],job['state'])).fetchone()
+                    budget=self._read_retry_budget(connection,job_id)
+                    if failure is None and budget is None:continue
+                    if budget is not None and budget.generation!=job['generation']:raise ValueError('cold failure budget generation changed')
+                    if failure is not None:self._failure_state_for_audit(connection,job_id,job['generation'],job['revision'],failure[0])
                 generation = _require_sqlite_integer(job["generation"], "generation") + 1
                 revision = _require_sqlite_integer(job["revision"], "revision") + 1
                 retry_budget = self._read_retry_budget(connection, job_id)
@@ -5983,13 +6738,12 @@ class SQLiteStore:
                 )
                 if fenced_retry is not None:
                     self._replace_retry_budget(connection, fenced_retry)
-                connection.execute(
-                    """
-                    INSERT INTO events (kind, job_id, generation, revision)
-                    VALUES ('job_paused', ?, ?, ?)
-                    """,
-                    (job_id, generation, revision),
-                )
+                audit = connection.execute(
+                    "INSERT INTO events(kind,job_id,generation,revision) VALUES ('job_paused',?,?,?)",
+                    (job_id,generation,revision)).lastrowid
+                if self._latest_body_source(connection,job_id) is not None:
+                    connection.execute('INSERT INTO saved_cold_fences VALUES (?,?,?,?,?,?,?,?,?)',
+                        (audit,job_id,old_epoch,epoch,job['generation'],job['revision'],job['state'],generation,revision))
             for predecessor, matches in eligible_predecessors.values():
                 self._advance_publication_pointer(connection,predecessor,preserve=matches,old_epoch=old_epoch)
             for head in target_heads:
@@ -6312,6 +7066,779 @@ class SQLiteStore:
             raise ValueError("persisted worker epoch is invalid")
         return _require_worker_epoch(epoch, "worker epoch")
 
+    @staticmethod
+    def _edit_request(connection, request):
+        from hermes_downloads.ipc import EditCommand
+        row=connection.execute('SELECT * FROM direct_edit_requests WHERE request_id=?',(request,)).fetchone()
+        if row is None:raise ValueError('edit authority missing')
+        command=EditCommand.from_record(_batch_decode(row['wire']))
+        if command.request_id!=request or row['seal']!=hashlib.sha256(row['wire']+row['capture'].encode()+str(row['worker_epoch']).encode()+row['receipt']).hexdigest():raise ValueError('edit authority changed')
+        if _batch_decode(row['receipt'])!=dict(request_id=request,status='pending',replayed=False,ids=list(command.ids)):raise ValueError('edit receipt changed')
+        capture=json.loads(row['capture'])
+        if type(capture) is not dict or set(capture)!=set(command.ids):raise ValueError('edit capture changed')
+        return row,command,capture
+
+    @staticmethod
+    def _effective_settings(connection, job):
+        current=dict(priority=job.priority,order_key=str(job.order_key),scheduled_for=None if job.scheduled_for is None else job.scheduled_for.astimezone(UTC).isoformat(),limit_bps=None,destination=dict(category=job.category,collection=job.destination_collection))
+        prior=None
+        for row in connection.execute('SELECT * FROM direct_job_edits WHERE job_id=? ORDER BY rowid',(job.job_id,)):
+            _,command,capture=SQLiteStore._edit_request(connection,row['request_id'])
+            values=[row[name] for name in ('request_id','job_id','generation','revision','audit_id','previous_revision','source_request_id','settings','prior_request_id')]
+            if row['seal']!=hashlib.sha256(_batch_canonical(values,16384)).hexdigest() or row['prior_request_id']!=prior or row['job_id'] not in command.ids:raise ValueError('effective edit changed')
+            patch=command.to_record()['patch']
+            if 'scheduled_for' in patch and patch['scheduled_for'] is not None:patch['scheduled_for']=datetime.fromisoformat(patch['scheduled_for']).astimezone(UTC).isoformat()
+            current=current|patch
+            if json.loads(row['settings'])!=current:raise ValueError('edit projection changed')
+            audit=connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?',(row['audit_id'],)).fetchone()
+            if audit is None or tuple(audit)!=('job_edited',job.job_id,row['generation'],row['revision']) or row['revision']!=row['previous_revision']+1:raise ValueError('edit audit changed')
+            outcome=connection.execute('SELECT status FROM direct_edit_outcomes WHERE request_id=? AND job_id=?',(row['request_id'],job.job_id)).fetchone()
+            if outcome is None or outcome[0]!='applied':raise ValueError('edit outcome changed')
+            prior=row['request_id']
+        return current
+
+    def accept_edit(self, command, *, deadline):
+        connection=self._connection
+        with self._batch_budget(deadline=deadline):
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                if connection.execute('SELECT 1 FROM direct_edit_requests WHERE request_id=?',(command.request_id,)).fetchone():
+                    row,old,_=self._edit_request(connection,command.request_id)
+                    if old._wire_request!=command._wire_request:raise RequestConflictError('edit request conflict')
+                    connection.rollback();return _batch_decode(row['receipt'])|dict(replayed=True)
+                if self._read_command_receipt(connection,command.request_id) is not None:raise RequestConflictError('edit request conflict')
+                capture={}
+                for job in command.ids:
+                    origin=self._read_creation_origin(connection,job,{})
+                    current=self._read_job_control_projection(connection,job)
+                    if origin.job is None or origin.job.source_kind is not SourceKind.DIRECT or current.state in _TERMINAL_JOB_CONTROL_STATES:raise ValueError('edit job unavailable')
+                    if command.expected_revision is not None and current.revision!=command.expected_revision:raise ValueError('edit revision stale')
+                    if connection.execute("SELECT 1 FROM direct_edit_outcomes WHERE job_id=? AND status='pending' UNION ALL SELECT 1 FROM direct_source_requests WHERE job_id=? AND status='pending'",(job,job)).fetchone():raise ValueError('job change pending')
+                    capture[job]=dict(generation=current.generation,revision=current.revision,state=current.state)
+                receipt=dict(request_id=command.request_id,status='pending',replayed=False,ids=list(command.ids))
+                encoded=_batch_canonical(receipt,131072);captured=json.dumps(capture,sort_keys=True,separators=(',',':'));epoch=self.worker_epoch()
+                seal=hashlib.sha256(command._wire_request+captured.encode()+str(epoch).encode()+encoded).hexdigest()
+                connection.execute('INSERT INTO direct_edit_requests VALUES (?,?,?,?,?,?)',(command.request_id,epoch,command._wire_request,captured,encoded,seal))
+                connection.executemany("INSERT INTO direct_edit_outcomes VALUES (?,?,'pending',NULL)",[(command.request_id,job) for job in command.ids])
+                if time.monotonic()>=deadline:raise TimeoutError('edit deadline')
+                connection.commit();return receipt
+            except BaseException:connection.rollback();raise
+
+    def apply_edit(self, request, job):
+        connection=self._connection;row,command,capture=self._edit_request(connection,request)
+        current=self._read_job_control_projection(connection,job);original=self.get_materialized_job(job)
+        if current.state in {'resolving','downloading','finalizing'} or any(owner[0]==job for owner in self._job_engine_owners()):return
+        old=capture[job];patch=command.to_record()['patch'];reason=None
+        if row['worker_epoch']!=self.worker_epoch() or old['generation']!=current.generation or current.revision not in {old['revision'],old['revision']+1}:reason='stale_fence'
+        source=self._latest_body_source(connection,job)
+        if 'destination' in patch and source is not None and reason is None:
+            from hermes_downloads.paths import _require_saved_pair
+            origin=self._read_creation_origin(connection,job,{})
+            checkpoint=self._saved_checkpoint(connection,job,source)
+            try:
+                if origin.kind!='batch' or origin.batch.expected_sha256 is None or checkpoint is None or self._checkpoint_fence(connection,checkpoint[0])!=(self.worker_epoch(),current.generation,current.revision):raise ValueError('saved destination authority unavailable')
+                _require_saved_pair(self._saved_destination(job),self._effective_reservation(connection,job),checkpoint[1])
+            except (OSError,ValueError):reason='saved_destination_requires_decision'
+        settings=self._effective_settings(connection,original)|patch
+        if settings['scheduled_for'] is not None:settings['scheduled_for']=datetime.fromisoformat(settings['scheduled_for']).astimezone(UTC).isoformat()
+        head=self._capture_target_head(connection,job)
+        connection.execute('BEGIN IMMEDIATE')
+        try:
+            if reason is None:
+                updated=self._persist_direct_dispatch_lifecycle(connection,current=current,state=current.state,event_kind='job_edited',_qualified_head=head,_defer_target_head=True)
+                audit=self._target_latest(connection,job)['event_id']
+                prior=connection.execute('SELECT request_id FROM direct_job_edits WHERE job_id=? ORDER BY rowid DESC LIMIT 1',(job,)).fetchone()
+                values=(request,job,updated.generation,updated.revision,audit,current.revision,source,json.dumps(settings,sort_keys=True,separators=(',',':')),None if prior is None else prior[0])
+                connection.execute('INSERT INTO direct_job_edits VALUES (?,?,?,?,?,?,?,?,?,?)',(*values,hashlib.sha256(_batch_canonical(list(values),16384)).hexdigest()))
+                if 'destination' in patch:
+                    dest=patch['destination'];token=secrets.token_hex(32);authority=(request,job,dest['category'],dest['collection'],token)
+                    connection.execute('INSERT INTO direct_destinations VALUES (?,?,?,?,?,?)',(*authority,hashlib.sha256(_batch_canonical(list(authority),4096)).hexdigest()))
+                self._advance_target_head(connection,head)
+            connection.execute("UPDATE direct_edit_outcomes SET status=?,reason=? WHERE request_id=? AND job_id=? AND status='pending'",('applied' if reason is None else 'blocked',reason,request,job))
+            self._require_one_changed_row(connection,'edit outcome CAS');connection.commit()
+        except BaseException:connection.rollback();raise
+        if reason is None and source is not None and settings['limit_bps']!='0' and current.authorized and not current.manual_hold and head is not None and head.intent_status=='current':
+            resume='edit-resume:'+hashlib.sha256((request+':'+job).encode()).hexdigest()
+            self.apply_target_authorize(TargetAuthorizeCommand(resume,self.worker_epoch(),'resume',dict(kind='jobs',targets=[dict(job=job,expected_revision=updated.revision)])))
+
+    @staticmethod
+    def _destination_version(connection,job,request=None):
+        row=connection.execute('SELECT * FROM direct_destinations WHERE job_id=?'+(' ORDER BY rowid DESC LIMIT 1' if request is None else ' AND request_id=?'),(job,) if request is None else (job,request)).fetchone()
+        if row is None:return None
+        values=[row[name] for name in ('request_id','job_id','category','collection','claim_token')]
+        _,command,_=SQLiteStore._edit_request(connection,row['request_id'])
+        if row['seal']!=hashlib.sha256(_batch_canonical(values,4096)).hexdigest() or command.to_record()['patch'].get('destination')!=dict(category=row['category'],collection=row['collection']):raise ValueError('destination authority changed')
+        outcome=connection.execute('SELECT status FROM direct_edit_outcomes WHERE request_id=? AND job_id=?',(row['request_id'],job)).fetchone()
+        if outcome is None or outcome[0]!='applied':raise ValueError('destination not applied')
+        return row
+
+    @staticmethod
+    def _effective_reservation(connection,job,request=None):
+        original=SQLiteStore._read_publication_reservation(connection,job)
+        row=SQLiteStore._destination_version(connection,job,request)
+        return original if row is None else PublicationReservation(job,row['collection'] or row['category'],original.final_filename,row['claim_token'])
+
+    def runtime_destination(self,job,request=None):
+        from hermes_downloads.paths import rehydrate_destination
+        original=self.get_materialized_job(job);row=self._destination_version(self._connection,job,request)
+        destination=rehydrate_destination(category=original.category if row is None else row['category'],collection=original.destination_collection if row is None else row['collection'],partial_filename=original.partial_filename,selected_final_filename=original.selected_final_filename,job_id=job)
+        return destination if row is None else replace(destination,workspace_reservation=self._read_publication_reservation(self._connection,job))
+
+    def _source_request(self, request):
+        from hermes_downloads.ipc import ReplaceSourceCommand
+        row=self._connection.execute('SELECT * FROM direct_source_requests WHERE request_id=?',(request,)).fetchone()
+        if row is None:raise ValueError('source request missing')
+        command=ReplaceSourceCommand.from_record(_batch_decode(row['wire']))
+        capture=[row['job_id'],row['worker_epoch'],row['generation'],row['revision']]
+        if (command.id,command.request_id)!=(row['job_id'],request) or row['seal']!=hashlib.sha256(command._wire_request+_batch_canonical(capture,4096)+row['receipt']).hexdigest():raise ValueError('source request changed')
+        expected=dict(request_id=request,id=command.id,revision=str(row['revision']),status='pending',replayed=False)
+        if _batch_decode(row['receipt'])!=expected or row['status'] not in {'pending','applied','blocked'}:raise ValueError('source receipt changed')
+        return row,command
+
+    def accept_source_replacement(self, command, *, deadline):
+        connection=self._connection
+        with self._batch_budget(deadline=deadline):
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                if connection.execute('SELECT 1 FROM direct_source_requests WHERE request_id=?',(command.request_id,)).fetchone():
+                    row,old=self._source_request(command.request_id)
+                    if old._wire_request!=command._wire_request:raise RequestConflictError('source request conflict')
+                    connection.rollback();return _batch_decode(row['receipt'])|dict(replayed=True)
+                if self._read_command_receipt(connection,command.request_id) is not None:raise RequestConflictError('source request conflict')
+                source=validate_source_url(command.url)
+                if source.raw_url!=command.url.encode():raise ValueError('source bytes changed')
+                origin=self._read_creation_origin(connection,command.id,{})
+                current=self._read_job_control_projection(connection,command.id)
+                if origin.job is None or origin.job.source_kind is not SourceKind.DIRECT or current.state in _TERMINAL_JOB_CONTROL_STATES:raise ValueError('source job unavailable')
+                if command.expected_revision is not None and command.expected_revision!=current.revision:raise ValueError('source revision stale')
+                if connection.execute("SELECT 1 FROM direct_source_requests WHERE job_id=? AND status='pending' UNION ALL SELECT 1 FROM direct_edit_outcomes WHERE job_id=? AND status='pending'",(command.id,command.id)).fetchone():raise ValueError('source change pending')
+                receipt=dict(request_id=command.request_id,id=command.id,revision=str(current.revision),status='pending',replayed=False)
+                encoded=_batch_canonical(receipt,4096);epoch=self.worker_epoch()
+                capture=[command.id,epoch,current.generation,current.revision]
+                seal=hashlib.sha256(command._wire_request+_batch_canonical(capture,4096)+encoded).hexdigest()
+                connection.execute("INSERT INTO direct_source_requests VALUES (?,?,?,?,?,?,?,?,'pending')",(command.request_id,command.id,epoch,current.generation,current.revision,command._wire_request,encoded,seal))
+                if time.monotonic()>=deadline:raise TimeoutError('source deadline')
+                connection.commit();return receipt
+            except BaseException:connection.rollback();raise
+
+    def _control_request(self,request):
+        from hermes_downloads.ipc import ControlIntentCommand
+        connection=self._connection;row=connection.execute('SELECT * FROM direct_control_requests WHERE request_id=?',(request,)).fetchone()
+        if row is None:raise ValueError('captured control missing')
+        command=ControlIntentCommand.from_record(_batch_decode(row['wire']));receipt=_batch_decode(row['receipt'])
+        if command.request_id!=request:raise ValueError('captured request identity changed')
+        cohorts=connection.execute('SELECT * FROM direct_control_cohorts WHERE request_id=? ORDER BY cohort_index',(request,)).fetchall();total=0;digests=[]
+        for index,cohort in enumerate(cohorts):
+            members=json.loads(cohort['members']);digest=hashlib.sha256(cohort['members'].encode()).hexdigest()
+            if cohort['cohort_index']!=index or not 1<=len(members)<=500 or digest!=cohort['digest'] or cohort['child_request_id']!='capture:'+hashlib.sha256(request.encode()).hexdigest()+':'+str(index):raise ValueError('captured cohort changed')
+            captured=connection.execute('SELECT * FROM direct_control_members WHERE request_id=? AND cohort_index=? ORDER BY target_index',(request,index)).fetchall()
+            if [member['target_index'] for member in captured]!=list(range(len(members))):raise ValueError('captured target indices changed')
+            for member in members:
+                if type(member) is not dict or set(member)!={'job_id','generation','revision'}:raise ValueError('captured member shape changed')
+                _require_identifier(member['job_id'],'captured job');_require_counter(member['generation'],'captured generation');_require_counter(member['revision'],'captured revision')
+            stored=[dict(job_id=m['job_id'],generation=m['generation'],revision=m['revision']) for m in captured]
+            if stored!=members:raise ValueError('captured members changed')
+            total+=len(members);digests.append(digest)
+            if command.action=='start' and cohort['status']=='applied':
+                child,original,_=self._read_target_command(connection,cohort['child_request_id'],{})
+                if child._wire_request!=TargetAuthorizeCommand(cohort['child_request_id'],command.expected_worker_epoch,'start',dict(kind='jobs',targets=[dict(job=m['job_id'],expected_revision=m['revision']) for m in members]))._wire_request or original._wire_reply!=cohort['receipt']:raise ValueError('captured child receipt changed')
+        digest=hashlib.sha256(_batch_canonical(digests,131072)).hexdigest()
+        if row['membership_digest']!=digest or row['worker_epoch']!=command.expected_worker_epoch or row['seal']!=hashlib.sha256(row['wire']+row['receipt']+digest.encode()).hexdigest():raise ValueError('captured control seal changed')
+        if receipt!=dict(request_id=request,status='pending',replayed=False,member_count=str(total),cohort_count=str(len(cohorts)),revision=receipt.get('revision')) or type(receipt['revision']) is not str or re.fullmatch(r'0|[1-9][0-9]{0,18}',receipt['revision']) is None:raise ValueError('captured control receipt changed')
+        _require_counter(int(receipt['revision']),'captured revision')
+        if row['status']=='applied' and command.action=='start' and any(c['status']!='applied' for c in cohorts):raise ValueError('captured control settlement changed')
+        return row,command,cohorts
+
+    def accept_control_intent(self,command,*,deadline):
+        connection=self._connection
+        with self._batch_budget(deadline=deadline):
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                if connection.execute('SELECT 1 FROM direct_control_requests WHERE request_id=?',(command.request_id,)).fetchone():
+                    row,old,_=self._control_request(command.request_id)
+                    if old._wire_request!=command._wire_request:raise RequestConflictError('captured control conflict')
+                    connection.rollback();return _batch_decode(row['receipt'])|dict(replayed=True)
+                if self._read_command_receipt(connection,command.request_id) is not None:raise RequestConflictError('captured control conflict')
+                if command.expected_worker_epoch!=self.worker_epoch():raise ValueError('control epoch stale')
+                revision=0
+                if command.scope=='collection' and not connection.execute('SELECT 1 FROM materialized_jobs WHERE queue_collection_id=?',(command.collection,)).fetchone():raise ValueError('unknown collection')
+                if command.scope=='collection' and command.action in {'pause','resume'}:
+                    key='collection_gate:'+hashlib.sha256(command.collection.encode()).hexdigest()
+                    old=connection.execute('SELECT revision FROM settings WHERE key=?',(key,)).fetchone();revision=0 if old is None else old[0]
+                    if command.expected_revision!=revision:raise ValueError('collection revision stale')
+                    if connection.execute("SELECT 1 FROM direct_control_requests WHERE status='pending' AND wire!=?",(command._wire_request,)).fetchone():
+                        for pending in connection.execute("SELECT request_id FROM direct_control_requests WHERE status='pending'"):
+                            _,other,_=self._control_request(pending[0])
+                            if other.scope=='collection' and other.collection==command.collection and other.action in {'pause','resume'}:raise ValueError('collection change pending')
+                    revision+=1;_require_counter(revision,'collection revision')
+                    connection.execute('INSERT INTO settings VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,revision=excluded.revision',(key,command.action,revision))
+                    if command.action=='pause':connection.execute('INSERT OR IGNORE INTO collection_holds VALUES (?)',(command.collection,))
+                    else:connection.execute('DELETE FROM collection_holds WHERE collection_id=?',(command.collection,))
+                selected=connection.execute("SELECT jobs.job_id,jobs.generation,jobs.revision FROM jobs JOIN materialized_jobs USING(job_id) WHERE source_kind='direct' AND jobs.state NOT IN ('completed','removed','cancelled')"+(' AND queue_collection_id=?' if command.scope=='collection' else ' AND jobs.job_id=?' if command.scope=='job' else '')+' ORDER BY jobs.job_id', (command.collection,) if command.scope=='collection' else (command.job,) if command.scope=='job' else ()).fetchall()
+                if command.scope=='job' and (len(selected)!=1 or selected[0]['revision']!=command.expected_revision):raise ValueError('job control fence stale')
+                groups=[selected[index:index+500] for index in range(0,len(selected),500)];cohorts=[]
+                for index,group in enumerate(groups):
+                    members=[dict(job_id=m[0],generation=m[1],revision=m[2]) for m in group];encoded=json.dumps(members,sort_keys=True,separators=(',',':'));digest=hashlib.sha256(encoded.encode()).hexdigest()
+                    cohorts.append((index,'capture:'+hashlib.sha256(command.request_id.encode()).hexdigest()+':'+str(index),encoded,digest,members))
+                digest=hashlib.sha256(_batch_canonical([c[3] for c in cohorts],131072)).hexdigest();receipt=dict(request_id=command.request_id,status='pending',replayed=False,member_count=str(len(selected)),cohort_count=str(len(cohorts)),revision=str(revision));encoded=_batch_canonical(receipt,4096)
+                connection.execute("INSERT INTO direct_control_requests VALUES (?,?,?,?,?,?,'pending',0)",(command.request_id,command.expected_worker_epoch,command._wire_request,encoded,digest,hashlib.sha256(command._wire_request+encoded+digest.encode()).hexdigest()))
+                for index,child,members,digest,values in cohorts:
+                    connection.execute("INSERT INTO direct_control_cohorts VALUES (?,?,?,?,?,'pending',NULL)",(command.request_id,index,child,members,digest))
+                    connection.executemany('INSERT INTO direct_control_members VALUES (?,?,?,?,?,?)',[(command.request_id,m['job_id'],index,target,m['generation'],m['revision']) for target,m in enumerate(values)])
+                if time.monotonic()>=deadline:raise TimeoutError('captured control deadline')
+                connection.commit();return receipt
+            except BaseException:connection.rollback();raise
+
+    def control_snapshot(self,request,*,deadline=None):
+        with self._batch_budget(deadline=deadline):
+            row,_,_=self._control_request(request);receipt=_batch_decode(row['receipt']);receipt.pop('replayed')
+            return receipt|dict(status=row['status'],completion_closed=bool(row['completion_closed']))
+
+    def _preemption(self,request):
+        row=self._connection.execute('SELECT * FROM direct_preemptions WHERE request_id=?',(request,)).fetchone()
+        if row is None:return None
+        _,command,_=self._control_request(request)
+        values=[row[name] for name in ('request_id','job_id','source_request_id','worker_epoch','generation','revision','process')]
+        body=self._read_direct_dispatch_command(self._connection,row['source_request_id'])
+        owner=self._connection.execute('SELECT process FROM saved_body_owners WHERE request_id=?',(row['source_request_id'],)).fetchone()
+        if command.scope!='job' or command.action!='preempt' or command.job==row['job_id'] or command.expected_worker_epoch!=row['worker_epoch'] or row['seal']!=hashlib.sha256(_batch_canonical(values,16384)).hexdigest():raise ValueError('preemption authority changed')
+        if body is None or (body.job,body.generation,body.revision,body.state,body.status)!=(row['job_id'],row['generation'],row['revision'],'downloading','started') or owner is None or json.loads(owner[0])!=json.loads(row['process']):raise ValueError('preemption BODY changed')
+        return row
+
+    def reserve_preemption(self,request,plan,record):
+        old=self._preemption(request)
+        if old is not None:return old
+        _,command,_=self._control_request(request)
+        current=self._read_job_control_projection(self._connection,plan.job.job_id)
+        if command.expected_worker_epoch!=self.worker_epoch() or current.state!='downloading' or self._engine_record_for_dispatch(plan)!=record or (current.generation,current.revision)!=(plan.generation,plan.revision):raise ValueError('preemption owner stale')
+        process=json.dumps(record.identity.to_record(),sort_keys=True,separators=(',',':'));values=(request,current.job,plan.request_id,self.worker_epoch(),current.generation,current.revision,process)
+        self._connection.execute('INSERT INTO direct_preemptions VALUES (?,?,?,?,?,?,?,?)',(*values,hashlib.sha256(_batch_canonical(list(values),16384)).hexdigest()))
+        return self._preemption(request)
+
+    def finish_preemption(self,request):
+        intent,command,_=self._control_request(request)
+        selected=self._read_job_control_projection(self._connection,command.job)
+        target='preempt-selected:'+hashlib.sha256(request.encode()).hexdigest()
+        result=self.apply_target_authorize(TargetAuthorizeCommand(target,self.worker_epoch(),'start_now',dict(kind='jobs',targets=[dict(job=command.job,expected_revision=command.expected_revision)])))
+        if result.to_record()['results'][0]['outcome'] not in {'new_authority','existing_authority'}:raise ValueError('preemption selected target blocked')
+        victim=self._preemption(request)
+        if victim is not None:
+            current=self._read_job_control_projection(self._connection,victim['job_id'])
+            if current.state=='paused' and current.authorized and not current.manual_hold:
+                resume='preempt-victim:'+hashlib.sha256(request.encode()).hexdigest()
+                self.apply_target_authorize(TargetAuthorizeCommand(resume,self.worker_epoch(),'resume',dict(kind='jobs',targets=[dict(job=current.job,expected_revision=current.revision)])))
+        self._connection.execute("UPDATE direct_control_requests SET status='applied' WHERE request_id=? AND status='pending'",(request,))
+        self._connection.execute("UPDATE direct_control_cohorts SET status='applied' WHERE request_id=? AND status='pending'",(request,))
+
+    def _retry_reopen(self,connection,audit):
+        row=connection.execute('SELECT * FROM direct_retry_reopens WHERE audit_id=?',(audit,)).fetchone()
+        if row is None:raise ValueError('retry budget fence missing')
+        values=[row[name] for name in ('request_id','job_id','worker_epoch','old_generation','old_revision','generation','revision','audit_id','source_request_id','resume_request_id','before_budget','after_budget')]
+        if row['seal']!=hashlib.sha256(_batch_canonical(values,32768)).hexdigest():raise ValueError('retry budget fence changed')
+        intent,command,_=self._control_request(row['request_id'])
+        captured=connection.execute('SELECT generation,revision FROM direct_control_members WHERE request_id=? AND job_id=?',(row['request_id'],row['job_id'])).fetchone()
+        event=connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?',(audit,)).fetchone()
+        before=json.loads(row['before_budget']);after=json.loads(row['after_budget'])
+        if (command.scope,command.action,command.job,command.expected_worker_epoch,command.expected_revision)!=('job','retry',row['job_id'],row['worker_epoch'],row['old_revision']) or captured is None or tuple(captured)!=(row['old_generation'],row['old_revision']):raise ValueError('retry budget consent changed')
+        if (row['generation'],row['revision'])!=(row['old_generation']+1,row['old_revision']+1) or event is None or tuple(event)!=('job_retry_opened',row['job_id'],row['generation'],row['revision']):raise ValueError('retry budget audit changed')
+        if set(before)!={'generation','budget_number','ordinary_attempts','exhausted'} or not before['exhausted'] or before['generation']!=row['old_generation'] or after!=dict(generation=row['generation'],budget_number=before['budget_number']+1,ordinary_attempts=0,exhausted=False):raise ValueError('retry budget transition changed')
+        return row
+
+    def apply_explicit_retry(self,request):
+        from hermes_downloads.paths import _saved_open_chain
+        connection=self._connection;intent,command,_=self._control_request(request)
+        if intent['status']!='pending':return
+        existing=connection.execute('SELECT audit_id FROM direct_retry_reopens WHERE request_id=?',(request,)).fetchone()
+        if existing is None:
+            current=self._read_job_control_projection(connection,command.job);budget=self.get_retry_budget(command.job)
+            if intent['worker_epoch']!=self.worker_epoch() or (current.revision!=command.expected_revision or current.state not in {'blocked','paused'}) or budget is None or budget.generation!=current.generation or not budget.exhausted or any(owner[0]==current.job for owner in self._job_engine_owners()):raise ValueError('exhausted retry unavailable')
+            member=connection.execute('SELECT generation,revision FROM direct_control_members WHERE request_id=? AND job_id=?',(request,current.job)).fetchone()
+            if member is None or tuple(member)!=(current.generation,current.revision):raise ValueError('retry capture stale')
+            source=self._latest_body_source(connection,current.job);failure=connection.execute('SELECT * FROM direct_failures WHERE body_request_id=?',(source,)).fetchone()
+            if failure is None or failure['action']!='exhausted':raise ValueError('exhausted typed failure missing')
+            self._failure_state_for_audit(connection,current.job,failure['generation'],failure['revision'],failure['audit_id'])
+            checkpoint=self._saved_checkpoint(connection,current.job,source);chain=marker=None
+            if checkpoint is None:
+                destination=self._saved_destination(current.job);reservation=self._effective_reservation(connection,current.job)
+                descriptors,chain,marker=_saved_open_chain(destination,reservation)
+                try:
+                    for name in (destination.partial_path.name,destination.partial_path.name+'.aria2'):
+                        try:os.stat(name,dir_fd=descriptors[3],follow_symlinks=False)
+                        except FileNotFoundError:continue
+                        raise ValueError('unqualified bytes preserved')
+                finally:
+                    for descriptor in reversed(descriptors):os.close(descriptor)
+            elif self._checkpoint_fence(connection,checkpoint[0])!=(self.worker_epoch(),current.generation,current.revision):raise ValueError('retry checkpoint fence stale')
+            head=self._capture_target_head(connection,current.job)
+            authority=RetryAuthority.restore(policy=RetryPolicy(),budget=budget);after=authority.resume_after_exhaustion(new_generation=current.generation+1)
+            if current.generation==_MAX_COUNTER or current.revision==_MAX_COUNTER:raise ValueError('retry counters exhausted')
+            resume='explicit-retry:'+hashlib.sha256(request.encode()).hexdigest()
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                connection.execute("UPDATE jobs SET generation=generation+1,revision=revision+1,state='paused' WHERE job_id=? AND generation=? AND revision=? AND state IN ('blocked','paused')",(current.job,current.generation,current.revision));self._require_one_changed_row(connection,'retry generation CAS')
+                audit=connection.execute("INSERT INTO events(kind,job_id,generation,revision) VALUES ('job_retry_opened',?,?,?)",(current.job,current.generation+1,current.revision+1)).lastrowid
+                encode=lambda value:json.dumps(dict(generation=value.generation,budget_number=value.budget_number,ordinary_attempts=value.ordinary_attempts,exhausted=value.exhausted),sort_keys=True,separators=(',',':'))
+                values=(request,current.job,self.worker_epoch(),current.generation,current.revision,current.generation+1,current.revision+1,audit,source,resume,encode(budget),encode(after))
+                connection.execute('INSERT INTO direct_retry_reopens VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',(*values,hashlib.sha256(_batch_canonical(list(values),32768)).hexdigest()))
+                self._replace_retry_budget(connection,after);self._advance_target_head(connection,head)
+                if checkpoint is None:
+                    carrier=TargetAuthorizeCommand(resume,self.worker_epoch(),'resume',dict(kind='jobs',targets=[dict(job=current.job,expected_revision=current.revision+1)]))
+                    self._insert_fresh_retry(connection,carrier,dict(failure)|dict(generation=current.generation+1,revision=current.revision+1),chain,marker,time.time_ns()//1_000_000)
+                connection.commit()
+            except BaseException:connection.rollback();raise
+            existing=(audit,)
+        reopened=self._retry_reopen(connection,existing[0]);current=self._read_job_control_projection(connection,reopened['job_id'])
+        result=self.apply_target_authorize(TargetAuthorizeCommand(reopened['resume_request_id'],self.worker_epoch(),'resume',dict(kind='jobs',targets=[dict(job=current.job,expected_revision=reopened['revision'])])))
+        if result.to_record()['results'][0]['outcome']!='existing_authority':raise ValueError('retry resume blocked')
+        connection.execute("UPDATE direct_control_requests SET status='applied' WHERE request_id=? AND status='pending'",(request,));connection.execute("UPDATE direct_control_cohorts SET status='applied' WHERE request_id=? AND status='pending'",(request,))
+
+    def apply_captured_cohort(self,request):
+        row,command,cohorts=self._control_request(request)
+        if row['status']!='pending':return
+        if command.expected_worker_epoch!=self.worker_epoch():
+            self._connection.execute("UPDATE direct_control_requests SET status='blocked' WHERE request_id=? AND status='pending'",(request,));self._connection.execute("UPDATE direct_control_cohorts SET status='blocked' WHERE request_id=? AND status='pending'",(request,));return
+        cohort=next((c for c in cohorts if c['status']=='pending'),None)
+        if cohort is not None:
+            members=json.loads(cohort['members'])
+            result=self.apply_target_authorize(TargetAuthorizeCommand(cohort['child_request_id'],command.expected_worker_epoch,'start',dict(kind='jobs',targets=[dict(job=m['job_id'],expected_revision=m['revision']) for m in members])))
+            self._connection.execute("UPDATE direct_control_cohorts SET status='applied',receipt=? WHERE request_id=? AND cohort_index=? AND status='pending'",(result._wire_reply,request,cohort['cohort_index']));self._require_one_changed_row(self._connection,'captured child CAS')
+        if not self._connection.execute("SELECT 1 FROM direct_control_cohorts WHERE request_id=? AND status='pending'",(request,)).fetchone():
+            self._connection.execute('BEGIN IMMEDIATE')
+            try:
+                self._connection.execute("UPDATE direct_control_requests SET status='applied' WHERE request_id=? AND status='pending'",(request,))
+                self._close_captured_completion(self._connection,request);self._connection.commit()
+            except BaseException:self._connection.rollback();raise
+
+    @staticmethod
+    def _file_request(connection,request):
+        from hermes_downloads.ipc import FilesCommand
+        row=connection.execute('SELECT * FROM direct_file_requests WHERE request_id=?',(request,)).fetchone()
+        if row is None:raise ValueError('file authority missing')
+        command=FilesCommand.from_record(_batch_decode(row['wire']))
+        if command.request_id!=request or row['seal']!=hashlib.sha256(row['wire']+str(row['worker_epoch']).encode()+row['receipt']).hexdigest():raise ValueError('file authority changed')
+        if _batch_decode(row['receipt'])!=dict(request_id=request,status='pending',replayed=False,ids=list(command.ids)):raise ValueError('file receipt changed')
+        return row,command
+
+    def accept_files(self,command,*,deadline):
+        connection=self._connection
+        with self._batch_budget(deadline=deadline):
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                if connection.execute('SELECT 1 FROM direct_file_requests WHERE request_id=?',(command.request_id,)).fetchone():
+                    row,old=self._file_request(connection,command.request_id)
+                    if old._wire_request!=command._wire_request:raise RequestConflictError('file request conflict')
+                    connection.rollback();return _batch_decode(row['receipt'])|dict(replayed=True)
+                if self._read_command_receipt(connection,command.request_id) is not None:raise RequestConflictError('file request conflict')
+                for job in command.ids:
+                    origin=self._read_creation_origin(connection,job,{})
+                    if origin.job is None or origin.job.source_kind is not SourceKind.DIRECT:raise ValueError('direct file owner required')
+                receipt=dict(request_id=command.request_id,status='pending',replayed=False,ids=list(command.ids));encoded=_batch_canonical(receipt,131072);epoch=self.worker_epoch()
+                seal=hashlib.sha256(command._wire_request+str(epoch).encode()+encoded).hexdigest()
+                connection.execute('INSERT INTO direct_file_requests VALUES (?,?,?,?,?)',(command.request_id,epoch,command._wire_request,encoded,seal))
+                connection.executemany("INSERT INTO direct_file_outcomes(request_id,job_id,status) VALUES (?,?,'pending')",[(command.request_id,job) for job in command.ids])
+                if time.monotonic()>=deadline:raise TimeoutError('file deadline')
+                connection.commit();return receipt
+            except BaseException:connection.rollback();raise
+
+    def certified_file(self,job):
+        from hermes_downloads.paths import _direct_cleanup_payload,require_current_direct_cleanup_payload
+        claim=self._read_direct_cleanup_claim(self._connection,job,{})
+        if claim is None or claim.phase!='finished':raise ValueError('finished file proof unavailable')
+        payload=_direct_cleanup_payload(claim.attempt.prepared,claim.certified_stat)
+        require_current_direct_cleanup_payload(claim.attempt.prepared,payload,marker_present=False)
+        return claim,payload
+
+    def _saved_purge_records(self,job,source):
+        connection=self._connection;checkpoint,pair=self._saved_checkpoint(connection,job,source)
+        destination=self._saved_destination(job);fence=checkpoint
+        records=[dict(basename=name,facts=list(facts),source_request_id=source,continuation_request_id=None,role=role) for role,(name,facts) in enumerate(((destination.partial_path.name,pair.payload),(destination.partial_path.name+'.aria2',pair.control)))]
+        rows=connection.execute('SELECT * FROM saved_direct_continuations WHERE job_id=? UNION ALL SELECT * FROM saved_direct_cycles WHERE job_id=?',(job,job)).fetchall()
+        prepared=False
+        for row in rows:
+            continuation=self._saved_continuation(connection,job,row['request_id'])
+            binding=connection.execute('SELECT drained FROM saved_resume_bindings WHERE request_id=?',(row['request_id'],)).fetchone()
+            prior,old=self._saved_checkpoint(connection,job,continuation.source_request_id)
+            history=json.loads(row['facts'])
+            if row['phase'] not in {'ready','admitted'} or binding is None or binding[0]!=1 or old.chain!=pair.chain or old.marker!=pair.marker or set(history)!={'linked','retired','ready'} or set(history['ready'])!={'retained','candidates'} or history['retired']!=dict(retained=history['ready']['retained']):raise ValueError('saved purge original drain changed')
+            for group in (history['ready']['retained'],history['ready']['candidates']):
+                if type(group) is not list or len(group)!=2 or any(type(fact) is not list or len(fact)!=9 or any(type(value) is not int or value<0 for value in fact) for fact in group):raise ValueError('saved purge finite pair changed')
+            if len({tuple(fact[:2]) for fact in (*history['ready']['retained'],*history['ready']['candidates'])})!=4:raise ValueError('saved purge candidate identity changed')
+            children=connection.execute('SELECT request_id FROM saved_resume_bindings WHERE prepared_from=?',(row['request_id'],)).fetchall()
+            if children:
+                if len(children)!=1 or row['phase']!='ready':raise ValueError('saved purge prepared lineage ambiguous')
+                self._saved_continuation(connection,job,children[0][0])
+                continue
+            if row['phase']=='ready':
+                if prepared or continuation.source_request_id!=source or row['worker_epoch']>=self.worker_epoch():raise ValueError('saved purge prepared owner changed')
+                prepared=True;fence=row
+                for record,facts in zip(records[:2],history['ready']['candidates']):
+                    record['facts']=facts;record['continuation_request_id']=continuation.request_id
+            records.extend(dict(basename=name,facts=facts,source_request_id=continuation.source_request_id,continuation_request_id=continuation.request_id,role=role) for role,(name,facts) in enumerate(zip(continuation.retained_names,history['ready']['retained'])))
+        if len({record['basename'] for record in records})!=len(records):raise ValueError('saved purge names collide')
+        return checkpoint,pair,records,fence
+
+    def prepare_saved_file_purge(self,request,job):
+        from hermes_downloads.paths import _qualify_saved_purge
+        connection=self._connection;intent,command=self._file_request(connection,request)
+        if command.action!='purge' or job not in command.ids:raise ValueError('saved purge request changed')
+        old=connection.execute('SELECT * FROM direct_saved_purge WHERE request_id=? AND job_id=?',(request,job)).fetchone()
+        source=self._latest_body_source(connection,job) if old is None else old['source_request_id']
+        checkpoint,pair,records,fence=self._saved_purge_records(job,source)
+        if old is None:
+            current=self._read_job_control_projection(connection,job)
+            epoch,generation,revision=self._checkpoint_fence(connection,fence)
+            exact=(epoch,generation,revision)==(self.worker_epoch(),current.generation,current.revision)
+            if not exact and current.state=='removed' and epoch<=self.worker_epoch() and (generation,revision+1)==(current.generation,current.revision):
+                head=self._capture_target_head(connection,job)
+                exact=head is not None and head.intent_status=='terminal' and self._batch_control_corroborated(job,'remove',current.generation,current.revision,'removed',False)
+            if intent['worker_epoch']!=self.worker_epoch() or not exact:raise ValueError('fresh saved purge fence required')
+            prior_rows=connection.execute('SELECT p.* FROM direct_saved_purge p WHERE p.job_id=? AND p.source_request_id=? AND NOT EXISTS (SELECT 1 FROM direct_saved_purge_successors s WHERE s.prior_request_id=p.request_id AND s.job_id=p.job_id)',(job,source)).fetchall()
+            if len(prior_rows)>1:raise ValueError('saved purge predecessor ambiguous')
+            prior=None if not prior_rows else prior_rows[0]
+            prior_records=None if prior is None else self.prepare_saved_file_purge(prior['request_id'],job)[2]
+            marker=_qualify_saved_purge(self._saved_destination(job),self._effective_reservation(connection,job),pair,records,prior=prior_records)
+            records.append(dict(basename='.hermes-reservation',facts=list(marker),source_request_id=source,continuation_request_id=None,role=2))
+            encoded=json.dumps(records,sort_keys=True,separators=(',',':'))
+            if prior is not None and encoded!=prior['records']:raise ValueError('saved purge predecessor artifacts changed')
+            values=[request,job,source,checkpoint['checkpoint_digest'],encoded]
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                connection.execute('INSERT INTO direct_saved_purge VALUES (?,?,?,?,?,?)',(*values,hashlib.sha256(_batch_canonical(values,131072)).hexdigest()))
+                if prior is not None:connection.execute('INSERT INTO direct_saved_purge_successors VALUES (?,?,?)',(request,job,prior['request_id']))
+                connection.executemany('INSERT INTO direct_saved_purge_artifacts VALUES (?,?,?,?,NULL)',[(request,job,index,'authorized') for index in range(len(records))])
+                connection.execute("UPDATE direct_file_outcomes SET status='saved_purge_authorized' WHERE request_id=? AND job_id=? AND status='pending'",(request,job));self._require_one_changed_row(connection,'saved purge authorize CAS');connection.commit()
+            except BaseException:connection.rollback();raise
+        else:
+            stored=json.loads(old['records']);values=[request,job,source,old['checkpoint_digest'],old['records']]
+            if old['seal']!=hashlib.sha256(_batch_canonical(values,131072)).hexdigest() or old['checkpoint_digest']!=checkpoint['checkpoint_digest'] or stored[:-1]!=records or stored[-1]['basename']!='.hermes-reservation' or tuple(stored[-1]['facts'][:2])!=pair.marker:raise ValueError('saved purge authority changed')
+            link=connection.execute('SELECT prior_request_id FROM direct_saved_purge_successors WHERE request_id=? AND job_id=?',(request,job)).fetchone()
+            if link is not None:
+                prior=connection.execute('SELECT rowid,* FROM direct_saved_purge WHERE request_id=? AND job_id=?',(link[0],job)).fetchone()
+                self._file_request(connection,link[0])
+                old_rowid=connection.execute('SELECT rowid FROM direct_saved_purge WHERE request_id=? AND job_id=?',(request,job)).fetchone()[0]
+                if prior is None or prior['rowid']>=old_rowid or (prior['source_request_id'],prior['checkpoint_digest'],prior['records'])!=(source,old['checkpoint_digest'],old['records']) or prior['seal']!=hashlib.sha256(_batch_canonical([link[0],job,source,prior['checkpoint_digest'],prior['records']],131072)).hexdigest():raise ValueError('saved purge predecessor authority changed')
+            records=stored
+        phases=connection.execute('SELECT ordinal,phase,observation FROM direct_saved_purge_artifacts WHERE request_id=? AND job_id=? ORDER BY ordinal',(request,job)).fetchall()
+        if [row[0] for row in phases]!=list(range(len(records))):raise ValueError('saved purge finite artifacts changed')
+        for artifact in phases:
+            if artifact['phase']=='authorized' and artifact['observation'] is not None or artifact['phase']=='absent' and (artifact['observation'] is None or json.loads(artifact['observation']) not in [dict(absence_observed=True,kind=kind) for kind in ('unlink_observed','qualified_present_absence')]):raise ValueError('saved purge absence certificate changed')
+        inherited=set()
+        link=connection.execute('SELECT prior_request_id FROM direct_saved_purge_successors WHERE request_id=? AND job_id=?',(request,job)).fetchone()
+        if link is not None:inherited={item[0] for item in connection.execute("SELECT ordinal FROM direct_saved_purge_artifacts WHERE request_id=? AND job_id=? AND phase='absent'",(link[0],job))}
+        # Prior absence fences rebound; the new request still acknowledges its own observation.
+        return 'saved',pair,[record|dict(phase='absent' if index in inherited else phase[1]) for index,(record,phase) in enumerate(zip(records,phases))],intent['worker_epoch']==self.worker_epoch()
+
+    def acknowledge_saved_file_artifact(self,request,job,index,fact):
+        if type(index) is not int or type(fact) is not dict or fact not in [dict(absence_observed=True,kind=kind) for kind in ('unlink_observed','qualified_present_absence')]:raise ValueError('saved purge observation changed')
+        self._file_request(self._connection,request)
+        row=self._connection.execute('SELECT phase FROM direct_saved_purge_artifacts WHERE request_id=? AND job_id=? AND ordinal=?',(request,job,index)).fetchone()
+        if row is None:raise ValueError('saved purge artifact missing')
+        if row[0]=='authorized':
+            self._connection.execute("UPDATE direct_saved_purge_artifacts SET phase='absent',observation=? WHERE request_id=? AND job_id=? AND ordinal=? AND phase='authorized'",(json.dumps(fact,sort_keys=True,separators=(',',':')),request,job,index));self._require_one_changed_row(self._connection,'saved purge absence CAS')
+
+    def prepare_file_action(self,request,job):
+        connection=self._connection;intent,command=self._file_request(connection,request)
+        row=connection.execute('SELECT * FROM direct_file_outcomes WHERE request_id=? AND job_id=?',(request,job)).fetchone()
+        if row is None or job not in command.ids:raise ValueError('file member changed')
+        if row['status'] not in {'pending','purge_authorized','saved_purge_authorized'}:return None
+        if row['status']=='saved_purge_authorized':return self.prepare_saved_file_purge(request,job)
+        if command.action=='purge' and self._latest_body_source(connection,job) is not None and self._read_job_control_projection(connection,job).state!='completed':
+            try:return self.prepare_saved_file_purge(request,job)
+            except (ValueError,OSError):
+                connection.execute("UPDATE direct_file_outcomes SET status='blocked',reason='saved_artifact_not_qualified' WHERE request_id=? AND job_id=? AND status='pending'",(request,job));return None
+        artifact=connection.execute('SELECT * FROM direct_file_artifacts WHERE request_id=? AND job_id=?',(request,job)).fetchone()
+        if artifact is not None:
+            claim=self._read_direct_cleanup_claim(connection,job,{})
+            facts=json.loads(artifact['facts'])
+            values=[request,job,artifact['attempt_id'],artifact['facts']]
+            if (claim is None or claim.phase!='finished' or claim.attempt.attempt_id!=artifact['attempt_id'] or list(claim.certified_stat)!=facts
+                or artifact['seal']!=hashlib.sha256(_batch_canonical(values,16384)).hexdigest()):raise ValueError('purge authority changed')
+            return claim,intent['worker_epoch']==self.worker_epoch()
+        try:
+            if intent['worker_epoch']!=self.worker_epoch():raise ValueError('fresh file consent required')
+            claim,_=self.certified_file(job)
+        except (ValueError,OSError):
+            connection.execute("UPDATE direct_file_outcomes SET status='blocked',reason='qualified_finished_file_required' WHERE request_id=? AND job_id=? AND status='pending'",(request,job));return None
+        if command.action=='reveal':
+            connection.execute("UPDATE direct_file_outcomes SET status='reveal_pending' WHERE request_id=? AND job_id=? AND status='pending'",(request,job));return None
+        facts=json.dumps(list(claim.certified_stat),separators=(',',':'));values=[request,job,claim.attempt.attempt_id,facts]
+        connection.execute('BEGIN IMMEDIATE')
+        try:
+            connection.execute('INSERT INTO direct_file_artifacts VALUES (?,?,?,?,?,0)',(*values,hashlib.sha256(_batch_canonical(values,16384)).hexdigest()))
+            connection.execute("UPDATE direct_file_outcomes SET status='purge_authorized' WHERE request_id=? AND job_id=? AND status='pending'",(request,job));self._require_one_changed_row(connection,'purge authorize CAS');connection.commit()
+        except BaseException:connection.rollback();raise
+        return claim,True
+
+    def acknowledge_file_purge(self,request,job,*,failed):
+        self._file_request(self._connection,request)
+        self._connection.execute('BEGIN IMMEDIATE')
+        try:
+            saved=self._connection.execute('SELECT count(*) FROM direct_saved_purge_artifacts WHERE request_id=? AND job_id=?',(request,job)).fetchone()[0]
+            if not failed and saved:
+                if self._connection.execute("SELECT count(*) FROM direct_saved_purge_artifacts WHERE request_id=? AND job_id=? AND phase='absent'",(request,job)).fetchone()[0]!=saved:raise ValueError('saved purge acknowledgement incomplete')
+            if not failed and not saved:
+                self._connection.execute('UPDATE direct_file_artifacts SET absence_observed=1 WHERE request_id=? AND job_id=? AND absence_observed=0',(request,job));self._require_one_changed_row(self._connection,'purge absence CAS')
+            self._connection.execute("UPDATE direct_file_outcomes SET status=?,reason=? WHERE request_id=? AND job_id=? AND status IN ('purge_authorized','saved_purge_authorized')",('blocked' if failed else 'purged','artifact_changed_or_cancelled' if failed else None,request,job));self._require_one_changed_row(self._connection,'purge outcome CAS');self._connection.commit()
+        except BaseException:self._connection.rollback();raise
+
+    def file_bridge(self,record,*,deadline):
+        op=record.get('op');base={'op','protocol_version'}
+        if record.get('protocol_version')!=1 or type(record.get('protocol_version')) is not int:raise ValueError('reveal version')
+        if op=='reveal_pending':
+            if set(record)!=base:raise ValueError('reveal shape')
+        else:
+            fields=base|{'request_id','job_id'}|({'token'} if op in {'reveal_presented','reveal_click','reveal_settle'} else set())|({'notification_id'} if op=='reveal_presented' else set())|({'success'} if op=='reveal_settle' else set())
+            if set(record)!=fields:raise ValueError('reveal shape')
+            for name in ('request_id','job_id'):_require_identifier(record[name],name)
+            if 'token' in record and (type(record['token']) is not str or re.fullmatch('[0-9a-f]{64}',record['token']) is None):raise ValueError('reveal token')
+            if op=='reveal_settle' and type(record['success']) is not bool:raise ValueError('reveal result')
+            if op=='reveal_presented' and (type(record['notification_id']) is not str or not 1<=len(record['notification_id'])<=256 or not record['notification_id'].strip() or any(ord(c)<32 or 127<=ord(c)<=159 for c in record['notification_id'])):raise ValueError('reveal presentation')
+        with self._notification_transaction(deadline=deadline,write=op!='reveal_pending') as connection:
+            if op=='reveal_pending':
+                row=connection.execute("SELECT request_id,job_id FROM direct_file_outcomes JOIN direct_file_requests USING(request_id) WHERE status='reveal_pending' AND worker_epoch=? ORDER BY direct_file_outcomes.rowid LIMIT 1",(self.worker_epoch(),)).fetchone()
+                return dict(request=None if row is None else dict(request_id=row[0],job_id=row[1]))
+            intent,command=self._file_request(connection,record['request_id']);job=record['job_id']
+            row=connection.execute('SELECT * FROM direct_file_outcomes WHERE request_id=? AND job_id=?',(command.request_id,job)).fetchone()
+            if row is None or job not in command.ids or command.action!='reveal' or intent['worker_epoch']!=self.worker_epoch():return dict(status='stale',path=None,token=None)
+            if op=='reveal_offer':
+                if row['status']!='reveal_pending':return dict(status='unknown',path=None,token=None)
+                _,payload=self.certified_file(job);token=secrets.token_hex(32)
+                connection.execute("UPDATE direct_file_outcomes SET status='reveal_offered',token=? WHERE request_id=? AND job_id=? AND status='reveal_pending'",(token,command.request_id,job));self._require_one_changed_row(connection,'reveal offer CAS')
+                return dict(status='offered',path=str(payload.path),token=token)
+            if row['token']!=record['token']:return dict(status='stale',path=None,token=None)
+            if op=='reveal_presented':
+                if row['presentation'] is not None and row['presentation']!=record['notification_id']:raise ValueError('presentation changed')
+                connection.execute('UPDATE direct_file_outcomes SET presentation=? WHERE request_id=? AND job_id=?',(record['notification_id'],command.request_id,job));return dict(status='presented',path=None,token=None)
+            if op=='reveal_click':
+                if row['status']!='reveal_offered':return dict(status='unknown',path=None,token=None)
+                _,payload=self.certified_file(job)
+                connection.execute("UPDATE direct_file_outcomes SET status='reveal_issued' WHERE request_id=? AND job_id=? AND status='reveal_offered'",(command.request_id,job));self._require_one_changed_row(connection,'reveal click CAS')
+                return dict(status='issued',path=str(payload.path),token=record['token'])
+            if op!='reveal_settle':raise ValueError('reveal operation')
+            status='revealed' if record['success'] else 'reveal_failed'
+            if row['status']==status:return dict(status=status,path=None,token=None)
+            if row['status']!='reveal_issued':return dict(status='unknown',path=None,token=None)
+            connection.execute('UPDATE direct_file_outcomes SET status=? WHERE request_id=? AND job_id=? AND status=?',(status,command.request_id,job,'reveal_issued'));self._require_one_changed_row(connection,'reveal SDK result CAS')
+            return dict(status=status,path=None,token=None)
+
+    def source_detail(self, job, *, deadline=None):
+        from zoneinfo import ZoneInfo
+        _require_identifier(job,'job')
+        with self._batch_budget(deadline=deadline):
+            original=self.get_materialized_job(job)
+            if original is None:raise ValueError('unknown job')
+            effective=self._effective_settings(self._connection,original)
+            if effective['scheduled_for'] is not None:effective=effective|dict(scheduled_for=datetime.fromisoformat(effective['scheduled_for']).astimezone(ZoneInfo('Asia/Tehran')).isoformat())
+            source=None;edit=None
+            row=self._connection.execute('SELECT request_id FROM direct_source_requests WHERE job_id=? ORDER BY rowid DESC LIMIT 1',(job,)).fetchone()
+            if row is not None:
+                value,_=self._source_request(row[0]);status=value['status']
+                source=dict(request_id=row[0],status=status,alternative='separate_download' if status=='blocked' else None)
+            row=self._connection.execute('SELECT request_id,status,reason FROM direct_edit_outcomes WHERE job_id=? ORDER BY rowid DESC LIMIT 1',(job,)).fetchone()
+            if row is not None:
+                self._edit_request(self._connection,row[0]);edit=dict(request_id=row[0],status=row[1],reason=row[2])
+            files=None
+            file=self._connection.execute('SELECT request_id,status,reason FROM direct_file_outcomes WHERE job_id=? ORDER BY rowid DESC LIMIT 1',(job,)).fetchone()
+            if file is not None:
+                self._file_request(self._connection,file[0]);path=None
+                if file[1] in {'reveal_pending','reveal_offered','reveal_issued','revealed','reveal_failed'}:
+                    try:path=str(self.certified_file(job)[1].path)
+                    except (ValueError,OSError):pass
+                files=dict(request_id=file[0],status=file[1],reason=file[2],path=path)
+            collection=None
+            if original.queue_collection_id is not None:
+                identifier=original.queue_collection_id
+                gate=self._connection.execute('SELECT value,revision FROM settings WHERE key=?',('collection_gate:'+hashlib.sha256(identifier.encode()).hexdigest(),)).fetchone()
+                held=self._connection.execute('SELECT 1 FROM collection_holds WHERE collection_id=?',(identifier,)).fetchone() is not None
+                revision=0 if gate is None else _require_counter(gate['revision'],'collection revision')
+                if gate is not None and (gate['value'] not in {'pause','resume'} or held!=(gate['value']=='pause')):raise ValueError('collection gate changed')
+                collection=dict(id=identifier,held=held,revision=str(revision))
+            budget=self.get_retry_budget(job);retry=None
+            if budget is not None:
+                due=None
+                failure=self._connection.execute("SELECT retry_due_ms FROM direct_failures WHERE job_id=? AND generation=? AND state='retry_wait' ORDER BY audit_id DESC LIMIT 1",(job,budget.generation)).fetchone()
+                if failure is not None and self._read_job_control_projection(self._connection,job).state=='retry_wait':
+                    due=datetime.fromtimestamp(_require_counter(failure[0],'retry due')/1000,UTC).isoformat()
+                retry=dict(generation=str(budget.generation),budget_number=str(budget.budget_number),ordinary_attempts=str(budget.ordinary_attempts),paused=budget.paused,exhausted=budget.exhausted,due_at=due)
+            return dict(id=job,source_replacement=source,edit=edit,effective=effective,files=files,collection=collection,retry=retry)
+
+    def apply_source_replacement(self, request):
+        connection=self._connection;row,command=self._source_request(request)
+        current=self._read_job_control_projection(connection,command.id)
+        origin=self._read_creation_origin(connection,command.id,{})
+        if current.state in {'resolving','downloading','finalizing'}:return False
+        if any(owner[0]==command.id for owner in self._job_engine_owners()):return False
+        checkpoint=self._saved_checkpoint(connection,command.id)
+        expected=None if origin.kind!='batch' else origin.batch.expected_sha256
+        head=self._capture_target_head(connection,command.id)
+        qualified=(expected is not None and row['worker_epoch']==self.worker_epoch() and row['generation']==current.generation
+            and current.state in {'paused','queued','blocked','needs_link','needs_auth'} and head is not None
+            and (head.last_admission_serial==0 or checkpoint is not None))
+        connection.execute('BEGIN IMMEDIATE')
+        try:
+            if qualified:
+                source=None if checkpoint is None else checkpoint[0]['source_request_id'];digest=None if checkpoint is None else checkpoint[0]['checkpoint_digest']
+                values=(request,command.id,current.generation,current.revision,source,digest,expected)
+                connection.execute('INSERT INTO direct_sources VALUES (?,?,?,?,?,?,?,?)',(*values,hashlib.sha256(_batch_canonical(list(values),4096)).hexdigest()))
+            connection.execute("UPDATE direct_source_requests SET status=? WHERE request_id=? AND status='pending'",('applied' if qualified else 'blocked',request))
+            self._require_one_changed_row(connection,'source outcome CAS');connection.commit()
+        except BaseException:connection.rollback();raise
+        if qualified and current.authorized and not current.manual_hold and head.intent_status=='current':
+            resume='source-resume:'+hashlib.sha256(request.encode()).hexdigest()
+            self.apply_target_authorize(TargetAuthorizeCommand(resume,self.worker_epoch(),'resume',dict(kind='jobs',targets=[dict(job=command.id,expected_revision=current.revision)])))
+        return True
+
+    def effective_source(self, job):
+        rows=self._connection.execute('SELECT * FROM direct_sources WHERE job_id=? ORDER BY rowid',(job,)).fetchall()
+        source=self.get_job(job).source_url
+        for row in rows:
+            values=tuple(row[name] for name in ('request_id','job_id','generation','revision','source_request_id','checkpoint_digest','expected_sha256'))
+            intent,command=self._source_request(row['request_id'])
+            origin=self._read_creation_origin(self._connection,job,{},target=False)
+            if (row['seal']!=hashlib.sha256(_batch_canonical(list(values),4096)).hexdigest() or intent['status']!='applied'
+                or row['job_id']!=command.id or origin.kind!='batch' or origin.batch.expected_sha256!=row['expected_sha256']):raise ValueError('effective source binding changed')
+            if row['source_request_id'] is not None:
+                checkpoint=self._saved_checkpoint(self._connection,job,row['source_request_id'])
+                if checkpoint is None or checkpoint[0]['checkpoint_digest']!=row['checkpoint_digest']:raise ValueError('source checkpoint changed')
+            source=command.url.encode()
+        return source
+
+    def configuration_command(self, *, revision=None, request_id=None):
+        from hermes_downloads.ipc import ConfigureCommand
+        row=self._connection.execute('SELECT * FROM direct_configurations WHERE '+('revision=?' if revision is not None else 'request_id=?'),(revision if revision is not None else request_id,)).fetchone()
+        if row is None:raise ValueError('configuration authority missing')
+        command=ConfigureCommand.from_record(_batch_decode(row['wire']))
+        if (row['request_id'],row['payload_digest'],row['wire'])!=(command.request_id,command.payload_digest,command._wire_request):raise ValueError('configuration authority changed')
+        _require_worker_epoch(row['worker_epoch'],'configuration epoch')
+        if _batch_decode(row['receipt'])!=dict(request_id=command.request_id,revision=str(row['revision']),status='pending',replayed=False):raise ValueError('configuration receipt changed')
+        return command,row['worker_epoch']
+
+    def configuration_snapshot(self, *, deadline=None):
+        from hermes_downloads.ipc import ConfigureCommand
+        with (nullcontext() if self._connection.in_transaction else self._batch_budget(deadline=deadline)):
+            values=[]
+            default=dict(concurrency='1',connections='4',global_limit_bps=None)
+            for key in ('direct_desired','direct_applied'):
+                row=self._connection.execute('SELECT value,revision FROM settings WHERE key=?',(key,)).fetchone()
+                value=default if row is None else json.loads(row['value'])
+                ConfigureCommand('settings-validation',value)
+                if set(value)!=set(default):raise ValueError('incomplete settings')
+                values.append((value,0 if row is None else _require_counter(row['revision'],'settings revision')))
+            desired,applied=values
+            if applied[1]>desired[1]:raise ValueError('applied settings exceed authority')
+            current=default;qualified={0:default}
+            for revision in range(1,desired[1]+1):
+                command,_=self.configuration_command(revision=revision)
+                current=current|command.to_record()['patch']
+                if revision in {desired[1],applied[1]}:qualified[revision]=current
+            if desired[0]!=qualified[desired[1]] or applied[0]!=qualified[applied[1]]:raise ValueError('settings projection changed')
+            return dict(desired=desired[0],applied=applied[0],revision=str(desired[1]),applied_revision=str(applied[1]),
+                status='applied' if desired==applied else 'pending',speed_units='bytes per second')
+
+    def accept_configuration(self, command, *, deadline):
+        from hermes_downloads.ipc import ConfigureCommand
+        if type(command) is not ConfigureCommand: raise ValueError('invalid configuration')
+        connection=self._connection
+        with self._batch_budget(deadline=deadline):
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                row=connection.execute('SELECT * FROM direct_configurations WHERE request_id=?',(command.request_id,)).fetchone()
+                if row is not None:
+                    if (row['payload_digest'],row['wire'])!=(command.payload_digest,command._wire_request): raise RequestConflictError('configuration request conflict')
+                    receipt=_batch_decode(row['receipt'])
+                    if receipt!=dict(request_id=command.request_id,revision=str(row['revision']),status='pending',replayed=False): raise ValueError('configuration receipt changed')
+                    connection.rollback();return receipt|dict(replayed=True)
+                if self._read_command_receipt(connection,command.request_id) is not None or self._read_direct_dispatch_command(connection,command.request_id) is not None:
+                    raise RequestConflictError('configuration request conflict')
+                current=self.configuration_snapshot();revision=int(current['revision'])+1
+                _require_counter(revision,'configuration revision')
+                desired=current['desired']|command.to_record()['patch']
+                encoded=json.dumps(desired,sort_keys=True,separators=(',',':'))
+                receipt=dict(request_id=command.request_id,revision=str(revision),status='pending',replayed=False)
+                connection.execute("INSERT INTO settings VALUES ('direct_desired',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,revision=excluded.revision",(encoded,revision))
+                connection.execute('INSERT INTO direct_configurations VALUES (?,?,?,?,?,?)',(command.request_id,command.payload_digest,command._wire_request,_batch_canonical(receipt,4096),revision,self._current_worker_epoch(connection)))
+                if time.monotonic()>=deadline: raise TimeoutError('configuration deadline')
+                connection.commit();return receipt
+            except BaseException:connection.rollback();raise
+
+    def applied_configuration(self, snapshot):
+        connection=self._connection
+        with self._batch_budget():
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                current=self.configuration_snapshot()
+                if current!=snapshot:raise ValueError('settings changed during application')
+                desired=json.dumps(snapshot['desired'],sort_keys=True,separators=(',',':'))
+                connection.execute("INSERT INTO settings VALUES ('direct_applied',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,revision=excluded.revision",(desired,int(snapshot['revision'])))
+                connection.commit()
+            except BaseException:connection.rollback();raise
+
+    @staticmethod
+    def _job_engine_seal(values):
+        return hashlib.sha256(_batch_canonical(list(values),4096)).hexdigest()
+
+    def _decode_job_engine(self, row):
+        if row['owner_digest']!=self._job_engine_seal(row[name] for name in ('job_id','dispatch_request_id','worker_epoch','reservation_token','phase','process','rpc_port','rpc_secret')):raise ValueError('engine owner binding changed')
+        _require_identifier(row['job_id'],'engine job');_require_identifier(row['dispatch_request_id'],'engine dispatch')
+        _require_worker_epoch(row['worker_epoch'],'engine epoch');_require_reservation_token(row['reservation_token'])
+        if row['phase'] not in {'reserved','bound','ready'}:raise ValueError('engine phase changed')
+        record=None if row['process'] is None else DirectEngineRecord(row['worker_epoch'],ProcessBirthIdentity.from_record(json.loads(row['process'])))
+        capability=None if row['rpc_port'] is None else _DirectEngineRecoveryCapability(row['rpc_port'],row['rpc_secret'])
+        if (row['phase']=='reserved')!=(record is None) or (row['phase']=='ready')!=(capability is not None):raise ValueError('engine owner incomplete')
+        receipt=self._read_direct_dispatch_command(self._connection,row['dispatch_request_id'])
+        cause=self._read_target_dispatch_cause(self._connection,row['dispatch_request_id'],{})
+        if receipt is None or receipt.job!=row['job_id'] or cause is None or cause['kind']!='body':raise ValueError('engine dispatch changed')
+        command=self._read_target_command(self._connection,cause['activation_request_id'],{})[0]
+        if command.expected_worker_epoch!=row['worker_epoch']:raise ValueError('engine dispatch epoch changed')
+        return row['job_id'],record,row['dispatch_request_id'],row['reservation_token'],capability
+
+    def _job_engine_owners(self):
+        return [self._decode_job_engine(row) for row in self._connection.execute('SELECT * FROM direct_job_engines ORDER BY job_id')]
+
+    def _job_engine_for_record(self, record):
+        if type(record) is not DirectEngineRecord:raise ValueError('engine record invalid')
+        found=[row for row in self._job_engine_owners() if row[1]==record]
+        if len(found)>1:raise ValueError('ambiguous process owner')
+        return found[0] if found else None
+
+    def _engine_record_for_dispatch(self, plan):
+        row=self._connection.execute('SELECT * FROM direct_job_engines WHERE job_id=?',(plan.job.job_id,)).fetchone()
+        if row is None:return self.get_direct_engine_record()
+        owner=self._decode_job_engine(row)
+        if owner[2]!=plan.request_id:raise ValueError('engine belongs to another dispatch')
+        return owner[1]
+
+    def reserve_job_engine(self, plan):
+        connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+        try:
+            self._require_pending_direct_dispatch_command(connection,plan,_effect=True)
+            if (self.get_direct_engine_record() is not None or self.get_direct_engine_activation_fence() is not None
+                or len(self._job_engine_owners())>=int(self.configuration_snapshot()['desired']['concurrency'])):raise ValueError('engine capacity unavailable')
+            fence=DirectEngineActivationFence(self.worker_epoch(),secrets.token_hex(32))
+            values=(plan.job.job_id,plan.request_id,fence.worker_epoch,fence.reservation_token,'reserved',None,None,None)
+            connection.execute('INSERT INTO direct_job_engines VALUES (?,?,?,?,?,?,?,?,?)',(*values,self._job_engine_seal(values)))
+            connection.commit();return fence
+        except BaseException:connection.rollback();raise
+
+    def bind_job_engine(self, plan, fence, record):
+        connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+        try:
+            self._require_pending_direct_dispatch_command(connection,plan,_effect=True)
+            if record.worker_epoch!=fence.worker_epoch or fence.worker_epoch!=self.worker_epoch():raise ValueError('engine epoch changed')
+            encoded=json.dumps(record.identity.to_record(),sort_keys=True,separators=(',',':'))
+            row=connection.execute('SELECT * FROM direct_job_engines WHERE job_id=?',(plan.job.job_id,)).fetchone();self._decode_job_engine(row)
+            sealed=self._job_engine_seal((plan.job.job_id,plan.request_id,fence.worker_epoch,fence.reservation_token,'bound',encoded,None,None))
+            connection.execute("UPDATE direct_job_engines SET phase='bound',process=?,owner_digest=? WHERE job_id=? AND dispatch_request_id=? AND worker_epoch=? AND reservation_token=? AND phase='reserved'",(encoded,sealed,plan.job.job_id,plan.request_id,fence.worker_epoch,fence.reservation_token))
+            self._require_one_changed_row(connection,'job engine bind');connection.commit()
+        except BaseException:connection.rollback();raise
+
+    def clear_job_engine_fence(self, plan, fence):
+        connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+        try:
+            connection.execute("DELETE FROM direct_job_engines WHERE job_id=? AND dispatch_request_id=? AND worker_epoch=? AND reservation_token=? AND phase='reserved'",(plan.job.job_id,plan.request_id,fence.worker_epoch,fence.reservation_token))
+            changed=connection.execute('SELECT changes()').fetchone()[0];connection.commit();return changed==1
+        except BaseException:connection.rollback();raise
+
     def reserve_direct_engine_activation(
         self, *, worker_epoch: int
     ) -> DirectEngineActivationFence | None:
@@ -6325,6 +7852,9 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
+            if self._job_engine_owners():
+                connection.commit();return None
+
             if self._current_worker_epoch(connection) != worker_epoch:
                 raise ValueError("direct engine activation worker epoch is not current")
             direct_record = connection.execute(
@@ -6691,6 +8221,8 @@ class SQLiteStore:
             worker_epoch=record.worker_epoch,
             identity=record.identity,
         )
+        owner=self._job_engine_for_record(record)
+        if owner is not None:return owner[4]
         rows = self._connection.execute(
             """
             SELECT
@@ -6779,6 +8311,16 @@ class SQLiteStore:
             rpc_port=capability.rpc_port,
             rpc_secret=capability.rpc_secret,
         )
+        owner=self._job_engine_for_record(record)
+        if owner is not None:
+            connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+            try:
+                if self.worker_epoch()!=record.worker_epoch:raise ValueError('engine capability epoch changed')
+                encoded=json.dumps(record.identity.to_record(),sort_keys=True,separators=(',',':'))
+                sealed=self._job_engine_seal((owner[0],owner[2],record.worker_epoch,owner[3],'ready',encoded,capability.rpc_port,capability.rpc_secret))
+                connection.execute("UPDATE direct_job_engines SET phase='ready',rpc_port=?,rpc_secret=?,owner_digest=? WHERE job_id=? AND dispatch_request_id=? AND worker_epoch=? AND reservation_token=? AND process=? AND phase='bound'",(capability.rpc_port,capability.rpc_secret,sealed,owner[0],owner[2],record.worker_epoch,owner[3],encoded))
+                self._require_one_changed_row(connection,'job capability bind');connection.commit();return
+            except BaseException:connection.rollback();raise
         identity = record.identity
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
@@ -6883,6 +8425,15 @@ class SQLiteStore:
             rpc_port=capability.rpc_port,
             rpc_secret=capability.rpc_secret,
         )
+        owner=self._job_engine_for_record(record)
+        if owner is not None:
+            if owner[4]!=capability:return False
+            connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+            try:
+                encoded=json.dumps(record.identity.to_record(),sort_keys=True,separators=(',',':'))
+                connection.execute("DELETE FROM direct_job_engines WHERE job_id=? AND dispatch_request_id=? AND worker_epoch=? AND reservation_token=? AND process=? AND phase='ready' AND rpc_port=? AND rpc_secret=?",(owner[0],owner[2],record.worker_epoch,owner[3],encoded,capability.rpc_port,capability.rpc_secret))
+                changed=connection.execute('SELECT changes()').fetchone()[0];connection.commit();return changed==1
+            except BaseException:connection.rollback();raise
         identity = record.identity
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
@@ -6970,6 +8521,15 @@ class SQLiteStore:
             worker_epoch=record.worker_epoch,
             identity=record.identity,
         )
+        owner=self._job_engine_for_record(record)
+        if owner is not None:
+            if owner[4] is not None:return False
+            connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+            try:
+                encoded=json.dumps(record.identity.to_record(),sort_keys=True,separators=(',',':'))
+                connection.execute("DELETE FROM direct_job_engines WHERE job_id=? AND dispatch_request_id=? AND worker_epoch=? AND reservation_token=? AND process=? AND phase='bound'",(owner[0],owner[2],record.worker_epoch,owner[3],encoded))
+                changed=connection.execute('SELECT changes()').fetchone()[0];connection.commit();return changed==1
+            except BaseException:connection.rollback();raise
         identity = record.identity
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
@@ -7225,6 +8785,12 @@ class SQLiteStore:
     ) -> PublicationMarkerBinding | None:
         """Read a marker identity only through its current reservation owner chain."""
 
+        version=SQLiteStore._destination_version(connection,job_id)
+        if version is not None:
+            row=connection.execute('SELECT device,inode FROM direct_destination_markers WHERE request_id=? AND job_id=?',(version['request_id'],job_id)).fetchone()
+            original=connection.execute('SELECT marker_device,marker_inode FROM publication_marker_bindings WHERE job_id=?',(job_id,)).fetchone()
+            if original is not None and row is not None and tuple(original)!=tuple(row):raise ValueError('destination marker changed original workspace')
+            return None if row is None else PublicationMarkerBinding(job_id,*tuple(row))
         reservation = SQLiteStore._read_publication_reservation(connection, job_id)
         rows = connection.execute(
             """
@@ -7276,6 +8842,13 @@ class SQLiteStore:
     ) -> _StagedPayloadBinding | None:
         """Read staged identity only through complete current owner chains."""
 
+        version=SQLiteStore._destination_version(connection,job_id)
+        if version is not None:
+            row=connection.execute('SELECT device,inode,size FROM direct_destination_staged WHERE request_id=? AND job_id=?',(version['request_id'],job_id)).fetchone()
+            if row is None:return None
+            binding=_StagedPayloadBinding(job_id,*tuple(row))
+            if SQLiteStore._read_publication_marker_binding(connection,job_id) is None:raise ValueError('destination stage lacks marker')
+            return binding
         requested: _StagedPayloadBinding | None = None
         rows = connection.execute(
             """
@@ -7332,6 +8905,14 @@ class SQLiteStore:
     ) -> _FinalPublicationBinding | None:
         """Read final identity only when it exactly matches a staged owner chain."""
 
+        version=SQLiteStore._destination_version(connection,job_id)
+        if version is not None:
+            row=connection.execute('SELECT device,inode,size FROM direct_destination_final WHERE request_id=? AND job_id=?',(version['request_id'],job_id)).fetchone()
+            if row is None:return None
+            binding=_FinalPublicationBinding(job_id,*tuple(row))
+            stage=SQLiteStore._read_staged_payload_binding(connection,job_id)
+            if stage is None or (stage.partial_device,stage.partial_inode,stage.logical_size)!=(binding.final_device,binding.final_inode,binding.logical_size):raise ValueError('destination final lacks stage')
+            return binding
         requested: _FinalPublicationBinding | None = None
         rows = connection.execute(
             """
@@ -7408,13 +8989,19 @@ class SQLiteStore:
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
-            reservation = self._read_publication_reservation(connection, job_id)
+            reservation = self._effective_reservation(connection, job_id)
             if reservation is None:
                 raise ValueError(
                     "publication marker binding requires a current publication reservation"
                 )
             if reservation.claim_token != claim_token:
                 raise ValueError("publication marker claim token does not match")
+            version=self._destination_version(connection,job_id)
+            if version is not None:
+                existing=self._read_publication_marker_binding(connection,job_id)
+                if existing is None:connection.execute('INSERT INTO direct_destination_markers VALUES (?,?,?,?)',(version['request_id'],job_id,marker_device,marker_inode))
+                elif existing!=requested:raise ValueError('destination marker rebound')
+                connection.commit();return requested
             existing = self._read_publication_marker_binding(connection, job_id)
             self._read_source_kind(connection, job_id)
             if existing is None:
@@ -7478,7 +9065,7 @@ class SQLiteStore:
         self, connection: sqlite3.Connection, *, requested: _StagedPayloadBinding,
         claim_token: str,
     ) -> _StagedPayloadBinding:
-        reservation = self._read_publication_reservation(connection, requested.job_id)
+        reservation = self._effective_reservation(connection, requested.job_id)
         if reservation is None:
             raise ValueError(
                 "staged payload binding requires a current publication reservation"
@@ -7492,6 +9079,12 @@ class SQLiteStore:
             )
         if marker.job_id != reservation.job_id:
             raise ValueError("publication marker binding does not match its owner")
+        version=self._destination_version(connection,requested.job_id)
+        if version is not None:
+            existing=self._read_staged_payload_binding(connection,requested.job_id)
+            if existing is None:connection.execute('INSERT INTO direct_destination_staged VALUES (?,?,?,?,?)',(version['request_id'],requested.job_id,requested.partial_device,requested.partial_inode,requested.logical_size))
+            elif existing!=requested:raise ValueError('destination payload rebound')
+            return requested
         existing = self._read_staged_payload_binding(connection, requested.job_id)
         self._read_source_kind(connection, requested.job_id)
         if existing is None:
@@ -7561,7 +9154,7 @@ class SQLiteStore:
         if type(requested) is not _FinalPublicationBinding:
             raise TypeError("requested must be a final publication binding")
         claim_token = _require_reservation_token(claim_token)
-        reservation = self._read_publication_reservation(connection, requested.job_id)
+        reservation = self._effective_reservation(connection, requested.job_id)
         if reservation is None:
             raise ValueError("final publication binding requires a current publication reservation")
         if reservation.claim_token != claim_token:
@@ -7582,6 +9175,12 @@ class SQLiteStore:
             or requested.logical_size != staged.logical_size
         ):
             raise ValueError("final publication binding does not match staged payload")
+        version=self._destination_version(connection,requested.job_id)
+        if version is not None:
+            existing=self._read_final_publication_binding(connection,requested.job_id)
+            if existing is None:connection.execute('INSERT INTO direct_destination_final VALUES (?,?,?,?,?)',(version['request_id'],requested.job_id,requested.final_device,requested.final_inode,requested.logical_size))
+            elif existing!=requested:raise ValueError('destination payload rebound')
+            return requested
         existing = self._read_final_publication_binding(connection, requested.job_id)
         self._read_source_kind(connection, requested.job_id)
         if existing is None:
@@ -7732,6 +9331,150 @@ class SQLiteStore:
             for row in rows
         )
 
+    def _notification_projection(self, connection, row, now):
+        identity = self._notification_store_uuid(connection)
+        if identity is None or row['store_uuid'] != identity:
+            raise ValueError('notification identity unavailable')
+        if _require_counter(row['sequence'], 'notification sequence') < 1:
+            raise ValueError('notification sequence invalid')
+        _require_counter(row['generation'], 'notification generation')
+        _require_counter(row['created_at_ms'], 'notification creation')
+        path = None
+        if row['type']=='completion' and row['count'] == 1 and row['job_id'] is not None:
+            from hermes_downloads.paths import _direct_cleanup_payload, require_current_direct_cleanup_payload
+            try:
+                claim = self._read_direct_cleanup_claim(connection, row['job_id'], {})
+                if claim is not None and claim.phase == 'finished':
+                    provenance = json.loads(row['provenance'])
+                    fact = (provenance['completion'] if provenance['kind'] == 'job' else
+                        next(m['completion'] for m in provenance['members'] if m['completion'] is not None))
+                    if (fact['job_id'], fact['audit_id'], fact['generation'], fact['revision']) != (
+                            claim.job_id, claim.completion_audit_id, claim.completion_generation, claim.completion_revision):
+                        raise ValueError('notification cleanup identity changed')
+                    payload = _direct_cleanup_payload(claim.attempt.prepared, claim.certified_stat)
+                    require_current_direct_cleanup_payload(claim.attempt.prepared, payload, marker_present=False)
+                    path = str(payload.path)
+            except (ValueError, TypeError, KeyError, StopIteration, OSError):
+                # An event survives incomplete cleanup or a changed final namespace.
+                path = None
+        state = row['presentation_state']
+        if state == 'claimed' and row['lease_expires_at_ms'] <= now:
+            state = 'pending'
+        event = dict(event_id=f"{identity}:{row['sequence']}", type=row['type'], job_id=row['job_id'],
+            collection_id=row['collection_id'], generation=row['generation'], created_at_ms=row['created_at_ms'],
+            count=row['count'], reason_code=row['reason_code'], reveal_path=path, presentation_state=state)
+        # A legitimate native signed64 completion survives a renderer projection refusal.
+        validate_notification_event({**event, 'reveal_path': None})
+        if path is not None:
+            try:
+                validate_notification_event(event)
+            except (ValueError, TypeError):
+                event['reveal_path'] = None
+        return event
+
+    @contextmanager
+    def _notification_transaction(self, *, deadline, write):
+        connection = self._connection
+        if connection.in_transaction:
+            raise ValueError('notification cannot borrow a transaction')
+        with self._batch_budget(deadline=deadline) as end:
+            connection.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
+            try:
+                yield connection
+                if time.monotonic() >= end:
+                    raise TimeoutError('notification database deadline')
+                if write:
+                    remaining_ms = int((end - time.monotonic()) * 1000)
+                    if remaining_ms <= 0:
+                        raise TimeoutError('notification database deadline')
+                    connection.execute(f'PRAGMA busy_timeout = {remaining_ms}')
+                    connection.commit()
+            finally:
+                connection.rollback()
+
+    def read_notification_pending(self, command, *, deadline=None):
+        if type(command) is not NotificationPendingCommand:
+            raise ValueError('invalid notification pending')
+        with self._notification_transaction(deadline=deadline, write=False) as connection:
+            now = time.time_ns() // 1_000_000
+            rows = connection.execute('''SELECT * FROM notification_outbox WHERE deliverable=1
+                ORDER BY delivery_priority,sequence LIMIT 2''').fetchall()
+            events = [] if not rows else [self._notification_projection(connection, rows[0], now)]
+            return NotificationResult(command.op, dict(schema_version=1, profile='default', source='local',
+                events=events, next_cursor=events[0]['event_id'] if len(rows) > 1 else None, has_more=len(rows) > 1))
+
+    def claim_notification(self, command, *, deadline=None):
+        if type(command) is not NotificationClaimCommand:
+            raise ValueError('invalid notification claim')
+        with self._notification_transaction(deadline=deadline, write=True) as connection:
+            now = time.time_ns() // 1_000_000
+            row = connection.execute('''SELECT * FROM notification_outbox WHERE deliverable=1
+                AND presentation_state='claimed' AND consumer_id=? AND lease_expires_at_ms>?
+                ORDER BY delivery_priority,sequence LIMIT 1''', (command.consumer_id, now)).fetchone()
+            if row is None:
+                row = connection.execute('''SELECT * FROM notification_outbox WHERE deliverable=1
+                    AND (presentation_state='pending' OR lease_expires_at_ms<=?)
+                    ORDER BY delivery_priority,sequence LIMIT 1''', (now,)).fetchone()
+            claims = []
+            if row is not None:
+                event = self._notification_projection(connection, row, now)
+                if row['presentation_state'] == 'claimed' and row['lease_expires_at_ms'] > now:
+                    history = connection.execute('SELECT * FROM notification_claims WHERE sequence=? AND claim_token=?',
+                        (row['sequence'], row['claim_token'])).fetchone()
+                    if history is None or (history['consumer_id'], history['lease_expires_at_ms'], history['outcome']) != (
+                            command.consumer_id, row['lease_expires_at_ms'], 'claimed'):
+                        raise ValueError('notification claim history changed')
+                    token, expiry = row['claim_token'], row['lease_expires_at_ms']
+                else:
+                    token, expiry = secrets.token_hex(32), now + 30_000
+                    connection.execute('''UPDATE notification_outbox SET presentation_state='claimed',
+                        consumer_id=?,claim_token=?,lease_expires_at_ms=? WHERE sequence=?''',
+                        (command.consumer_id, token, expiry, row['sequence']))
+                    connection.execute('INSERT INTO notification_claims VALUES (?,?,?,?,?,NULL)',
+                        (row['sequence'], token, command.consumer_id, expiry, 'claimed'))
+                event['presentation_state'] = 'claimed'
+                claims.append(dict(event=event, claim_token=token, lease_expires_at_ms=expiry))
+            return NotificationResult(command.op, dict(schema_version=1, profile='default', source='local',
+                claims=claims, server_now_ms=now))
+
+    def _settle_notification(self, command, *, deadline):
+        presented = type(command) is NotificationPresentedCommand
+        with self._notification_transaction(deadline=deadline, write=True) as connection:
+            identity, sequence = command.event_id.rsplit(':', 1)
+            row = connection.execute('SELECT * FROM notification_outbox WHERE sequence=? AND store_uuid=?',
+                (int(sequence), identity)).fetchone()
+            status = 'stale_claim'
+            if row is not None and identity == self._notification_store_uuid(connection):
+                history = connection.execute('SELECT * FROM notification_claims WHERE sequence=? AND claim_token=?',
+                    (row['sequence'], command.claim_token)).fetchone()
+                outcome = 'presented' if presented else 'released'
+                receipt = command.notification_id if presented else None
+                exact = history is not None and history['consumer_id'] == command.consumer_id
+                if exact and (history['outcome'], history['notification_id']) == (outcome, receipt):
+                    status = 'already_' + outcome
+                elif (exact and history['outcome'] == 'claimed' and row['presentation_state'] == 'claimed'
+                    and (row['consumer_id'], row['claim_token'], row['lease_expires_at_ms']) ==
+                        (command.consumer_id, command.claim_token, history['lease_expires_at_ms'])
+                    and row['lease_expires_at_ms'] > time.time_ns() // 1_000_000):
+                    connection.execute('UPDATE notification_claims SET outcome=?,notification_id=? WHERE sequence=? AND claim_token=?',
+                        (outcome, receipt, row['sequence'], command.claim_token))
+                    if presented:
+                        connection.execute("UPDATE notification_outbox SET presentation_state='presented' WHERE sequence=?", (row['sequence'],))
+                    else:
+                        connection.execute("UPDATE notification_outbox SET presentation_state='pending',consumer_id=NULL,claim_token=NULL,lease_expires_at_ms=NULL WHERE sequence=?", (row['sequence'],))
+                    status = outcome
+            return NotificationResult(command.op, dict(status=status))
+
+    def present_notification(self, command, *, deadline=None):
+        if type(command) is not NotificationPresentedCommand:
+            raise ValueError('invalid notification presentation')
+        return self._settle_notification(command, deadline=deadline)
+
+    def release_notification(self, command, *, deadline=None):
+        if type(command) is not NotificationReleaseCommand:
+            raise ValueError('invalid notification release')
+        return self._settle_notification(command, deadline=deadline)
+
     def read_query_list_page(self, *, cursor=None, deadline=None) -> QueryListPage:
         """Finite live keyset, bounded by the first page's maximal ID and epoch."""
         connection = self._connection
@@ -7871,3 +9614,377 @@ class SQLiteStore:
             revision=row["revision"],
             state=row["state"],
         )
+
+    def _saved_destination(self, job_id):
+        return self.runtime_destination(job_id)
+
+    def _latest_body_source(self, connection, job_id):
+        row = connection.execute("SELECT request_id FROM target_dispatch_causes WHERE job_id=? AND kind='body' ORDER BY admission_serial DESC LIMIT 1",(job_id,)).fetchone()
+        return None if row is None else row[0]
+
+    def _continuation_table(self, connection, request):
+        tables = [table for table in ('saved_direct_continuations','saved_direct_cycles')
+            if connection.execute(f'SELECT 1 FROM {table} WHERE request_id=?',(request,)).fetchone()]
+        if len(tables)!=1: raise ValueError('continuation identity ambiguous')
+        return tables[0]
+
+    def _continuation_row(self, connection, job_id, request=None):
+        if request is None:
+            head = connection.execute('SELECT activation_request_id FROM job_authorization_heads WHERE job_id=?',(job_id,)).fetchone()
+            if head is None: return None
+            request = head[0]
+        rows = connection.execute('SELECT * FROM saved_direct_continuations WHERE request_id=? UNION ALL SELECT * FROM saved_direct_cycles WHERE request_id=?',(request,request)).fetchall()
+        if not rows: return None
+        if len(rows)!=1 or rows[0]['job_id']!=job_id: raise ValueError('continuation identity changed')
+        return rows[0]
+
+    def _saved_checkpoint(self, connection, job_id, source_request_id=None):
+        from hermes_downloads.paths import _StoppedPair
+        source = source_request_id or self._latest_body_source(connection,job_id)
+        rows = connection.execute("SELECT *, 'pause' AS stop_kind,22 AS version FROM stopped_direct_bodies WHERE source_request_id=? UNION ALL SELECT *,23 AS version FROM stopped_direct_cycles WHERE source_request_id=? UNION ALL SELECT *,24 AS version FROM stopped_failed_bodies WHERE source_request_id=? UNION ALL SELECT *,24 AS version FROM stopped_control_bodies WHERE source_request_id=? UNION ALL SELECT *,24 AS version FROM stopped_absent_bodies WHERE source_request_id=?",(source,source,source,source,source)).fetchall()
+        if not rows: return None
+        if len(rows)!=1 or rows[0]['job_id']!=job_id: raise ValueError('checkpoint source ambiguous')
+        row = rows[0]
+        facts = _StoppedPair.from_record(json.loads(row['facts']))
+        closure = json.loads(row['closure'])
+        value = dict(source=row['source_request_id'],pause=row['pause_request_id'],audit=row['pause_audit_id'],
+            epoch=row['worker_epoch'],generation=row['generation'],revision=row['revision'],facts=facts.to_record(),closure=closure)
+        if row['version']>=23: value['stop_kind']=row['stop_kind']
+        digest = hashlib.sha256(_batch_canonical(value,16384)).hexdigest()
+        if digest!=row['checkpoint_digest']: raise ValueError('stopped checkpoint digest changed')
+        receipt = self._read_direct_dispatch_command(connection,source)
+        cause = self._read_target_dispatch_cause(connection,source,{})
+        audit = connection.execute('SELECT * FROM events WHERE event_id=?',(row['pause_audit_id'],)).fetchone()
+        if (receipt is None or receipt.status!='started' or receipt.state!='downloading' or receipt.job!=job_id
+            or cause is None or cause['kind']!='body'
+            or audit is None or (audit['kind'],audit['job_id'],audit['generation'],audit['revision'])!=(('job_failure' if row['stop_kind']=='failure' else 'job_paused'),job_id,row['generation'],row['revision'])
+            or set(closure)!={'process','returncode','group_absent','observer_joined','gid','completed_length'}
+            or closure['group_absent'] is not True
+            or (closure['completed_length'] is not None if row['stop_kind']=='cold_absent' else type(closure['completed_length']) is not int or not 0<closure['completed_length']<=facts.payload[2])
+            or type(closure['gid']) is not str or re.fullmatch('[0-9a-fA-F]{16}',closure['gid']) is None):
+            raise ValueError('stopped BODY provenance changed')
+        ProcessBirthIdentity.from_record(closure['process'])
+        if row['stop_kind'] in {'cold','cold_absent'}:
+            owner = connection.execute('SELECT * FROM saved_body_owners WHERE request_id=?',(source,)).fetchone()
+            if (owner is None or json.loads(owner['process'])!=closure['process'] or owner['gid']!=closure['gid']
+                or closure['observer_joined'] is not False or closure['returncode'] is not None):
+                raise ValueError('cold containment provenance changed')
+            fences=connection.execute('SELECT * FROM saved_cold_fences WHERE audit_id=?',(row['pause_audit_id'],)).fetchone()
+            if fences is None or (fences['old_generation'],fences['generation'])!=(receipt.generation,row['generation']):
+                raise ValueError('cold stopped fence missing')
+        else:
+            if receipt.generation!=row['generation'] or closure['observer_joined'] is not True or type(closure['returncode']) is not int:
+                raise ValueError('original owner drain missing')
+            if row['stop_kind']=='failure':
+                failure=connection.execute('SELECT * FROM direct_failures WHERE body_request_id=?',(source,)).fetchone()
+                if (failure is None or (failure['job_id'],failure['worker_epoch'],failure['generation'],failure['revision'],failure['audit_id'])!=(job_id,row['worker_epoch'],row['generation'],row['revision'],row['pause_audit_id'])
+                    or any(json.loads(failure['closure'])[k]!=closure[k] for k in ('process','returncode','group_absent','observer_joined','gid'))): raise ValueError('failure stop provenance changed')
+                self._failure_state_for_audit(connection,job_id,row['generation'],row['revision'],row['pause_audit_id'])
+            elif row['stop_kind']=='pause':
+                pause=connection.execute('SELECT * FROM job_control_commands WHERE request_id=?',(row['pause_request_id'],)).fetchone()
+                if pause is None or (pause['job_id'],pause['action'],pause['status'],pause['generation'],pause['revision'],pause['state'])!=(job_id,'pause','applied',row['generation'],row['revision'],'paused'):
+                    raise ValueError('pause provenance changed')
+            elif row['stop_kind']=='queue':
+                pause=connection.execute('SELECT gate FROM queue_commands WHERE request_id=?',(row['pause_request_id'],)).fetchone()
+                if pause is None or pause[0]!='paused': raise ValueError('queue stop provenance changed')
+            elif row['stop_kind']=='configure':
+                self.configuration_command(request_id=row['pause_request_id'])
+            elif row['stop_kind']=='replace_source':
+                self._source_request(row['pause_request_id'])
+            elif row['stop_kind']=='preempt':
+                victim=self._preemption(row['pause_request_id'])
+                if victim is None or (victim['job_id'],victim['source_request_id'],victim['worker_epoch'],victim['generation'],victim['revision'])!=(job_id,source,row['worker_epoch'],row['generation'],row['revision']-1) or json.loads(victim['process'])!=closure['process']:raise ValueError('preemption stop changed')
+            elif row['stop_kind']=='collection':
+                _,control,_=self._control_request(row['pause_request_id'])
+                member=connection.execute('SELECT generation,revision FROM direct_control_members WHERE request_id=? AND job_id=?',(row['pause_request_id'],job_id)).fetchone()
+                if control.scope!='collection' or control.action!='pause' or control.collection!=self.get_materialized_job(job_id).queue_collection_id or member is None or tuple(member)!=(row['generation'],row['revision']-1):raise ValueError('collection stopped member changed')
+            elif row['stop_kind']=='purge':
+                self._file_request(connection,row['pause_request_id'])
+            elif row['stop_kind']=='edit':
+                self._edit_request(connection,row['pause_request_id'])
+            elif row['stop_kind']!='shutdown': raise ValueError('unknown stop provenance')
+        return row,facts
+
+    def seal_stopped_direct_body(self, plan, pause, result, facts, closure, *, stop_kind='pause'):
+        connection=self._connection
+        connection.execute('BEGIN IMMEDIATE')
+        with connection:
+            current=self._read_job_control_projection(connection,plan.job.job_id)
+            if (current.generation,current.revision,current.state)!=(result.generation,result.revision,result.state) or (current.state!='paused' and stop_kind!='failure'):
+                raise ValueError('stopped checkpoint stale')
+            origin=self._read_creation_origin(connection,current.job,{},target=False)
+            if origin.kind!='batch' or origin.batch.expected_sha256 is None: return
+            if self._saved_checkpoint(connection,current.job,plan.request_id) is not None: return
+            audit=self._target_latest(connection,current.job)['event_id'];epoch=self._current_worker_epoch(connection)
+            request=pause.request_id if pause is not None else ('cold:'+str(audit) if stop_kind in {'cold','cold_absent'} else ('failure:'+plan.request_id if stop_kind=='failure' else 'shutdown:'+plan.request_id))
+            cause=self._read_target_dispatch_cause(connection,plan.request_id,{})
+            legacy = stop_kind=='pause' and cause['admission_serial']==1 and not connection.execute('SELECT 1 FROM stopped_direct_bodies WHERE job_id=?',(current.job,)).fetchone()
+            value=dict(source=plan.request_id,pause=request,audit=audit,epoch=epoch,generation=current.generation,
+                revision=current.revision,facts=facts.to_record(),closure=closure)
+            if not legacy: value['stop_kind']=stop_kind
+            digest=hashlib.sha256(_batch_canonical(value,16384)).hexdigest()
+            values=(current.job,plan.request_id,request,audit,epoch,current.generation,current.revision,digest,
+                json.dumps(facts.to_record(),separators=(',',':'),sort_keys=True),json.dumps(closure,separators=(',',':'),sort_keys=True))
+            if legacy: connection.execute('INSERT INTO stopped_direct_bodies VALUES (?,?,?,?,?,?,?,?,?,?)',values)
+            else:
+                table='stopped_absent_bodies' if stop_kind=='cold_absent' else 'stopped_failed_bodies' if stop_kind=='failure' else 'stopped_control_bodies' if stop_kind in {'configure','replace_source','edit','purge','collection','preempt'} else 'stopped_direct_cycles'
+                connection.execute(f'INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?,?,?,?)',(*values,stop_kind))
+            self._saved_checkpoint(connection,current.job,plan.request_id)
+
+    def _checkpoint_fence(self, connection, row, *, through=None):
+        epoch,generation,revision=row['worker_epoch'],row['generation'],row['revision']
+        source=row['source_request_id'] if 'source_request_id' in row.keys() else connection.execute('SELECT source_request_id FROM saved_resume_bindings WHERE request_id=?',(row['request_id'],)).fetchone()[0]
+        actions=[(fence['audit_id'],'cold',fence) for fence in connection.execute('SELECT * FROM saved_cold_fences WHERE job_id=? AND new_epoch>?',(row['job_id'],epoch))]
+        actions.extend((edit['audit_id'],'edit',edit) for edit in connection.execute('SELECT * FROM direct_job_edits WHERE job_id=? AND (generation>? OR (generation=? AND revision>?))',(row['job_id'],generation,generation,revision)))
+        actions.extend((reopened['audit_id'],'retry',reopened) for reopened in connection.execute('SELECT * FROM direct_retry_reopens WHERE job_id=? AND generation>?',(row['job_id'],generation)))
+        for _,kind,fence in sorted(actions,key=lambda action:action[0]):
+            if through is not None and (fence['generation'],fence['revision'])>(through[1],through[2]):continue
+            if kind=='retry':
+                reopened=self._retry_reopen(connection,fence['audit_id'])
+                if (reopened['worker_epoch'],reopened['old_generation'],reopened['old_revision'],reopened['source_request_id'])!=(epoch,generation,revision,source):raise ValueError('retry checkpoint chain changed')
+                generation,revision=reopened['generation'],reopened['revision'];continue
+            if kind=='edit':
+                intent,_,_=self._edit_request(connection,fence['request_id'])
+                self._effective_settings(connection,self.get_materialized_job(row['job_id']))
+                if (intent['worker_epoch'],fence['generation'],fence['previous_revision'],fence['source_request_id'])!=(epoch,generation,revision,source):raise ValueError('edited checkpoint chain changed')
+                revision=fence['revision']
+                continue
+            if (fence['old_epoch'],fence['old_generation'],fence['old_revision'])!=(epoch,generation,revision):raise ValueError('cold checkpoint chain changed')
+            if (fence['new_epoch'],fence['generation'],fence['revision'])!=(epoch+1,generation+1,revision+1):raise ValueError('cold checkpoint counters changed')
+            audit=connection.execute('SELECT kind,job_id,generation,revision FROM events WHERE event_id=?',(fence['audit_id'],)).fetchone()
+            if audit is None or tuple(audit)!=('job_paused',row['job_id'],fence['generation'],fence['revision']):raise ValueError('cold checkpoint audit changed')
+            epoch,generation,revision=fence['new_epoch'],fence['generation'],fence['revision']
+        return epoch,generation,revision
+
+    def _reusable_prepared(self, connection, job_id, source):
+        bindings=connection.execute('SELECT * FROM saved_resume_bindings WHERE source_request_id=?',(source,)).fetchall()
+        if not bindings: return None
+        leaves=[binding for binding in bindings if not connection.execute('SELECT 1 FROM saved_resume_bindings WHERE prepared_from=?',(binding['request_id'],)).fetchone()]
+        if len(leaves)!=1: raise ValueError('prepared lineage ambiguous')
+        binding=leaves[0];row=self._continuation_row(connection,job_id,binding['request_id'])
+        if row is None or row['phase']!='ready' or row['worker_epoch']>=self._current_worker_epoch(connection) or binding['drained']!=1:
+            raise ValueError('prepared owner drain unavailable')
+        self._require_ready_saved_pair(connection,job_id,row['request_id'])
+        return row,binding
+
+    def _saved_resume_eligible(self, connection, origin, current, head, command=None):
+        from hermes_downloads.paths import _require_saved_pair
+        if command is not None and self._fresh_retry(connection,current.job,command.request_id): return True
+        if head is not None and head.last_admission_serial==0: return True
+        if origin.kind!='batch' or origin.batch.expected_sha256 is None or head is None or current.state not in {'paused','retry_wait','blocked','needs_auth','needs_link'}: return False
+        checkpoint=self._saved_checkpoint(connection,current.job)
+        if checkpoint is None: return False
+        row,facts=checkpoint
+        budget=self.get_retry_budget(current.job)
+        if budget is not None and (budget.generation!=current.generation or budget.exhausted): return False
+        prior=connection.execute('SELECT 1 FROM saved_direct_continuations WHERE checkpoint_digest=? UNION ALL SELECT 1 FROM saved_direct_cycles WHERE checkpoint_digest=?',(row['checkpoint_digest'],row['checkpoint_digest'])).fetchone()
+        if prior:
+            try:
+                prepared=self._reusable_prepared(connection,current.job,row['source_request_id'])
+                return prepared is not None and self._checkpoint_fence(connection,prepared[0])==(
+                    self._current_worker_epoch(connection),current.generation,current.revision)
+            except (OSError,ValueError): return False
+        if self._checkpoint_fence(connection,row)!=(self._current_worker_epoch(connection),current.generation,current.revision): return False
+        try: _require_saved_pair(self._saved_destination(current.job),self._effective_reservation(connection,current.job),facts)
+        except (OSError,ValueError): return False
+        return True
+
+    def _create_saved_continuation(self, connection, command, job_id):
+        from hermes_downloads.paths import _SAVED_NAMES
+        if self._fresh_retry(connection,job_id,command.request_id): return
+        row,_=self._saved_checkpoint(connection,job_id)
+        current=self._read_job_control_projection(connection,job_id)
+        prepared=self._reusable_prepared(connection,job_id,row['source_request_id'])
+        legacy=prepared is None and not connection.execute('SELECT 1 FROM saved_direct_continuations WHERE job_id=?',(job_id,)).fetchone() and row['version']==22
+        names=_SAVED_NAMES if legacy else tuple('.hermes-resume-'+hashlib.sha256(row['source_request_id'].encode()).hexdigest()+'-'+role for role in ('payload','control'))
+        if prepared is not None: names=tuple(json.loads(prepared[1]['retained_names']))
+        table='saved_direct_continuations' if legacy else 'saved_direct_cycles'
+        connection.execute(f'INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?,?,NULL)',(job_id,command.request_id,command.payload_digest,
+            row['checkpoint_digest'],command.expected_worker_epoch,current.generation,current.revision,
+            'intent' if prepared is None else 'ready','{}' if prepared is None else prepared[0]['facts']))
+        connection.execute('INSERT INTO saved_resume_bindings VALUES (?,?,?,?,?)',(command.request_id,row['source_request_id'],
+            json.dumps(names,separators=(',',':')),int(prepared is not None),None if prepared is None else prepared[0]['request_id']))
+        budget=self.get_retry_budget(job_id)
+        if budget is not None and budget.paused:
+            authority=RetryAuthority.restore(policy=RetryPolicy(),budget=budget);authority.reopen_ordinary(generation=current.generation)
+            self._replace_retry_budget(connection,authority.budget)
+
+    def _saved_continuation(self, connection, job_id, request=None):
+        from hermes_downloads.paths import _SAVED_NAMES
+        row=self._continuation_row(connection,job_id,request)
+        if row is None: return None
+        binding=connection.execute('SELECT * FROM saved_resume_bindings WHERE request_id=?',(row['request_id'],)).fetchone()
+        if binding is None:
+            source=connection.execute('SELECT source_request_id FROM stopped_direct_bodies WHERE job_id=? AND checkpoint_digest=?',(job_id,row['checkpoint_digest'])).fetchone()
+            if source is None: raise ValueError('legacy continuation checkpoint missing')
+            source=source[0];names=_SAVED_NAMES
+        else:
+            source=binding['source_request_id'];names=tuple(json.loads(binding['retained_names']))
+            fixed=tuple('.hermes-resume-'+hashlib.sha256(source.encode()).hexdigest()+'-'+role for role in ('payload','control'))
+            if names not in (_SAVED_NAMES,fixed): raise ValueError('retained names changed')
+            if binding['prepared_from'] is not None:
+                previous=connection.execute('SELECT * FROM saved_resume_bindings WHERE request_id=?',(binding['prepared_from'],)).fetchone()
+                prior=self._continuation_row(connection,job_id,binding['prepared_from'])
+                if (previous is None or previous['source_request_id']!=source or previous['retained_names']!=binding['retained_names']
+                    or previous['drained']!=1 or prior is None or prior['phase']!='ready' or prior['facts']!=row['facts']
+                    or prior['worker_epoch']>=row['worker_epoch']): raise ValueError('prepared drain lineage changed')
+            elif names==_SAVED_NAMES and self._continuation_table(connection,row['request_id'])!='saved_direct_continuations':
+                raise ValueError('legacy retained names changed')
+        checkpoint=self._saved_checkpoint(connection,job_id,source)
+        if checkpoint is None or checkpoint[0]['checkpoint_digest']!=row['checkpoint_digest']: raise ValueError('continuation checkpoint changed')
+        command,_,members=self._read_target_command(connection,row['request_id'],{})
+        selected=[m for m in members if m['job_id']==job_id and m['outcome']=='existing_authority']
+        if len(selected)!=1: raise ValueError('continuation member missing')
+        member=selected[0];prefix='intent' if member['intent_audit_id'] is not None else 'captured'
+        if ((row['generation'],row['revision'])!=(member[prefix+'_generation'],member[prefix+'_revision'])
+            or command.action not in {'resume','start_now'} or command.payload_digest!=row['payload_digest'] or command.expected_worker_epoch!=row['worker_epoch']):
+            raise ValueError('continuation intent changed')
+        # Validate the captured cold chain as it existed at consent, not a later current projection.
+        predecessor=prior if binding is not None and binding['prepared_from'] is not None else checkpoint[0]
+        epoch,generation,revision=self._checkpoint_fence(connection,predecessor,through=(row['worker_epoch'],row['generation'],row['revision']-1))
+        if (row['worker_epoch'],row['generation'],row['revision'])!=(epoch,generation,revision+1): raise ValueError('continuation intent fences changed')
+        cause=self._read_target_dispatch_cause(connection,source,{})
+        if row['body_request_id'] is not None:
+            body=connection.execute('SELECT job_id,activation_request_id,admission_serial FROM target_dispatch_causes WHERE request_id=?',(row['body_request_id'],)).fetchone()
+            if body is None or tuple(body)!=(job_id,row['request_id'],cause['admission_serial']+1): raise ValueError('continuation serial changed')
+        return _SavedResumePlan(job_id,row['request_id'],row['checkpoint_digest'],row['worker_epoch'],row['generation'],row['revision'],source,names,cause['admission_serial'])
+
+    def record_saved_phase(self, plan, phase, facts):
+        connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+        with connection:
+            current=self._read_job_control_projection(connection,plan.job_id);head=self._capture_target_head(connection,plan.job_id)
+            if (self._saved_continuation(connection,plan.job_id)!=plan or self._current_worker_epoch(connection)!=plan.worker_epoch
+                or (current.generation,current.revision,current.state)!=(plan.generation,plan.revision,'queued')
+                or head.activation_request_id!=plan.request_id or head.last_admission_serial!=plan.source_serial
+                or not self._direct_dispatch_admission(connection,materialized=self.get_materialized_job(plan.job_id),now=datetime.now(UTC)).allowed):
+                raise ValueError('saved preparation revoked')
+            row=self._continuation_row(connection,plan.job_id,plan.request_id);old=row['phase']
+            if (old,phase) not in {('intent','linked'),('linked','retired'),('retired','ready')}: raise ValueError('saved phase changed')
+            history=json.loads(row['facts']);expected={'intent':set(),'linked':{'linked'},'retired':{'linked','retired'}}[old]
+            if set(history)!=expected: raise ValueError('saved phase facts changed')
+            history[phase]=facts;table=self._continuation_table(connection,plan.request_id)
+            connection.execute(f'UPDATE {table} SET phase=?,facts=? WHERE request_id=? AND phase=?',(phase,json.dumps(history,separators=(',',':'),sort_keys=True),plan.request_id,old))
+            self._require_one_changed_row(connection,'saved phase CAS')
+            if phase=='ready': self._require_ready_saved_pair(connection,plan.job_id,plan.request_id,require_drain=False)
+
+    def qualify_saved_drain(self, plan):
+        if self._saved_continuation(self._connection,plan.job_id,plan.request_id)!=plan: raise ValueError('saved drain changed')
+        self._require_ready_saved_pair(self._connection,plan.job_id,plan.request_id,require_drain=False)
+        self._connection.execute('UPDATE saved_resume_bindings SET drained=1 WHERE request_id=? AND drained=0',(plan.request_id,))
+        self._require_one_changed_row(self._connection,'saved original observation JOIN')
+
+    def _require_ready_saved_pair(self, connection, job_id, request=None, *, require_drain=True):
+        from hermes_downloads.paths import _require_saved_pair
+        plan=self._saved_continuation(connection,job_id,request)
+        if plan is None: raise ValueError('saved continuation missing')
+        _,facts=self._saved_checkpoint(connection,job_id,plan.source_request_id)
+        row=self._continuation_row(connection,job_id,plan.request_id)
+        if row['phase'] not in {'ready','admitted'}: raise ValueError('saved pair not ready')
+        binding=connection.execute('SELECT drained FROM saved_resume_bindings WHERE request_id=?',(plan.request_id,)).fetchone()
+        if require_drain and (binding is None or binding[0]!=1): raise ValueError('saved original drain missing')
+        history=json.loads(row['facts'])
+        if set(history)!={'linked','retired','ready'}: raise ValueError('saved phase history incomplete')
+        evidence=history['ready']
+        if history['retired']!=dict(retained=evidence['retained']) or set(evidence)!={'retained','candidates'}: raise ValueError('retained phase facts changed')
+        _require_saved_pair(self._saved_destination(job_id),self._effective_reservation(connection,job_id),facts,
+            retained=evidence['retained'],candidates=evidence['candidates'],retained_names=plan.retained_names)
+        return row
+
+    def fail_saved_preparation(self, plan, *, pause=True):
+        table=self._continuation_table(self._connection,plan.request_id)
+        self._connection.execute(f"UPDATE {table} SET phase='failed' WHERE request_id=? AND phase!='admitted'",(plan.request_id,))
+        current=self.get_job(plan.job_id)
+        if pause and current.state=='queued':
+            self.apply_job_control(job_id=plan.job_id,action='pause',request_id='saved-failed:'+plan.checkpoint_digest,payload_digest=plan.checkpoint_digest,expected_revision=current.revision)
+
+    def cold_body_owner(self, record):
+        rows=self._connection.execute('SELECT * FROM saved_body_owners WHERE worker_epoch=?',(record.worker_epoch,)).fetchall()
+        selected=[]
+        for owner in rows:
+            if json.loads(owner['process'])!=record.identity.to_record(): continue
+            receipt=self._read_direct_dispatch_command(self._connection,owner['request_id'])
+            cause=self._read_target_dispatch_cause(self._connection,owner['request_id'],{})
+            if receipt is None or cause is None or cause['kind']!='body' or receipt.status!='started': continue
+            fence=self._connection.execute('SELECT * FROM saved_cold_fences WHERE job_id=? AND new_epoch=?',(receipt.job,self.worker_epoch())).fetchone()
+            if (fence is not None and fence['old_state']=='downloading' and fence['old_epoch']==record.worker_epoch
+                and fence['old_generation']==receipt.generation and self._latest_body_source(self._connection,receipt.job)==owner['request_id']
+                and self._saved_checkpoint(self._connection,receipt.job,owner['request_id']) is None):
+                selected.append((owner,receipt))
+        if len(selected)>1: raise ValueError('cold BODY ownership ambiguous')
+        return selected[0] if selected else None
+
+    def seal_cold_body(self, record, owned, completed, facts):
+        owner,receipt=owned
+        if self.cold_body_owner(record)!=owned: raise ValueError('cold BODY ownership changed')
+        job=self.get_materialized_job(receipt.job)
+        current=self.get_job(receipt.job)
+        plan=_DirectDispatchPlan(job,self._effective_reservation(self._connection,receipt.job),
+            self._direct_dispatch_admission(self._connection,materialized=job,now=datetime.now(UTC)),
+            receipt.generation,receipt.revision,receipt.request_id,receipt.payload_digest)
+        closure=dict(process=record.identity.to_record(),returncode=None,group_absent=True,observer_joined=False,
+            gid=owner['gid'],completed_length=completed)
+        self.seal_stopped_direct_body(plan,None,current,facts,closure,stop_kind='cold_absent' if completed is None else 'cold')
+
+    def retained_cleanup_records(self, plan, *, authorize=False):
+        from hermes_downloads.paths import _saved_open_chain,_saved_visible,_STAGED_PARTIAL_READ_FLAGS
+        import os
+        connection=self._connection
+        if authorize: connection.execute('BEGIN IMMEDIATE')
+        try:
+            claim=self._require_cleanup_plan(connection,plan,{})
+            records=[]
+            rows=connection.execute("SELECT * FROM saved_direct_continuations WHERE job_id=? AND phase='admitted' UNION ALL SELECT * FROM saved_direct_cycles WHERE job_id=? AND phase='admitted'",(claim.job_id,claim.job_id)).fetchall()
+            for row in rows:
+                continuation=self._saved_continuation(connection,claim.job_id,row['request_id'])
+                checkpoint,pair=self._saved_checkpoint(connection,claim.job_id,continuation.source_request_id)
+                history=json.loads(row['facts'])
+                if set(history)!={'linked','retired','ready'} or history['retired']!=dict(retained=history['ready']['retained']):
+                    raise ValueError('retained cleanup history changed')
+                for role,(name,facts) in enumerate(zip(continuation.retained_names,history['ready']['retained'])):
+                    encoded=json.dumps(facts,separators=(',',':'))
+                    previous=connection.execute('SELECT * FROM saved_retained_cleanup WHERE request_id=? AND role=?',(row['request_id'],role)).fetchone()
+                    if previous is None:
+                        if not authorize: raise ValueError('retained cleanup authority missing')
+                        descriptors,_,_=_saved_open_chain(claim.attempt.prepared.destination,claim.attempt.prepared.reservation,pair)
+                        fd=None
+                        try:
+                            fd=os.open(name,_STAGED_PARTIAL_READ_FLAGS,dir_fd=descriptors[3])
+                            if _saved_visible(descriptors[3],name,fd)!=tuple(facts): raise ValueError('retained cleanup source changed')
+                        finally:
+                            if fd is not None: os.close(fd)
+                            for descriptor in reversed(descriptors): os.close(descriptor)
+                        connection.execute("INSERT INTO saved_retained_cleanup VALUES (?,?,?,?,?,'authorized')",(row['request_id'],role,claim.attempt_id,name,encoded))
+                        phase='authorized'
+                    else:
+                        if (previous['attempt_id'],previous['basename'],previous['facts'])!=(claim.attempt_id,name,encoded):
+                            raise ValueError('retained cleanup authority changed')
+                        phase=previous['phase']
+                    records.append(dict(request_id=row['request_id'],source_request_id=continuation.source_request_id,role=role,
+                        basename=name,facts=facts,phase=phase,checkpoint=pair.to_record()))
+            known=connection.execute('SELECT count(*) FROM saved_retained_cleanup WHERE attempt_id=?',(claim.attempt_id,)).fetchone()[0]
+            if known!=len(records): raise ValueError('retained cleanup aliases changed')
+            if authorize: connection.commit()
+            return records
+        except BaseException:
+            if authorize: connection.rollback()
+            raise
+
+    def acknowledge_retained_cleanup(self, plan):
+        from hermes_downloads.paths import _require_retained_absence
+        records=self.retained_cleanup_records(plan)
+        _require_retained_absence(plan.claim.attempt.prepared,records,marker_present=True)
+        for record in records:
+            self._connection.execute("UPDATE saved_retained_cleanup SET phase='absent' WHERE request_id=? AND role=? AND phase='authorized'",(record['request_id'],record['role']))
+        return records
+
+    def _qualify_cleanup_target(self, connection, request, job_id, epoch):
+        command,_,members=self._read_target_command(connection,request,{})
+        carrier=connection.execute('SELECT * FROM saved_cleanup_requests WHERE request_id=?',(request,)).fetchone()
+        current=self._read_job_control_projection(connection,job_id)
+        if (command.action!='resume' or command.expected_worker_epoch!=epoch or carrier is None
+            or (carrier['job_id'],carrier['worker_epoch'])!=(job_id,epoch) or len(members)!=1
+            or members[0]['outcome']!='existing_authority'
+            or (members[0]['job_id'],members[0]['captured_generation'],members[0]['captured_revision'],members[0]['captured_state'])!=
+                (job_id,current.generation,current.revision,'completed')):
+            raise ValueError('cleanup target authority changed')
+        return command

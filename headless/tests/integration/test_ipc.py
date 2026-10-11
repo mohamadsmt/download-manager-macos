@@ -49,6 +49,86 @@ from hermes_downloads.store import (
 _WATCHDOG_SECONDS = 5.0
 
 
+def test_notification_real_owner_callbacks_are_closed_and_share_original_deadline(short_socket_root):
+    path = short_socket_root / 'worker.sock'
+    calls = []
+    with closing(SQLiteStore(short_socket_root / 'events.db')) as store:
+        def callback(command, deadline):
+            calls.append((type(command), deadline - time.monotonic()))
+            return store.read_notification_pending(command, deadline=deadline)
+        with closing(ipc.HealthServer(path, health=lambda: ipc.WorkerHealth(1,'paused'),
+                notification_pending=callback)) as server:
+            result = _serve_one(server, lambda: ipc.request_notification(path, ipc.NotificationPendingCommand()))
+            assert result.record['events'] == []
+            assert calls[0][0] is ipc.NotificationPendingCommand and 0 < calls[0][1] <= 2
+            for bad in [dict(op='notification_pending',protocol_version=1,view='pending',limit=True),
+                    dict(op='notification_pending',protocol_version=1,view='pending',limit=1,path='secret')]:
+                response = _serve_one(server, lambda: _raw_request(path, json.dumps(bad).encode()+b'\n'))
+                assert response == {'error':'downloads_notifications_unavailable'}
+            assert len(calls) == 1
+
+
+def test_notification_sql_contention_spends_remaining_accept_deadline_and_restores(short_socket_root):
+    database = short_socket_root / 'events.db'; path = short_socket_root / 'worker.sock'
+    with closing(SQLiteStore(database)) as store, closing(sqlite3.connect(database)) as blocker:
+        store._connection.execute('PRAGMA busy_timeout=37')
+        blocker.execute('BEGIN EXCLUSIVE')
+        seen = []; errors = []
+        def callback(command, deadline):
+            seen.append(deadline-time.monotonic())
+            return store.claim_notification(command, deadline=deadline)
+        with closing(ipc.HealthServer(path, health=lambda: ipc.WorkerHealth(1,'paused'), notification_claim=callback)) as server:
+            def slow():
+                try:
+                    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
+                        client.settimeout(5); client.connect(str(path)); client.sendall(b'{'); time.sleep(1.4)
+                        wire = ipc.NotificationClaimCommand('12345678-1234-1234-1234-123456789abc').to_record()
+                        client.sendall(json.dumps(wire).encode()[1:]+b'\n'); client.shutdown(socket.SHUT_WR)
+                        client.recv(4096)
+                except BaseException as e: errors.append(e)
+            observer = threading.Thread(target=slow); observer.start(); started = time.monotonic()
+            try: server.serve_once()
+            finally: observer.join(5); blocker.rollback()
+            assert not observer.is_alive() and not errors and time.monotonic()-started < 2.6
+            assert len(seen) == 1 and 0 < seen[0] < .8
+            assert store._connection.execute('PRAGMA busy_timeout').fetchone()[0] == 37
+            assert not store._connection.in_transaction
+            assert _serve_one(server, lambda: ipc.request_notification(path, ipc.NotificationClaimCommand(
+                '12345678-1234-1234-1234-123456789abc'))).record['claims'] == []
+
+
+def test_notification_client_original_five_seconds_includes_eof(short_socket_root):
+    path = short_socket_root / 'delayed.sock'; stop = threading.Event(); errors = []
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(path)); listener.listen(1); listener.settimeout(5)
+        def respond():
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    assert ipc._read_line(connection) is not None
+                    connection.sendall(b'{"schema_version":1,"profile":"default","source":"local","events":[],"next_cursor":null,"has_more":false}\n')
+                    stop.wait(6)
+            except BaseException as error: errors.append(error)
+        observer = threading.Thread(target=respond); observer.start(); started = time.monotonic()
+        try:
+            with pytest.raises(ipc.IPCError, match='^downloads_notifications_unavailable$'):
+                ipc.request_notification(path, ipc.NotificationPendingCommand())
+            assert 4.8 <= time.monotonic()-started < 5.6
+        finally: stop.set(); observer.join(5)
+        assert not observer.is_alive() and not errors
+
+
+@pytest.mark.parametrize('reply', [b'{}\n', b'{"error":"private-engine-output"}\n', b'{}\n{}\n'])
+def test_notification_transport_failure_is_closed_redacted(short_socket_root, reply):
+    path = short_socket_root / 'bad.sock'; requests = []
+    observer, errors = _start_response_server(path, reply, requests)
+    try:
+        with pytest.raises(ipc.IPCError, match='^downloads_notifications_unavailable$'):
+            ipc.request_notification(path, ipc.NotificationPendingCommand())
+    finally: observer.join(5)
+    assert not observer.is_alive() and not errors
+
+
 @pytest.mark.parametrize('counter', [0, 9007199254740991])
 def test_query_dtos_safe_integer_boundaries_and_exact_health_compatibility(counter):
     row = ipc.PublicJobRecord('job', counter, counter, 'removed')
@@ -82,7 +162,8 @@ def test_query_cursors_canonical_closed_disjoint_and_bounded():
 
 def test_query_event_whitelist_is_exact_and_closed():
     kinds = {'job_added', 'job_target_authorized', 'job_paused', 'job_resumed',
-        'job_start_now_requested', 'job_removed', 'job_resolving', 'job_downloading', 'job_finalizing', 'job_completed'}
+        'job_start_now_requested', 'job_removed', 'job_resolving', 'job_downloading', 'job_finalizing', 'job_completed',
+        'job_failure','job_edited','job_retry_opened'}
     assert ipc._QUERY_EVENT_KINDS == kinds
     for kind in kinds:
         event = ipc.QueryEventRecord(1, kind, 'job', 0, 0)
@@ -2845,8 +2926,8 @@ def test_worker_direct_activation_blocks_retry_after_unpersisted_cleanup_failure
             _join(process)
             assert _result(results) == (
                 "error",
-                "RuntimeError",
-                "fake direct close failure",
+                "IPCStateError",
+                "direct_dispatch_blocked",
             )
             assert _direct_engine_claims(state_root) == (None, retained_fence)
 
@@ -2959,8 +3040,8 @@ def test_worker_direct_activation_shutdown_close_failure_retains_exact_record() 
             _join(process)
             assert _result(results) == (
                 "error",
-                "RuntimeError",
-                "fake direct close failure",
+                "IPCStateError",
+                "direct_dispatch_blocked",
             )
             assert reconciliation_called.wait(_WATCHDOG_SECONDS)
             assert close_called.wait(_WATCHDOG_SECONDS)
@@ -5753,13 +5834,28 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                 assert activate_direct_engine(socket_path, expected_worker_epoch=1).status == "blocked"
                 observer = SQLiteStore(state_root / "state.db")
                 try:
-                    assert observer.get_direct_engine_record() is None
+                    assert observer.get_direct_engine_record()==owned
+                    assert observer._get_direct_engine_recovery_capability(owned) is not None
                 finally:
                     observer.close()
                 release.set()
                 assert returned.wait(_WATCHDOG_SECONDS)
+                deadline=time.monotonic()+_WATCHDOG_SECONDS
+                while True:
+                    observer=SQLiteStore(state_root/'state.db')
+                    try:retained=observer.get_direct_engine_record()
+                    finally:observer.close()
+                    if retained is None:break
+                    assert time.monotonic()<deadline;time.sleep(.005)
             elif action == "shutdown":
                 shutdown.set()
+                assert not stopped.wait(1.7) and process.is_alive() and not returned.is_set()
+                import fcntl
+                with (state_root/'.worker.lock').open('rb') as lease:
+                    with pytest.raises(BlockingIOError):fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                observer=SQLiteStore(state_root/'state.db')
+                try:assert observer.get_direct_engine_record()==owned
+                finally:observer.close()
                 release.set()
                 assert stopped.wait(_WATCHDOG_SECONDS)
                 _join(process)
@@ -5782,7 +5878,7 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                     observer.close()
                 return
             if action != "shutdown":
-                expected = "paused" if mode in {"rpc", "error", "marker", "absent"} or action == "pause" else "removed" if action == "remove" else "completed"
+                expected = "needs_link" if mode=="error" else "paused" if mode in {"rpc", "marker", "absent"} or action == "pause" else "removed" if action == "remove" else "completed"
                 deadline = time.monotonic() + _WATCHDOG_SECONDS
                 while request_jobs_page(socket_path).jobs[0].state != expected and time.monotonic() < deadline:
                     time.sleep(0.005)
@@ -5821,6 +5917,8 @@ def test_worker_terminal_observation_is_responsive_and_fenced(short_socket_root,
                         assert observer._get_staged_payload_binding("dispatch-job") is None
                     if mode in {"rpc", "error"}:
                         assert observer.get_direct_engine_record() is None
+                    if mode=="error":
+                        assert [tuple(row) for row in observer._connection.execute("SELECT type,count FROM notification_outbox")]==[("needs_link",1)]
                 finally:
                     observer.close()
                 partial = root / ".incomplete" / "dispatch-job" / "dispatch.bin"
@@ -6000,6 +6098,14 @@ def test_stage_producer_real_completion_races_and_crash_retention(short_socket_r
                 assert (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) == (
                     details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)
                 assert current.st_ctime_ns != details.st_ctime_ns
+            if action in {'pause','remove','queue'}:
+                observer = SQLiteStore(state_root / 'state.db')
+                try:
+                    assert observer.get_direct_engine_record() == owned
+                    assert observer._get_direct_engine_recovery_capability(owned) is not None
+                finally:
+                    observer.close()
+                assert not returned.is_set()
             if process.is_alive():
                 release.set()
             if mode in {"persist-uncertain", "contain-uncertain"}:
@@ -6064,3 +6170,25 @@ def test_stage_producer_real_completion_races_and_crash_retention(short_socket_r
                 _join(process)
             if owned is not None and not _group_is_gone(owned.identity.process_group_id):
                 os.killpg(owned.identity.process_group_id, signal.SIGKILL)
+
+
+@pytest.mark.parametrize('revision',[str((1<<63)-1),'01',True,1.5,str(1<<63)])
+def test_source_receipt_uses_closed_decimal_signed64_counter(tmp_path,revision):
+    with tempfile.TemporaryDirectory(prefix='source-reply-',dir='/private/tmp') as temporary:
+        endpoint=Path(temporary)/'s';command=ipc.ReplaceSourceCommand('job','https://example.test/file','source-request')
+        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as server:
+            server.bind(str(endpoint));server.listen(1);errors=[]
+            def respond():
+                try:
+                    client,_=server.accept()
+                    with client:
+                        while client.recv(4096):pass
+                        client.sendall(json.dumps(dict(request_id=command.request_id,id=command.id,revision=revision,status='pending',replayed=False)).encode()+b'\n')
+                except BaseException as error:errors.append(error)
+            observer=threading.Thread(target=respond);observer.start()
+            try:
+                if revision==str((1<<63)-1):assert ipc.request_source(endpoint,command)['revision']==revision
+                else:
+                    with pytest.raises(ipc.IPCError):ipc.request_source(endpoint,command)
+            finally:observer.join(5)
+            assert not observer.is_alive() and not errors

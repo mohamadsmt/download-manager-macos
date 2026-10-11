@@ -205,14 +205,14 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
             return
 
         status, headers, body = self._response_for(endpoint, handler.headers.get("Range"))
-        self._send_response(
+        sent = self._send_response(
             handler,
             status,
             headers,
             body,
             pace_large_range=(endpoint == "range" and len(self.payload) > _PAYLOAD_BYTES),
         )
-        self._record_request(endpoint, len(body), 0, handler.headers.get("Range"))
+        self._record_request(endpoint, sent, 0, handler.headers.get("Range"))
 
     def _response_for(
         self, endpoint: str, range_header: str | None
@@ -290,7 +290,7 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
         *,
         content_length: int | None = None,
         pace_large_range: bool = False,
-    ) -> None:
+    ) -> int:
         handler.send_response(status)
         for name, value in headers.items():
             handler.send_header(name, value)
@@ -298,20 +298,22 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
             "Content-Length", str(len(body) if content_length is None else content_length)
         )
         handler.end_headers()
+        sent = 0
         if not body:
-            return
+            return sent
         try:
             if pace_large_range:
                 for start in range(0, len(body), _RANGE_PACED_CHUNK_BYTES):
-                    handler.wfile.write(body[start : start + _RANGE_PACED_CHUNK_BYTES])
+                    sent += handler.wfile.write(body[start : start + _RANGE_PACED_CHUNK_BYTES])
                     handler.wfile.flush()
                     if start + _RANGE_PACED_CHUNK_BYTES < len(body):
                         time.sleep(_RANGE_PACED_CHUNK_DELAY_SECONDS)
             else:
-                handler.wfile.write(body)
+                sent += handler.wfile.write(body)
                 handler.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            return
+            pass
+        return sent
 
     def _send_delayed(self, handler: BaseHTTPRequestHandler, endpoint: str) -> None:
         handler.send_response(200)
@@ -332,8 +334,8 @@ class SyntheticHttpOrigin(metaclass=_SyntheticHttpOriginMeta):
     def _send_disconnect(self, handler: BaseHTTPRequestHandler, endpoint: str) -> None:
         body = self.payload[: self.disconnect_after]
         handler.close_connection = True
-        self._send_response(handler, 200, {}, body, content_length=len(self.payload))
-        self._record_request(endpoint, len(body), 1, handler.headers.get("Range"))
+        sent = self._send_response(handler, 200, {}, body, content_length=len(self.payload))
+        self._record_request(endpoint, sent, 1, handler.headers.get("Range"))
 
     def _record_connection(self) -> None:
         with self._lock:

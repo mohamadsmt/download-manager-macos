@@ -43,7 +43,7 @@ Proven local packaging pattern: `/Users/mohamadsmt/Documents/google-docs-mcp/scr
 
 Use finite integer shares `b_i` so each running job has `b_i <= item_cap_i` and `sum(b_i) <= global_cap`. Equal-share capped allocation is enough; no adaptive bandwidth optimizer.
 
-- Direct: one private aria2 daemon, per-GID `max-download-limit`, plus `max-overall-download-limit` equal to the total direct allocation.
+- Direct: one existing private aria2 controller/daemon per active job, qualified by job, dispatch, epoch, token, birth and GID. Each daemon receives that job's share through both `max-download-limit` and `max-overall-download-limit`; the aggregate shares stay within the global budget. This permits independent sibling containment without replacing the stock engine.
 - Zero allocated budget means WAIT, not `0` passed to aria2 (where zero means unlimited).
 - Reconfiguration closes admission, reduces/quiesces old transfers, confirms process-group termination when necessary, applies reductions before increases, then reopens admission. No old-cap process may survive the acknowledgement.
 - Proposed acceptance semantics: direct-file payload bytes, not total machine traffic or instantaneous wire rate; each 30-second steady measurement window after 10-second settling must be <=105% of cap. Measure short-window bursts separately. These are test thresholds, not already-proven engine guarantees. If stock engines fail, stop and revise rather than waive A08.

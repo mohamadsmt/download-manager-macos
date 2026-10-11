@@ -308,6 +308,7 @@ def test_actual_new_completion_removes_only_owned_partial_and_marker():
         _wait(lambda: any(row['kind'] == 'durable-finish_direct_cleanup' for row in _effect_rows(fixture)))
         assert final.stat().st_nlink == 1
         assert _rows(fixture['database'], "SELECT count(*) FROM events WHERE kind='job_completed'") == [(1,)]
+        assert _rows(fixture['database'], 'SELECT type,count FROM notification_outbox') == [('completion',1)]
         assert _rows(fixture['database'], 'SELECT * FROM direct_dispatch_commands WHERE request_id=?',
             ('cleanup-start',))[0] == fixture['original_receipt']
         assert _rows(fixture['database'], 'SELECT phase FROM direct_cleanup_claims') == [('finished',)]
@@ -440,6 +441,7 @@ def test_actual_completion_and_cleanup_faults_keep_truthful_atomic_phase(mode, p
         if phase is None:
             assert _rows(fixture['database'], 'SELECT count(*) FROM final_publication_bindings') == [(0,)]
         assert _rows(fixture['database'], "SELECT count(*) FROM events WHERE kind='job_completed'") == [(0 if phase is None else 1,)]
+        assert _rows(fixture['database'], 'SELECT count(*) FROM notification_outbox') == [(0 if phase is None else 1,)]
         assert _rows(fixture['database'], 'SELECT * FROM direct_dispatch_commands WHERE request_id=?',
             ('cleanup-start',))[0] == fixture['original_receipt']
         assert (fixture['partial'].parent / 'unknown.sidecar').exists()

@@ -6,6 +6,10 @@ from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 import importlib
 import importlib.util
+import json
+import pwd
+import signal
+import time
 import os
 from pathlib import Path
 import shutil
@@ -65,6 +69,7 @@ def _environment(private_roots: dict[str, Path]) -> dict[str, str]:
             "UV_CACHE_DIR": str(private_roots["uv_cache"]),
             "UV_LINK_MODE": "copy",
             "UV_NO_PROGRESS": "1",
+            "UV_OFFLINE": "1",
         }
     )
     return environment
@@ -73,19 +78,29 @@ def _environment(private_roots: dict[str, Path]) -> dict[str, str]:
 def _run(
     argv: list[str], *, cwd: Path, environment: dict[str, str], timeout: float = 120
 ) -> subprocess.CompletedProcess[str]:
+    started=time.monotonic();birth=None;out=err='';timed_out=False
+    child=subprocess.Popen(argv,cwd=cwd,env=environment,stdin=subprocess.DEVNULL,text=True,
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
     try:
-        completed = subprocess.run(
-            argv,
-            cwd=cwd,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-        )
+        birth=subprocess.check_output(['/bin/ps','-p',str(child.pid),'-o','pid=,ppid=,pgid=,lstart=,comm='],text=True,timeout=5).strip()
+        out,err=child.communicate(timeout=max(.001,timeout-(time.monotonic()-started)))
     except subprocess.TimeoutExpired:
-        pytest.fail(f"command timed out: {argv[0]}")
+        timed_out=True
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid,signal.SIGTERM)
+            try:child.wait(timeout=5)
+            except subprocess.TimeoutExpired:os.killpg(child.pid,signal.SIGKILL);child.wait(timeout=5)
+        waited=child.wait(timeout=0)
+        try:os.killpg(child.pid,0);absent=False
+        except ProcessLookupError:absent=True
+        evidence=os.environ.get('T18_IMPLEMENTATION_RUN')
+        if evidence:
+            with (Path(evidence)/'packaging-processes.jsonl').open('a') as stream:
+                stream.write(json.dumps(dict(kind='packaging-original-child',argv=argv,pid=child.pid,birth=birth,wait_returncode=waited,reaped=True,group_absent=absent,timed_out=timed_out,elapsed_seconds=time.monotonic()-started))+'\n')
+    assert absent
+    if timed_out:pytest.fail(f'command timed out: {argv[0]}')
+    completed=subprocess.CompletedProcess(argv,waited,out,err)
     assert completed.returncode == 0, completed.stderr[-4000:]
     return completed
 
@@ -180,7 +195,7 @@ def test_installed_wheel_imports_from_scratch_without_ambient_python_paths(
         path.mkdir(mode=0o700)
 
     _run(
-        [uv, "build", "--wheel", "--out-dir", str(wheel_root)],
+        [uv, "build", "--offline", "--cache-dir", str(Path(pwd.getpwuid(os.geteuid()).pw_dir)/".cache/uv"), "--wheel", "--out-dir", str(wheel_root)],
         cwd=HEADLESS_ROOT,
         environment=clean_environment,
     )

@@ -85,7 +85,9 @@ async function harness(options = {}) {
     socket(path, fn) { const s = { path, fn, cancelled: false }; sockets.push(s); return () => { s.cancelled = true; }; },
     async rest(path, opts = {}) {
       calls.push({ path, opts, profile: state.profile.get(), connectionId: state.connectionId.get(), gateway: state.gateway.get() });
+      if (path.startsWith('/files/') && !options.files) return { request: null };
       if (handler) return handler(path, opts);
+      if (path === '/files/reveals') return { request: null };
       if (path.startsWith('/events?')) return pending();
       if (path === '/events/claim') return claims();
       if (path === '/events/presented') return { status: 'presented' };
@@ -122,13 +124,13 @@ for (const scope of [
   { connectionId: '' }, { gateway: 'closed' }, { gateway: 'connecting' },
 ]) test(`inactive scope makes no calls ${JSON.stringify(scope)}`, async () => {
   const h = await harness(scope); h.poll(); h.wake(); await flush();
-  assert.equal(h.calls.length, 0); assert.equal(h.notifications.length, 0);
+  assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 0); assert.equal(h.notifications.length, 0);
   assert.equal(h.sockets.length, 0); assert.equal(h.intervals.length, 0);
   h.dispose();
 });
 test('local/default/open uses pure bounded query then one claim and receipt ack', async () => {
   const h = await harness({ connectionId: 'local' }); await flush();
-  assert.deepEqual(h.calls.map(c => c.path), ['/events?view=pending&limit=1', '/events/claim', '/events/presented']);
+  assert.deepEqual(h.calls.filter(c => !c.path.startsWith('/files/')).map(c => c.path), ['/events?view=pending&limit=1', '/events/claim', '/events/presented']);
   assert.equal(h.queryCalls.length, 1);
   const q = h.queryCalls[0];
   assert.equal(q.retry, false); assert.equal(q.staleTime, 0);
@@ -148,7 +150,7 @@ test('local/default/open uses pure bounded query then one claim and receipt ack'
 });
 test('empty read never claims; has_more never drains without another wake', async () => {
   const h = await harness({ rest: path => path.startsWith('/events?') ? pending(null, { has_more: true, next_cursor: 'cursor-1' }) : assert.fail('no mutation from empty read') });
-  await flush(); assert.equal(h.calls.length, 1); h.dispose();
+  await flush(); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 1); h.dispose();
 });
 test('has_more with a completion still produces only one notification', async () => {
   const h = await harness({ rest: path => path.startsWith('/events?') ? pending(event(), { has_more: true, next_cursor: 'cursor-1' }) : path === '/events/claim' ? claims() : { status: 'presented' } });
@@ -178,7 +180,7 @@ const badEvents = [
 ];
 for (const [name, patch] of badEvents) test(`reject ${name} in pure read before mutation`, async () => {
   const h = await harness({ rest: path => path.startsWith('/events?') ? pending(event(patch)) : assert.fail('malformed read must not mutate') });
-  await flush(); assert.equal(h.notifications.length, 0); assert.equal(h.calls.length, 1); h.dispose();
+  await flush(); assert.equal(h.notifications.length, 0); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 1); h.dispose();
 });
 for (const [name, patch] of [
   ['unknown envelope', { message: 'SECRET' }], ['wrong profile', { profile: 'work' }],
@@ -188,7 +190,7 @@ for (const [name, patch] of [
   ['newline cursor', { next_cursor: 'cursor-1\n' }],
 ]) test(`reject pending ${name}`, async () => {
   const h = await harness({ rest: () => pending(event(), patch) });
-  await flush(); assert.equal(h.calls.length, 1); assert.equal(h.notifications.length, 0); h.dispose();
+  await flush(); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 1); assert.equal(h.notifications.length, 0); h.dispose();
 });
 for (const [name, patch] of [
   ['wrong profile', { profile: 'work' }], ['wrong source', { source: 'remote' }],
@@ -202,7 +204,7 @@ for (const [name, patch] of [
   ['malformed claim DTO', { claims: [{ ...claims().claims[0], event: event({ reason_code: 'SECRET' }) }] }],
 ]) test(`reject claim ${name} before notification or ack/release`, async () => {
   const h = await harness({ rest: path => path.startsWith('/events?') ? pending() : claims(event(), patch) });
-  await flush(); assert.equal(h.calls.length, 2); assert.equal(h.notifications.length, 0); h.dispose();
+  await flush(); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 2); assert.equal(h.notifications.length, 0); h.dispose();
 });
 for (const state of ['presented', 'resolved']) test(`already ${state} data never notifies or claims`, async () => {
   const h = await harness({ rest: () => pending(event({ presentation_state: state })) });
@@ -263,11 +265,11 @@ for (const field of ['profile', 'connectionId', 'gateway']) for (const stage of 
     return path.startsWith('/events?') ? pending() : path === '/events/claim' ? claims() : { status: 'presented' };
   } });
   await flush(); assert.equal(blocked, true);
-  const before = h.calls.length;
+  const before = h.calls.filter(c => !c.path.startsWith('/files/')).length;
   h.state[field].set(field === 'profile' ? 'work' : field === 'connectionId' ? 'remote' : 'closed');
   d.resolve(stage === 'query' ? pending() : stage === 'claim' ? claims() : { status: stage === 'ack' ? 'presented' : 'released' });
   await flush(); h.poll(); h.wake(); await flush();
-  assert.equal(h.calls.length, before);
+  assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, before);
   assert.equal(h.notifications.length, stage === 'query' || stage === 'claim' ? 0 : 1);
   assert.ok(h.sockets.every(s => s.cancelled)); assert.ok(h.intervals.every(t => t.cancelled)); h.dispose();
 });
@@ -276,7 +278,7 @@ test('scope change within synchronous notify prevents stale ack and release', as
   const claim = deferred();
   h = await harness({ notify: () => { h.state.profile.set('work'); return ''; }, rest: path => path.startsWith('/events?') ? pending() : claim.promise });
   await flush(); claim.resolve(claims()); await flush();
-  assert.equal(h.calls.length, 2); assert.equal(h.notifications.length, 1); h.dispose();
+  assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 2); assert.equal(h.notifications.length, 1); h.dispose();
 });
 for (const stage of ['query', 'claim', 'ack', 'release']) test(`dispose during ${stage} await removes lifetime and stops effects`, async () => {
   const d = deferred();
@@ -284,10 +286,10 @@ for (const stage of ['query', 'claim', 'ack', 'release']) test(`dispose during $
     if ((stage === 'query' && path.startsWith('/events?')) || path === `/events/${stage === 'ack' ? 'presented' : stage}`) return d.promise;
     return path.startsWith('/events?') ? pending() : claims();
   } });
-  await flush(); const before = h.calls.length; h.dispose();
+  await flush(); const before = h.calls.filter(c => !c.path.startsWith('/files/')).length; h.dispose();
   d.resolve(stage === 'query' ? pending() : stage === 'claim' ? claims() : { status: 'presented' });
   await flush(); h.poll(); h.wake(); await flush();
-  assert.equal(h.calls.length, before); assert.ok(h.sockets.every(s => s.cancelled)); assert.ok(h.intervals.every(t => t.cancelled));
+  assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, before); assert.ok(h.sockets.every(s => s.cancelled)); assert.ok(h.intervals.every(t => t.cancelled));
   for (const a of Object.values(h.state)) assert.equal(a.listeners.size, 0);
   assert.equal(h.cache.size, 0); assert.ok(h.removals.every(r => r.exact === true));
 });
@@ -366,7 +368,7 @@ for (const path of [
 ]) test(`unsafe reveal path ${JSON.stringify(path)} never contributes an action or notification`, async () => {
   const e = event({ reveal_path: path });
   const h = await harness({ rest: () => pending(e) }); await flush();
-  assert.equal(h.notifications.length, 0); assert.equal(h.reveals.length, 0); assert.equal(h.calls.length, 1); h.dispose();
+  assert.equal(h.notifications.length, 0); assert.equal(h.reveals.length, 0); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 1); h.dispose();
 });
 
 test('valid bounded identifiers and reason codes never leak into fixed toast copy', async () => {
@@ -395,26 +397,26 @@ for (const stage of ['query', 'claim', 'ack', 'release']) test(`leave and return
     if (target && first) { first = false; return d.promise; }
     return path.startsWith('/events?') ? pending() : path === '/events/claim' ? claims() : { status: stage === 'release' ? 'released' : 'presented' };
   } });
-  await flush(); const oldCalls = h.calls.length; const oldNotifications = h.notifications.length;
+  await flush(); const oldCalls = h.calls.filter(c => !c.path.startsWith('/files/')).length; const oldNotifications = h.notifications.length;
   const oldSocket = h.sockets[0];
   h.state.connectionId.set('remote'); h.state.connectionId.set('local');
-  await flush(); assert.equal(h.calls.length, oldCalls, 'new activation waits for the old serialized lane');
+  await flush(); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, oldCalls, 'new activation waits for the old serialized lane');
   d.resolve(stage === 'query' ? pending() : stage === 'claim' ? claims() : { status: stage === 'release' ? 'released' : 'presented' });
   await flush();
   assert.equal(h.notifications.length, oldNotifications + 1);
   assert.equal(oldSocket.cancelled, true); assert.equal(h.cache.size, 1);
   const claimCalls = of(h, '/events/claim');
   if (claimCalls.length > 1) assert.notEqual(claimCalls[0].opts.body.consumer_id, claimCalls[1].opts.body.consumer_id);
-  const before = h.calls.length; oldSocket.fn({}); await flush(); assert.equal(h.calls.length, before);
+  const before = h.calls.filter(c => !c.path.startsWith('/files/')).length; oldSocket.fn({}); await flush(); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, before);
   h.dispose(); await flush(); assert.equal(h.cache.size, 0);
 });
 test('disabled lifetime ignores delayed socket, poll and captured reveal callbacks', async () => {
   const e = event({ reveal_path: goodPath });
   const h = await harness({ rest: path => path.startsWith('/events?') ? pending(e) : path === '/events/claim' ? claims(e) : { status: 'presented' } });
-  await flush(); const action = h.notifications[0].action; const before = h.calls.length;
+  await flush(); const action = h.notifications[0].action; const before = h.calls.filter(c => !c.path.startsWith('/files/')).length;
   h.dispose(); for (const s of h.sockets) s.fn({}); for (const t of h.intervals) t.fn();
   await action.onClick(); await flush();
-  assert.equal(h.calls.length, before); assert.equal(h.reveals.length, 0); assert.equal(h.notifications.length, 1);
+  assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, before); assert.equal(h.reveals.length, 0); assert.equal(h.notifications.length, 1);
 });
 
 test('malformed release response preserves uncertainty without duplicate notify', async () => {
@@ -429,20 +431,53 @@ test('malformed release response preserves uncertainty without duplicate notify'
 });
 test('empty claim produces no notification or mutation', async () => {
   const h = await harness({ rest: path => path.startsWith('/events?') ? pending() : claims(null) });
-  await flush(); assert.equal(h.calls.length, 2); assert.equal(h.notifications.length, 0); h.dispose();
+  await flush(); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 2); assert.equal(h.notifications.length, 0); h.dispose();
 });
 test('malformed pure read is never stored in the shared query cache', async () => {
   const h = await harness({ rest: () => pending(event({ url: 'SECRET' })) }); await flush();
-  assert.equal(h.cache.size, 0); assert.equal(h.calls.length, 1); h.dispose();
+  assert.equal(h.cache.size, 0); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 1); h.dispose();
 });
 test('scope change while shared fetch is pending prevents claim even after the read completed', async () => {
   const d = deferred();
   const h = await harness({ fetchQuery: async opts => { const result = await opts.queryFn(); await d.promise; return result; } });
-  await flush(); assert.equal(h.calls.length, 1);
+  await flush(); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 1);
   h.state.gateway.set('closed'); d.resolve(); await flush();
-  assert.equal(h.calls.length, 1); assert.equal(h.notifications.length, 0); assert.equal(h.cache.size, 0); h.dispose();
+  assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 1); assert.equal(h.notifications.length, 0); assert.equal(h.cache.size, 0); h.dispose();
 });
 for (const state of ['presented', 'resolved']) test(`claim with ${state} DTO grants no presentation authority`, async () => {
   const h = await harness({ rest: path => path.startsWith('/events?') ? pending() : claims(event({ presentation_state: state })) });
-  await flush(); assert.equal(h.notifications.length, 0); assert.equal(h.calls.length, 2); h.dispose();
+  await flush(); assert.equal(h.notifications.length, 0); assert.equal(h.calls.filter(c => !c.path.startsWith('/files/')).length, 2); h.dispose();
+});
+
+test('explicit later reveal offers a normal action and freshly certifies exactly one SDK invocation', async () => {
+  const path='/Users/test/Downloads/Hermes/Other/file.bin';let issued=false;
+  const h=await harness({files:true,rest:(route,options)=>{
+    if(route.startsWith('/events?'))return pending(null);
+    if(route==='/files/reveals')return {request:{request_id:'file-request',job_id:'job-1'}};
+    if(route==='/files/reveals/offer')return {status:'offered',path,token};
+    if(route==='/files/reveals/presented')return {status:'presented',path:null,token:null};
+    if(route==='/files/reveals/click'){if(issued)return {status:'unknown',path:null,token:null};issued=true;return {status:'issued',path,token};}
+    if(route==='/files/reveals/settle'){assert.equal(options.body.success,true);return {status:'revealed',path:null,token:null};}
+    assert.fail(route);
+  }});
+  await flush();assert.equal(h.notifications.length,1);assert.equal(h.reveals.length,0);
+  const action=h.notifications[0].action;assert.equal(typeof action.onClick,'function');
+  await action.onClick();await action.onClick();assert.deepEqual(h.reveals,[path]);
+  assert.equal(of(h,'/files/reveals/click').length,1);assert.equal(of(h,'/files/reveals/settle').length,1);
+  h.dispose();
+});
+
+test('explicit reveal lost click acknowledgement and later scope loss never invoke the OS', async () => {
+  const path='/Users/test/Downloads/Hermes/Other/file.bin';
+  const h=await harness({files:true,rest:route=>{
+    if(route.startsWith('/events?'))return pending(null);
+    if(route==='/files/reveals')return {request:{request_id:'file-request',job_id:'job-1'}};
+    if(route==='/files/reveals/offer')return {status:'offered',path,token};
+    if(route==='/files/reveals/presented')return {status:'presented',path:null,token:null};
+    if(route==='/files/reveals/click')throw new Error('lost acknowledgement');
+    assert.fail(route);
+  }});
+  await flush();assert.equal(h.notifications.length,1);const action=h.notifications[0].action;
+  await action.onClick();await action.onClick();assert.equal(of(h,'/files/reveals/click').length,1);assert.equal(h.reveals.length,0);
+  h.state.profile.set('work');await action.onClick();assert.equal(h.reveals.length,0);h.dispose();
 });

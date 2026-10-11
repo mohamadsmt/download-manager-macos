@@ -31,7 +31,7 @@ _EXPECTED_INPUT_SCHEMA: dict[str, object] = {
     "additionalProperties": False,
     "required": ["scope"],
     "properties": {
-        "scope": {"type": "string", "enum": ["health", "list", "status", "events", "queue"]},
+        "scope": {"type": "string", "enum": ["health", "list", "status", "events", "queue", "settings", "detail", "control"]},
         "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
         "cursor": {
             "anyOf": [
@@ -45,6 +45,9 @@ _EXPECTED_INPUT_SCHEMA: dict[str, object] = {
         },
     },
     "oneOf": [
+        {"type":"object","additionalProperties":False,"required":["scope","id"],"properties":{"scope":{"const":"control"},"id":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"}}},
+        {"type":"object","additionalProperties":False,"required":["scope","id"],"properties":{"scope":{"const":"detail"},"id":{"type":"string"}}},
+        {"type":"object","additionalProperties":False,"required":["scope"],"properties":{"scope":{"const":"settings"}}},
         {
             "type": "object", "additionalProperties": False,
             "properties": {"scope": {"const": "queue"}}, "required": ["scope"],
@@ -273,7 +276,7 @@ def test_downloads_query_server_factory_is_available() -> None:
 
 
 def test_downloads_query_stdio_round_trip_is_read_only_and_redacted() -> None:
-    """The official SDK discovers exactly three tools and real redacted reads."""
+    """The official SDK discovers exactly seven tools and real redacted reads."""
 
     with tempfile.TemporaryDirectory(dir="/tmp", prefix="hd-mcp-") as temporary_root:
         state_root = Path(temporary_root) / "state"
@@ -319,7 +322,7 @@ def test_downloads_query_stdio_round_trip_is_read_only_and_redacted() -> None:
                 "experimental": {},
                 "tools": {"listChanged": False},
             }
-            assert sorted(tool.name for tool in listed.tools) == ['downloads_add', 'downloads_control', 'downloads_query']
+            assert sorted(tool.name for tool in listed.tools) == ['downloads_add', 'downloads_configure', 'downloads_control', 'downloads_edit', 'downloads_files', 'downloads_query', 'downloads_replace_source']
             tool = next(tool for tool in listed.tools if tool.name == 'downloads_query')
             assert tool.name == "downloads_query"
             assert tool.inputSchema == _EXPECTED_INPUT_SCHEMA

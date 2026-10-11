@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import sys
@@ -966,7 +967,7 @@ def test_direct_sets_per_transfer_allocation_and_reads_back(
         ("aria2.getOption", [transfer.gid]),
         (
             "aria2.tellStatus",
-            [transfer.gid, ["status", "totalLength", "completedLength"]],
+            [transfer.gid, ["status", "totalLength", "completedLength", "errorCode"]],
         ),
     ]
 
@@ -999,7 +1000,7 @@ def test_direct_zero_allocation_pauses_without_sending_an_unlimited_limit(
         ("aria2.pause", [transfer.gid]),
         (
             "aria2.tellStatus",
-            [transfer.gid, ["status", "totalLength", "completedLength"]],
+            [transfer.gid, ["status", "totalLength", "completedLength", "errorCode"]],
         ),
     ]
 
@@ -1031,7 +1032,7 @@ def test_direct_zero_allocation_rejects_nonpaused_readback(
         ("aria2.pause", [transfer.gid]),
         (
             "aria2.tellStatus",
-            [transfer.gid, ["status", "totalLength", "completedLength"]],
+            [transfer.gid, ["status", "totalLength", "completedLength", "errorCode"]],
         ),
     ]
 
@@ -1638,7 +1639,7 @@ def test_direct_binding_interrupt_reaps_spawned_daemon_and_removes_private_runti
         _assert_group_gone(process.pid)
         assert not private_runtime_paths[0].exists()
         assert secret_marker not in launch_argvs[0]
-        assert launch_options[0]["stdout"] is direct.subprocess.DEVNULL
+        assert launch_options[0]["stdout"] is direct.subprocess.PIPE
         assert launch_options[0]["stderr"] is direct.subprocess.DEVNULL
         assert secret_marker not in str(raised.value)
         assert secret_marker not in repr(raised.value)
@@ -2993,7 +2994,7 @@ def test_payload_limit_oversized_counter_is_redacted_transfer_error(tmp_path, mo
     assert calls == [
         ("aria2.changeOption", [transfer.gid, {"max-download-limit": expected}]),
         ("aria2.getOption", [transfer.gid]),
-        ("aria2.tellStatus", [transfer.gid, ["status", "totalLength", "completedLength"]]),
+        ("aria2.tellStatus", [transfer.gid, ["status", "totalLength", "completedLength", "errorCode"]]),
     ]
 
 
@@ -3119,3 +3120,128 @@ def test_payload_limit_zero_gate_survives_blank_restart_without_implicit_transfe
         controller.resume(job_id=job_id, generation=1, admission=_admission(queue, job_id))
         completed = controller.wait_for_terminal(job_id=job_id, generation=1, timeout=5)
         assert completed.hash_verified
+
+
+# Private framed stock observations; raw heads are never a persistent log.
+def _stock_frames(tag, status=503, headers=b"Retry-After: 999\r\n", cuid=6):
+    request=(f"[INFO] [HttpConnection.cc:129] CUID#{cuid} - Requesting:\nGET /signed?private=value HTTP/1.1\r\nHost: example.test\r\nX-Hermes-Attempt: {tag}\r\n\r\n\n").encode()
+    response=(f"[INFO] [HttpConnection.cc:164] CUID#{cuid} - Response received:\nHTTP/1.1 {status} synthetic\r\n").encode()+headers+b"Content-Length: 0\r\n\r\n\n"
+    return request+response
+
+
+def test_stock_capture_frames_survive_every_byte_cut_and_redact():
+    direct=_direct_module();tag="a"*64;payload=_stock_frames(tag)
+    for offset in range(len(payload)+1):
+        capture=direct._StockCapture();capture.bind("0123456789abcdef",tag)
+        capture.feed(payload[:offset]);capture.feed(payload[offset:]);capture.finish()
+        result=capture.result("0123456789abcdef")
+        assert result.known and result.http_status==503 and result.retry_after_seconds==999
+        assert result.contributors==1 and result.resource_digest is not None
+        assert "private" not in repr(result) and "example.test" not in repr(result)
+    capture=direct._StockCapture();capture.bind("0123456789abcdef",tag)
+    for byte in payload: capture.feed(bytes([byte]))
+    capture.finish();assert capture.result("0123456789abcdef").known
+
+
+@pytest.mark.parametrize("fault",["truncated","duplicate","unknown-tag","response-only","large","reader-error","nul","unfinished","conflict"])
+def test_stock_capture_observable_gaps_are_sticky_unknown(fault):
+    direct=_direct_module();tag="b"*64;capture=direct._StockCapture();capture.bind("0123456789abcdef",tag)
+    payload=_stock_frames(tag)
+    if fault=="truncated":payload=payload[:-4]
+    elif fault=="duplicate":payload=_stock_frames(tag,headers=b"Retry-After: 7\r\nRetry-After: 8\r\n")
+    elif fault=="unknown-tag":payload=_stock_frames("c"*64)
+    elif fault=="response-only":payload=payload[payload.index(b"[INFO]",1):]
+    elif fault=="large":payload=_stock_frames(tag,headers=b"X-Large: "+b"x"*2048+b"\r\nRetry-After: 999\r\n")
+    elif fault=="nul":payload=payload.replace(b"999",b"9\x009")
+    elif fault=="unfinished":payload=payload.split(b"[INFO]",2)[0]+payload[:payload.index(b"[INFO]",1)]
+    elif fault=="conflict":payload+=_stock_frames(tag,status=429,cuid=7)
+    capture.feed(payload)
+    if fault=="reader-error":capture.fail()
+    capture.feed(_stock_frames(tag,cuid=8));capture.finish()
+    result=capture.result("0123456789abcdef")
+    assert not result.known and result.http_status is None and result.retry_after_seconds is None
+
+
+def test_stock_capture_redirect_interim_and_resource_identity():
+    direct=_direct_module();tag="d"*64;capture=direct._StockCapture();capture.bind("0123456789abcdef",tag)
+    capture.feed(_stock_frames(tag,status=302,headers=b"Location: /next\r\n"))
+    payload=_stock_frames(tag,status=206,headers=b'ETag: "same"\r\nContent-Range: bytes 0-3/4\r\n')
+    payload=payload.replace(b"GET /signed?private=value",b"GET /next")
+    payload=payload.replace(b"X-Hermes-Attempt:",b"Range: bytes=0-3\r\nX-Hermes-Attempt:").replace(b"Content-Length: 0",b"Content-Length: 4")
+    interim=b"[INFO] [HttpConnection.cc:164] CUID#6 - Response received:\nHTTP/1.1 100 Continue\r\n\r\n\n"
+    position=payload.index(b"[INFO]",1)
+    capture.feed(payload[:position]+interim+payload[position:]);capture.finish()
+    result=capture.result("0123456789abcdef")
+    assert result.known and result.strong_validator==hashlib.sha256(b'"same"').hexdigest() and result.total_length==4
+
+
+@pytest.mark.parametrize("status",[401,403,404,407,410,429,502,503,504])
+def test_real_stock_owned_pipe_typed_failure_and_original_reader_join(tmp_path,monkeypatch,status):
+    direct=_direct_module();tagged=[]
+    assert hasattr(direct,'_StockCapture'), 'owned stock capture is missing'
+    with _origin_type()() as origin:
+        origin._response_for=lambda *_:(status,{"Retry-After":"999"} if status in {429,503} else {},b"")
+        job="typed-stock";queue=_admitted_queue(job);destination=_destination(job,"typed.bin")
+        controller=direct.DirectAria2Controller(runtime_root=tmp_path/"runtime")
+        controller.start();original=controller._process;identity=controller.engine_identity;reader=controller._capture_reader
+        try:
+            paused=controller.add_paused(job_id=job,generation=0,source=_source(origin,"/range"),destination=destination,expected_sha256=None,admission=_admission(queue,job))
+            assert paused.status=="paused" and origin.ledger.response_body_bytes==0
+            options=controller._rpc("aria2.getOption",[paused.gid])
+            assert re.fullmatch(r"X-Hermes-Attempt: [0-9a-f]{64}\n?",options["header"])
+            controller.resume(job_id=job,generation=0,admission=_admission(queue,job))
+            with pytest.raises(direct.DirectTransferError):controller.wait_for_terminal(job_id=job,generation=0,timeout=5)
+        finally:controller.close()
+        result=controller._sealed_stock_result(job,0,paused.gid)
+        assert result.known and result.http_status==status
+        assert result.retry_after_seconds==(999 if status in {429,503} else None)
+        assert original.returncode is not None and _group_is_gone(identity.process_group_id)
+        with pytest.raises(ChildProcessError):os.waitpid(original.pid,os.WNOHANG)
+        assert not reader.is_alive() and controller._capture.eof
+        root=Path(os.environ.get("T26_RESUME_RUN",str(tmp_path)))
+        record=dict(status=status,engine_pid=original.pid,wait_returncode=original.returncode,group_absent=True,reader_ident=reader.ident,reader_joined=True,http_status=result.http_status,retry_after_seconds=result.retry_after_seconds,synthetic=True)
+        (root/f"stock-{status}-{original.pid}.json").write_text(json.dumps(record))
+
+
+def test_stock_observation_owner_bound_before_body_and_frozen_after_original_join(tmp_path):
+    direct=_direct_module()
+    assert callable(getattr(direct.DirectAria2Controller,'_bind_stock_owner',None)), 'stock owner binding absent'
+    from hermes_downloads import processes
+    with _origin_type()() as origin:
+        queue=_admitted_queue('bound-stock');controller=direct.DirectAria2Controller(runtime_root=tmp_path/'runtime')
+        controller.start();original=controller._process
+        try:
+            transfer=controller.add_paused(job_id='bound-stock',generation=0,source=_source(origin,'/range'),destination=_destination('bound-stock','bound.bin'),expected_sha256=None,admission=_admission(queue,'bound-stock'))
+            birth=processes.capture_process_birth(controller.engine_identity)
+            with pytest.raises(direct.DirectEngineError):controller._bind_stock_owner('bound-stock',1,transfer.gid,1,'body-bound',birth)
+            owner=controller._bind_stock_owner('bound-stock',0,transfer.gid,1,'body-bound',birth)
+            assert owner[:5]==('bound-stock',0,transfer.gid,1,'body-bound')
+            assert origin.ledger.response_body_bytes==0 and origin.ledger.request_count==0
+            controller.resume(job_id='bound-stock',generation=0,admission=_admission(queue,'bound-stock'))
+            controller.wait_for_terminal(job_id='bound-stock',generation=0,timeout=6)
+        finally:controller.close()
+        sealed=controller._sealed_stock_result('bound-stock',0,transfer.gid)
+        assert sealed.owner==owner and sealed.known
+        assert original.returncode is not None and not controller._capture_reader.is_alive()
+        with pytest.raises((AttributeError,TypeError)):sealed.owner=()
+
+
+def test_stock_capture_cuid_fifo_retains_original_request_across_interim():
+    direct=_direct_module();tag='e'*64;capture=direct._StockCapture();capture.bind('0123456789abcdef',tag)
+    first=_stock_frames(tag,status=206,headers=b'Content-Range: bytes 0-3/4\r\n').replace(b'X-Hermes-Attempt:',b'Range: bytes=0-3\r\nX-Hermes-Attempt:').replace(b'Content-Length: 0',b'Content-Length: 4')
+    second=_stock_frames(tag,status=206,headers=b'Content-Range: bytes 0-3/4\r\n').replace(b'X-Hermes-Attempt:',b'Range: bytes=0-3\r\nX-Hermes-Attempt:').replace(b'Content-Length: 0',b'Content-Length: 4')
+    a=first.index(b'[INFO]',1);b=second.index(b'[INFO]',1)
+    interim=b'[INFO] [HttpConnection.cc:164] CUID#6 - Response received:\nHTTP/1.1 100 Continue\r\n\r\n\n'
+    capture.feed(first[:a]+second[:b]+interim+first[a:]+second[b:]);capture.finish()
+    observed=capture.result('0123456789abcdef')
+    assert observed.known and observed.http_status==206 and observed.total_length==4 and observed.contributors==2
+
+
+def test_owned_group_close_uses_one_original_aggregate_deadline(monkeypatch):
+    direct=_direct_module();observed=[];deadline=direct.time.monotonic()+.15
+    monkeypatch.setattr(direct,'_signal_group',lambda *args:None)
+    monkeypatch.setattr(direct,'_wait_for_group_absence',lambda group,end:observed.append(end) or False)
+    monkeypatch.setattr(direct,'_wait_for_leader',lambda process,end:observed.append(end) or True)
+    stopped,error=direct._stop_process_group(object(),4242,deadline=deadline)
+    assert stopped is False and error is None and len(observed)==4
+    assert all(end<=deadline for end in observed)

@@ -157,8 +157,9 @@ def test_queued_again_after_contained_body_is_not_an_implicit_retry(tmp_path):
         store.apply_queue_gate(gate='running',request_id='run',payload_digest='a'*64,expected_revision=1)
         plan=store._prepare_target_dispatch(expected_worker_epoch=1,owner_slot_ready=True,now=datetime.now(UTC))
         assert store.abort_direct_dispatch(plan).state=='paused'
-        assert authorize(store,'resume','resume')['results'][0]['outcome']=='existing_authority'
-        assert store.get_job('batch-job-0').state=='queued'
+        result=authorize(store,'resume','resume')['results'][0]
+        assert (result['outcome'],result['reason'])==('blocked','incompatible_authority')
+        assert store.get_job('batch-job-0').state=='paused'
         before=tuple(store._connection.iterdump())
         assert store._prepare_target_dispatch(expected_worker_epoch=1,owner_slot_ready=True,now=datetime.now(UTC)) is None
         assert tuple(store._connection.iterdump())==before
@@ -190,18 +191,82 @@ def test_independent_holds_and_cold_cannot_create_private_receipt(tmp_path, hold
 def _scheduler_worker(state, ready, shutdown, stopped, results, origin, evidence, fail_start=False,
     barrier=None, entered=None, release=None, recovery_entered=None, recovery_release=None,
     private_start=True, cleanup_mode=None, cleanup_entered=None, cleanup_release=None,
-    late_entry=None, fail_close=False):
+    late_entry=None, fail_close=False, recover_socket=False):
     """Record original objects/results while using the real accepted engine fixture."""
     from hermes_downloads import direct, network, paths, store as store_module
-    grant = network.LocalOriginGrant.for_url(origin)
+    grants = [network.LocalOriginGrant.for_url(value) for value in (origin if type(origin) is tuple else (origin,))]
     validate = store_module.validate_source_url
-    store_module.validate_source_url = lambda value: validate(value,local_origin_grant=grant)
+    def validate_fixture_origin(value):
+        for grant in grants:
+            try:return validate(value,local_origin_grant=grant)
+            except ValueError:pass
+        return validate(value)
+    store_module.validate_source_url = validate_fixture_origin
     ledger = Path(evidence) / 'scheduler-effects.jsonl'
     def record(kind, **values):
         with ledger.open('a') as stream:
             os.chmod(ledger,0o600)
             stream.write(json.dumps(dict(kind=kind,monotonic=time.monotonic(),**values))+'\n')
             stream.flush()
+    if private_start is None:
+        run=worker.run_worker
+        def observed_run(*args,**kwargs):
+            try:return run(*args,**kwargs)
+            except BaseException:
+                import traceback
+                record('worker-error-origin',traceback=traceback.format_exc())
+                raise
+        worker.run_worker=observed_run
+    for method in ('apply_explicit_retry','activate_direct_cleanup','retained_cleanup_records','acknowledge_retained_cleanup','certify_direct_cleanup','finish_direct_cleanup','cold_body_owner','seal_cold_body','finalize_direct_terminal','prepare_direct_stage','bind_direct_staged_payload','reserve_direct_publication','complete_direct_publication'):
+        original=getattr(SQLiteStore,method)
+        def traced(self,*args,_original=original,_method=method,**kwargs):
+            try:
+                value=_original(self,*args,**kwargs)
+                record('cleanup-owner-effect',operation=_method)
+                return value
+            except BaseException:
+                import traceback
+                record('cleanup-owner-error',operation=_method,traceback=traceback.format_exc())
+                raise
+        setattr(SQLiteStore,method,traced)
+    if barrier in {'cut-retained','cut-canonical','cut-cleanup-marker','cut-saved-purge','cut-saved-purge-marker'}:
+        unlink=paths.os.unlink
+        def cut_unlink(name,*args,**kwargs):
+            result=unlink(name,*args,**kwargs)
+            directory=kwargs.get('dir_fd')
+            if directory is None:return result
+            with sqlite3.connect(Path(state)/'state.db') as db:claim=db.execute('SELECT phase FROM direct_cleanup_claims LIMIT 1').fetchone()
+            with sqlite3.connect(Path(state)/'state.db') as db:purge=db.execute('SELECT 1 FROM direct_saved_purge LIMIT 1').fetchone()
+            selected=(purge is not None and ((barrier=='cut-saved-purge' and name=='file-0.bin') or (barrier=='cut-saved-purge-marker' and name=='.hermes-reservation'))) or claim is not None and ((barrier=='cut-retained' and str(name).startswith('.hermes-resume-')) or (barrier=='cut-canonical' and name=='retained.bin') or (barrier=='cut-cleanup-marker' and name=='.hermes-reservation'))
+            if selected:
+                record('actual-authorized-unlink-cut',basename=str(name),phase='saved-purge' if claim is None else claim[0],directory_stat=[os.fstat(directory).st_dev,os.fstat(directory).st_ino])
+                entered.set();end=time.monotonic()+12
+                while not release.is_set() and time.monotonic()<end:release.wait(.01)
+                assert release.is_set(),'bounded retained cleanup cut expired'
+            return result
+        paths.os.unlink=cut_unlink
+    allocation=direct.DirectAria2Controller.set_allocation
+    def allocated(self,**kwargs):
+        result=allocation(self,**kwargs)
+        options=self._rpc('aria2.getOption',[result.gid]);global_options=self._rpc('aria2.getGlobalOption',[])
+        record('actual-stock-allocation',job=kwargs['job_id'],generation=kwargs['generation'],gid=result.gid,allocation_bps=kwargs['allocation_bps'],
+            item_option=options['max-download-limit'],global_option=global_options['max-overall-download-limit'],connections=options['max-connection-per-server'],split=options['split'])
+        return result
+    direct.DirectAria2Controller.set_allocation=allocated
+    recover=direct._recover_owned_direct_engine
+    def observed_recover(identity,capability,**kwargs):
+        result=recover(identity,capability,**kwargs)
+        record('cold-engine-contained',identity=identity.to_record(),completed_length=result)
+        return result
+    direct._recover_owned_direct_engine=observed_recover
+    original_aliases=paths._cleanup_retained_aliases
+    def traced_aliases(*args,**kwargs):
+        try: return original_aliases(*args,**kwargs)
+        except BaseException:
+            import traceback
+            record('cleanup-alias-error',traceback=traceback.format_exc())
+            raise
+    paths._cleanup_retained_aliases=traced_aliases
     prepare=SQLiteStore._prepare_target_dispatch
     def observed_prepare(self,**kwargs):
         try: result=prepare(self,**kwargs)
@@ -240,13 +305,21 @@ def _scheduler_worker(state, ready, shutdown, stopped, results, origin, evidence
             record('late-unowned-entry',path=str(entry_path),bytes=entry_path.read_bytes().hex())
         return result
     direct.DirectAria2Controller.start=causal_start
+    observe_terminal=direct.DirectAria2Controller.observe_terminal
+    def traced_terminal(self,**kwargs):
+        try:return observe_terminal(self,**kwargs)
+        except BaseException:
+            import traceback
+            record('terminal-observation-error',traceback=traceback.format_exc())
+            raise
+    direct.DirectAria2Controller.observe_terminal=traced_terminal
     if fail_close:
         close=direct.DirectAria2Controller.close
-        def held_close(self):
+        def held_close(self,**kwargs):
             if not release.is_set():
                 record('actual-owned-close-refused',pid=self._process.pid)
                 raise RuntimeError('finite owned containment failure')
-            return close(self)
+            return close(self,**kwargs)
         direct.DirectAria2Controller.close=held_close
     join=threading.Thread.join
     def observed_join(self,*args,**kwargs):
@@ -264,8 +337,23 @@ def _scheduler_worker(state, ready, shutdown, stopped, results, origin, evidence
                 record('queue-control-error',error=str(error),type=type(error).__name__)
                 raise
         handlers['queue_gate']=gate
+        job_control=handlers['job_control']
+        def observed_job_control(command):
+            try:return job_control(command)
+            except BaseException:
+                import traceback
+                record('job-control-error',traceback=traceback.format_exc())
+                raise
+        handlers['job_control']=observed_job_control
         return server(*args,**handlers)
     worker.HealthServer=observed_server
+    if barrier in {'space-stage','space-publication'}:
+        import errno
+        name='attest_staged_partial_payload' if barrier=='space-stage' else 'publish_staged_partial_payload'
+        def no_space(*args,**kwargs):
+            record('actual-filesystem-errno',errno=errno.ENOSPC,operation=name)
+            raise OSError(errno.ENOSPC,'synthetic bounded ENOSPC')
+        setattr(paths,name,no_space)
     link=paths.os.link
     def observed_link(*args,**kwargs):
         with sqlite3.connect(Path(state)/'state.db') as connection:
@@ -275,6 +363,46 @@ def _scheduler_worker(state, ready, shutdown, stopped, results, origin, evidence
         record('publication-link',result=result)
         return result
     paths.os.link=observed_link
+    add_paused = direct.DirectAria2Controller.add_paused
+    def observed_add(self,**kwargs):
+        result = add_paused(self,**kwargs)
+        if kwargs.get('saved_resume'):
+            options = self._rpc('aria2.getOption',[result.gid])
+            record('saved-stock-paused',gid=result.gid,expected_sha256=kwargs['expected_sha256'],
+                options={name:options.get(name) for name in ('split','max-connection-per-server','continue','always-resume','allow-overwrite','auto-file-renaming')})
+        return result
+    direct.DirectAria2Controller.add_paused = observed_add
+    if barrier=='saved-drained':
+        original_drain=SQLiteStore.qualify_saved_drain
+        def hold_drained(self,plan):
+            original_drain(self,plan)
+            record('actual-saved-observation-drained',request_id=plan.request_id)
+            entered.set()
+            assert release.wait(12), 'finite drained-ready crash barrier expired'
+        SQLiteStore.qualify_saved_drain=hold_drained
+    if barrier in {'saved-clone','saved-clone-cancellable'}:
+
+        active_cancel = [lambda:False]
+        prepare_pair = paths._prepare_saved_pair
+        def observed_pair(*args,**kwargs):
+            active_cancel[0] = kwargs['cancelled']
+            return prepare_pair(*args,**kwargs)
+        paths._prepare_saved_pair = observed_pair
+        clone = paths._clone_saved_payload
+        def held_clone(*args):
+            result = clone(*args)
+            record('saved-clone-entered-return-held')
+            entered.set()
+            if barrier=='saved-clone-cancellable':
+                end=time.monotonic()+8
+                while not release.is_set() and not active_cancel[0]():
+                    assert time.monotonic()<end
+                    release.wait(.01)
+            else:
+                assert release.wait(8), 'finite saved clone return barrier expired'
+            record('saved-clone-returned')
+            return result
+        paths._clone_saved_payload = held_clone
     if cleanup_mode is not None:
         def cleanup_hold(kind):
             record('held-private-cleanup',operation=kind)
@@ -317,7 +445,7 @@ def _scheduler_worker(state, ready, shutdown, stopped, results, origin, evidence
         paths._hash_publication_payload=observed_hash
     context=multiprocessing.get_context('spawn')
     _publication_worker(state,str(Path(state)/'worker.sock'),ready,shutdown,stopped,results,
-        origin,barrier,entered or context.Event(),release or context.Event(),evidence)
+        origin,barrier,entered or context.Event(),release or context.Event(),evidence,recover_socket=recover_socket)
 
 
 @pytest.mark.parametrize('batch', [False, True])
@@ -508,7 +636,7 @@ def test_private_completed_cleanup_keeps_gate_first_and_owned_join_context(tmp_p
 
 @pytest.mark.parametrize('fail_start', [False, True])
 def test_real_default_one_causal_bodies_reap_join_cleanup_before_next(tmp_path, fail_start, monkeypatch):
-    evidence=tmp_path/'effects';evidence.mkdir(mode=0o700)
+    evidence=Path(tempfile.mkdtemp(prefix='default-one-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));evidence.chmod(0o700)
     home=tmp_path/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home))
     (Path.home()/'Downloads/Hermes').mkdir(parents=True,mode=0o700,exist_ok=True)
     with tempfile.TemporaryDirectory(dir='/private/tmp',prefix='causal-') as directory:
@@ -627,8 +755,12 @@ def test_real_private_post_link_hold_replay_and_existing_only_recovery(tmp_path,
                 if fail_close:
                     assert any(r['kind']=='actual-owned-close-refused' for r in errors)
                 with sqlite3.connect(state/'state.db') as connection:
-                    assert connection.execute('SELECT state FROM jobs').fetchone()[0]==('finalizing' if fail_close else 'paused')
+                    assert connection.execute('SELECT state FROM jobs').fetchone()[0]=='finalizing'
                     assert connection.execute('SELECT attempt_id,proof FROM direct_publication_attempts').fetchone()==proof
+                with closing(SQLiteStore(state/'state.db')) as observed:
+                    retained=observed._job_engine_owners()
+                    assert len(retained)==1 and retained[0][1] is not None
+                    assert observed._get_direct_engine_recovery_capability(retained[0][1]) is not None
                 release.set()
                 time.sleep(.15)
                 replay=ipc.set_queue_gate(state/'worker.sock',gate='paused',request_id='hold',expected_revision=2)
@@ -737,3 +869,21 @@ def test_real_sealed_legacy_original_body_gets_only_exact_private_publication(tm
                     try: results.close()
                     finally: results.join_thread()
         assert origin_thread is not None and not origin_thread.is_alive()
+
+@pytest.mark.parametrize('field,value',[('process','{}'),('rpc_port',43124),('rpc_secret','b'*43),('reservation_token','d'*64)])
+def test_job_engine_owner_rebound_is_blocked_without_retiring_slot(tmp_path,field,value):
+    from hermes_downloads.processes import ProcessBirthIdentity
+    from hermes_downloads.store import DirectEngineRecord,_DirectEngineRecoveryCapability
+    with closing(SQLiteStore(tmp_path/'owner.db')) as store:
+        store.recover_cold_start();store.apply_add_batch(ipc.AddBatchCommand.from_record(envelope()))
+        authorize(store);store.apply_queue_gate(gate='running',request_id='go',payload_digest='a'*64,expected_revision=1)
+        plan=store._prepare_target_dispatch(expected_worker_epoch=1,owner_slot_ready=True,now=datetime.now(UTC))
+        fence=store.reserve_job_engine(plan)
+        identity=ProcessBirthIdentity(4321,4321,4321,os.geteuid(),123456789,'a'*64)
+        record=DirectEngineRecord(1,identity)
+        store.bind_job_engine(plan,fence,record)
+        store._bind_direct_engine_recovery_capability(record,_DirectEngineRecoveryCapability(43123,'a'*43))
+        store._connection.execute(f'UPDATE direct_job_engines SET {field}=?',(value,))
+        before=tuple(store._connection.iterdump())
+        with pytest.raises(ValueError):store._job_engine_owners()
+        assert tuple(store._connection.iterdump())==before

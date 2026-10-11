@@ -12,7 +12,7 @@ import re
 import socket
 import stat
 import time
-from typing import Callable, Final, Mapping
+from typing import Callable, ClassVar, Final, Mapping
 import unicodedata
 
 from hermes_downloads.models import JobState
@@ -31,6 +31,11 @@ __all__ = [
     "JobControlResult",
     "JobsPage",
     "MAX_MESSAGE_BYTES",
+    "NotificationPendingCommand",
+    "NotificationClaimCommand",
+    "NotificationPresentedCommand",
+    "NotificationReleaseCommand",
+    "NotificationResult",
     "PublicJobRecord",
     "QueryCursor",
     "QueryEventRecord",
@@ -51,6 +56,7 @@ __all__ = [
     "request_query_list",
     "request_query_status",
     "request_query_events",
+    "request_notification",
     "set_queue_gate",
     "validate_available_socket_path",
 ]
@@ -78,6 +84,177 @@ _DIRECT_ENGINE_ACTIVATE_STATUSES: Final = frozenset(
     {"active", "blocked", "stale_epoch"}
 )
 _DIRECT_JOB_DISPATCH_STATUSES: Final = frozenset({"started", "blocked", "stale", "pending"})
+
+_NOTIFICATION_UUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+_NOTIFICATION_OPS = ('notification_pending', 'notification_claim', 'notification_presented', 'notification_release')
+_NOTIFICATION_FIELDS = frozenset('event_id type job_id collection_id generation created_at_ms count reason_code reveal_path presentation_state'.split())
+
+
+def _notification_uuid(value):
+    if type(value) is not str or re.fullmatch(_NOTIFICATION_UUID, value) is None:
+        raise ValueError('invalid notification consumer')
+    return value
+
+
+def _notification_event_id(value):
+    if type(value) is not str or (match := re.fullmatch(_NOTIFICATION_UUID + r':([1-9][0-9]{0,15})', value)) is None:
+        raise ValueError('invalid notification event')
+    _query_counter(int(match[1]), positive=True)
+    return value
+
+
+def _notification_token(value):
+    if type(value) is not str or re.fullmatch(r'[0-9a-f]{64}', value) is None:
+        raise ValueError('invalid notification token')
+    return value
+
+
+def _notification_receipt(value):
+    if (type(value) is not str or not value.strip() or len(value) > 256
+        or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 0xD800 <= ord(c) <= 0xDFFF for c in value)):
+        raise ValueError('invalid notification receipt')
+    return value
+
+
+@dataclass(frozen=True)
+class NotificationPendingCommand:
+    op: ClassVar[str] = 'notification_pending'
+
+    def to_record(self):
+        return dict(op=self.op, protocol_version=1, view='pending', limit=1)
+
+
+@dataclass(frozen=True)
+class NotificationClaimCommand:
+    consumer_id: str
+    op: ClassVar[str] = 'notification_claim'
+
+    def __post_init__(self):
+        _notification_uuid(self.consumer_id)
+
+    def to_record(self):
+        return dict(op=self.op, protocol_version=1, consumer_id=self.consumer_id, limit=1)
+
+
+@dataclass(frozen=True)
+class NotificationReleaseCommand:
+    consumer_id: str
+    event_id: str
+    claim_token: str
+    op: ClassVar[str] = 'notification_release'
+
+    def __post_init__(self):
+        _notification_uuid(self.consumer_id)
+        _notification_event_id(self.event_id)
+        _notification_token(self.claim_token)
+
+    def to_record(self):
+        return dict(op=self.op, protocol_version=1, consumer_id=self.consumer_id,
+            event_id=self.event_id, claim_token=self.claim_token)
+
+
+@dataclass(frozen=True)
+class NotificationPresentedCommand(NotificationReleaseCommand):
+    notification_id: str
+    op: ClassVar[str] = 'notification_presented'
+
+    def __post_init__(self):
+        super().__post_init__()
+        _notification_receipt(self.notification_id)
+
+    def to_record(self):
+        return dict(super().to_record(), notification_id=self.notification_id)
+
+
+def notification_command_from_record(record):
+    if type(record) is not dict or type(record.get('protocol_version')) is not int or record['protocol_version'] != 1:
+        raise ValueError('invalid notification command')
+    op = record.get('op')
+    if op == 'notification_pending':
+        result = NotificationPendingCommand()
+    elif op == 'notification_claim':
+        result = NotificationClaimCommand(record.get('consumer_id'))
+    elif op == 'notification_presented':
+        result = NotificationPresentedCommand(record.get('consumer_id'), record.get('event_id'),
+            record.get('claim_token'), record.get('notification_id'))
+    elif op == 'notification_release':
+        result = NotificationReleaseCommand(record.get('consumer_id'), record.get('event_id'), record.get('claim_token'))
+    else:
+        raise ValueError('invalid notification operation')
+    if set(record) != set(result.to_record()) or record != result.to_record() or ('limit' in record and type(record['limit']) is not int):
+        raise ValueError('invalid notification command')
+    return result
+
+
+def validate_notification_event(event):
+    if type(event) is not dict or set(event) != _NOTIFICATION_FIELDS:
+        raise ValueError('invalid notification DTO')
+    _notification_event_id(event['event_id'])
+    if event['type'] not in {'completion','needs_link','needs_login','needs_space','persistent_error'}:
+        raise ValueError('invalid notification type')
+    for key in ('job_id','collection_id'):
+        if event[key] is not None:
+            _require_identifier(event[key], key)
+    for key in ('generation','created_at_ms'):
+        _query_counter(event[key])
+    if type(event['count']) is not int or not 1 <= event['count'] <= 500:
+        raise ValueError('invalid notification count')
+    if event['reason_code'] is not None and event['reason_code'] not in {'link_expired','login_required','insufficient_space','retry_exhausted','download_failed'}:
+        raise ValueError('invalid notification reason')
+    if event['presentation_state'] not in {'pending','claimed','presented','resolved'}:
+        raise ValueError('invalid notification state')
+    path = event['reveal_path']
+    if path is not None:
+        if (event['type'] != 'completion' or type(path) is not str or len(path) > 4096
+            or not path.startswith('/') or any(ord(c) < 32 or 127 <= ord(c) <= 159 or c == '\\' or 0xD800 <= ord(c) <= 0xDFFF for c in path)):
+            raise ValueError('invalid notification path')
+        parts = path[1:].split('/')
+        if (len(parts) < 6 or parts[0] not in {'Users','home'} or parts[2:4] != ['Downloads','Hermes']
+            or any(not p.strip() or p in {'.','..'} or len(p) > 255 for p in parts)):
+            raise ValueError('invalid notification path')
+    return event
+
+
+@dataclass(frozen=True)
+class NotificationResult:
+    op: str
+    record: dict
+
+    def __post_init__(self):
+        r = self.record
+        if self.op not in _NOTIFICATION_OPS or type(r) is not dict:
+            raise ValueError('invalid notification result')
+        if self.op in ('notification_presented', 'notification_release'):
+            allowed = {'presented','already_presented','stale_claim'} if self.op == 'notification_presented' else {'released','already_released','stale_claim'}
+            if set(r) != {'status'} or type(r['status']) is not str or r['status'] not in allowed:
+                raise ValueError('invalid notification status')
+            return
+        fields = {'schema_version','profile','source'} | ({'events','next_cursor','has_more'} if self.op == 'notification_pending' else {'claims','server_now_ms'})
+        if set(r) != fields or type(r['schema_version']) is not int or r['schema_version'] != 1 or r['profile'] != 'default' or r['source'] != 'local':
+            raise ValueError('invalid notification envelope')
+        if self.op == 'notification_pending':
+            if type(r['events']) is not list or len(r['events']) > 1 or type(r['has_more']) is not bool:
+                raise ValueError('invalid notification page')
+            if r['next_cursor'] is not None and (type(r['next_cursor']) is not str or re.fullmatch(r'[A-Za-z0-9._:-]{1,256}', r['next_cursor']) is None):
+                raise ValueError('invalid notification cursor')
+            for e in r['events']:
+                validate_notification_event(e)
+        else:
+            _query_counter(r['server_now_ms'])
+            if type(r['claims']) is not list or len(r['claims']) > 1:
+                raise ValueError('invalid notification claims')
+            for c in r['claims']:
+                if type(c) is not dict or set(c) != {'event','claim_token','lease_expires_at_ms'}:
+                    raise ValueError('invalid notification claim')
+                validate_notification_event(c['event'])
+                _notification_token(c['claim_token'])
+                _query_counter(c['lease_expires_at_ms'])
+                if c['event']['presentation_state'] not in {'pending','claimed'} or c['lease_expires_at_ms'] <= r['server_now_ms']:
+                    raise ValueError('invalid notification lease')
+
+    def to_record(self):
+        self.__post_init__()
+        return self.record
 
 
 class IPCError(RuntimeError):
@@ -283,6 +460,10 @@ def _job_add_wire_request(
 
 _BATCH_PREAMBLE: Final = b'HDM2\n'
 _TARGET_PREAMBLE: Final = b'HDT2\n'
+_EDIT_PREAMBLE: Final = b'HDE2\n'
+_FILES_PREAMBLE: Final = b'HDF2\n'
+_SOURCE_PREAMBLE: Final = b'HDS2\n'
+_CONTROL_PREAMBLE: Final = b'HDC2\n'
 _MAX_TARGET_BODY: Final = 128 * 1024
 _MAX_TARGET_REPLY: Final = 256 * 1024
 _TARGET_ERRORS: Final = frozenset({'target_request_invalid', 'unsupported_selection_size',
@@ -1411,7 +1592,7 @@ _QUERY_MAX_SAFE: Final = (1 << 53) - 1
 _QUERY_EVENT_KINDS: Final = frozenset({
     'job_added', 'job_target_authorized', 'job_paused', 'job_resumed',
     'job_start_now_requested', 'job_removed', 'job_resolving', 'job_downloading',
-    'job_finalizing', 'job_completed',
+    'job_finalizing', 'job_completed', 'job_failure', 'job_edited', 'job_retry_opened',
 })
 
 
@@ -1733,6 +1914,244 @@ def _decode_direct_job_dispatch_request(
         return None
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ConfigureCommand:
+    request_id: str
+    patch: object = field(repr=False)
+    payload_digest: str = field(init=False)
+    _wire_request: bytes = field(init=False, repr=False)
+
+    def __post_init__(self):
+        _require_identifier(self.request_id, 'request_id')
+        patch = self.patch
+        if type(patch) is not dict or not patch or not set(patch) <= {'concurrency','connections','global_limit_bps'}:
+            raise ValueError('invalid configuration')
+        for name, value in patch.items():
+            if value is None and name == 'global_limit_bps': continue
+            if type(value) is not str or re.fullmatch(r'0|[1-9][0-9]{0,18}', value) is None:
+                raise ValueError('invalid configuration counter')
+            maximum = 64 if name == 'concurrency' else 16 if name == 'connections' else (1 << 63)-1
+            if not (0 if name == 'global_limit_bps' else 1) <= int(value) <= maximum:
+                raise ValueError('configuration counter out of range')
+        raw = _batch_canonical(dict(op='configure', request_id=self.request_id, patch=patch), 4096)
+        object.__setattr__(self, 'patch', raw)
+        object.__setattr__(self, '_wire_request', raw)
+        object.__setattr__(self, 'payload_digest', hashlib.sha256(raw).hexdigest())
+
+    def to_record(self): return _batch_decode(self._wire_request)
+
+    @classmethod
+    def from_record(cls, record):
+        if type(record) is not dict or set(record) != {'op','request_id','patch'} or record['op'] != 'configure':
+            raise ValueError('invalid configuration request')
+        return cls(record['request_id'], record['patch'])
+
+
+def request_configuration(socket_path, command=None):
+    request = {'op':'query_settings'} if command is None else command.to_record()
+    deadline = time.monotonic() + 5.0
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+            client.settimeout(max(.001,deadline-time.monotonic()))
+            client.connect(str(_require_socket_path(socket_path)))
+            client.settimeout(max(.001,deadline-time.monotonic()))
+            client.sendall(_encoded_record(request)); client.shutdown(socket.SHUT_WR)
+            payload = _read_line(client,maximum_bytes=16384,deadline=deadline)
+            result = _decode_request(payload)
+            if type(result) is not dict or 'error' in result: raise ValueError('configuration unavailable')
+            if command is not None:
+                if (set(result) != {'request_id','revision','status','replayed'} or result['request_id'] != command.request_id
+                    or result['status'] != 'pending' or type(result['replayed']) is not bool
+                    or type(result['revision']) is not str or re.fullmatch(r'[1-9][0-9]{0,18}',result['revision']) is None
+                    or int(result['revision']) > (1<<63)-1): raise ValueError('invalid configuration receipt')
+            elif set(result) != {'desired','applied','revision','applied_revision','status','speed_units'}:
+                raise ValueError('invalid settings readback')
+            return result
+        except (OSError,TimeoutError,TypeError,ValueError,RecursionError):
+            raise IPCError('configuration_unavailable') from None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class EditCommand:
+    ids: object
+    patch: object = field(repr=False)
+    request_id: str
+    expected_revision: int | None = None
+    _wire_request: bytes = field(init=False,repr=False)
+    payload_digest: str = field(init=False)
+    def __post_init__(self):
+        from datetime import datetime
+        _require_identifier(self.request_id,'request_id')
+        if type(self.ids) is not list or not 1<=len(self.ids)<=500 or len(set(self.ids))!=len(self.ids):raise ValueError('invalid edit targets')
+        for id in self.ids:_require_identifier(id,'id')
+        if self.expected_revision is not None:_require_counter(self.expected_revision,'expected revision')
+        patch=self.patch
+        if type(patch) is not dict or not patch or not set(patch)<={'priority','order_key','scheduled_for','destination','limit_bps'}:raise ValueError('invalid edit patch')
+        for key,value in patch.items():
+            if key=='priority':_require_priority(value)
+            elif key in {'order_key','limit_bps'}:
+                if value is None and key=='limit_bps':continue
+                if type(value) is not str or re.fullmatch(r'0|[1-9][0-9]{0,18}',value) is None or int(value)>(1<<63)-1:raise ValueError('invalid edit counter')
+            elif key=='scheduled_for' and value is not None:
+                if type(value) is not str or len(value)>64 or re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|[+-]\d\d:\d\d)',value) is None:raise ValueError('schedule needs a zoned instant')
+                instant=datetime.fromisoformat(value)
+                if instant.tzinfo is None or instant.utcoffset() is None:raise ValueError('schedule needs timezone')
+            elif key=='destination':
+                if type(value) is not dict or set(value)!={'category','collection'}:raise ValueError('invalid destination')
+                _require_category(value['category'])
+                if value['collection'] is not None:_batch_component(value['collection'])
+        raw=_batch_canonical(dict(op='edit',ids=self.ids,patch=patch,request_id=self.request_id,expected_revision=self.expected_revision),131072)
+        object.__setattr__(self,'ids',tuple(self.ids));object.__setattr__(self,'patch',raw)
+        object.__setattr__(self,'_wire_request',raw);object.__setattr__(self,'payload_digest',hashlib.sha256(raw).hexdigest())
+    def to_record(self):return _batch_decode(self._wire_request)
+    @classmethod
+    def from_record(cls,value):
+        if type(value) is not dict or set(value)!={'op','ids','patch','request_id','expected_revision'} or value['op']!='edit':raise ValueError('invalid edit')
+        return cls(value['ids'],value['patch'],value['request_id'],value['expected_revision'])
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ControlIntentCommand:
+    scope: str
+    action: str
+    request_id: str
+    expected_worker_epoch: int
+    collection: str | None = None
+    expected_revision: int | None = None
+    job: str | None = None
+    _wire_request: bytes = field(init=False,repr=False)
+    payload_digest: str = field(init=False)
+    def __post_init__(self):
+        _require_identifier(self.request_id,'request_id');_require_positive_counter(self.expected_worker_epoch,'worker_epoch')
+        if self.scope=='queue':
+            if self.action!='start' or self.collection is not None or self.expected_revision is not None:raise ValueError('invalid queue capture')
+        elif self.scope=='collection':
+            _require_identifier(self.collection,'collection')
+            if self.action not in {'start','pause','resume'}:raise ValueError('invalid collection action')
+            if self.action in {'pause','resume'}:_require_counter(self.expected_revision,'collection revision')
+            elif self.expected_revision is not None:raise ValueError('unexpected collection revision')
+        elif self.scope=='job':
+            _require_identifier(self.job,'job');_require_counter(self.expected_revision,'job revision')
+            if self.action not in {'retry','preempt'} or self.collection is not None:raise ValueError('invalid explicit job control')
+        else:raise ValueError('invalid captured control scope')
+        if self.scope!='job' and self.job is not None:raise ValueError('unexpected job')
+        raw=_batch_canonical(dict(op='control_intent',scope=self.scope,action=self.action,request_id=self.request_id,expected_worker_epoch=self.expected_worker_epoch,collection=self.collection,expected_revision=self.expected_revision,job=self.job),4096)
+        object.__setattr__(self,'_wire_request',raw);object.__setattr__(self,'payload_digest',hashlib.sha256(raw).hexdigest())
+    def to_record(self):return _batch_decode(self._wire_request)
+    @classmethod
+    def from_record(cls,value):
+        if type(value) is not dict or set(value)!={'op','scope','action','request_id','expected_worker_epoch','collection','expected_revision','job'} or value['op']!='control_intent':raise ValueError('invalid captured control')
+        return cls(value['scope'],value['action'],value['request_id'],value['expected_worker_epoch'],value['collection'],value['expected_revision'],value['job'])
+
+
+def request_control_intent(socket_path,command=None,*,request_id=None):
+    deadline=time.monotonic()+5
+    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
+        try:
+            client.settimeout(max(.001,deadline-time.monotonic()));client.connect(str(_require_socket_path(socket_path)))
+            payload=(_CONTROL_PREAMBLE+len(command._wire_request).to_bytes(4,'big')+command._wire_request) if command is not None else _encoded_record(dict(op='query_control',request_id=_require_identifier(request_id,'request_id')))
+            client.settimeout(max(.001,deadline-time.monotonic()));client.sendall(payload);client.shutdown(socket.SHUT_WR)
+            value=_decode_request(_read_line(client,maximum_bytes=4096,deadline=deadline))
+            fields={'request_id','status','member_count','cohort_count','revision'}|({'replayed'} if command is not None else {'completion_closed'})
+            if type(value) is not dict or set(value)!=fields or value['request_id']!=(command.request_id if command else request_id) or value['status'] not in {'pending','applied','blocked'}:raise ValueError('invalid control receipt')
+            for key in ('member_count','cohort_count','revision'):
+                if type(value[key]) is not str or re.fullmatch(r'0|[1-9][0-9]{0,18}',value[key]) is None or int(value[key])>(1<<63)-1:raise ValueError('invalid control counter')
+            if command is not None and (type(value['replayed']) is not bool or value['status']!='pending'):raise ValueError('invalid captured receipt')
+            if command is None and type(value['completion_closed']) is not bool:raise ValueError('invalid control settlement')
+            return value
+        except (OSError,TimeoutError,TypeError,ValueError,RecursionError):raise IPCError('control_unavailable') from None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class FilesCommand:
+    action: str
+    ids: object
+    request_id: str
+    confirmed: bool = False
+    _wire_request: bytes = field(init=False,repr=False)
+    payload_digest: str = field(init=False)
+    def __post_init__(self):
+        _require_identifier(self.request_id,'request_id')
+        if self.action not in {'reveal','purge'} or type(self.confirmed) is not bool or (self.action=='purge' and not self.confirmed) or (self.action=='reveal' and self.confirmed):raise ValueError('explicit file action required')
+        if type(self.ids) is not list or not 1<=len(self.ids)<=500:raise ValueError('invalid file targets')
+        for job in self.ids:_require_identifier(job,'id')
+        if len(set(self.ids))!=len(self.ids):raise ValueError('duplicate file targets')
+        raw=_batch_canonical(dict(op='files',action=self.action,ids=self.ids,request_id=self.request_id,confirmed=self.confirmed),131072)
+        object.__setattr__(self,'ids',tuple(self.ids));object.__setattr__(self,'_wire_request',raw);object.__setattr__(self,'payload_digest',hashlib.sha256(raw).hexdigest())
+    def to_record(self):return _batch_decode(self._wire_request)
+    @classmethod
+    def from_record(cls,value):
+        if type(value) is not dict or set(value)!={'op','action','ids','request_id','confirmed'} or value['op']!='files':raise ValueError('invalid file action')
+        return cls(value['action'],value['ids'],value['request_id'],value['confirmed'])
+
+
+def request_edit(socket_path,command):
+    deadline=time.monotonic()+5
+    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
+        try:
+            client.settimeout(max(.001,deadline-time.monotonic()));client.connect(str(_require_socket_path(socket_path)))
+            client.settimeout(max(.001,deadline-time.monotonic()));client.sendall((_FILES_PREAMBLE if type(command) is FilesCommand else _EDIT_PREAMBLE)+len(command._wire_request).to_bytes(4,'big')+command._wire_request);client.shutdown(socket.SHUT_WR)
+            value=_decode_request(_read_line(client,maximum_bytes=131072,deadline=deadline))
+            if type(value) is not dict or set(value)!={'request_id','status','replayed','ids'} or value['request_id']!=command.request_id or value['status']!='pending' or type(value['replayed']) is not bool or value['ids']!=list(command.ids):raise ValueError('invalid edit receipt')
+            return value
+        except (OSError,TimeoutError,TypeError,ValueError,RecursionError):raise IPCError('edit_unavailable') from None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReplaceSourceCommand:
+    id: str
+    url: str = field(repr=False)
+    request_id: str
+    expected_revision: int | None = None
+    payload_digest: str = field(init=False)
+    _wire_request: bytes = field(init=False,repr=False)
+    def __post_init__(self):
+        _require_identifier(self.id,'id');_require_identifier(self.request_id,'request_id')
+        if type(self.url) is not str or not 1<=len(self.url.encode('utf-8'))<=8192:raise ValueError('invalid source bytes')
+        if self.expected_revision is not None:_require_counter(self.expected_revision,'expected revision')
+        raw=_batch_canonical(dict(op='replace_source',id=self.id,url=self.url,request_id=self.request_id,expected_revision=self.expected_revision),16384)
+        object.__setattr__(self,'_wire_request',raw);object.__setattr__(self,'payload_digest',hashlib.sha256(raw).hexdigest())
+    def to_record(self):return _batch_decode(self._wire_request)
+    @classmethod
+    def from_record(cls,value):
+        if type(value) is not dict or set(value)!={'op','id','url','request_id','expected_revision'} or value['op']!='replace_source':raise ValueError('invalid replacement')
+        return cls(value['id'],value['url'],value['request_id'],value['expected_revision'])
+
+
+def request_source(socket_path, command=None, *, id=None):
+    request=dict(op='query_detail',id=_require_identifier(id,'id')) if command is None else command.to_record()
+    deadline=time.monotonic()+5
+    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
+        try:
+            client.settimeout(max(.001,deadline-time.monotonic()));client.connect(str(_require_socket_path(socket_path)))
+            client.settimeout(max(.001,deadline-time.monotonic()));client.sendall((_SOURCE_PREAMBLE+len(command._wire_request).to_bytes(4,'big')+command._wire_request) if command is not None else _encoded_record(request));client.shutdown(socket.SHUT_WR)
+            value=_decode_request(_read_line(client,maximum_bytes=16384,deadline=deadline))
+            if type(value) is not dict or 'error' in value:raise ValueError('source operation unavailable')
+            if command is not None:
+                if set(value)!={'request_id','id','revision','status','replayed'} or value['request_id']!=command.request_id or value['id']!=command.id or value['status']!='pending' or type(value['replayed']) is not bool:raise ValueError('invalid source receipt')
+                raw=value['revision']
+                if type(raw) is not str or not re.fullmatch(r'0|[1-9][0-9]{0,18}',raw) or int(raw)>_MAX_COUNTER:raise ValueError('invalid source counter')
+            else:
+                if set(value)!={'id','source_replacement','edit','effective','files','collection','retry'} or value['id']!=id:raise ValueError('invalid detail')
+                collection=value['collection'];retry=value['retry']
+                if collection is not None:
+                    if type(collection) is not dict or set(collection)!={'id','held','revision'} or type(collection['held']) is not bool:raise ValueError('invalid collection detail')
+                    _require_identifier(collection['id'],'collection')
+                if retry is not None:
+                    if type(retry) is not dict or set(retry)!={'generation','budget_number','ordinary_attempts','paused','exhausted','due_at'} or any(type(retry[name]) is not bool for name in ('paused','exhausted')):raise ValueError('invalid retry detail')
+                    due=retry['due_at']
+                    if due is not None:
+                        from datetime import datetime,timedelta
+                        if type(due) is not str or len(due)>64 or datetime.fromisoformat(due).utcoffset()!=timedelta(0):raise ValueError('invalid retry due')
+                for record,names in ((collection,('revision',)),(retry,('generation','budget_number','ordinary_attempts'))):
+                    if record is not None:
+                        for name in names:
+                            raw=record[name]
+                            if type(raw) is not str or not re.fullmatch(r'0|[1-9][0-9]{0,18}',raw) or int(raw)>_MAX_COUNTER:raise ValueError('invalid detail counter')
+            return value
+        except (OSError,TimeoutError,TypeError,ValueError,RecursionError):raise IPCError('source_unavailable') from None
+
+
 class HealthServer:
     """A one-request AF_UNIX listener owned and serviced by the worker thread."""
 
@@ -1745,12 +2164,25 @@ class HealthServer:
         query_list: Callable[[str | None, float], QueryListPage] | None = None,
         query_status: Callable[[str, float], QueryStatus] | None = None,
         query_events: Callable[[str | None, float], QueryEventsPage] | None = None,
+        notification_pending: Callable[[NotificationPendingCommand, float], NotificationResult] | None = None,
+        notification_claim: Callable[[NotificationClaimCommand, float], NotificationResult] | None = None,
+        notification_presented: Callable[[NotificationPresentedCommand, float], NotificationResult] | None = None,
+        notification_release: Callable[[NotificationReleaseCommand, float], NotificationResult] | None = None,
         queue_snapshot: Callable[[float], WorkerQueueSnapshot] | None = None,
         queue_gate: Callable[[QueueGateCommand], QueueGateResult] | None = None,
         job_control: Callable[[JobControlCommand], JobControlResult] | None = None,
         job_add: Callable[[JobAddCommand], JobAddResult] | None = None,
         add_batch: Callable[[AddBatchCommand], AddBatchResult] | None = None,
         target_authorize: Callable[[TargetAuthorizeCommand], TargetAuthorizeResult] | None = None,
+        configure: Callable | None = None,
+        query_settings: Callable | None = None,
+        replace_source: Callable | None = None,
+        edit: Callable | None = None,
+        files: Callable | None = None,
+        files_bridge: Callable | None = None,
+        control_intent: Callable | None = None,
+        query_control: Callable | None = None,
+        query_detail: Callable | None = None,
         direct_engine_activate: Callable[
             [DirectEngineActivateCommand], DirectEngineActivateResult
         ]
@@ -1768,6 +2200,9 @@ class HealthServer:
         for callback in (query_list, query_status, query_events, queue_snapshot):
             if callback is not None and not callable(callback):
                 raise TypeError('query callback must be callable')
+        for callback in (notification_pending, notification_claim, notification_presented, notification_release):
+            if callback is not None and not callable(callback):
+                raise TypeError('notification callback must be callable')
         if queue_gate is not None and not callable(queue_gate):
             raise TypeError("queue_gate must be callable")
         if job_control is not None and not callable(job_control):
@@ -1806,12 +2241,25 @@ class HealthServer:
         self._query_list = query_list
         self._query_status = query_status
         self._query_events = query_events
+        self._notification_pending = notification_pending
+        self._notification_claim = notification_claim
+        self._notification_presented = notification_presented
+        self._notification_release = notification_release
         self._queue_snapshot = queue_snapshot
         self._queue_gate = queue_gate
         self._job_control = job_control
         self._job_add = job_add
         self._add_batch = add_batch
         self._target_authorize = target_authorize
+        self._configure = configure
+        self._query_settings = query_settings
+        self._replace_source=replace_source
+        self._edit=edit
+        self._files=files
+        self._files_bridge=files_bridge
+        self._control_intent=control_intent
+        self._query_control=query_control
+        self._query_detail=query_detail
         self._direct_engine_activate = direct_engine_activate
         self._direct_job_dispatch = direct_job_dispatch
         self._listener = listener
@@ -1838,13 +2286,57 @@ class HealthServer:
                     preamble = b'H' + _batch_read_exact(connection, 4, deadline)
                 except (OSError, TimeoutError, ValueError):
                     preamble = b''
-                if preamble == _TARGET_PREAMBLE:
+                if preamble in {_EDIT_PREAMBLE,_FILES_PREAMBLE,_SOURCE_PREAMBLE,_CONTROL_PREAMBLE}:
+                    self._serve_change(connection,deadline,preamble)
+                elif preamble == _TARGET_PREAMBLE:
                     self._serve_target_authorize(connection, deadline)
                 else:
                     self._serve_add_batch(connection, deadline, preamble)
                 return
             payload = _read_line(connection, initial=first, deadline=deadline)
             request = _decode_request(payload)
+            if type(request) is dict and request.get('op') in {'configure','query_settings','replace_source','query_detail','edit','query_control'}:
+                try:
+                    if request['op']=='query_control':
+                        if set(request)!={'op','request_id'} or self._query_control is None:raise ValueError('control unavailable')
+                        result=self._query_control(_require_identifier(request['request_id'],'request_id'),deadline)
+                    elif request['op']=='edit':
+                        command=EditCommand.from_record(request)
+                        if self._edit is None:raise ValueError('edit unavailable')
+                        result=self._edit(command,deadline)
+                    elif request['op']=='replace_source':
+                        command=ReplaceSourceCommand.from_record(request)
+                        if self._replace_source is None:raise ValueError('source unavailable')
+                        result=self._replace_source(command,deadline)
+                    elif request['op']=='query_detail':
+                        if set(request)!={'op','id'} or self._query_detail is None:raise ValueError('detail unavailable')
+                        result=self._query_detail(_require_identifier(request['id'],'id'),deadline)
+                    elif request['op'] == 'configure':
+                        command = ConfigureCommand.from_record(request)
+                        if self._configure is None: raise ValueError('configuration unavailable')
+                        result = self._configure(command,deadline)
+                    else:
+                        if set(request) != {'op'} or self._query_settings is None: raise ValueError('settings unavailable')
+                        result = self._query_settings(deadline)
+                    response = _encoded_record(result,maximum_bytes=131072)
+                except Exception:
+                    response = _encoded_record({'error':'configuration_unavailable'})
+                remaining = deadline-time.monotonic()
+                if remaining > 0:
+                    try:
+                        connection.settimeout(remaining);connection.sendall(response)
+                    except (OSError,TimeoutError): pass
+                return
+            if type(request) is dict and request.get('op') in {'reveal_pending','reveal_offer','reveal_presented','reveal_click','reveal_settle'}:
+                try:
+                    if self._files_bridge is None:raise ValueError('files bridge unavailable')
+                    response=_encoded_record(self._files_bridge(request,deadline),maximum_bytes=16384)
+                    connection.settimeout(max(.001,deadline-time.monotonic()));connection.sendall(response)
+                except Exception:pass
+                return
+            if type(request) is dict and request.get('op') in _NOTIFICATION_OPS:
+                self._serve_notification(connection, request, deadline)
+                return
             if type(request) is dict and request.get('op') in ('query_list', 'query_status', 'query_events', 'queue_snapshot'):
                 self._serve_query(connection, request, deadline)
                 return
@@ -1972,6 +2464,32 @@ class HealthServer:
             except (OSError, TimeoutError):
                 return
 
+    def _serve_notification(self, connection, request, deadline):
+        try:
+            command = notification_command_from_record(request)
+            callback = {
+                'notification_pending': self._notification_pending,
+                'notification_claim': self._notification_claim,
+                'notification_presented': self._notification_presented,
+                'notification_release': self._notification_release,
+            }[command.op]
+            if callback is None or time.monotonic() >= deadline:
+                raise ValueError('notification unavailable')
+            result = callback(command, deadline)
+            if type(result) is not NotificationResult or result.op != command.op:
+                raise ValueError('notification result invalid')
+            response = _encoded_record(result.to_record(), maximum_bytes=_MAX_RESPONSE_BYTES)
+        except Exception:
+            response = _encoded_record({'error': 'downloads_notifications_unavailable'})
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            connection.settimeout(remaining)
+            connection.sendall(response)
+        except (OSError, TimeoutError):
+            return
+
     def _serve_query(self, connection, request, deadline):
         try:
             op = request['op']
@@ -2010,6 +2528,22 @@ class HealthServer:
             connection.sendall(response)
         except (OSError, TimeoutError):
             return
+
+    def _serve_change(self,connection,deadline,preamble):
+        try:
+            record=_batch_decode(_batch_read_body(connection,deadline,131072))
+            if preamble==_EDIT_PREAMBLE:command=EditCommand.from_record(record);callback=self._edit
+            elif preamble==_FILES_PREAMBLE:command=FilesCommand.from_record(record);callback=self._files
+            elif preamble==_CONTROL_PREAMBLE:command=ControlIntentCommand.from_record(record);callback=self._control_intent
+            else:command=ReplaceSourceCommand.from_record(record);callback=self._replace_source
+            if callback is None:raise ValueError('change unavailable')
+            result=callback(command,deadline)
+            response=_encoded_record(result,maximum_bytes=131072)
+        except Exception:response=_encoded_record({'error':'change_unavailable'})
+        remaining=deadline-time.monotonic()
+        if remaining>0:
+            try:connection.settimeout(remaining);connection.sendall(response)
+            except (OSError,TimeoutError):pass
 
     def _serve_add_batch(self, connection, deadline, preamble):
         try:
@@ -2140,6 +2674,29 @@ def request_jobs_page(socket_path: Path, *, cursor: str | None = None) -> JobsPa
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
         raise IPCError("ipc_response_invalid") from None
     return JobsPage.from_record(record)
+
+
+def request_notification(socket_path, command):
+    """Four fixed delivery operations; one client deadline includes EOF."""
+    deadline = time.monotonic() + _CLIENT_TIMEOUT_SECONDS
+    command = notification_command_from_record(command.to_record())
+    path = _require_socket_path(socket_path)
+    request = _encoded_record(command.to_record())
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+            for operation in (lambda: client.connect(str(path)), lambda: client.sendall(request)):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                client.settimeout(remaining)
+                operation()
+            client.shutdown(socket.SHUT_WR)
+            payload = _read_line(client, maximum_bytes=_MAX_RESPONSE_BYTES, deadline=deadline)
+            if payload is None or time.monotonic() >= deadline:
+                raise ValueError('notification unavailable')
+            return NotificationResult(command.op, _decode_request(payload))
+        except (OSError, TimeoutError, TypeError, ValueError, IPCError, RecursionError):
+            raise IPCError('downloads_notifications_unavailable') from None
 
 
 def _request_query(socket_path, op, selector, expected):

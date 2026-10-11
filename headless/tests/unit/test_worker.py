@@ -835,16 +835,19 @@ def test_held_observation_cannot_overlap_controller_after_same_process_worker_re
     try:
         assert entered.wait(_WATCHDOG_SECONDS)
         shutdown.set()
-        assert stopped.wait(_WATCHDOG_SECONDS)
+        assert not stopped.wait(1.7) and thread.is_alive() and not returned.is_set()
+        assert worker.run_worker(state_root,socket_path=state_root/'worker.sock',ready_event=threading.Event(),
+            shutdown_event=threading.Event(),stopped_event=threading.Event())==worker.worker_busy
+        assert len(constructed)==1
+        release.set()
         thread.join(_WATCHDOG_SECONDS)
-        assert errors == []
-        assert not returned.is_set()
+        assert stopped.is_set() and returned.is_set() and not thread.is_alive() and errors==[]
         phase[0] = 2
         shutdown.clear()
         stopped.clear()
         run()
-        assert responses == [ipc.DirectEngineActivateResult(worker_epoch=2, status="blocked")]
-        assert len(constructed) == 1
+        assert responses == [ipc.DirectEngineActivateResult(worker_epoch=2, status="active")]
+        assert len(constructed) == 2
     finally:
         release.set()
         shutdown.set()
@@ -878,7 +881,7 @@ def test_certified_serving_reads_complete_schema16_without_history_effects(short
         assert json.loads(record)['schema'] == 1
         with sqlite3.connect((root / 'state.db').as_uri() + '?mode=ro', uri=True) as connection:
             before = tuple(connection.iterdump())
-            assert connection.execute('PRAGMA user_version').fetchone()[0] == 20
+            assert connection.execute('PRAGMA user_version').fetchone()[0] == 24
             assert connection.execute('SELECT COUNT(*) FROM direct_publication_attempts').fetchone()[0] == 0
             assert connection.execute('SELECT COUNT(*) FROM closed_direct_publication_attempts').fetchone()[0] == 0
         certificate = ownership.preflight(root)
@@ -914,7 +917,7 @@ def test_schema16_certificate_refuses_before_lease_bootstrap_and_reclaim(short_s
         assert readback.database_identity == (database_details.st_dev, database_details.st_ino)
         with sqlite3.connect(root / 'state.db') as connection:
             if fault == 'newer':
-                connection.execute('PRAGMA user_version=21')
+                connection.execute('PRAGMA user_version=25')
             elif fault.endswith('archive'):
                 connection.execute('DROP TABLE closed_direct_publication_attempts')
                 if fault == 'malformed-archive':

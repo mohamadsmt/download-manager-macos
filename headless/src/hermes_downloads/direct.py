@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -72,12 +75,201 @@ _SAFE_ENVIRONMENT_NAMES: Final = frozenset(
 _TERMINAL_STATUSES: Final = frozenset({"complete", "error", "removed"})
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _StockResult:
+    known: bool
+    http_status: int | None = None
+    retry_after_seconds: int | None = None
+    resource_digest: str | None = None
+    strong_validator: str | None = None
+    total_length: int | None = None
+    contributors: int = 0
+    owner: tuple | None = None
+
+    def __post_init__(self):
+        if type(self.known) is not bool or type(self.contributors) is not int or not 0<=self.contributors<=128:
+            raise ValueError('invalid stock observation')
+        if self.known:
+            if type(self.http_status) is not int or not 100<=self.http_status<=599: raise ValueError('invalid stock status')
+        elif any(x is not None for x in (self.http_status,self.retry_after_seconds,self.resource_digest,self.strong_validator,self.total_length)) or self.contributors!=0:
+            raise ValueError('unknown stock observation has facts')
+        for value in (self.resource_digest,self.strong_validator):
+            if value is not None and (type(value) is not str or _SHA256.fullmatch(value) is None): raise ValueError('invalid stock identity')
+        for value in (self.retry_after_seconds,self.total_length):
+            if value is not None and (type(value) is not int or not 0<=value<=(1<<63)-1): raise ValueError('invalid stock scalar')
+        if self.owner is not None:
+            owner=self.owner
+            if (type(owner) is not tuple or len(owner)!=7 or type(owner[0]) is not str or _IDENTIFIER.fullmatch(owner[0]) is None
+                or type(owner[1]) is not int or not 0<=owner[1]<=(1<<63)-1 or type(owner[2]) is not str or _GID.fullmatch(owner[2]) is None
+                or type(owner[3]) is not int or not 1<=owner[3]<=(1<<63)-1 or type(owner[4]) is not str or _IDENTIFIER.fullmatch(owner[4]) is None
+                or any(type(x) is not str or _SHA256.fullmatch(x) is None for x in owner[5:])): raise ValueError('invalid stock owner')
+
+
+def _stock_retry_after(value: bytes) -> int:
+    if re.fullmatch(rb'[0-9]{1,19}', value):
+        seconds = int(value)
+    else:
+        instant = parsedate_to_datetime(value.decode('ascii'))
+        if instant.tzinfo is None: raise ValueError('unzoned Retry-After')
+        seconds = max(0, math.ceil((instant-datetime.now(UTC)).total_seconds()))
+    if seconds > (1 << 63)-1: raise ValueError('Retry-After overflow')
+    return seconds
+
+
+class _StockCapture:
+    """Bounded stock INFO heads; discard raw lines and fail closed on observable gaps."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tags = {}
+        self._pending = {}
+        self._heads = {}
+        self._line = bytearray()
+        self._dropping = False
+        self._frame = None
+        self._frame_bytes = 0
+        self._lines = []
+        self._unknown = False
+        self.eof = False
+
+    def bind(self, gid, tag):
+        with self._lock:
+            if (_GID.fullmatch(gid) is None or re.fullmatch('[0-9a-f]{64}',tag) is None
+                or tag.encode() in self._tags or gid in self._tags.values() or len(self._tags)>=64 or self.eof):
+                raise DirectEngineError('stock attempt binding invalid')
+            self._tags[tag.encode()] = gid
+            self._heads[gid] = []
+
+    def fail(self):
+        with self._lock: self._unknown = True
+
+    def feed(self, data):
+        with self._lock:
+            if self.eof: self._unknown = True; return
+            for byte in data:
+                if self._dropping:
+                    if byte==10: self._dropping = False
+                    continue
+                self._line.append(byte)
+                if len(self._line)>2048:
+                    if self._frame is not None: self._unknown = True; self._frame = None; self._lines = []
+                    self._line.clear(); self._dropping = byte!=10
+                elif byte==10:
+                    line = bytes(self._line); self._line.clear()
+                    self._consume_line(line)
+
+    def _consume_line(self, line):
+        prefix = re.search(rb'\[HttpConnection\.cc:[0-9]+\] CUID#([0-9]{1,20}) - (Requesting|Response received):\n$',line)
+        if prefix:
+            if self._frame is not None: self._unknown = True
+            self._frame = (prefix[1],prefix[2]); self._frame_bytes = len(line); self._lines = []
+            return
+        if self._frame is None: return
+        self._frame_bytes += len(line)
+        if self._frame_bytes>=2048 or not line.endswith(b'\r\n') or b'\0' in line:
+            self._unknown = True; self._frame = None; self._lines = []; return
+        if line!=b'\r\n':
+            self._lines.append(line[:-2])
+            return
+        cuid,kind = self._frame; lines = self._lines
+        self._frame = None; self._lines = []
+        try: self._head(cuid,kind,lines)
+        except (ValueError,TypeError,KeyError,UnicodeError,OverflowError): self._unknown = True
+
+    def _head(self, cuid, kind, lines):
+        if not lines: raise ValueError('empty head')
+        headers = {}
+        relevant = {b'host',b'x-hermes-attempt',b'range'} if kind==b'Requesting' else {
+            b'etag',b'content-range',b'content-length',b'content-encoding',b'retry-after',b'location'}
+        for line in lines[1:]:
+            name,sep,value = line.partition(b':')
+            if not sep or re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+",name) is None:
+                raise ValueError('malformed header')
+            name = name.lower()
+            if name not in relevant: continue
+            if name in headers: raise ValueError('duplicate header')
+            value = value.strip(b' \t')
+            if any(byte<32 or byte>=127 for byte in value): raise ValueError('invalid header')
+            headers[name] = value
+        if kind==b'Requesting':
+            match = re.fullmatch(rb'(GET|HEAD) ([^ \r\n]+) HTTP/1\.[01]',lines[0])
+            if match is None or headers.get(b'x-hermes-attempt') not in self._tags or not headers.get(b'host'):
+                raise ValueError('unbound request')
+            gid = self._tags[headers[b'x-hermes-attempt']]
+            resource = hashlib.sha256(headers[b'host']+b'\0'+match[2]).hexdigest()
+            span = None
+            if b'range' in headers:
+                interval = re.fullmatch(rb'bytes=([0-9]+)-([0-9]*)',headers[b'range'])
+                if interval is None: raise ValueError('unsupported request range')
+                span = (int(interval[1]),int(interval[2]) if interval[2] else None)
+            if sum(map(len,self._pending.values()))>=64: raise ValueError('request FIFO bound')
+            self._pending.setdefault(cuid,[]).append((gid,match[1],resource,span))
+            return
+        match = re.fullmatch(rb'HTTP/1\.[01] ([1-5][0-9]{2})(?: [^\r\n]*)?',lines[0])
+        if match is None or cuid not in self._pending: raise ValueError('unpaired response')
+        status = int(match[1]); gid,method,resource,span = self._pending[cuid][0]
+        if status<200:
+            if status==101: raise ValueError('unsupported switch')
+            return
+        self._pending[cuid].pop(0)
+        if not self._pending[cuid]: del self._pending[cuid]
+        if method==b'HEAD' or 300<=status<400: return
+        retry = _stock_retry_after(headers[b'retry-after']) if b'retry-after' in headers else None
+        total = None
+        if b'content-length' in headers:
+            if re.fullmatch(rb'[0-9]{1,19}',headers[b'content-length']) is None: raise ValueError('invalid length')
+            total = int(headers[b'content-length'])
+            if total>(1<<63)-1: raise ValueError('length overflow')
+        if status==206:
+            interval = re.fullmatch(rb'bytes ([0-9]+)-([0-9]+)/([0-9]+)',headers.get(b'content-range',b''))
+            if interval is None or span is None: raise ValueError('unqualified range')
+            start,end,length = map(int,interval.groups())
+            if max(start,end,length)>(1<<63)-1: raise ValueError('range overflow')
+            if not (start<=end<length and start==span[0] and (span[1] is None or end<=span[1]) and total==end-start+1):
+                raise ValueError('range mismatch')
+            total = length
+        elif b'content-range' in headers: raise ValueError('unexpected range')
+        validator = headers.get(b'etag')
+        strong = (hashlib.sha256(validator).hexdigest() if validator is not None
+            and re.fullmatch(rb'"[\x21\x23-\x7e]*"',validator) else None)
+        if headers.get(b'content-encoding',b'identity').lower()!=b'identity': strong = None
+        heads = self._heads[gid]
+        if len(heads)>=128: raise ValueError('contributor bound')
+        heads.append((status,retry,resource,strong,total))
+
+    def finish(self):
+        with self._lock:
+            if self._frame is not None or self._pending or b'HttpConnection.cc' in self._line:
+                self._unknown = True
+            self._line.clear(); self._lines = []; self.eof = True
+
+    def result(self, gid):
+        with self._lock:
+            heads = self._heads.get(gid,[])
+            if self._unknown or not self.eof or not heads: return _StockResult(False)
+            failures = [head for head in heads if head[0]>=400]
+            selected = failures or heads
+            if len({head[:2] for head in selected})!=1: return _StockResult(False)
+            status,retry = selected[0][:2]
+            resources = {head[2] for head in selected}
+            resource = next(iter(resources)) if len(resources)==1 else None
+            identities = {head[2:] for head in heads}
+            validator,total = (heads[0][3:] if not failures and len(identities)==1 else (None,None))
+            return _StockResult(True,status,retry,resource,validator,total,len(heads))
+
+
 class DirectEngineError(RuntimeError):
     """A bounded aria2 lifecycle or RPC failure with no engine diagnostics."""
 
 
 class DirectTransferError(DirectEngineError):
     """aria2 could not produce a hash-verified direct payload."""
+
+
+class _StockTerminalError(DirectTransferError):
+    def __init__(self, state):
+        super().__init__('stock terminal error')
+        self.state = state
 
 
 class DirectAdmissionError(DirectTransferError):
@@ -124,6 +316,7 @@ class DirectTransfer:
     hash_verified: bool
     verification: CompletionVerification | None
     verified_identity: _VerifiedPayloadIdentity | None = None
+    error_code: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +371,11 @@ class DirectAria2Controller:
         self._observation_cancelled = threading.Event()
         self._global_limit_lock = threading.RLock()
         self._global_resume_blocked = False
+        self._capture = _StockCapture()
+        self._capture_reader = None
+        self._sealed_stock = {}
+        self._stock_owners = {}
+        self._stock_tags = {}
 
     def __enter__(self) -> DirectAria2Controller:
         self.start()
@@ -238,6 +436,10 @@ class DirectAria2Controller:
         if self._private_runtime_path is not None or self._private_config_path is not None:
             raise DirectEngineError("aria2 private runtime cleanup is pending")
         self._observation_cancelled.clear()
+        self._capture = _StockCapture()
+        self._sealed_stock = {}
+        self._stock_owners = {}
+        self._stock_tags = {}
         runtime_path: Path | None = None
         process: subprocess.Popen[bytes] | None = None
         process_group_id: int | None = None
@@ -250,13 +452,25 @@ class DirectAria2Controller:
                 cwd=str(runtime_path),
                 env=_filtered_environment(),
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 shell=False,
                 start_new_session=True,
                 close_fds=True,
             )
             self._process = process
+            def drain():
+                try:
+                    while chunk := process.stdout.read1(4096):
+                        self._capture.feed(chunk)
+                except BaseException:
+                    self._capture.fail()
+                finally:
+                    try: process.stdout.close()
+                    except BaseException: self._capture.fail()
+                    finally: self._capture.finish()
+            self._capture_reader = threading.Thread(target=drain,name='direct-stock-reader',daemon=True)
+            self._capture_reader.start()
             self._port = port
             self._secret = secret
             self._launch_argv = argv
@@ -280,6 +494,7 @@ class DirectAria2Controller:
         except (OSError, ValueError):
             stopped, interruption = _stop_process(process, process_group_id)
             if stopped:
+                self._join_stock_reader(time.monotonic()+_RECOVERY_SHUTDOWN_TIMEOUT_SECONDS)
                 self._clear_stopped_process_state()
                 self._cleanup_owned_private_runtime(preserve_primary=True)
             if interruption is not None:
@@ -290,16 +505,22 @@ class DirectAria2Controller:
         except BaseException:
             stopped, _cleanup_interruption = _stop_process(process, process_group_id)
             if stopped:
-                self._clear_stopped_process_state()
-                self._cleanup_owned_private_runtime(preserve_primary=True)
+                try: self._join_stock_reader(time.monotonic()+_RECOVERY_SHUTDOWN_TIMEOUT_SECONDS)
+                except BaseException: pass
+                else:
+                    self._clear_stopped_process_state()
+                    self._cleanup_owned_private_runtime(preserve_primary=True)
             raise
 
-    def close(self) -> None:
+    def close(self, *, deadline=None) -> None:
         """Stop the owned daemon and erase its secret-bearing temporary config."""
 
         self._observation_cancelled.set()
-        stopped, interruption = self._stop_owned_process()
+        supplied=deadline is not None
+        deadline = time.monotonic()+_RECOVERY_SHUTDOWN_TIMEOUT_SECONDS if deadline is None else deadline
+        stopped, interruption = self._stop_owned_process(deadline=deadline) if supplied else self._stop_owned_process()
         if stopped:
+            self._join_stock_reader(deadline)
             self._clear_mappings()
             self._clear_stopped_process_state()
             self._cleanup_owned_private_runtime(
@@ -327,6 +548,7 @@ class DirectAria2Controller:
             raise DirectEngineError("aria2 absent owner discard failed") from None
         if type(returncode) is not int:
             raise DirectEngineError("aria2 absent owner discard failed")
+        self._join_stock_reader(time.monotonic()+_RECOVERY_SHUTDOWN_TIMEOUT_SECONDS)
         self._clear_mappings()
         self._cleanup_owned_private_runtime(preserve_primary=False)
         self._clear_stopped_process_state()
@@ -360,6 +582,7 @@ class DirectAria2Controller:
         destination: DestinationIntent,
         expected_sha256: str | None,
         admission: Admission,
+        saved_resume: bool = False,
     ) -> DirectTransfer:
         """Add one admitted transfer with aria2 paused before any body request."""
 
@@ -379,7 +602,12 @@ class DirectAria2Controller:
             "continue": "true",
             "allow-overwrite": "false",
             "auto-file-renaming": "false",
+            "header": "X-Hermes-Attempt: "+secrets.token_hex(32),
         }
+        if type(saved_resume) is not bool: raise TypeError('invalid saved resume flag')
+        if saved_resume:
+            if expected_sha256 is not None: raise DirectTransferError('saved transport cannot own checksum')
+            options['always-resume'] = 'true'
         if expected_sha256 is not None:
             options["checksum"] = f"sha-256={expected_sha256}"
             options["check-integrity"] = "true"
@@ -396,6 +624,16 @@ class DirectAria2Controller:
         self._by_job_id[job_id] = transfer
         self._by_gid[gid] = transfer
         try:
+            actual = self._rpc('aria2.getOption',[gid])
+            if type(actual) is not dict or actual.get('header') not in (options['header'],options['header']+'\n'):
+                raise DirectTransferError('stock attempt tag not confirmed')
+            tag=options['header'].split(': ',1)[1]
+            self._capture.bind(gid,tag)
+            self._stock_tags[gid]=hashlib.sha256(tag.encode()).hexdigest()
+            if saved_resume:
+                for name in ('continue','always-resume','allow-overwrite','auto-file-renaming'):
+                    if type(actual) is not dict or actual.get(name) != options[name]:
+                        raise DirectTransferError('saved continuation option not confirmed')
             return self._readback(transfer)
         except BaseException:
             self._by_job_id.pop(job_id, None)
@@ -540,6 +778,8 @@ class DirectAria2Controller:
             state = self._readback(transfer)
             if state.status in {"active", "waiting", "paused"}:
                 return None
+            if state.status == 'error':
+                raise _StockTerminalError(state)
             if state.status != "complete" or state.total_length != state.completed_length:
                 raise DirectTransferError("aria2 terminal observation failed")
             verified = self._verify_completed_output(state, transfer)
@@ -549,7 +789,7 @@ class DirectAria2Controller:
             ):
                 raise StaleGenerationError("stale direct observation")
             return verified
-        except StaleGenerationError:
+        except (StaleGenerationError, _StockTerminalError):
             raise
         except Exception:
             raise DirectTransferError("aria2 terminal verification failed") from None
@@ -595,7 +835,7 @@ class DirectAria2Controller:
             "aria2.tellStatus",
             [
                 transfer.gid,
-                ["status", "totalLength", "completedLength"],
+                ["status", "totalLength", "completedLength", "errorCode"],
             ],
         )
         if type(response) is not dict:
@@ -605,6 +845,9 @@ class DirectAria2Controller:
             raise DirectTransferError("aria2 returned an invalid state")
         total_length = _parse_counter(response.get("totalLength"))
         completed_length = _parse_counter(response.get("completedLength"))
+        code = response.get('errorCode')
+        if status == 'error' and (type(code) is not str or re.fullmatch(r'[1-9]|[12][0-9]|3[0-2]',code) is None):
+            raise DirectTransferError('invalid stock error code')
         return DirectTransfer(
             job_id=transfer.job_id,
             generation=transfer.generation,
@@ -615,6 +858,7 @@ class DirectAria2Controller:
             partial_path=transfer.destination.partial_path,
             hash_verified=False,
             verification=None,
+            error_code=int(code) if status == 'error' else None,
         )
 
     def _verify_completed_output(
@@ -701,6 +945,10 @@ class DirectAria2Controller:
             "--auto-file-renaming=false",
             "--auto-save-interval=0",
             "--max-tries=1",
+            "--log=-",
+            "--log-level=info",
+            "--quiet=true",
+            "--console-log-level=error",
         )
 
     def _wait_for_rpc_ready(self) -> None:
@@ -715,7 +963,7 @@ class DirectAria2Controller:
                 return
         raise DirectEngineError("aria2 RPC did not become ready")
 
-    def _rpc(self, method: str, params: list[Any]) -> Any:
+    def _rpc(self, method: str, params: list[Any], *, deadline=None) -> Any:
         process, port, secret = self._require_running()
         request = {
             "jsonrpc": "2.0",
@@ -726,7 +974,7 @@ class DirectAria2Controller:
         try:
             encoded = json.dumps(request, separators=(",", ":")).encode("utf-8")
             connection = http.client.HTTPConnection(
-                "127.0.0.1", port, timeout=_RPC_TIMEOUT_SECONDS
+                "127.0.0.1", port, timeout=_RPC_TIMEOUT_SECONDS if deadline is None else max(.001,min(_RPC_TIMEOUT_SECONDS,deadline-time.monotonic()))
             )
             try:
                 connection.request(
@@ -760,25 +1008,51 @@ class DirectAria2Controller:
             raise DirectEngineError("aria2 is not running")
         return self._process, self._port, self._secret
 
-    def _stop_owned_process(self) -> tuple[bool, BaseException | None]:
+    def _stop_owned_process(self, *, deadline=None) -> tuple[bool, BaseException | None]:
         process, identity = self._process, self._identity
         if process is None:
             return True, None
         interruption: BaseException | None = None
         try:
-            self._rpc("aria2.forceShutdown", [])
+            if deadline is None:self._rpc("aria2.forceShutdown", [])
+            else:self._rpc("aria2.forceShutdown", [],deadline=deadline)
         except DirectEngineError:
             pass
         except BaseException as raised:
             interruption = raised
         stopped, cleanup_interruption = _stop_process(
-            process, None if identity is None else identity.process_group_id
+            process, None if identity is None else identity.process_group_id, **({} if deadline is None else dict(deadline=deadline))
         )
         return stopped, interruption or cleanup_interruption
 
     def _clear_mappings(self) -> None:
         self._by_job_id.clear()
         self._by_gid.clear()
+
+    def _bind_stock_owner(self, job_id, generation, gid, epoch, request_id, birth):
+        transfer=self._callback_transfer(job_id,generation,gid)
+        if self._readback(transfer).status!='paused': raise DirectEngineError('stock owner requires paused GID')
+        if (type(epoch) is not int or epoch<1 or type(request_id) is not str or _IDENTIFIER.fullmatch(request_id) is None
+            or type(birth) is not ProcessBirthIdentity or capture_process_birth(self._identity)!=birth
+            or gid not in self._stock_tags or gid in self._stock_owners): raise DirectEngineError('stock owner binding invalid')
+        owner=(job_id,generation,gid,epoch,request_id,
+            hashlib.sha256(json.dumps(birth.to_record(),sort_keys=True,separators=(',',':')).encode()).hexdigest(),self._stock_tags[gid])
+        self._stock_owners[gid]=owner
+        return owner
+
+    def _join_stock_reader(self, deadline):
+        reader = self._capture_reader
+        if reader is None: return
+        reader.join(max(0,deadline-time.monotonic()))
+        if reader.is_alive() or not self._capture.eof:
+            raise DirectEngineError('stock reader drain incomplete')
+        for transfer in self._by_job_id.values():
+            self._sealed_stock[(transfer.job_id,transfer.generation,transfer.gid)] = replace(self._capture.result(transfer.gid),owner=self._stock_owners.get(transfer.gid))
+
+    def _sealed_stock_result(self, job_id, generation, gid):
+        result = self._sealed_stock.get((job_id,generation,gid))
+        if result is None: raise StaleGenerationError('sealed stock attempt unavailable')
+        return result
 
     def _clear_stopped_process_state(self) -> None:
         self._process = None
@@ -817,7 +1091,8 @@ class DirectAria2Controller:
 def _recover_owned_direct_engine(
     identity: ProcessBirthIdentity,
     capability: _DirectEngineRecoveryCapability,
-) -> None:
+    *, gid: str | None = None,
+) -> int | None:
     """Use one persisted loopback authority to stop a reconciled crashed owner.
 
     This is deliberately not a controller lifecycle: it creates no subprocess,
@@ -835,6 +1110,12 @@ def _recover_owned_direct_engine(
     if reconcile_process_birth(identity) != "current":
         raise DirectEngineError("aria2 recovery failed")
 
+    completed = None
+    if gid is not None:
+        if type(gid) is not str or re.fullmatch('[0-9a-fA-F]{16}',gid) is None:
+            raise DirectEngineError('aria2 recovery GID invalid')
+        completed = _request_recovery_force_shutdown(capability,timeout=_RPC_TIMEOUT_SECONDS,gid=gid)
+        if type(completed) is not int or completed<=0: completed=None
     deadline = time.monotonic() + _RECOVERY_SHUTDOWN_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         timeout = min(_RPC_TIMEOUT_SECONDS, max(0.001, deadline - time.monotonic()))
@@ -847,7 +1128,7 @@ def _recover_owned_direct_engine(
     while time.monotonic() < deadline:
         reconciliation = reconcile_process_birth(identity)
         if reconciliation == "absent":
-            return
+            return completed
         # A daemon that has accepted forceShutdown can be briefly unreconcilable
         # while its former parent reaps it.  Keep the state fail-closed until
         # bounded final absence is proven; do not treat that transient as absent.
@@ -856,18 +1137,19 @@ def _recover_owned_direct_engine(
         time.sleep(_POLL_INTERVAL_SECONDS)
     if reconcile_process_birth(identity) != "absent":
         raise DirectEngineError("aria2 recovery failed")
+    return completed
 
 
 def _request_recovery_force_shutdown(
-    capability: _DirectEngineRecoveryCapability, *, timeout: float
-) -> bool:
+    capability: _DirectEngineRecoveryCapability, *, timeout: float, gid: str | None = None
+) -> bool | int:
     """Issue only the fixed authenticated loopback recovery shutdown request."""
 
     request = {
         "jsonrpc": "2.0",
         "id": "hermes-downloads-recovery",
-        "method": "aria2.forceShutdown",
-        "params": [f"token:{capability.rpc_secret}"],
+        "method": "aria2.forceShutdown" if gid is None else "aria2.tellStatus",
+        "params": [f"token:{capability.rpc_secret}"] + ([] if gid is None else [gid,['gid','completedLength']]),
     }
     try:
         encoded = json.dumps(request, separators=(",", ":")).encode("utf-8")
@@ -888,6 +1170,12 @@ def _request_recovery_force_shutdown(
         if response.status != 200 or len(body) > _MAX_RPC_RESPONSE_BYTES:
             return False
         parsed = json.loads(body)
+        if gid is not None:
+            if (type(parsed) is not dict or parsed.get('jsonrpc')!='2.0'
+                or parsed.get('id')!='hermes-downloads-recovery' or 'error' in parsed
+                or type(parsed.get('result')) is not dict or parsed['result'].get('gid')!=gid):
+                return False
+            return _parse_counter(parsed['result'].get('completedLength'))
         return (
             type(parsed) is dict
             and parsed.get("jsonrpc") == "2.0"
@@ -1154,17 +1442,17 @@ def _wait_for_leader(process: subprocess.Popen[bytes], deadline: float) -> bool:
 
 
 def _stop_process(
-    process: subprocess.Popen[bytes] | None, process_group_id: int | None
+    process: subprocess.Popen[bytes] | None, process_group_id: int | None, *, deadline=None
 ) -> tuple[bool, BaseException | None]:
     if process is None:
         return True, None
     if process_group_id is None:
         try:
-            return _stop_unbound_process(process), None
+            return _stop_unbound_process(process, **({} if deadline is None else dict(deadline=deadline))), None
         except BaseException as raised:
             return False, raised
     try:
-        result = _stop_process_group(process, process_group_id)
+        result = _stop_process_group(process, process_group_id, **({} if deadline is None else dict(deadline=deadline)))
     except BaseException as raised:
         return False, raised
     if type(result) is tuple:
@@ -1172,27 +1460,27 @@ def _stop_process(
     return result, None
 
 
-def _stop_unbound_process(process: subprocess.Popen[bytes]) -> bool:
+def _stop_unbound_process(process: subprocess.Popen[bytes], *, deadline=None) -> bool:
     try:
         process.terminate()
     except OSError:
         return False
-    if _wait_for_leader(process, time.monotonic() + _GROUP_STOP_GRACE_SECONDS):
+    if _wait_for_leader(process, min(time.monotonic() + _GROUP_STOP_GRACE_SECONDS, float('inf') if deadline is None else deadline)):
         return True
     try:
         process.kill()
     except OSError:
         return False
-    return _wait_for_leader(process, time.monotonic() + _GROUP_KILL_GRACE_SECONDS)
+    return _wait_for_leader(process, min(time.monotonic() + _GROUP_KILL_GRACE_SECONDS, float('inf') if deadline is None else deadline))
 
 
 def _stop_process_group(
-    process: subprocess.Popen[bytes], process_group_id: int
+    process: subprocess.Popen[bytes], process_group_id: int, *, deadline=None
 ) -> tuple[bool, BaseException | None]:
     """Contain the bound group before reaping its leader or reusing its PID."""
 
     interruption: BaseException | None = None
-    term_deadline = time.monotonic() + _GROUP_STOP_GRACE_SECONDS
+    term_deadline = min(time.monotonic() + _GROUP_STOP_GRACE_SECONDS, float('inf') if deadline is None else deadline)
     try:
         _signal_group(process_group_id, signal.SIGTERM)
     except BaseException as raised:
@@ -1211,14 +1499,14 @@ def _stop_process_group(
                 interruption = raised
         try:
             _wait_for_group_absence(
-                process_group_id, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
+                process_group_id, min(time.monotonic() + _GROUP_KILL_GRACE_SECONDS, float('inf') if deadline is None else deadline)
             )
         except BaseException as raised:
             if interruption is None:
                 interruption = raised
     try:
         leader_reaped = _wait_for_leader(
-            process, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
+            process, min(time.monotonic() + _GROUP_KILL_GRACE_SECONDS, float('inf') if deadline is None else deadline)
         )
     except BaseException as raised:
         if interruption is None:
@@ -1229,7 +1517,7 @@ def _stop_process_group(
     # point: the numerical process-group ID could have been recycled.
     try:
         final_absence = _wait_for_group_absence(
-            process_group_id, time.monotonic() + _GROUP_KILL_GRACE_SECONDS
+            process_group_id, min(time.monotonic() + _GROUP_KILL_GRACE_SECONDS, float('inf') if deadline is None else deadline)
         )
     except BaseException as raised:
         if interruption is None:

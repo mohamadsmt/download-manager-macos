@@ -40,12 +40,14 @@ def test_real_discovery_requires_downloads_control(private_worker, sdk_lifecycle
         evidence('controls-discovery', tools=names, no_sql_effects=True,
             origin_requests=requests, output_unchanged=True)
         assert 'downloads_control' in names, 'DOWNLOADS_CONTROL_ABSENT: ' + repr(names)
-        assert names == ['downloads_add', 'downloads_control', 'downloads_query']
+        assert names == ['downloads_add', 'downloads_control', 'downloads_edit', 'downloads_replace_source', 'downloads_files', 'downloads_configure', 'downloads_query']
         schema = tools.tools[1].inputSchema
         assert schema['type']=='object' and schema['additionalProperties'] is False
         assert set(schema['required']) == {'scope','action','request_id'}
         assert set(schema['required']) <= set(schema['properties'])
-        assert len(schema['oneOf']) == 3
+        assert len(schema['oneOf']) == 9
+        assert set(schema['properties']['scope']['enum']) == {'queue','job','targets','collection'}
+        assert set(schema['properties']['action']['enum']) == {'pause','resume','remove','start','start_now','retry','preempt'}
         for branch in schema['oneOf']:
             assert branch['type']=='object' and branch['additionalProperties'] is False
             assert set(branch['required']) <= set(branch['properties'])
@@ -239,22 +241,27 @@ def test_real_target_reports_manual_collection_and_not_due_holds(private_worker,
 
 
 @contextmanager
-def body_worker(root, origin_url, ledger):
+def body_worker(root, origin_url, ledger, *, barrier=None, entered=None, release=None, crash=False, recover_socket=False):
     context = multiprocessing.get_context('spawn')
     ready, shutdown, stopped = [context.Event() for _ in range(3)]
     results = context.Queue()
     process = context.Process(target=_scheduler_worker,
-        args=(str(root), ready, shutdown, stopped, results, origin_url, str(ledger)))
+        args=(str(root), ready, shutdown, stopped, results, origin_url, str(ledger)),
+        kwargs=dict(barrier=barrier,entered=entered,release=release,recover_socket=recover_socket))
     process.start()
     try:
         assert ready.wait(6), 'private scheduler did not become ready'
         yield process
     finally:
-        shutdown.set()
+        if not crash:shutdown.set()
         try:
-            _close_fixture_process(process, ledger)
-            assert process.exitcode == 0
-            assert results.get(timeout=3) == ('result', None)
+            _close_fixture_process(process, ledger,crash=crash)
+            if crash:
+                import signal
+                assert process.exitcode == -signal.SIGKILL
+            else:
+                assert process.exitcode == 0
+                assert results.get(timeout=3) == ('result', None)
         finally:
             try:
                 results.close()
@@ -302,7 +309,7 @@ def test_real_body_start_containment_retains_bytes_and_global_blocks_next(tmp_pa
                             positive_bytes = partial.stat().st_size
                             assert 0 < positive_bytes < len(origin_server.payload)
                             with closing(SQLiteStore(root/'state.db')) as store:
-                                engine = store.get_direct_engine_record()
+                                engine = next((owner[1] for owner in store._job_engine_owners() if owner[0]=='batch-job-0'),None)
                             assert engine is not None
                             identity = engine.identity
                             assert processes.is_current_process_birth(identity)
@@ -330,6 +337,11 @@ def test_real_body_start_containment_retains_bytes_and_global_blocks_next(tmp_pa
                                 and row['waitpid']=='ECHILD' and type(row['returncode']) is int for row in closures)
                             effects = [json.loads(line) for line in (ledger/'scheduler-effects.jsonl').read_text().splitlines()]
                             assert any(row['kind']=='observer-join' and not row['alive'] and row['monotonic']<=received for row in effects)
+                            if action=='pause':
+                                unsupported = await call('downloads_control',dict(scope='job',action='resume',job='batch-job-0',
+                                    request_id='hashless-resume',expected_revision=contained['revision'],expected_worker_epoch='1'))
+                                assert unsupported['results'][0]['reason']=='incompatible_authority'
+                                assert partial.read_bytes()==retained
                             replay = await call('downloads_control', request)
                             assert replay == authorization | dict(replayed=True)
                             assert replay['execution_effect'] == 'none'
@@ -349,3 +361,667 @@ def test_real_body_start_containment_retains_bytes_and_global_blocks_next(tmp_pa
         assert origin_thread is not None and not origin_thread.is_alive()
         evidence('controls-origin-joined', action=action, joined=True,
             requests=origin_server.ledger.request_count, response_body_bytes=origin_server.ledger.response_body_bytes)
+
+
+def test_public_configure_applies_owned_concurrent_slots_and_independent_pause(tmp_path,monkeypatch,sdk_lifecycle):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='slots15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.06)
+    with tempfile.TemporaryDirectory(prefix='slots-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=64*1024*1024) as long_origin, _helpers._origin_type()(payload_size=16*1024*1024) as short_origin:
+            with body_worker(root,(long_origin.url(),short_origin.url()),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            configure=dict(request_id='configure-slots',concurrency='2',connections='4',global_limit_bps=None)
+                            accepted=await call('downloads_configure',configure)
+                            assert accepted['status']=='pending' and accepted['revision']=='1'
+                            assert await call('downloads_configure',configure)==accepted|dict(replayed=True)
+                            assert long_origin.ledger.response_body_bytes==short_origin.ledger.response_body_bytes==0
+                            await call('downloads_add',dict(request_id='slots-add',items=[entry(0,source_url=long_origin.url(),expected_sha256=hashlib.sha256(long_origin.payload).hexdigest()),entry(1,source_url=short_origin.url(),expected_sha256=hashlib.sha256(short_origin.payload).hexdigest())]))
+                            await call('downloads_control',targets(['batch-job-0','batch-job-1']))
+                            await call('downloads_control',dict(scope='queue',action='resume',request_id='slots-go',expected_revision='1'))
+                            end=time.monotonic()+12
+                            while True:
+                                a=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                                b=(await call('downloads_query',dict(scope='status',id='batch-job-1')))['record']
+                                partial=output/'.incomplete/batch-job-1/file-1.bin'
+                                if a['state']==b['state']=='downloading' and partial.exists() and partial.stat().st_blocks*512>=2*1024*1024:break
+                                assert time.monotonic()<end and process.is_alive(),(a,b)
+                                await asyncio.sleep(.03)
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                owners=store._job_engine_owners()
+                                assert len(owners)==2 and len({row[1].identity.leader_pid for row in owners})==2
+                                original={row[0]:row[1] for row in owners}
+                                assert store.get_direct_engine_record() is None
+                            pause=await call('downloads_control',dict(scope='job',action='pause',request_id='pause-sibling',job='batch-job-1',expected_revision=str(b['revision'])))
+                            assert pause['state']=='paused' and processes.reconcile_process_birth(original['batch-job-1'].identity)=='absent'
+                            assert processes.reconcile_process_birth(original['batch-job-0'].identity)=='current'
+                            held_a=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                            assert held_a['state']=='downloading'
+                            end=time.monotonic()+8
+                            while not (output/'.incomplete/batch-job-1/file-1.bin.aria2').exists():
+                                assert time.monotonic()<end
+                                await asyncio.sleep(.03)
+                            resume=await call('downloads_control',dict(scope='job',action='resume',request_id='resume-sibling',job='batch-job-1',expected_revision=pause['revision'],expected_worker_epoch='1'))
+                            assert resume['results'][0]['outcome']=='existing_authority'
+                            end=time.monotonic()+20
+                            while not (output/'Other/file-1.bin').exists():
+                                assert time.monotonic()<end
+                                await asyncio.sleep(.04)
+                            assert (output/'Other/file-1.bin').read_bytes()==short_origin.payload
+                            assert processes.reconcile_process_birth(original['batch-job-0'].identity)=='current'
+                            a=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                            await call('downloads_control',dict(scope='job',action='pause',request_id='pause-long',job='batch-job-0',expected_revision=str(a['revision'])))
+                            assert processes.reconcile_process_birth(original['batch-job-0'].identity)=='absent'
+                            settings=await call('downloads_query',dict(scope='settings'))
+                            assert settings['desired']==settings['applied'] and settings['applied']['concurrency']=='2' and settings['speed_units']=='bytes per second'
+                            (directory/'slots-result.json').write_text(json.dumps(dict(originals={j:r.identity.to_record() for j,r in original.items()},independent_pause=True,short_finished_while_long_owned=True,synthetic=True)))
+                asyncio.run(exercise())
+
+
+def test_public_zero_configuration_seals_truthful_stop_and_positive_resumes(tmp_path,monkeypatch,sdk_lifecycle):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='zero15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.05)
+    with tempfile.TemporaryDirectory(prefix='zero-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=16*1024*1024) as origin:
+            with body_worker(root,origin.url(),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='zero-add',items=[entry(source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest())]))
+                            authorization=await call('downloads_control',targets(['batch-job-0']))
+                            await call('downloads_control',dict(scope='queue',action='resume',request_id='zero-go',expected_revision='1'))
+                            partial=output/'.incomplete/batch-job-0/file-0.bin'
+                            end=time.monotonic()+10
+                            while not partial.exists() or partial.stat().st_blocks*512<2*1024*1024:
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            stopped=await call('downloads_configure',dict(request_id='zero-wait',global_limit_bps='0'))
+                            assert stopped['status']=='pending'
+                            end=time.monotonic()+8
+                            while (await call('downloads_query',dict(scope='settings')))['status']!='applied':
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            status=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                            assert status['state']=='paused'
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                assert store._job_engine_owners()==[]
+                                assert store._connection.execute("SELECT count(*) FROM job_control_commands WHERE action='pause'").fetchone()[0]==0
+                                assert store._connection.execute("SELECT stop_kind FROM stopped_control_bodies").fetchall()[0][0]=='configure'
+                            before=origin.ledger.response_body_bytes
+                            await call('downloads_query',dict(scope='list'));await asyncio.sleep(.1)
+                            assert origin.ledger.response_body_bytes==before
+                            await call('downloads_configure',dict(request_id='zero-clear',global_limit_bps=None))
+                            end=time.monotonic()+20
+                            while not (output/'Other/file-0.bin').exists():
+                                assert time.monotonic()<end;await asyncio.sleep(.03)
+                            assert (output/'Other/file-0.bin').read_bytes()==origin.payload
+                            assert await call('downloads_control',targets(['batch-job-0']))==authorization|dict(replayed=True)
+                asyncio.run(exercise())
+
+@pytest.mark.parametrize('known',[True,False,'mismatch'])
+def test_public_replace_source_quiesces_preserves_creation_and_uses_fresh_authority(tmp_path,monkeypatch,sdk_lifecycle,known):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='replace15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.05)
+    with tempfile.TemporaryDirectory(prefix='replace-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=16*1024*1024) as old, _helpers._origin_type()(payload_size=16*1024*1024) as fresh:
+            if known=='mismatch':fresh.payload=fresh.changed_payload
+            with body_worker(root,(old.url(),fresh.url()),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='replace-add',items=[entry(source_url=old.url(),expected_sha256=hashlib.sha256(old.payload).hexdigest() if known else None)]))
+                            await call('downloads_control',targets(['batch-job-0']));await call('downloads_control',dict(scope='queue',action='resume',request_id='replace-go',expected_revision='1'))
+                            partial=output/'.incomplete/batch-job-0/file-0.bin';end=time.monotonic()+10
+                            while not partial.exists() or partial.stat().st_blocks*512<2*1024*1024:
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            with sqlite3.connect(root/'state.db') as db:
+                                creation=db.execute('SELECT source_url FROM jobs').fetchone()[0]
+                                receipt=db.execute('SELECT receipt FROM add_batch_commands').fetchone()[0]
+                            replacement=dict(id='batch-job-0',url=fresh.url(),request_id='replace-source')
+                            accepted=await call('downloads_replace_source',replacement)
+                            assert accepted['status']=='pending'
+                            end=time.monotonic()+12
+                            while True:
+                                detail=await call('downloads_query',dict(scope='detail',id='batch-job-0'))
+                                if detail['source_replacement']['status']!='pending':break
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            assert detail['source_replacement']['status']==('applied' if known else 'blocked')
+                            assert await call('downloads_replace_source',replacement)==accepted|dict(replayed=True)
+                            if known=='mismatch':
+                                end=time.monotonic()+22
+                                while True:
+                                    current=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                                    with closing(SQLiteStore(root/'state.db')) as store:
+                                        bodies=store._connection.execute("SELECT count(*) FROM target_dispatch_causes WHERE kind='body'").fetchone()[0]
+                                        owners=store._job_engine_owners()
+                                    if bodies==2 and current['state']=='paused' and not owners:break
+                                    assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.03)
+                                assert not (output/'Other/file-0.bin').exists()
+                                with closing(SQLiteStore(root/'state.db')) as store:retained_name=store._saved_continuation(store._connection,'batch-job-0').retained_names[0]
+                                retained=partial.parent/retained_name
+                                assert retained.exists() and fresh.ledger.response_body_bytes>0
+                                digest=hashlib.sha256(retained.read_bytes()).hexdigest();await asyncio.sleep(.1)
+                                assert hashlib.sha256(retained.read_bytes()).hexdigest()==digest
+                            elif known:
+                                end=time.monotonic()+22
+                                while not (output/'Other/file-0.bin').exists():
+                                    assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.03)
+                                assert (output/'Other/file-0.bin').read_bytes()==old.payload
+                                assert fresh.ledger.response_body_bytes>0
+                                assert any(row.range_header is not None for row in fresh.ledger.entries)
+                            else:
+                                before=partial.read_bytes();await asyncio.sleep(.1)
+                                assert partial.read_bytes()==before and fresh.ledger.response_body_bytes==0
+                                assert detail['source_replacement']['alternative']=='separate_download'
+                            with sqlite3.connect(root/'state.db') as db:
+                                assert db.execute('SELECT source_url FROM jobs').fetchone()[0]==creation
+                                assert db.execute('SELECT receipt FROM add_batch_commands').fetchone()[0]==receipt
+                asyncio.run(exercise())
+
+def test_public_edits_reach_order_schedule_cap_and_destination(tmp_path,monkeypatch,sdk_lifecycle):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='edit15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    with tempfile.TemporaryDirectory(prefix='edit-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=1024) as origin:
+            with body_worker(root,origin.url(),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='edit-add',items=[entry(i,source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest()) for i in range(2)]))
+                            first=dict(ids=['batch-job-0'],patch=dict(priority=10,order_key='9',scheduled_for='2032-01-01T12:00:00+03:30',limit_bps='102400'),request_id='edit-first')
+                            receipt=await call('downloads_edit',first)
+                            second=dict(ids=['batch-job-1'],patch=dict(destination=dict(category='Documents',collection=None)),request_id='edit-destination')
+                            await call('downloads_edit',second)
+                            end=time.monotonic()+5
+                            while (await call('downloads_query',dict(scope='detail',id='batch-job-1')))['edit']['status']!='applied':
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            await call('downloads_control',targets(['batch-job-0','batch-job-1'],revision='1'))
+                            await call('downloads_control',dict(scope='queue',action='resume',request_id='edit-go',expected_revision='1'))
+                            end=time.monotonic()+10
+                            while not (output/'Documents/file-1.bin').exists():
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.03)
+                            assert not (output/'Other/file-0.bin').exists()
+                            detail=await call('downloads_query',dict(scope='detail',id='batch-job-0'))
+                            assert detail['effective']['scheduled_for']=='2032-01-01T12:00:00+03:30' and detail['effective']['limit_bps']=='102400'
+                            current=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                            await call('downloads_control',dict(scope='job',action='start_now',job='batch-job-0',request_id='edit-start-now',expected_revision=str(current['revision']),expected_worker_epoch='1'))
+                            end=time.monotonic()+10
+                            while not (output/'Other/file-0.bin').exists():
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.03)
+                            assert await call('downloads_edit',first)==receipt|dict(replayed=True)
+                            assert (output/'Documents/file-1.bin').read_bytes()==origin.payload
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                captured=store.get_batch_creation_intent('batch-job-1')
+                                assert captured.original_job.category=='Other' and captured.reservation.target_component=='Other'
+                asyncio.run(exercise())
+
+@pytest.mark.parametrize('destination_change',[False,True])
+def test_public_active_edit_retains_checkpoint_and_attempt_budget(tmp_path,monkeypatch,sdk_lifecycle,destination_change):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='activeedit15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.05)
+    with tempfile.TemporaryDirectory(prefix='activeedit-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=16*1024*1024) as origin:
+            if destination_change:
+                response=origin._response_for;requests=[]
+                def first_failure(*args):
+                    requests.append(True)
+                    return (503,{},b'') if len(requests)==1 else response(*args)
+                origin._response_for=first_failure
+            with body_worker(root,origin.url(),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='activeedit-add',items=[entry(source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest())]))
+                            await call('downloads_control',targets(['batch-job-0']));await call('downloads_control',dict(scope='queue',action='resume',request_id='activeedit-go',expected_revision='1'))
+                            partial=output/'.incomplete/batch-job-0/file-0.bin';end=time.monotonic()+20
+                            while not partial.exists() or partial.stat().st_blocks*512<2*1024*1024:
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                before=store.get_retry_budget('batch-job-0')
+                            edit=dict(ids=['batch-job-0'],patch=dict(priority=8,limit_bps=None),request_id='activeedit-change')
+                            if destination_change:edit['patch']['destination']=dict(category='Documents',collection=None)
+                            marker=partial.parent/'.hermes-reservation';original_marker=(marker.stat().st_ino,marker.read_bytes())
+                            with closing(SQLiteStore(root/'state.db')) as store:original_reservation=store.get_publication_reservation('batch-job-0')
+                            receipt=await call('downloads_edit',edit)
+                            end=time.monotonic()+25
+                            final=output/('Documents' if destination_change else 'Other')/'file-0.bin'
+                            while not final.exists():
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.03)
+                            assert final.read_bytes()==origin.payload
+                            assert not destination_change or not (output/'Other/file-0.bin').exists()
+                            assert any(row.range_header is not None for row in origin.ledger.entries)
+                            assert await call('downloads_edit',edit)==receipt|dict(replayed=True)
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                after=store.get_retry_budget('batch-job-0')
+                                if destination_change:
+                                    assert before is not None and after is not None and before.ordinary_attempts==1
+                                    assert (before.generation,before.budget_number,before.ordinary_attempts,before.exhausted)==(after.generation,after.budget_number,after.ordinary_attempts,after.exhausted)
+                                else:assert before is None and after is None
+                                assert store.get_publication_reservation('batch-job-0')==original_reservation
+                            end=time.monotonic()+5
+                            while marker.exists():
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            assert not list(partial.parent.glob('.hermes-resume-*'))
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                assert store._connection.execute("SELECT stop_kind FROM stopped_control_bodies").fetchone()[0]=='edit'
+                                assert store._connection.execute("SELECT count(*) FROM job_control_commands WHERE action='pause'").fetchone()[0]==0
+                asyncio.run(exercise())
+
+
+def test_public_files_reveal_and_confirmed_exact_final_purge(tmp_path,monkeypatch,sdk_lifecycle):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='files15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    with tempfile.TemporaryDirectory(prefix='files-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=1024) as origin:
+            with body_worker(root,origin.url(),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='files-add',items=[entry(source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest())]))
+                            await call('downloads_control',targets(['batch-job-0']));await call('downloads_control',dict(scope='queue',action='resume',request_id='files-go',expected_revision='1'))
+                            end=time.monotonic()+10
+                            while True:
+                                with closing(SQLiteStore(root/'state.db')) as store:
+                                    claim=store._read_direct_cleanup_claim(store._connection,'batch-job-0',{})
+                                    finished=claim is not None and claim.phase=='finished'
+                                if finished:break
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            final=output/'Other/file-0.bin';sentinel=final.parent/'unknown.sidecar';sentinel.write_bytes(b'unknown')
+                            reveal=dict(action='reveal',ids=['batch-job-0'],request_id='files-reveal')
+                            accepted=await call('downloads_files',reveal)
+                            assert accepted['status']=='pending'
+                            end=time.monotonic()+5
+                            while True:
+                                detail=await call('downloads_query',dict(scope='detail',id='batch-job-0'))
+                                if detail['files']['status']!='pending':break
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            assert detail['files']['status']=='reveal_pending' and detail['files']['path']==str(final)
+                            assert await call('downloads_files',reveal)==accepted|dict(replayed=True)
+                            refused=await session.call_tool('downloads_files',arguments=dict(action='purge',ids=['batch-job-0'],request_id='files-unconfirmed'))
+                            assert refused.isError and final.exists()
+                            purge=dict(action='purge',ids=['batch-job-0'],request_id='files-purge',confirmed=True)
+                            receipt=await call('downloads_files',purge)
+                            end=time.monotonic()+5
+                            while final.exists():
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            end=time.monotonic()+5
+                            while (await call('downloads_query',dict(scope='detail',id='batch-job-0')))['files']['status']!='purged':
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            assert sentinel.read_bytes()==b'unknown'
+                            assert await call('downloads_files',purge)==receipt|dict(replayed=True)
+                            assert (await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']['state']=='completed'
+                asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('removed',[False,True])
+def test_public_active_purge_contains_and_deletes_only_recorded_stopped_artifacts(tmp_path,monkeypatch,sdk_lifecycle,removed):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='activepurge15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.08)
+    with tempfile.TemporaryDirectory(prefix='activepurge-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=32*1024*1024) as origin:
+            with body_worker(root,origin.url(),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='activepurge-add',items=[entry(source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest())]))
+                            await call('downloads_control',targets(['batch-job-0']));await call('downloads_control',dict(scope='queue',action='resume',request_id='activepurge-go',expected_revision='1'))
+                            partial=output/'.incomplete/batch-job-0/file-0.bin';end=time.monotonic()+10
+                            while not partial.exists() or partial.stat().st_blocks*512<2*1024*1024:
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            status=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                            paused=await call('downloads_control',dict(scope='job',action='pause',request_id='activepurge-pause',job='batch-job-0',expected_revision=str(status['revision'])))
+                            end=time.monotonic()+6
+                            while True:
+                                with closing(SQLiteStore(root/'state.db')) as store:checkpoint=store._saved_checkpoint(store._connection,'batch-job-0')
+                                if checkpoint is not None:break
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            await call('downloads_control',dict(scope='job',action='resume',request_id='activepurge-resume',job='batch-job-0',expected_revision=paused['revision'],expected_worker_epoch='1'))
+                            end=time.monotonic()+10
+                            while True:
+                                with closing(SQLiteStore(root/'state.db')) as store:
+                                    bodies=store._connection.execute("SELECT count(*) FROM target_dispatch_causes WHERE kind='body'").fetchone()[0];owners=store._job_engine_owners()
+                                if bodies==2 and owners and owners[0][1] is not None and partial.stat().st_blocks*512>3*1024*1024:break
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            identity=owners[0][1].identity;sentinel=partial.parent/'unknown.sidecar';sentinel.write_bytes(b'unknown')
+                            if removed:
+                                current=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                                stopped=await call('downloads_control',dict(scope='job',action='pause',request_id='remove-pause',job='batch-job-0',expected_revision=str(current['revision'])))
+                                end=time.monotonic()+6
+                                while True:
+                                    with closing(SQLiteStore(root/'state.db')) as store:sealed=store._saved_checkpoint(store._connection,'batch-job-0')
+                                    if sealed is not None and sealed[0]['source_request_id']!=checkpoint[0]['source_request_id']:break
+                                    assert time.monotonic()<end;await asyncio.sleep(.02)
+                                deleted=await call('downloads_control',dict(scope='job',action='remove',request_id='remove-before-purge',job='batch-job-0',expected_revision=stopped['revision']))
+                                assert deleted['status']=='applied' and deleted['state']=='removed'
+                                assert partial.exists() and sentinel.exists()
+                            request=dict(action='purge',ids=['batch-job-0'],request_id='activepurge-files',confirmed=True)
+                            receipt=await call('downloads_files',request);end=time.monotonic()+8
+                            while True:
+                                detail=await call('downloads_query',dict(scope='detail',id='batch-job-0'))
+                                if detail['files']['status'] not in {'pending','purge_authorized','saved_purge_authorized'}:break
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            assert detail['files']['status']=='purged'
+                            assert processes.reconcile_process_birth(identity)=='absent'
+                            assert list(partial.parent.iterdir())==[sentinel] and sentinel.read_bytes()==b'unknown'
+                            assert not (output/'Other/file-0.bin').exists()
+                            before=origin.ledger.response_body_bytes;await asyncio.sleep(.15)
+                            assert origin.ledger.response_body_bytes==before
+                            assert await call('downloads_files',request)==receipt|dict(replayed=True)
+                asyncio.run(exercise())
+
+
+def test_public_queue_start_freezes_more_than_500_and_replay_never_expands(private_worker,sdk_lifecycle):
+    root,process=private_worker
+    with origin() as requests:
+        async def exercise():
+            async with stdio_client(parameters(root)) as (read,write):
+                async with ClientSession(read,write) as session:
+                    await session.initialize()
+                    async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                    for offset,count in ((0,500),(500,1)):
+                        await call('downloads_add',dict(request_id='capture-add-'+str(offset),items=[entry(i,source_url='https://downloads.example.test/capture.bin') for i in range(offset,offset+count)]))
+                    await call('downloads_control',dict(scope='job',action='pause',request_id='capture-manual',job='batch-job-500',expected_revision='0'))
+                    request=dict(scope='queue',action='start',request_id='capture-queue',expected_worker_epoch='1')
+                    receipt=await call('downloads_control',request)
+                    assert receipt['status']=='pending' and receipt['member_count']=='501' and receipt['cohort_count']=='2'
+                    await call('downloads_add',dict(request_id='capture-later',items=[entry(501,source_url='https://downloads.example.test/later.bin')]))
+                    end=time.monotonic()+15
+                    while True:
+                        status=await call('downloads_query',dict(scope='control',id='capture-queue'))
+                        if status['status']!='pending':break
+                        assert time.monotonic()<end;await asyncio.sleep(.02)
+                    assert status['status']=='applied' and status['member_count']=='501'
+                    assert await call('downloads_control',request)==receipt|dict(replayed=True)
+                    with closing(SQLiteStore(root/'state.db')) as store:
+                        assert store._connection.execute('SELECT count(*) FROM job_authorization_heads').fetchone()[0]==501
+                        assert store.get_materialized_job('batch-job-500').manual_hold
+                        assert not store.get_materialized_job('batch-job-501').authorized
+                        assert store._connection.execute("SELECT count(*) FROM target_dispatch_causes WHERE kind='body'").fetchone()[0]==0
+                    assert requests==[] and process.poll() is None
+        asyncio.run(exercise())
+
+
+def test_public_collection_gate_contains_only_matching_stock_slot(tmp_path,monkeypatch,sdk_lifecycle):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='collection15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.2)
+    with tempfile.TemporaryDirectory(prefix='collection-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=32*1024*1024) as origin:
+            with body_worker(root,origin.url(),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_configure',dict(request_id='collection-two',concurrency='2'))
+                            for i,name in enumerate(('collection-a','collection-b')):
+                                await call('downloads_add',dict(request_id='collection-add-'+str(i),collection=name,items=[entry(i,source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest())]))
+                            await call('downloads_control',targets(['batch-job-0','batch-job-1']));await call('downloads_control',dict(scope='queue',action='resume',request_id='collection-go',expected_revision='1'))
+                            end=time.monotonic()+15
+                            while True:
+                                with closing(SQLiteStore(root/'state.db')) as store:owners={row[0]:row[1] for row in store._job_engine_owners()}
+                                if len(owners)==2 and all(value is not None for value in owners.values()) and all((output/'.incomplete'/job/f'file-{i}.bin').exists() and (output/'.incomplete'/job/f'file-{i}.bin').stat().st_blocks*512>1024*1024 for i,job in enumerate(('batch-job-0','batch-job-1'))):break
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            identities={job:record.identity for job,record in owners.items()}
+                            collections=[(await call('downloads_query',dict(scope='detail',id='batch-job-'+str(i))))['collection'] for i in range(2)]
+                            assert all(value['revision']=='0' and value['held'] is False for value in collections)
+                            collection_ids=[value['id'] for value in collections]
+                            command=dict(scope='collection',action='pause',collection=collection_ids[0],request_id='collection-pause',expected_worker_epoch='1',expected_revision='0')
+                            receipt=await call('downloads_control',command)
+                            end=time.monotonic()+8
+                            while (await call('downloads_query',dict(scope='control',id='collection-pause')))['status']=='pending':
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            assert processes.reconcile_process_birth(identities['batch-job-0'])=='absent'
+                            assert processes.is_current_process_birth(identities['batch-job-1'])
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                assert store.collection_hold(collection_ids[0]) and not store.collection_hold(collection_ids[1])
+                                assert not store.get_materialized_job('batch-job-0').manual_hold
+                                assert store._connection.execute("SELECT stop_kind FROM stopped_control_bodies WHERE job_id='batch-job-0'").fetchone()[0]=='collection'
+                            assert await call('downloads_control',command)==receipt|dict(replayed=True)
+                            await call('downloads_control',dict(scope='collection',action='resume',collection=collection_ids[0],request_id='collection-resume',expected_worker_epoch='1',expected_revision='1'))
+                            end=time.monotonic()+8
+                            while True:
+                                with closing(SQLiteStore(root/'state.db')) as store:
+                                    count=store._connection.execute("SELECT count(*) FROM target_dispatch_causes WHERE kind='body' AND job_id='batch-job-0'").fetchone()[0]
+                                if count==2:break
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                asyncio.run(exercise())
+
+
+
+def test_public_explicit_retry_opens_new_budget_only_once_after_actual_exhausted_failure(tmp_path,monkeypatch,sdk_lifecycle):
+    import hashlib
+    from hermes_downloads import retry
+    directory=Path(tempfile.mkdtemp(prefix='retry-open-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    with tempfile.TemporaryDirectory(prefix='retryopen-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=1024) as origin:
+            response=origin._response_for;origin._response_for=lambda *_:(503,{},b'')
+            with body_worker(root,origin.url(),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='retry-open-add',items=[entry(source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest())]))
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                authority=retry.RetryAuthority.open(policy=retry.RetryPolicy(),job_id='batch-job-0',generation=0)
+                                for _ in range(4):authority.decide(retry.RetryFailure(retry.FailureKind.TRANSIENT_HOST),generation=0)
+                                store.set_retry_budget(authority.budget)
+                            await call('downloads_control',targets(['batch-job-0']));await call('downloads_control',dict(scope='queue',action='resume',request_id='retry-open-go',expected_revision='1'))
+                            end=time.monotonic()+8
+                            while True:
+                                current=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                                if current['state']=='blocked':break
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                before=store.get_retry_budget('batch-job-0');assert before.exhausted and before.ordinary_attempts==5
+                            origin._response_for=response
+                            request=dict(scope='job',action='retry',job='batch-job-0',request_id='retry-open-fresh',expected_revision=str(current['revision']),expected_worker_epoch='1')
+                            receipt=await call('downloads_control',request);assert receipt['status']=='pending'
+                            end=time.monotonic()+10
+                            while not (output/'Other/file-0.bin').exists():
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            assert (output/'Other/file-0.bin').read_bytes()==origin.payload
+                            assert await call('downloads_control',request)==receipt|dict(replayed=True)
+                            audit=await call('downloads_query',dict(scope='events'))
+                            kinds=[event['kind'] for event in audit['events']]
+                            assert kinds.count('job_retry_opened')==1 and kinds.count('job_failure')==1
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                after=store.get_retry_budget('batch-job-0')
+                                assert (after.generation,after.budget_number,after.ordinary_attempts,after.exhausted)==(1,before.budget_number+1,0,False)
+                                assert after.audit[:len(before.audit)]==before.audit
+                                assert sum(event.kind is retry.RetryAuditKind.EXPLICIT_RESUME for event in after.audit)==1
+                                assert store._connection.execute("SELECT count(*) FROM target_dispatch_causes WHERE kind='body'").fetchone()[0]==2
+                asyncio.run(exercise())
+
+
+def test_public_preemption_seals_victim_and_short_selected_job_publishes_first(tmp_path,monkeypatch,sdk_lifecycle):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='preempt15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.12)
+    with tempfile.TemporaryDirectory(prefix='preempt-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=32*1024*1024) as long, _helpers._origin_type()(payload_size=1024) as short:
+            with body_worker(root,(long.url(),short.url()),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='preempt-add',items=[entry(0,source_url=long.url(),expected_sha256=hashlib.sha256(long.payload).hexdigest()),entry(1,source_url=short.url(),expected_sha256=hashlib.sha256(short.payload).hexdigest())]))
+                            await call('downloads_control',targets(['batch-job-0']));await call('downloads_control',dict(scope='queue',action='resume',request_id='preempt-go',expected_revision='1'))
+                            partial=output/'.incomplete/batch-job-0/file-0.bin';end=time.monotonic()+10
+                            while not partial.exists() or partial.stat().st_blocks*512<2*1024*1024:
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            with closing(SQLiteStore(root/'state.db')) as store:original=store._job_engine_owners()[0][1].identity
+                            request=dict(scope='job',action='preempt',job='batch-job-1',request_id='preempt-short',expected_revision='0',expected_worker_epoch='1')
+                            receipt=await call('downloads_control',request);assert receipt['status']=='pending'
+                            end=time.monotonic()+10
+                            while not (output/'Other/file-1.bin').exists():
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            assert (output/'Other/file-1.bin').read_bytes()==short.payload
+                            assert not (output/'Other/file-0.bin').exists()
+                            assert processes.reconcile_process_birth(original)=='absent'
+                            end=time.monotonic()+10
+                            while True:
+                                with closing(SQLiteStore(root/'state.db')) as store:
+                                    bodies=store._connection.execute("SELECT count(*) FROM target_dispatch_causes WHERE job_id='batch-job-0' AND kind='body'").fetchone()[0]
+                                if bodies==2:break
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                assert not store.get_materialized_job('batch-job-0').manual_hold
+                                assert store._connection.execute("SELECT stop_kind FROM stopped_control_bodies WHERE job_id='batch-job-0'").fetchone()[0]=='preempt'
+                            assert await call('downloads_control',request)==receipt|dict(replayed=True)
+                asyncio.run(exercise())
+
+
+
+def test_public_tiny_positive_global_share_waits_without_admitting_zero_share_body(tmp_path,monkeypatch,sdk_lifecycle):
+    import hashlib
+    directory=Path(tempfile.mkdtemp(prefix='tinyshare15-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.06)
+    with tempfile.TemporaryDirectory(prefix='tinyshare-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=32*1024*1024) as origin:
+            with body_worker(root,origin.url(),directory) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_configure',dict(request_id='tinyshare-limit',concurrency='2',global_limit_bps='1'))
+                            await call('downloads_add',dict(request_id='tinyshare-add',items=[entry(i,source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest()) for i in range(2)]))
+                            await call('downloads_control',targets(['batch-job-0','batch-job-1']));await call('downloads_control',dict(scope='queue',action='resume',request_id='tinyshare-go',expected_revision='1'))
+                            end=time.monotonic()+10
+                            while not (output/'.incomplete/batch-job-0/file-0.bin').exists():
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            await asyncio.sleep(.5)
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                assert store.get_job('batch-job-1').state=='queued'
+                                assert store._capture_target_head(store._connection,'batch-job-1').last_admission_serial==0
+                                assert not store._connection.execute("SELECT 1 FROM target_dispatch_causes WHERE kind='body' AND job_id='batch-job-1'").fetchone()
+                            await call('downloads_configure',dict(request_id='tinyshare-positive',global_limit_bps='2000000'))
+                            end=time.monotonic()+8
+                            while True:
+                                with closing(SQLiteStore(root/'state.db')) as store:owners=store._job_engine_owners()
+                                if len(owners)==2 and all(owner[1] is not None for owner in owners):break
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            while True:
+                                records=[json.loads(line) for line in (directory/'scheduler-effects.jsonl').read_text().splitlines()]
+                                shares=[record for record in records if record['kind']=='actual-stock-allocation' and record['allocation_bps']==1000000]
+                                if {record['job'] for record in shares}=={'batch-job-0','batch-job-1'}:break
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            assert all(record['item_option']==record['global_option']=='1000000' and record['connections']==record['split']=='4' for record in shares)
+                            original={owner[0]:owner[1].identity for owner in owners}
+                            await call('downloads_configure',dict(request_id='tinyshare-connections',connections='2'))
+                            end=time.monotonic()+15
+                            while True:
+                                records=[json.loads(line) for line in (directory/'scheduler-effects.jsonl').read_text().splitlines()]
+                                changed=[record for record in records if record['kind']=='actual-stock-allocation' and record['connections']==record['split']=='2']
+                                if {record['job'] for record in changed}=={'batch-job-0','batch-job-1'}:break
+                                assert time.monotonic()<end and process.is_alive();await asyncio.sleep(.02)
+                            assert all(processes.reconcile_process_birth(identity)=='absent' for identity in original.values())
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                assert store.get_retry_budget('batch-job-0') is store.get_retry_budget('batch-job-1') is None
+                                assert [row[0] for row in store._connection.execute("SELECT count(*) FROM target_dispatch_causes WHERE kind='body' GROUP BY job_id ORDER BY job_id")]==[2,2]
+                            await call('downloads_configure',dict(request_id='tinyshare-unlimited',global_limit_bps=None))
+                            end=time.monotonic()+6
+                            while True:
+                                records=[json.loads(line) for line in (directory/'scheduler-effects.jsonl').read_text().splitlines()]
+                                unlimited=[record for record in records if record['kind']=='actual-stock-allocation' and record['allocation_bps'] is None]
+                                if {record['job'] for record in unlimited}=={'batch-job-0','batch-job-1'}:break
+                                assert time.monotonic()<end;await asyncio.sleep(.02)
+                            assert all(record['item_option']==record['global_option']=='0' for record in unlimited)
+                asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('cut',['cut-saved-purge','cut-saved-purge-marker'])
+def test_actual_cold_selected_purge_uses_fresh_consent_and_prior_unlink_authority(tmp_path,monkeypatch,sdk_lifecycle,cut):
+    import hashlib,signal
+    from test_direct_publication import _append_record
+    directory=Path(tempfile.mkdtemp(prefix=cut+'-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))));directory.chmod(0o700)
+    home=directory/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home));output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.1)
+    context=multiprocessing.get_context('spawn');entered,release=context.Event(),context.Event()
+    async def call(root,name,args):
+        async with stdio_client(parameters(root)) as (read,write):
+            async with ClientSession(read,write) as session:
+                await session.initialize();return result_record(await session.call_tool(name,arguments=args))
+    def invoke(root,name,args):return asyncio.run(call(root,name,args))
+    def wait(predicate,seconds=12):
+        end=time.monotonic()+seconds
+        while not predicate():assert time.monotonic()<end;time.sleep(.02)
+    with tempfile.TemporaryDirectory(prefix='purgecut-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=32*1024*1024) as origin:
+            with body_worker(root,origin.url(),directory,barrier=cut,entered=entered,release=release,crash=True,recover_socket=True) as original:
+                invoke(root,'downloads_add',dict(request_id='purgecut-add',items=[entry(source_url=origin.url(),expected_sha256=hashlib.sha256(origin.payload).hexdigest())]))
+                invoke(root,'downloads_control',targets(['batch-job-0']))
+                invoke(root,'downloads_control',dict(scope='queue',action='resume',request_id='purgecut-go',expected_revision='1'))
+                partial=output/'.incomplete/batch-job-0/file-0.bin';wait(lambda:partial.exists() and partial.stat().st_blocks*512>2*1024*1024)
+                sentinel=partial.parent/'unknown.sidecar';sentinel.write_bytes(b'preserved')
+                request=dict(action='purge',ids=['batch-job-0'],request_id='purgecut-old',confirmed=True)
+                receipt=invoke(root,'downloads_files',request);assert entered.wait(12)
+                with closing(SQLiteStore(root/'state.db')) as store:
+                    original_checkpoint=tuple(store._connection.execute('SELECT * FROM stopped_control_bodies').fetchone())
+                    preauthorized=[tuple(row) for row in store._connection.execute('SELECT * FROM direct_saved_purge')]
+                    creation=store.get_batch_creation_intent('batch-job-0')
+                records=[json.loads(line) for line in (directory/f'fixture-{original.pid}.jsonl').read_text().splitlines()]
+                identity=processes.ProcessBirthIdentity.from_record(next(row['identity'] for row in records if row['kind']=='worker-birth'))
+                os.killpg(identity.process_group_id,signal.SIGKILL);original.join(8);assert original.exitcode==-signal.SIGKILL
+                with pytest.raises(ChildProcessError):os.waitpid(original.pid,os.WNOHANG)
+                _append_record(directory/'original-purge-wait.jsonl','original-worker-wait',identity=identity.to_record(),exitcode=original.exitcode,waitpid='ECHILD')
+            before=origin.ledger.response_body_bytes;names=sorted(path.name for path in partial.parent.iterdir())
+            with body_worker(root,origin.url(),directory,recover_socket=True) as cold:
+                invoke(root,'downloads_query',dict(scope='list'))
+                assert (invoke(root,'downloads_query',dict(scope='queue')))['queue_gate']=='paused'
+                assert invoke(root,'downloads_files',request)==receipt|dict(replayed=True)
+                assert sorted(path.name for path in partial.parent.iterdir())==names and origin.ledger.response_body_bytes==before
+                fresh=request|dict(request_id='purgecut-fresh');accepted=invoke(root,'downloads_files',fresh)
+                wait(lambda:(invoke(root,'downloads_query',dict(scope='detail',id='batch-job-0')))['files']['status']=='purged')
+                assert list(partial.parent.iterdir())==[sentinel] and sentinel.read_bytes()==b'preserved'
+                assert not (output/'Other/file-0.bin').exists() and origin.ledger.response_body_bytes==before
+                assert invoke(root,'downloads_files',fresh)==accepted|dict(replayed=True)
+                with closing(SQLiteStore(root/'state.db')) as store:
+                    assert tuple(store._connection.execute('SELECT * FROM stopped_control_bodies').fetchone())==original_checkpoint
+                    assert [tuple(row) for row in store._connection.execute('SELECT * FROM direct_saved_purge WHERE request_id=?',(request['request_id'],))]==preauthorized
+                    assert store.get_batch_creation_intent('batch-job-0')==creation
+                (directory/'purge-cut-result.json').write_text(json.dumps(dict(cut=cut,original_wait=True,fresh_consent=True,prior_unlink_authority=True,body_inert=True,unknown_preserved=True,synthetic=True)))

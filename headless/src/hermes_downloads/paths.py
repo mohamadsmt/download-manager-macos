@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import os
+import re
 from pathlib import Path
 import stat
 from threading import Lock
@@ -107,6 +108,7 @@ class DestinationIntent:
     final_path: Path
     incomplete_dir: Path
     partial_path: Path
+    workspace_reservation: PublicationReservation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +372,10 @@ def prepare_persisted_destination_workspace(
     root_fd = _open_root(root)
     try:
         _preflight_persisted_workspace(root_fd, destination, final_component)
+        if destination.workspace_reservation is not None:
+            workspace=_destination_workspace_reservation(destination)
+            workspace_fd=_open_or_create_directory(root_fd,workspace.target_component)
+            os.close(workspace_fd)
         final_fd = _open_or_create_directory(root_fd, final_component)
         try:
             incomplete_fd = _open_or_create_directory(root_fd, _INCOMPLETE)
@@ -442,7 +448,7 @@ def attest_publication_reservation_marker(
         final_component,
         reservation,
     )
-    expected_bytes = _reservation_marker_bytes(reservation)
+    expected_bytes = _destination_marker_bytes(destination,reservation)
     _require_safe_writable_root(root)
 
     root_fd = _open_root(root)
@@ -504,7 +510,7 @@ def attest_staged_partial_payload(
         final_component,
         reservation,
     )
-    expected_marker_bytes = _reservation_marker_bytes(reservation)
+    expected_marker_bytes = _destination_marker_bytes(destination,reservation)
     _require_safe_writable_root(root)
 
     root_fd = _open_root(root)
@@ -637,7 +643,7 @@ def _require_current_staged_payload(
     descriptors = _open_visible_publication_chain(root, component, destination.job_id, chain)
     try:
         _verify_attested_reservation_marker(
-            descriptors[3], _reservation_marker_bytes(reservation), marker
+            descriptors[3], _destination_marker_bytes(destination,reservation), marker
         )
         before = _stat_staged_partial_payload(descriptors[3], destination.partial_path.name)
         payload_fd = _open_staged_partial_payload(descriptors[3], destination.partial_path.name)
@@ -650,7 +656,7 @@ def _require_current_staged_payload(
             fresh = _open_visible_publication_chain(root, component, destination.job_id, chain)
             try:
                 _verify_attested_reservation_marker(
-                    fresh[3], _reservation_marker_bytes(reservation), marker
+                    fresh[3], _destination_marker_bytes(destination,reservation), marker
                 )
                 visible = _stat_staged_partial_payload(fresh[3], destination.partial_path.name)
                 _require_matching_staged_partial_details(opened, visible)
@@ -697,7 +703,7 @@ def publish_staged_partial_payload(
         final_component,
         reservation,
     )
-    expected_marker_bytes = _reservation_marker_bytes(reservation)
+    expected_marker_bytes = _destination_marker_bytes(destination,reservation)
     expected_payload = _validate_staged_partial_payload_identity(
         destination,
         staged_payload,
@@ -933,6 +939,21 @@ def _validate_publication_reservation(
     ):
         raise PathValidationError("publication reservation does not match destination")
     return validated
+
+
+def _destination_workspace_reservation(destination):
+    original=destination.workspace_reservation
+    if (type(original) is not PublicationReservation or original.job_id!=destination.job_id
+        or original.final_filename!=destination.final_path.name):
+        raise PathValidationError('workspace reservation does not match destination')
+    _require_component(original.target_component,'workspace component')
+    PublicationReservation(original.job_id,original.target_component,original.final_filename,original.claim_token)
+    return original
+
+
+def _destination_marker_bytes(destination,reservation):
+    # A destination successor preserves the original workspace marker bytes.
+    return _reservation_marker_bytes(reservation if destination.workspace_reservation is None else _destination_workspace_reservation(destination))
 
 
 def _reservation_marker_bytes(reservation: PublicationReservation) -> bytes:
@@ -2080,7 +2101,7 @@ def _require_strict_publication_namespace(
     )
     try:
         _verify_attested_reservation_marker(
-            fresh[3], _reservation_marker_bytes(prepared.reservation), prepared.marker,
+            fresh[3], _destination_marker_bytes(prepared.destination,prepared.reservation), prepared.marker,
         )
         if _stat_visible_publication_payload(fresh[3], destination.partial_path.name) != expected:
             raise UnsafePathError("partial payload changed during publication")
@@ -2120,7 +2141,7 @@ def prepare_publication_payload(
             destination, reservation, marker, staged_payload, "", chain,
         )
         _verify_attested_reservation_marker(
-            descriptors[3], _reservation_marker_bytes(reservation), marker,
+            descriptors[3], _destination_marker_bytes(destination,reservation), marker,
         )
         if _stat_staged_partial_payload(descriptors[3], destination.partial_path.name) != expected:
             raise UnsafePathError("original staged metadata changed before preparation")
@@ -2285,7 +2306,7 @@ def _require_direct_cleanup_namespace(prepared, descriptor, snapshot, *, marker_
             raise UnsafePathError("cleanup directory owner changed")
         if marker_present:
             _verify_attested_reservation_marker(fresh[3],
-                _reservation_marker_bytes(prepared.reservation), prepared.marker)
+                _destination_marker_bytes(prepared.destination,prepared.reservation), prepared.marker)
             if os.stat(_RESERVATION_MARKER, dir_fd=fresh[3], follow_symlinks=False).st_uid != os.getuid():
                 raise UnsafePathError("cleanup marker owner changed")
         elif _entry_exists(fresh[3], _RESERVATION_MARKER):
@@ -2474,3 +2495,409 @@ def finish_direct_cleanup_payload(prepared, certified_stat, *, cancelled=None, m
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+_SAVED_NAMES = ('.hermes-resume-payload', '.hermes-resume-control')
+
+
+@dataclass(frozen=True, slots=True)
+class _StoppedPair:
+    chain: tuple[tuple[int, int], ...]
+    marker: tuple[int, int]
+    payload: tuple[int, ...]
+    control: tuple[int, ...]
+
+    def to_record(self):
+        return dict(chain=self.chain, marker=self.marker, payload=self.payload, control=self.control)
+
+    @classmethod
+    def from_record(cls, value):
+        if type(value) is not dict or set(value) != {'chain','marker','payload','control'}:
+            raise PathValidationError('saved pair shape invalid')
+        result = cls(tuple(tuple(x) for x in value['chain']), tuple(value['marker']),
+            tuple(value['payload']), tuple(value['control']))
+        if (len(result.chain) != 4 or any(len(x)!=2 for x in result.chain)
+            or len(result.marker)!=2 or len(result.payload)!=9 or len(result.control)!=9
+            or any(type(x) is not int or x<0 for seq in (*result.chain,result.marker,result.payload,result.control) for x in seq)):
+            raise PathValidationError('saved pair facts invalid')
+        return result
+
+
+def _saved_stat(details, *, links=1):
+    if (not stat.S_ISREG(details.st_mode) or details.st_nlink != links
+        or details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) & 0o133
+        or getattr(details, 'st_flags', 0) != 0):
+        raise UnsafePathError('saved file policy invalid')
+    return (details.st_dev, details.st_ino, details.st_size, details.st_mode,
+        details.st_nlink, details.st_mtime_ns, details.st_ctime_ns, details.st_uid,
+        getattr(details, 'st_flags', 0))
+
+
+def _saved_visible(job_fd, name, descriptor, *, links=1):
+    opened = _saved_stat(os.fstat(descriptor), links=links)
+    if _saved_stat(os.stat(name, dir_fd=job_fd, follow_symlinks=False), links=links) != opened:
+        raise UnsafePathError('saved visible file changed')
+    return opened
+
+
+def _saved_open_chain(destination, reservation, checkpoint=None):
+    root, component = _validate_destination_intent(destination)
+    _validate_publication_reservation(destination, component, reservation)
+    if destination.workspace_reservation is not None:component=_destination_workspace_reservation(destination).target_component
+    descriptors = []
+    try:
+        descriptors.append(_open_root(root))
+        descriptors.append(_open_existing_directory(descriptors[0], component))
+        descriptors.append(_open_existing_directory(descriptors[0], _INCOMPLETE))
+        descriptors.append(_open_existing_directory(descriptors[2], destination.job_id))
+        for descriptor in descriptors:
+            details = os.fstat(descriptor)
+            if details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != 0o700:
+                raise UnsafePathError('saved directory policy invalid')
+        chain = tuple((os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in descriptors)
+        marker = _attest_existing_reservation_marker(descriptors[3],
+            destination.incomplete_dir / _RESERVATION_MARKER, _destination_marker_bytes(destination,reservation))
+        identity = (marker.st_dev, marker.st_ino)
+        if checkpoint is not None and (chain, identity) != (checkpoint.chain, checkpoint.marker):
+            raise UnsafePathError('saved directory or marker changed')
+        return tuple(descriptors), chain, identity
+    except BaseException:
+        for fd in reversed(descriptors): os.close(fd)
+        raise
+
+
+def _seal_stopped_pair(destination, reservation):
+    descriptors, chain, marker = _saved_open_chain(destination, reservation)
+    files = []
+    try:
+        names = (destination.partial_path.name, destination.partial_path.name + '.aria2')
+        for name in names:
+            fd = os.open(name, _STAGED_PARTIAL_READ_FLAGS, dir_fd=descriptors[3]); files.append(fd)
+            before = _saved_visible(descriptors[3], name, fd)
+            os.fsync(fd)
+            if _saved_visible(descriptors[3], name, fd) != before:
+                raise UnsafePathError('stopped file changed during sync')
+        os.fsync(descriptors[3])
+        facts = [_saved_visible(descriptors[3], name, fd) for name,fd in zip(names,files)]
+        if facts[0][:2] == facts[1][:2] or min(x[2] for x in facts) <= 0:
+            raise UnsafePathError('stopped pair unavailable')
+        result = _StoppedPair(chain,marker,*facts)
+        check,_,_ = _saved_open_chain(destination,reservation,result)
+        for fd in reversed(check): os.close(fd)
+        return result
+    finally:
+        for fd in files: os.close(fd)
+        for fd in reversed(descriptors): os.close(fd)
+
+
+def _require_saved_pair(destination, reservation, checkpoint, *, retained=None, candidates=None, retained_names=_SAVED_NAMES):
+    if (retained is None)!=(candidates is None):raise PathValidationError('saved evidence pair incomplete')
+    if retained is not None:
+        for group in (retained,candidates):
+            if type(group) not in (list,tuple) or len(group)!=2 or any(type(fact) not in (list,tuple) or len(fact)!=9 or any(type(value) is not int or value<0 for value in fact) for fact in group):raise PathValidationError('saved evidence count invalid')
+        if len({tuple(fact[:2]) for fact in (*retained,*candidates)})!=4 or tuple(fact[2] for fact in retained)!=tuple(fact[2] for fact in candidates):raise PathValidationError('saved evidence identity invalid')
+    descriptors,_,_ = _saved_open_chain(destination,reservation,checkpoint)
+    try:
+        groups = [(tuple((destination.partial_path.name,destination.partial_path.name+'.aria2')),
+            (checkpoint.payload,checkpoint.control) if candidates is None else candidates)]
+        if retained is not None: groups.append((retained_names,retained))
+        for names,expected in groups:
+            for name,fact in zip(names,expected):
+                fd = os.open(name,_STAGED_PARTIAL_READ_FLAGS,dir_fd=descriptors[3])
+                try:
+                    if _saved_visible(descriptors[3],name,fd) != tuple(fact):
+                        raise UnsafePathError('saved pair changed')
+                finally: os.close(fd)
+    finally:
+        for fd in reversed(descriptors): os.close(fd)
+
+
+def _clone_saved_payload(source_fd, job_fd, name):
+    """shortcut: Darwin clone volumes only, add another policy only with new acceptance."""
+    import ctypes
+    import sys
+    if sys.platform != 'darwin': raise OSError('saved clone unsupported')
+    _require_component(name, 'saved candidate')
+    try:
+        clone = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True).fclonefileat
+    except (OSError, AttributeError):
+        raise OSError('saved clone unsupported') from None
+    clone.argtypes = (ctypes.c_int,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint32)
+    clone.restype = ctypes.c_int
+    if clone(source_fd,job_fd,os.fsencode(name),3) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def _prepare_saved_pair(destination, reservation, checkpoint, *, cancelled, phase, retained_names=_SAVED_NAMES):
+    """Retain the originals once; phase callback durably records actual effects."""
+    if (type(retained_names) is not tuple or len(retained_names)!=2
+        or re.fullmatch(r'\.hermes-resume-(?:[0-9a-f]{64}-)?payload',retained_names[0]) is None
+        or retained_names[1]!=retained_names[0].removesuffix('payload')+'control'):
+        raise PathValidationError('retained pair names invalid')
+    descriptors,_,_ = _saved_open_chain(destination,reservation,checkpoint)
+    job_fd = descriptors[3]
+    sources, candidates = [], []
+    names = (destination.partial_path.name,destination.partial_path.name+'.aria2')
+    def check_cancel():
+        if cancelled(): raise PathValidationError('saved preparation cancelled')
+    def fence():
+        check_cancel()
+        current,_,_ = _saved_open_chain(destination,reservation,checkpoint)
+        for fd in reversed(current): os.close(fd)
+    try:
+        for name,expected in zip(names,(checkpoint.payload,checkpoint.control)):
+            fd = os.open(name,_STAGED_PARTIAL_READ_FLAGS,dir_fd=job_fd); sources.append(fd)
+            if _saved_visible(job_fd,name,fd) != expected: raise UnsafePathError('stopped source changed')
+        for name in retained_names:
+            try: os.stat(name,dir_fd=job_fd,follow_symlinks=False)
+            except FileNotFoundError: pass
+            else: raise UnsafePathError('retained name occupied')
+        linked = []
+        for name,retained,fd,expected in zip(names,retained_names,sources,(checkpoint.payload,checkpoint.control)):
+            fence()
+            if _saved_visible(job_fd,name,fd) != expected: raise UnsafePathError('source changed before link')
+            os.link(name,retained,src_dir_fd=job_fd,dst_dir_fd=job_fd,follow_symlinks=False)
+            fact = _saved_visible(job_fd,retained,fd,links=2)
+            if fact[:4]+fact[5:6]+fact[7:] != expected[:4]+expected[5:6]+expected[7:]:
+                raise UnsafePathError('retained source changed')
+            if _saved_visible(job_fd,name,fd,links=2) != fact: raise UnsafePathError('source alias changed')
+            linked.append(fact)
+        for fd in sources: os.fsync(fd)
+        os.fsync(job_fd)
+        for name,fd,expected in zip(retained_names,sources,linked):
+            if _saved_visible(job_fd,name,fd,links=2)!=expected: raise UnsafePathError('linked source drift')
+        linked = tuple(linked)
+        phase('linked',dict(retained=linked))
+        settled = []
+        for name,retained,fd,expected in zip(names,retained_names,sources,linked):
+            fence()
+            if (_saved_visible(job_fd,name,fd,links=2) != expected
+                or _saved_visible(job_fd,retained,fd,links=2) != expected): raise UnsafePathError('alias changed before retirement')
+            os.unlink(name,dir_fd=job_fd)
+            after = _saved_visible(job_fd,retained,fd)
+            if after[:4]+after[5:6]+after[7:] != expected[:4]+expected[5:6]+expected[7:] or after[6]<expected[6]:
+                raise UnsafePathError('retired source drift')
+            settled.append(after)
+        os.fsync(job_fd)
+        retained = tuple(settled)
+        for name,fd,expected in zip(retained_names,sources,retained):
+            if _saved_visible(job_fd,name,fd)!=expected: raise UnsafePathError('settled source drift')
+        phase('retired',dict(retained=retained))
+        fence()
+        for name,fd,expected in zip(retained_names,sources,retained):
+            if _saved_visible(job_fd,name,fd)!=expected: raise UnsafePathError('source changed before clone')
+        _clone_saved_payload(sources[0],job_fd,names[0])
+        # The entered clone must return before cancellation can retire this lane.
+        check_cancel()
+        candidate = os.open(names[0],os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=job_fd); candidates.append(candidate)
+        cloned = _saved_visible(job_fd,names[0],candidate)
+        if (stat.S_IMODE(cloned[3]) != 0o600 or cloned[:2] in {x[:2] for x in retained}
+            or cloned[2] != retained[0][2]):
+            raise UnsafePathError('saved clone authority invalid')
+        candidate = os.open(names[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600,dir_fd=job_fd); candidates.append(candidate)
+        offset = 0
+        while offset < retained[1][2]:
+            check_cancel()
+            block = os.pread(sources[1],min(65536,retained[1][2]-offset),offset)
+            if not block: raise PathValidationError('saved control short read')
+            written = 0
+            while written < len(block):
+                check_cancel()
+                count = os.write(candidate,block[written:])
+                if count <= 0: raise PathValidationError('saved control short write')
+                written += count
+            offset += len(block)
+        for fd in candidates: os.fsync(fd)
+        os.fsync(job_fd)
+        fence()
+        for name,fd,expected in zip(retained_names,sources,retained):
+            if _saved_visible(job_fd,name,fd) != expected: raise UnsafePathError('retained source drift')
+        facts = tuple(_saved_visible(job_fd,name,fd) for name,fd in zip(names,candidates))
+        if len({tuple(x[:2]) for x in (*retained,*facts)}) != 4 or tuple(x[2] for x in facts) != tuple(x[2] for x in retained):
+            raise UnsafePathError('saved candidate not independent')
+        phase('ready',dict(retained=retained,candidates=facts))
+        return dict(retained=retained,candidates=facts)
+    finally:
+        for fd in (*candidates,*sources): os.close(fd)
+        for fd in reversed(descriptors): os.close(fd)
+
+
+def _require_retained_absence(prepared, records, *, marker_present):
+    root,component=_validate_destination_intent(prepared.destination)
+    descriptors=_open_visible_publication_chain(root,component,prepared.destination.job_id,prepared.directory_identities)
+    try:
+        for record in records:
+            if re.fullmatch(r'\.hermes-resume-(?:[0-9a-f]{64}-)?(?:payload|control)',record['basename']) is None:
+                raise PathValidationError('retained alias name invalid')
+            if _entry_exists(descriptors[3],record['basename']): raise UnsafePathError('retained alias rebound after cleanup')
+        if marker_present:
+            _attest_existing_reservation_marker(descriptors[3],prepared.marker.path,_destination_marker_bytes(prepared.destination,prepared.reservation))
+    finally:
+        for fd in reversed(descriptors): os.close(fd)
+
+
+def _cleanup_retained_aliases(prepared, published_stat, records, *, permits, cancelled):
+    if len(records)!=len(permits): raise PathValidationError('retained unlink permits missing')
+    for record,permit in zip(records,permits):
+        checkpoint=_StoppedPair.from_record(record['checkpoint'])
+        expected_chain=prepared.directory_identities
+        same_chain=checkpoint.chain==expected_chain
+        if prepared.destination.workspace_reservation is not None:
+            same_chain=all(checkpoint.chain[index]==expected_chain[index] for index in (0,2,3))
+        if not same_chain or checkpoint.marker!=(prepared.marker.st_dev,prepared.marker.st_ino):
+            raise UnsafePathError('retained cleanup chain changed')
+        descriptors,_,_=_saved_open_chain(prepared.destination,prepared.reservation,checkpoint)
+        opened=None;final=None;final_chain=()
+        try:
+            job_fd=descriptors[3];name=record['basename'];expected=tuple(record['facts'])
+            if re.fullmatch(r'\.hermes-resume-(?:[0-9a-f]{64}-)?(?:payload|control)',name) is None:
+                raise PathValidationError('retained alias name invalid')
+            root,component=_validate_destination_intent(prepared.destination)
+            final_chain=_open_visible_publication_chain(root,component,prepared.destination.job_id,prepared.directory_identities)
+            final=_open_publication_payload(final_chain[1],prepared.destination.final_path.name)
+            current=_fstat_direct_cleanup_payload(final)
+            if current[4]==2:
+                if current!=published_stat: raise UnsafePathError('retained cleanup final changed')
+            else: _require_cleanup_final_baseline(current,published_stat)
+            _require_direct_cleanup_namespace(prepared,final,current,marker_present=True,partial_present=current[4]==2)
+            _require_cleanup_not_cancelled(cancelled,permit)
+            try: opened=os.open(name,_STAGED_PARTIAL_READ_FLAGS,dir_fd=job_fd)
+            except FileNotFoundError:
+                # Prior durable unlink authority permits only a present absence certificate.
+                pass
+            else:
+                if record['phase']=='absent' or _saved_visible(job_fd,name,opened)!=expected:
+                    raise UnsafePathError('retained cleanup alias changed')
+                _require_cleanup_not_cancelled(cancelled,permit)
+                permit._enter_unlink()
+                try: os.unlink(name,dir_fd=job_fd)
+                finally: permit._finish_unlink()
+                after=os.fstat(opened)
+                if after.st_nlink!=0 or (after.st_dev,after.st_ino,after.st_size,after.st_mode,after.st_mtime_ns)!=(expected[0],expected[1],expected[2],expected[3],expected[5]):
+                    raise UnsafePathError('retained unlink identity changed')
+            if _entry_exists(job_fd,name): raise UnsafePathError('retained cleanup alias remains')
+            os.fsync(job_fd)
+            _require_direct_cleanup_namespace(prepared,final,current,marker_present=True,partial_present=current[4]==2)
+            _require_cleanup_not_cancelled(cancelled,permit)
+        finally:
+            if opened is not None: os.close(opened)
+            if final is not None: os.close(final)
+            for fd in reversed(final_chain):os.close(fd)
+            for fd in reversed(descriptors): os.close(fd)
+    _require_retained_absence(prepared,records,marker_present=True)
+
+
+def _purge_finished_payload(prepared,snapshot,*,permit,cancelled,allow_unlink=True):
+    root,component=_validate_direct_cleanup_evidence(prepared,snapshot,links=1)
+    _require_safe_writable_root(root)
+    descriptors=_open_visible_publication_chain(root,component,prepared.destination.job_id,prepared.directory_identities)
+    descriptor=None
+    try:
+        _require_cleanup_not_cancelled(cancelled,permit)
+        try:descriptor=_open_publication_payload(descriptors[1],prepared.destination.final_path.name)
+        except FileNotFoundError:pass
+        else:
+            if not allow_unlink:raise UnsafePathError('fresh purge consent required')
+            if _fstat_direct_cleanup_payload(descriptor)!=snapshot:raise UnsafePathError('purge final changed')
+            _require_direct_cleanup_namespace(prepared,descriptor,snapshot,marker_present=False,partial_present=False)
+            _require_cleanup_not_cancelled(cancelled,permit)
+            permit._enter_unlink()
+            try:os.unlink(prepared.destination.final_path.name,dir_fd=descriptors[1])
+            finally:permit._finish_unlink()
+            after=os.fstat(descriptor)
+            if after.st_nlink!=0 or (after.st_dev,after.st_ino,after.st_size,after.st_mode,after.st_mtime_ns)!=(snapshot[0],snapshot[1],snapshot[2],snapshot[3],snapshot[5]):raise UnsafePathError('purge held descriptor changed')
+        if _entry_exists(descriptors[1],prepared.destination.final_path.name):raise UnsafePathError('purge final remains')
+        if _entry_exists(descriptors[3],_RESERVATION_MARKER) or _entry_exists(descriptors[3],prepared.destination.partial_path.name):raise UnsafePathError('finished purge namespace changed')
+        os.fsync(descriptors[1])
+        fresh=_open_visible_publication_chain(root,component,prepared.destination.job_id,prepared.directory_identities)
+        try:
+            if _entry_exists(fresh[1],prepared.destination.final_path.name):raise UnsafePathError('purge absence changed')
+        finally:
+            for fd in reversed(fresh):os.close(fd)
+        return dict(absence_observed=True,unlink_attempted=permit.snapshot().unlink_attempted)
+    finally:
+        if descriptor is not None:os.close(descriptor)
+        for fd in reversed(descriptors):os.close(fd)
+
+
+def _qualify_saved_purge(destination,reservation,checkpoint,records,*,prior=None):
+    if prior is None:
+        descriptors,_,_=_saved_open_chain(destination,reservation,checkpoint)
+    else:
+        if len(prior)!=len(records)+1 or any({k:v for k,v in old.items() if k!='phase'}!=record for old,record in zip(prior,records)) or prior[-1]['basename']!=_RESERVATION_MARKER or tuple(prior[-1]['facts'][:2])!=checkpoint.marker:raise PathValidationError('prior purge artifacts changed')
+        root,component=_validate_destination_intent(destination)
+        if destination.workspace_reservation is not None:component=_destination_workspace_reservation(destination).target_component
+        descriptors=_open_visible_publication_chain(root,component,destination.job_id,checkpoint.chain)
+    opened=[]
+    try:
+        for descriptor in descriptors:
+            details=os.fstat(descriptor)
+            if details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700:raise UnsafePathError('purge directory policy changed')
+        marker_present=_entry_exists(descriptors[3],_RESERVATION_MARKER)
+        if marker_present:
+            check,_,_=_saved_open_chain(destination,reservation,checkpoint)
+            for fd in reversed(check):os.close(fd)
+        for index,record in enumerate(records):
+            try:fd=os.open(record['basename'],_STAGED_PARTIAL_READ_FLAGS,dir_fd=descriptors[3])
+            except FileNotFoundError:
+                if prior is None:raise
+                continue
+            opened.append(fd)
+            if not marker_present or prior is not None and prior[index]['phase']=='absent' or _saved_visible(descriptors[3],record['basename'],fd)!=tuple(record['facts']):raise UnsafePathError('saved purge source changed')
+        if not marker_present:return tuple(prior[-1]['facts'])
+        fd=os.open(_RESERVATION_MARKER,_STAGED_PARTIAL_READ_FLAGS,dir_fd=descriptors[3]);opened.append(fd)
+        marker=_saved_visible(descriptors[3],_RESERVATION_MARKER,fd)
+        if prior is not None and (prior[-1]['phase']=='absent' or marker!=tuple(prior[-1]['facts'])):raise UnsafePathError('saved purge marker changed')
+        return marker
+    finally:
+        for fd in reversed(opened):os.close(fd)
+        for fd in reversed(descriptors):os.close(fd)
+
+
+def _purge_saved_artifacts(destination,reservation,checkpoint,records,*,permits,cancelled,phase,allow_unlink):
+    if len(records)!=len(permits) or records[-1]['basename']!=_RESERVATION_MARKER:raise PathValidationError('saved purge authority incomplete')
+    root,component=_validate_destination_intent(destination)
+    if destination.workspace_reservation is not None:component=_destination_workspace_reservation(destination).target_component
+    descriptors=_open_visible_publication_chain(root,component,destination.job_id,checkpoint.chain);opened=[]
+    try:
+        marker_present=_entry_exists(descriptors[3],_RESERVATION_MARKER)
+        if marker_present:
+            check,_,_=_saved_open_chain(destination,reservation,checkpoint)
+            for fd in reversed(check):os.close(fd)
+        for record in records:
+            _require_cleanup_not_cancelled(cancelled,permits[len(opened)])
+            try:fd=os.open(record['basename'],_STAGED_PARTIAL_READ_FLAGS,dir_fd=descriptors[3])
+            except FileNotFoundError:fd=None
+            if fd is not None:
+                if record['phase']=='absent' or not allow_unlink or not marker_present:
+                    os.close(fd);raise UnsafePathError('saved purge requires fresh qualified consent')
+                if _saved_visible(descriptors[3],record['basename'],fd)!=tuple(record['facts']):
+                    os.close(fd);raise UnsafePathError('saved purge artifact changed')
+            opened.append(fd)
+        for index,(record,fd,permit) in enumerate(zip(records,opened,permits)):
+            _require_cleanup_not_cancelled(cancelled,permit)
+            name=record['basename'];expected=tuple(record['facts'])
+            if fd is not None:
+                if _saved_visible(descriptors[3],name,fd)!=expected:raise UnsafePathError('saved purge artifact rebound')
+                if name!=_RESERVATION_MARKER:
+                    check,_,_=_saved_open_chain(destination,reservation,checkpoint)
+                    for held in reversed(check):os.close(held)
+                permit._enter_unlink()
+                try:os.unlink(name,dir_fd=descriptors[3])
+                finally:permit._finish_unlink()
+                after=os.fstat(fd)
+                if after.st_nlink!=0 or (after.st_dev,after.st_ino,after.st_size,after.st_mode,after.st_mtime_ns)!=(expected[0],expected[1],expected[2],expected[3],expected[5]):raise UnsafePathError('saved purge held descriptor changed')
+            if _entry_exists(descriptors[3],name):raise UnsafePathError('saved purge artifact remains')
+            os.fsync(descriptors[3])
+            fresh=_open_visible_publication_chain(root,component,destination.job_id,checkpoint.chain)
+            try:
+                if _entry_exists(fresh[3],name):raise UnsafePathError('saved purge absence changed')
+            finally:
+                for held in reversed(fresh):os.close(held)
+            phase(index,dict(absence_observed=True,kind='unlink_observed' if permit.snapshot().unlink_attempted else 'qualified_present_absence'))
+        return dict(absence_observed=True,artifact_count=len(records))
+    finally:
+        for fd in reversed(opened):
+            if fd is not None:os.close(fd)
+        for fd in reversed(descriptors):os.close(fd)

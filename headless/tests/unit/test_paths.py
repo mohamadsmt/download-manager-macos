@@ -3127,3 +3127,291 @@ def test_direct_cleanup_unlink_permit_revocation_is_one_shot_and_nonblocking(per
         assert marker.path.exists()
     with pytest.raises(paths.PathValidationError):
         permit._enter_unlink()
+
+
+def _stopped_pair_fixture():
+    paths = _paths()
+    destination = _resolve(paths,_root())
+    reservation = _reservation(destination)
+    paths.attest_publication_reservation_marker(destination,reservation)
+    with destination.partial_path.open('wb') as stream:
+        stream.write(b'first-island')
+        stream.seek(32*1024*1024)
+        stream.write(b'last-island')
+        stream.truncate(64*1024*1024)
+    control = destination.partial_path.with_name(destination.partial_path.name+'.aria2')
+    control.write_bytes(b'opaque-control'*10000)
+    checkpoint = paths._seal_stopped_pair(destination,reservation)
+    return paths,destination,reservation,checkpoint
+
+
+def test_saved_sparse_clone_is_independent_without_dense_allocation():
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    phases = []
+    result = paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,
+        phase=lambda name,facts:phases.append((name,facts)))
+    assert [name for name,_ in phases]==['linked','retired','ready']
+    paths._require_saved_pair(destination,reservation,checkpoint,**result)
+    source = destination.incomplete_dir/paths._SAVED_NAMES[0]
+    candidate = destination.partial_path
+    assert source.stat().st_ino != candidate.stat().st_ino
+    assert source.stat().st_nlink == candidate.stat().st_nlink == 1
+    assert source.stat().st_size == candidate.stat().st_size == 64*1024*1024
+    assert source.stat().st_blocks*512 < 1024*1024
+    assert candidate.stat().st_blocks*512 < 1024*1024
+    assert stat.S_IMODE(candidate.stat().st_mode)==0o600
+    with source.open('r+b') as original, candidate.open('r+b') as copied:
+        assert original.read(12)==copied.read(12)==b'first-island'
+        copied.seek(1024);copied.write(b'candidate');copied.flush()
+        original.seek(1024);assert original.read(9)==b'\0'*9
+        original.seek(2048);original.write(b'original');original.flush()
+        copied.seek(2048);assert copied.read(8)==b'\0'*8
+        original.seek(32*1024*1024);copied.seek(32*1024*1024)
+        assert original.read(11)==copied.read(11)==b'last-island'
+    directory=os.environ.get('T26_RESUME_RUN')
+    if directory:
+        import json,uuid
+        record=dict(source_inode=source.stat().st_ino,candidate_inode=candidate.stat().st_ino,
+            logical_size=source.stat().st_size,source_allocated=source.stat().st_blocks*512,
+            candidate_allocated=candidate.stat().st_blocks*512,singlelink=True,bidirectional_write_isolation=True,
+            candidate_mode=oct(stat.S_IMODE(candidate.stat().st_mode)),not_whole_disk_A09=True)
+        evidence=Path(directory)/('sparse-production-'+uuid.uuid4().hex+'.json')
+        evidence.write_text(json.dumps(record,indent=2));evidence.chmod(0o600)
+    # Allocation is observed per file; shared extents are not whole-disk accounting.
+
+
+@pytest.mark.parametrize('collision',['regular','dangling'])
+def test_saved_candidate_collision_preserves_both_originals(collision):
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    def phase(name,facts):
+        if name=='retired':
+            if collision=='regular': destination.partial_path.write_bytes(b'unknown')
+            else: destination.partial_path.symlink_to('missing')
+    with pytest.raises(OSError):
+        paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=phase)
+    if collision=='regular': assert destination.partial_path.read_bytes()==b'unknown'
+    else: assert destination.partial_path.is_symlink() and os.readlink(destination.partial_path)=='missing'
+    for name,expected in zip(paths._SAVED_NAMES,(checkpoint.payload,checkpoint.control)):
+        details=(destination.incomplete_dir/name).stat()
+        assert (details.st_dev,details.st_ino,details.st_size,details.st_nlink)==(*expected[:3],1)
+
+
+@pytest.mark.parametrize('damage',['retained','retained-symlink','marker-missing','marker-content','payload-inode','payload-link','control-inode','job-dir'])
+def test_saved_authority_damage_never_readies_or_overwrites(damage,tmp_path):
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    original = destination.partial_path
+    if damage=='retained': (destination.incomplete_dir/paths._SAVED_NAMES[0]).write_bytes(b'unknown')
+    elif damage=='retained-symlink': (destination.incomplete_dir/paths._SAVED_NAMES[1]).symlink_to('missing')
+    elif damage=='marker-missing': _marker_path(destination).unlink()
+    elif damage=='marker-content': _marker_path(destination).write_bytes(b'bad marker')
+    elif damage in {'payload-inode','control-inode'}:
+        original = destination.partial_path if damage=='payload-inode' else destination.partial_path.with_name(destination.partial_path.name+'.aria2')
+        original.rename(original.with_name('preserved-original'))
+        original.write_bytes(b'unknown')
+    elif damage=='payload-link': os.link(original,tmp_path/'extra-link')
+    elif damage=='job-dir':
+        destination.incomplete_dir.rename(destination.incomplete_dir.with_name('preserved-directory'))
+        destination.incomplete_dir.mkdir(mode=0o700)
+    ready = []
+    with pytest.raises((OSError,ValueError)):
+        paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=lambda *a:ready.append(a))
+    assert ready==[]
+    if damage=='retained': assert (destination.incomplete_dir/paths._SAVED_NAMES[0]).read_bytes()==b'unknown'
+    if damage in {'payload-inode','control-inode'}: assert original.read_bytes()==b'unknown'
+
+
+@pytest.mark.parametrize('cut',['link1','link2','linked','unlink1','unlink2','retired','clone','control-copy','sync-pair','ready'])
+def test_saved_crash_cuts_preserve_original_inodes_and_do_not_heal(monkeypatch,cut):
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    original_link,original_unlink,original_clone = paths.os.link,paths.os.unlink,paths._clone_saved_payload
+    links=unlinks=0
+    def crash(): raise OSError('synthetic phase cut')
+    def link(*a,**k):
+        nonlocal links
+        result=original_link(*a,**k);links+=1
+        if cut==f'link{links}': crash()
+        return result
+    def unlink(*a,**k):
+        nonlocal unlinks
+        result=original_unlink(*a,**k);unlinks+=1
+        if cut==f'unlink{unlinks}': crash()
+        return result
+    def clone(*a):
+        result=original_clone(*a)
+        if cut=='clone': crash()
+        return result
+    monkeypatch.setattr(paths.os,'link',link);monkeypatch.setattr(paths.os,'unlink',unlink)
+    monkeypatch.setattr(paths,'_clone_saved_payload',clone)
+    write=paths.os.write
+    def control_write(fd,body):
+        result=write(fd,body)
+        if cut=='control-copy': crash()
+        return result
+    monkeypatch.setattr(paths.os,'write',control_write)
+    sync=paths.os.fsync
+    def fsync(fd):
+        result=sync(fd)
+        if cut=='sync-pair' and stat.S_ISREG(os.fstat(fd).st_mode) and os.fstat(fd).st_ino not in (checkpoint.payload[1],checkpoint.control[1],checkpoint.marker[1]): crash()
+        return result
+    monkeypatch.setattr(paths.os,'fsync',fsync)
+    with pytest.raises(OSError):
+        paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,
+            phase=lambda name,facts: crash() if name==cut else None)
+    names=list(destination.incomplete_dir.iterdir())
+    for expected in (checkpoint.payload,checkpoint.control):
+        aliases=[name for name in names if name.is_file() and name.stat().st_ino==expected[1]]
+        assert aliases and all(name.stat().st_size==expected[2] for name in aliases)
+    before=[(name.name,name.lstat()) for name in names]
+    with pytest.raises((OSError,ValueError)):
+        paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=lambda *a:None)
+    assert [(name.name,name.lstat()) for name in names]==before
+
+
+def test_saved_control_partial_enospc_and_late_clone_cancellation(monkeypatch):
+    import errno
+    import threading
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    clone=paths._clone_saved_payload
+    entered,release,cancel = threading.Event(),threading.Event(),threading.Event()
+    def held(*a):
+        clone(*a)
+        entered.set()
+        assert release.wait(3)
+    monkeypatch.setattr(paths,'_clone_saved_payload',held)
+    results=[];phases=[]
+    def run():
+        try: results.append(paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=cancel.is_set,phase=lambda name,facts:phases.append(name)))
+        except BaseException as error: results.append(error)
+    thread=threading.Thread(target=run)
+    thread.start()
+    try:
+        assert entered.wait(3)
+        cancel.set();thread.join(.05)
+        assert thread.is_alive(), 'entered operation cannot be declared joined'
+    finally:
+        release.set();thread.join(3)
+        assert not thread.is_alive()
+    assert len(results)==1 and isinstance(results[0],ValueError) and 'ready' not in phases
+    assert (destination.incomplete_dir/paths._SAVED_NAMES[0]).stat().st_ino==checkpoint.payload[1]
+
+
+def test_saved_control_short_io_and_enospc(monkeypatch):
+    import errno
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    write=paths.os.write
+    total=0
+    def failed_write(fd,body):
+        nonlocal total
+        if total>=100: raise OSError(errno.ENOSPC,'synthetic full disk')
+        count=write(fd,body[:100]);total+=count
+        return count
+    monkeypatch.setattr(paths.os,'write',failed_write)
+    with pytest.raises(OSError) as caught:
+        paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=lambda *a:None)
+    assert caught.value.errno==errno.ENOSPC
+    retained=destination.incomplete_dir/paths._SAVED_NAMES[1]
+    assert retained.stat().st_ino==checkpoint.control[1] and retained.stat().st_size==checkpoint.control[2]
+    assert destination.partial_path.with_name(destination.partial_path.name+'.aria2').stat().st_size==100
+
+
+def test_saved_clone_unsupported_preserves_retired_pair(monkeypatch):
+    import errno
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    def unsupported(*a): raise OSError(errno.ENOTSUP,'unsupported')
+    monkeypatch.setattr(paths,'_clone_saved_payload',unsupported)
+    with pytest.raises(OSError) as caught:
+        paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=lambda *a:None)
+    assert caught.value.errno==errno.ENOTSUP and not destination.partial_path.exists()
+    assert (destination.incomplete_dir/paths._SAVED_NAMES[0]).stat().st_ino==checkpoint.payload[1]
+
+
+def test_saved_opaque_control_handles_short_writes(monkeypatch):
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    write=paths.os.write
+    monkeypatch.setattr(paths.os,'write',lambda fd,body:write(fd,body[:997]))
+    result=paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=lambda *a:None)
+    control=destination.partial_path.with_name(destination.partial_path.name+'.aria2')
+    assert control.read_bytes()==(destination.incomplete_dir/paths._SAVED_NAMES[1]).read_bytes()==b'opaque-control'*10000
+    paths._require_saved_pair(destination,reservation,checkpoint,**result)
+
+
+def test_saved_retained_source_drift_after_clone_never_readies(monkeypatch):
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    clone=paths._clone_saved_payload
+    def changed(source_fd,*args):
+        result=clone(source_fd,*args)
+        retained=destination.incomplete_dir/paths._SAVED_NAMES[0]
+        with retained.open('r+b') as stream: stream.write(b'changed')
+        return result
+    monkeypatch.setattr(paths,'_clone_saved_payload',changed)
+    phases=[]
+    with pytest.raises(ValueError):
+        paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=lambda name,facts:phases.append(name))
+    assert phases==['linked','retired']
+
+
+def test_saved_both_linked_sources_are_synced_before_first_retirement(monkeypatch):
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    sync,unlink = paths.os.fsync,paths.os.unlink
+    linked_syncs=set()
+    original_inodes={checkpoint.payload[1],checkpoint.control[1]}
+    def fsync(fd):
+        details=os.fstat(fd)
+        if details.st_ino in original_inodes and details.st_nlink==2:
+            linked_syncs.add(details.st_ino)
+        return sync(fd)
+    def retire(*args,**kwargs):
+        assert linked_syncs==original_inodes, 'both original aliases must be durable before retirement'
+        return unlink(*args,**kwargs)
+    monkeypatch.setattr(paths.os,'fsync',fsync)
+    monkeypatch.setattr(paths.os,'unlink',retire)
+    paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=lambda *a:None)
+
+
+@pytest.mark.parametrize('rebound',['regular','hardlink','original'])
+def test_saved_post_clone_rebound_preserves_unknown_and_original(monkeypatch,rebound):
+    import hashlib,json,uuid
+    paths,destination,reservation,checkpoint = _stopped_pair_fixture()
+    if rebound=='original':
+        destination.partial_path.chmod(0o640)
+        checkpoint=paths._seal_stopped_pair(destination,reservation)
+    clone=paths._clone_saved_payload
+    snapshots=[]; phases=[]
+    def facts(file):
+        details=file.stat()
+        return dict(inode=details.st_ino,device=details.st_dev,mode=details.st_mode,
+            links=details.st_nlink,size=details.st_size,mtime=details.st_mtime_ns,
+            ctime=details.st_ctime_ns,sha256=hashlib.sha256(file.read_bytes()).hexdigest())
+    def rebind(source_fd,job_fd,name):
+        clone(source_fd,job_fd,name)
+        candidate=destination.incomplete_dir/name
+        candidate.rename(candidate.with_name('fixture-preserved-clone'))
+        retained=destination.incomplete_dir/paths._SAVED_NAMES[0]
+        unknown=candidate.with_name('fixture-unknown')
+        unknown.write_bytes(b'unknown-bytes'); unknown.chmod(0o644)
+        if rebound=='regular': unknown.rename(candidate)
+        else: os.link(retained if rebound=='original' else unknown,candidate)
+        files=[retained,destination.incomplete_dir/paths._SAVED_NAMES[1],candidate]
+        if rebound!='regular': files.append(unknown)
+        snapshots.extend((file,facts(file)) for file in files)
+    monkeypatch.setattr(paths,'_clone_saved_payload',rebind)
+    with pytest.raises((OSError,paths.PathValidationError)):
+        paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,
+            phase=lambda name,value:phases.append(name))
+    after=[(str(file),before,facts(file)) for file,before in snapshots]
+    directory=os.environ.get('T26_RESUME_RUN')
+    if directory:
+        evidence=Path(directory)/('rebound-'+rebound+'-'+uuid.uuid4().hex+'.json')
+        evidence.write_text(json.dumps(dict(rebound=rebound,phases=phases,files=after),indent=2));evidence.chmod(0o600)
+    assert 'ready' not in phases
+    assert all(before==current for _,before,current in after), after
+
+
+@pytest.mark.parametrize('count',[0,1])
+def test_ready_saved_pair_requires_both_finite_recorded_files(count):
+    paths,destination,reservation,checkpoint=_stopped_pair_fixture()
+    result=paths._prepare_saved_pair(destination,reservation,checkpoint,cancelled=lambda:False,phase=lambda *args:None)
+    before={path.name:(path.read_bytes(),_entry_signature(path)) for path in destination.incomplete_dir.iterdir()}
+    with pytest.raises(paths.PathValidationError):
+        paths._require_saved_pair(destination,reservation,checkpoint,retained=result['retained'][:count],candidates=result['candidates'][:count])
+    assert {path.name:(path.read_bytes(),_entry_signature(path)) for path in destination.incomplete_dir.iterdir()}==before
