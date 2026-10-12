@@ -397,6 +397,19 @@ ENTRY = {'command': '/usr/bin/env', 'args': ['/physical/python', '-I', '-B', '/p
     'connect_timeout': 15, 'timeout': 30}
 
 
+def test_yaml_indented_long_scalar_preserves_bytes_and_selective_rollback(installer):
+    raw = b'unrelated:\n  items:\n    - ' + b' '.join([b'sampleword'] * 24) + b'\n'
+    parser, data = installer.parse_yaml(raw)
+    assert installer.dump_yaml(parser, data) == raw
+    after, added = installer.patch_config(raw, ENTRY)
+    assert after.startswith(raw)
+    assert installer.rollback_config(after, raw, ENTRY, added) == raw
+    changed = after.replace(b'sampleword', b'laterword', 1)
+    assert installer.rollback_config(changed, raw, ENTRY, added) == raw.replace(b'sampleword', b'laterword', 1)
+    with pytest.raises(installer.Blocked, match='^YAML_BYTE_PRESERVATION_UNPROVEN$'):
+        installer.parse_yaml(b'unrelated:    value\n')
+
+
 def test_yaml_round_trip_preserves_raw_unknown_comments_quotes(installer):
     after, added = installer.patch_config(RAW, ENTRY)
     assert added is True

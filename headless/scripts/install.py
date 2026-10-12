@@ -202,7 +202,10 @@ def parse_yaml(raw):
             raise Blocked('YAML_UNSUPPORTED')
         data = parser.load(text) if raw else {}
         if not isinstance(data, dict): raise Blocked('YAML_UNSUPPORTED')
-        if raw and dump_yaml(parser, data) != raw: raise Blocked('YAML_BYTE_PRESERVATION_UNPROVEN')
+        if raw and dump_yaml(parser, data) != raw:
+            parser.width = MAX_BYTES + 1
+            parser.indent(mapping=2, sequence=4, offset=2)
+            if dump_yaml(parser, data) != raw: raise Blocked('YAML_BYTE_PRESERVATION_UNPROVEN')
         for name in ('plugins', 'mcp_servers'):
             if name in data and not isinstance(data[name], dict): raise Blocked('YAML_UNSUPPORTED')
         for name in ('enabled', 'disabled'):
