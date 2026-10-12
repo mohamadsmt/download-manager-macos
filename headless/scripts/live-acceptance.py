@@ -63,7 +63,7 @@ def digest(path):
 def packet_read(path):
     path=Path(path).absolute()
     if path.resolve()!=path or path.parent.stat().st_uid!=os.geteuid() or stat.S_IMODE(path.parent.stat().st_mode)!=0o700:raise Refused('private_input_parent')
-    with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC),'rb') as stream:
+    with os.fdopen(os.open(path,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC),'rb') as stream:
         info=os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o600 or info.st_nlink!=1 or info.st_size>16384:raise Refused('private_input')
         value=json.load(stream)
@@ -446,7 +446,7 @@ def run_live(packet,evidence,metadata,deadline):
             deadline.remaining()
             if worker.poll() is not None:raise Refused('worker_start_failed')
             time.sleep(.02)
-        asyncio.run(sdk_flow(state,home,packet,evidence,metadata,deadline,worker))
+        asyncio.run(asyncio.wait_for(sdk_flow(state,home,packet,evidence,metadata,deadline,worker),timeout=deadline.remaining()))
         final=final_verify(home,packet,deadline)
     worker_receipt=json.loads((evidence/'worker-closure.json').read_text())
     if worker_receipt['returncode']!=0:raise Refused('worker_exit_failed')
@@ -483,7 +483,7 @@ def run_live(packet,evidence,metadata,deadline):
 def main(argv=None):
     deadline=Deadline()  # Before input, preflight, metadata or any child birth.
     argv=sys.argv[1:] if argv is None else argv
-    if '--live' not in argv or os.environ.get('HERMES_DOWNLOADS_DISABLE_NETWORK')=='1':
+    if '--live' not in argv or os.environ.get('DISABLE_NETWORK')=='1' or os.environ.get('HERMES_DOWNLOADS_DISABLE_NETWORK')=='1':
         print(json.dumps(dict(outcome='SKIP',reason='explicit opt-in required; network disable wins; not A11 PASS')));return 0
     parser=Parser(add_help=False,allow_abbrev=False)
     parser.add_argument('--live',action='store_true');parser.add_argument('--input-file',type=Path)

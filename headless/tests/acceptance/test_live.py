@@ -24,12 +24,17 @@ def packet():
         qualification=dict(aria2_sha256='b'*64,trusted_fixed_representation=True,max_response_bytes=538364))
 
 
-@pytest.mark.parametrize('disabled',[False,True])
+@pytest.mark.parametrize('disabled',[None,'DISABLE_NETWORK','HERMES_DOWNLOADS_DISABLE_NETWORK'])
 def test_default_and_disabled_skip_before_input_or_effects(live,monkeypatch,tmp_path,capsys,disabled):
     def denied(*args,**kwargs):pytest.fail('skip crossed input/child/network boundary')
     monkeypatch.setattr(Path,'open',denied)
     monkeypatch.setattr(subprocess,'Popen',denied)
-    monkeypatch.setenv('HERMES_DOWNLOADS_DISABLE_NETWORK','1' if disabled else '0')
+    monkeypatch.delenv('DISABLE_NETWORK',raising=False)
+    monkeypatch.delenv('HERMES_DOWNLOADS_DISABLE_NETWORK',raising=False)
+    if disabled:monkeypatch.setenv(disabled,'1')
+    monkeypatch.setattr(live,'packet_read',denied)
+    monkeypatch.setattr(live,'preflight',denied)
+    monkeypatch.setattr(live,'run_live',denied)
     args=['--live','--input-file',str(tmp_path/'missing')] if disabled else ['--input-file',str(tmp_path/'missing')]
     assert live.main(args)==0
     assert 'SKIP' in capsys.readouterr().out
@@ -38,6 +43,7 @@ def test_default_and_disabled_skip_before_input_or_effects(live,monkeypatch,tmp_
 @pytest.mark.parametrize('damage',['missing','public','symlink','malformed','length','budget','unknown'])
 def test_private_input_and_budget_refuse_before_effects(live,monkeypatch,tmp_path,capsys,damage):
     monkeypatch.delenv('HERMES_DOWNLOADS_DISABLE_NETWORK',raising=False)
+    monkeypatch.delenv('DISABLE_NETWORK',raising=False)
     root=tmp_path/'packet-dir';root.mkdir(mode=0o700)
     path=root/'input.json';value=packet()
     if damage=='length':value['length']=True
@@ -109,7 +115,7 @@ def test_original_owned_worker_closes_on_birth_or_late_failure(live,monkeypatch,
 
 
 def test_real_authorized_direct_source(live,tmp_path):
-    if os.environ.get('HERMES_DOWNLOADS_DISABLE_NETWORK')=='1' or os.environ.get('HERMES_DOWNLOADS_LIVE')!='1':
+    if os.environ.get('DISABLE_NETWORK')=='1' or os.environ.get('HERMES_DOWNLOADS_DISABLE_NETWORK')=='1' or os.environ.get('HERMES_DOWNLOADS_LIVE')!='1':
         pytest.skip('T23 real source requires explicit opt-in; disabled/default SKIP is not A11 PASS')
     required=['HERMES_DOWNLOADS_LIVE_INPUT','HERMES_DOWNLOADS_LIVE_EVIDENCE','HERMES_DOWNLOADS_LIVE_COMMIT']
     assert all(os.environ.get(name) for name in required),'private input, fresh evidence and frozen commit required'
@@ -257,3 +263,69 @@ def test_owned_evidence_is_private_under_permissive_umask(live,tmp_path):
     finally:os.umask(previous)
     assert {path.name:path.stat().st_mode&0o777 for path in evidence.iterdir()}=={
         'worker.log':0o600,'worker-birth.json':0o600,'worker-closure.json':0o600}
+
+
+
+def test_private_fifo_refused_promptly_by_original_child(live,tmp_path):
+    import shutil
+    root=tmp_path/'fifo';root.mkdir(mode=0o700)
+    fifo=root/'input';os.mkfifo(fifo,mode=0o600)
+    evidence=root/'e';evidence.mkdir(mode=0o700)
+    code="""import runpy,sys
+ns=runpy.run_path(sys.argv[1])
+try:ns['packet_read'](sys.argv[2])
+except ns['Refused'] as error:
+ assert str(error)=='private_input'
+ print('FIFO_REFUSED',flush=True)
+else:raise AssertionError('FIFO accepted')
+"""
+    try:
+        with live.owned_worker([sys.executable,'-I','-B','-c',code,str(SCRIPT),str(fifo)],dict(os.environ),evidence,live.Deadline()) as child:
+            assert child.wait(timeout=1)==0
+        assert 'FIFO_REFUSED' in (evidence/'worker.log').read_text()
+    finally:
+        receipt=json.loads((evidence/'worker-closure.json').read_text())
+        assert receipt['original_wait'] and receipt['echild'] and receipt['group_absent'] and not receipt['forced']
+        destination=os.environ.get('T26_RESUME_RUN')
+        if destination:shutil.copytree(evidence,Path(destination)/'fifo-closure')
+
+
+def test_stalled_sdk_flow_times_out_and_closes_owned_contexts(live,monkeypatch):
+    import asyncio
+    from contextlib import asynccontextmanager
+    import shutil
+    import tempfile
+    async def stalled(state,home,packet,evidence,metadata,deadline,worker):
+        @asynccontextmanager
+        async def owned_sdk_context():
+            try:yield
+            finally:live.save(evidence/'sdk-stall-closure.json',dict(closed=True))
+        async with owned_sdk_context():
+            await asyncio.sleep(2)
+    def command(config):
+        code="""import json,signal,sys,time
+from pathlib import Path
+signal.signal(signal.SIGTERM,lambda *args:sys.exit(0))
+p=json.loads(Path(sys.argv[1]).read_text());Path(p['state'],'worker.sock').touch()
+time.sleep(30)
+"""
+        return [sys.executable,'-I','-B','-c',code,str(config)]
+    class ShortDeadline(live.Deadline):
+        def remaining(self,*,cleanup=False):
+            return min(super().remaining(cleanup=cleanup),60 if cleanup else .2)
+    monkeypatch.setattr(live,'sdk_flow',stalled)
+    monkeypatch.setattr(live,'worker_command',command)
+    def denied(*args):pytest.fail('stalled SDK flow crossed final verification')
+    monkeypatch.setattr(live,'final_verify',denied)
+    with tempfile.TemporaryDirectory(prefix='t23-stall-',dir='/private/tmp') as directory:
+        parent=Path(directory);parent.chmod(0o700);evidence=parent/'e'
+        started=time.monotonic()
+        try:
+            with pytest.raises(TimeoutError):live.run_live(packet(),evidence,dict(commit='synthetic-stall-only'),ShortDeadline())
+            assert time.monotonic()-started<1.5
+        finally:
+            assert json.loads((evidence/'sdk-stall-closure.json').read_text())==dict(closed=True)
+            receipt=json.loads((evidence/'worker-closure.json').read_text())
+            assert receipt['returncode']==0 and receipt['original_wait'] and receipt['echild'] and receipt['group_absent'] and not receipt['forced']
+            destination=os.environ.get('T26_RESUME_RUN')
+            if destination:shutil.copytree(evidence,Path(destination)/'sdk-stall-closure')
