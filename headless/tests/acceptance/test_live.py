@@ -290,6 +290,40 @@ else:raise AssertionError('FIFO accepted')
         if destination:shutil.copytree(evidence,Path(destination)/'fifo-closure')
 
 
+def test_final_output_fifo_refused_promptly_by_original_child(live,tmp_path):
+    import shutil
+    home=tmp_path/'home';output=home/'Downloads/Hermes/Other'
+    output.mkdir(parents=True,mode=0o700)
+    payload=output/'authorized.bin';payload.write_bytes(b'original')
+    payload.unlink();os.mkfifo(payload,mode=0o600)
+    evidence=tmp_path/'final-fifo-evidence';evidence.mkdir(mode=0o700)
+    code="""import os,runpy,sys
+from pathlib import Path
+ns=runpy.run_path(sys.argv[1]);opened=[];closed=[]
+original_open=os.open;original_close=os.close
+def track_open(*args,**kwargs):
+ fd=original_open(*args,**kwargs);opened.append(fd);return fd
+def track_close(fd):
+ original_close(fd);closed.append(fd)
+os.open=track_open;os.close=track_close
+try:ns['final_verify'](Path(sys.argv[2]),dict(length=8,expected_sha256='a'*64),ns['Deadline']())
+except ns['Refused'] as error:
+ assert str(error)=='final_descriptor'
+ assert len(opened)==3 and closed==list(reversed(opened))
+ print('FINAL_FIFO_REFUSED_DESCRIPTORS_CLOSED',flush=True)
+else:raise AssertionError('final FIFO accepted')
+"""
+    try:
+        with live.owned_worker([sys.executable,'-I','-B','-c',code,str(SCRIPT),str(home)],dict(os.environ),evidence,live.Deadline()) as child:
+            assert child.wait(timeout=1)==0
+        assert 'FINAL_FIFO_REFUSED_DESCRIPTORS_CLOSED' in (evidence/'worker.log').read_text()
+    finally:
+        receipt=json.loads((evidence/'worker-closure.json').read_text())
+        destination=os.environ.get('T26_RESUME_RUN')
+        if destination:shutil.copytree(evidence,Path(destination)/'final-fifo-closure')
+        assert receipt['original_wait'] and receipt['echild'] and receipt['group_absent'] and not receipt['forced']
+
+
 def test_stalled_sdk_flow_times_out_and_closes_owned_contexts(live,monkeypatch):
     import asyncio
     from contextlib import asynccontextmanager

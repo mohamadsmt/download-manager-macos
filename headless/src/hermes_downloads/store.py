@@ -4100,13 +4100,14 @@ class SQLiteStore:
                 if gate=='running':
                     captures=[]
                     for candidate in connection.execute("SELECT job_id FROM jobs WHERE state='paused' ORDER BY job_id").fetchall():
-                        job_id=candidate[0];current=self._read_job_control_projection(connection,job_id)
+                        job_id=candidate[0]
+                        head=self._capture_target_head(connection,job_id)
+                        if head is None:continue
+                        current=self._read_job_control_projection(connection,job_id)
                         job=self.get_materialized_job(job_id)
                         if job is None or job.source_kind is not SourceKind.DIRECT or not current.authorized or current.manual_hold:continue
                         if job.queue_collection_id is not None and connection.execute('SELECT 1 FROM collection_holds WHERE collection_id=?',(job.queue_collection_id,)).fetchone():continue
-                        head=self._capture_target_head(connection,job_id)
                         checkpoint=self._saved_checkpoint(connection,job_id)
-                        if head is None:continue
                         if checkpoint is None:
                             if head.last_admission_serial!=0 or head.intent_status!='inactive':continue
                         elif checkpoint[0]['stop_kind'] not in {'queue','shutdown','cold','cold_absent'}:continue

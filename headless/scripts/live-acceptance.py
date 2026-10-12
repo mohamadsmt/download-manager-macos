@@ -416,7 +416,7 @@ def final_verify(home,packet,deadline):
     try:
         fds.append(os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW))
         fds.append(os.open('Other',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fds[-1]))
-        fds.append(os.open('authorized.bin',os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=fds[-1]))
+        fds.append(os.open('authorized.bin',os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=fds[-1]))
         before=os.fstat(fds[-1]);hasher=hashlib.sha256();count=0
         if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid() or before.st_nlink!=1 or before.st_size!=packet['length']:raise Refused('final_descriptor')
         while block:=os.read(fds[-1],65536):deadline.remaining();hasher.update(block);count+=len(block)
