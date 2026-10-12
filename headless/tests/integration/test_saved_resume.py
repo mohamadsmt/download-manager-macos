@@ -292,7 +292,7 @@ def test_public_cancel_joins_saved_lane_and_late_clone_never_readies(tmp_path,mo
         assert not origin_thread.is_alive()
 
 
-@pytest.mark.parametrize('stop',['pause','queue','shutdown','crash','prepared','absent','prepared-purge'])
+@pytest.mark.parametrize('stop',['pause','queue','shutdown','crash','prepared','absent','prepared-purge','hashless','prepared-hashless'])
 def test_public_cold_fresh_consent_and_exact_lineage(tmp_path,monkeypatch,sdk_lifecycle,stop):
     import multiprocessing,signal
     from test_direct_publication import _append_record
@@ -319,12 +319,30 @@ def test_public_cold_fresh_consent_and_exact_lineage(tmp_path,monkeypatch,sdk_li
         return result
     with tempfile.TemporaryDirectory(prefix='cold13-',dir='/private/tmp') as directory:
         state=Path(directory);state.chmod(0o700)
-        with _helpers._origin_type()(payload_size=(32 if stop=='absent' else 16)*1024*1024) as origin:
+        origin=_helpers._origin_type()(payload_size=(32 if stop=='absent' else 16)*1024*1024)
+        cold_requests=[];cold_heads=[]
+        if stop in {'hashless','prepared-hashless'}:
+            response=origin._response_for
+            def respond(endpoint,span):
+                status,headers,body=response(endpoint,span)
+                return status,headers|{'ETag':'"cold-strong"'},body
+            origin._response_for=respond
+            handler_type=origin._handler_type
+            def handlers():
+                Handler=handler_type();get=Handler.do_GET
+                def head(handler):
+                    cold_heads.append(True);handler.send_response(200);handler.send_header('ETag','"cold-strong"')
+                    handler.send_header('Content-Length',str(len(origin.payload)));handler.end_headers()
+                def request(handler):
+                    cold_requests.append((handler.headers.get('Range'),handler.headers.get('If-Match')));get(handler)
+                Handler.do_HEAD=head;Handler.do_GET=request;return Handler
+            origin._handler_type=handlers
+        with origin:
             expected=hashlib.sha256(origin.payload).hexdigest();origin_thread=origin._thread
             with body_worker(state,origin.url(),evidence,barrier='saved-drained' if stop.startswith('prepared') else None,
-                entered=entered,release=release,crash=stop in {'crash','prepared','absent','prepared-purge'},
-                recover_socket=stop in {'crash','prepared','absent','prepared-purge'}) as original_worker:
-                values=[entry(source_url=origin.url(),expected_sha256=expected,partial_filename='cold.bin',selected_final_filename='cold.bin')]
+                entered=entered,release=release,crash=stop in {'crash','prepared','absent','prepared-purge','prepared-hashless'},
+                recover_socket=stop in {'crash','prepared','absent','prepared-purge','prepared-hashless'}) as original_worker:
+                values=[entry(source_url=origin.url(),expected_sha256=None if stop in {'hashless','prepared-hashless'} else expected,partial_filename='cold.bin',selected_final_filename='cold.bin')]
                 if stop=='queue': values.append(entry(1,source_url=origin.url(),expected_sha256=expected,partial_filename='next.bin',selected_final_filename='next.bin'))
                 invoke(state,'downloads_add',dict(request_id='cold-add',items=values))
                 authorized=targets(['batch-job-0'],request='cold-authorize')
@@ -336,7 +354,7 @@ def test_public_cold_fresh_consent_and_exact_lineage(tmp_path,monkeypatch,sdk_li
                 assert engine is not None
                 bodies_before=rows(state/'state.db',"SELECT * FROM target_dispatch_causes WHERE kind='body'")
                 receipts_before=rows(state/'state.db','SELECT * FROM direct_dispatch_commands')
-                if stop in {'pause','prepared','absent','prepared-purge'}:
+                if stop in {'pause','prepared','absent','prepared-purge','prepared-hashless'}:
                     current=invoke(state,'downloads_query',dict(scope='status',id='batch-job-0'))['record']
                     paused=invoke(state,'downloads_control',dict(scope='job',action='pause',request_id='cold-pause',job='batch-job-0',expected_revision=str(current['revision'])))
                     wait(lambda: bool(checkpoint_rows(state)))
@@ -366,7 +384,7 @@ def test_public_cold_fresh_consent_and_exact_lineage(tmp_path,monkeypatch,sdk_li
                     assert rows(state/'state.db',"SELECT stop_kind FROM stopped_direct_cycles")==[('queue',)]
                     assert rows(state/'state.db',"SELECT count(*) FROM job_control_commands WHERE action='pause'")==[(0,)]
                 saved_before=checkpoint_rows(state)
-                if stop in {'crash','prepared','absent','prepared-purge'}:
+                if stop in {'crash','prepared','absent','prepared-purge','prepared-hashless'}:
                     if stop=='crash':
                         assert processes.is_current_process_birth(engine.identity)
                         assert origin.ledger.response_body_bytes<len(origin.payload)
@@ -395,7 +413,7 @@ def test_public_cold_fresh_consent_and_exact_lineage(tmp_path,monkeypatch,sdk_li
                 else:
                     # Leave this original context naturally; it owns its actual shutdown and wait.
                     pass
-            if stop not in {'crash','prepared','absent','prepared-purge'}:
+            if stop not in {'crash','prepared','absent','prepared-purge','prepared-hashless'}:
                 assert original_worker.exitcode==0
                 saved_before=checkpoint_rows(state)
                 assert saved_before
@@ -403,6 +421,11 @@ def test_public_cold_fresh_consent_and_exact_lineage(tmp_path,monkeypatch,sdk_li
                     _exercise_cold_consent(state,origin,evidence,output,expected,authorized,original_receipt,saved_before,bodies_before,receipts_before,stop,invoke,wait,checkpoint_rows)
             assert processes.reconcile_process_birth(engine.identity)=='absent'
             with pytest.raises(ProcessLookupError): os.killpg(engine.identity.process_group_id,0)
+            if stop in {'hashless','prepared-hashless'}:
+                assert cold_heads==([True,True] if stop=='prepared-hashless' else [True])
+                resumed=[row for row in cold_requests if row[1] is not None]
+                assert resumed and all(row[1]=='"cold-strong"' for row in resumed)
+                assert any(row[0] and int(row[0].split('=')[1].split('-')[0])>0 for row in resumed)
         assert not origin_thread.is_alive()
         (evidence/'origin-joined.json').write_text(json.dumps(dict(joined=True,ident=origin_thread.ident)))
 
@@ -446,12 +469,16 @@ def _exercise_cold_consent(state,origin,evidence,output,expected,authorized,orig
         assert invoke(state,'downloads_files',request)==receipt|dict(replayed=True)
         (evidence/'result.json').write_text(json.dumps(dict(stop=stop,body_absent=True,checkpoint_unchanged=True,prepared_lineage_unchanged=True,unknown_sentinel_preserved=True,synthetic=True)))
         return
-    resume=dict(scope='job',action='resume',request_id='cold-fresh',job='batch-job-0',expected_revision=str(current['revision']),expected_worker_epoch='2')
-    receipt=invoke(state,'downloads_control',resume)
-    assert receipt['results'][0]['outcome']=='existing_authority',receipt
-    assert rows(state/'state.db',"SELECT * FROM target_dispatch_causes WHERE kind='body'")==bodies_before
     queue=invoke(state,'downloads_query',dict(scope='queue'))
-    invoke(state,'downloads_control',dict(scope='queue',action='resume',request_id='cold-go',expected_revision=queue['revision']))
+    if stop in {'queue','shutdown','crash','absent','hashless'}:
+        resume=dict(scope='queue',action='resume',request_id='cold-go',expected_revision=queue['revision'])
+        receipt=invoke(state,'downloads_control',resume)
+    else:
+        resume=dict(scope='job',action='resume',request_id='cold-fresh',job='batch-job-0',expected_revision=str(current['revision']),expected_worker_epoch='2')
+        receipt=invoke(state,'downloads_control',resume)
+        assert receipt['results'][0]['outcome']=='existing_authority',receipt
+        assert rows(state/'state.db',"SELECT * FROM target_dispatch_causes WHERE kind='body'")==bodies_before
+        invoke(state,'downloads_control',dict(scope='queue',action='resume',request_id='cold-go',expected_revision=queue['revision']))
     wait(lambda: bool(rows(state/'state.db',"SELECT 1 FROM direct_cleanup_claims WHERE phase='finished'")),50 if stop=='absent' else 25)
     assert (output/'Other/cold.bin').read_bytes()==origin.payload
     assert hashlib.sha256((output/'Other/cold.bin').read_bytes()).hexdigest()==expected
@@ -461,7 +488,7 @@ def _exercise_cold_consent(state,origin,evidence,output,expected,authorized,orig
     for original in receipts_before:
         assert rows(state/'state.db','SELECT * FROM direct_dispatch_commands WHERE request_id=?',(original[0],))==[original]
     assert rows(state/'state.db',"SELECT admission_serial FROM target_dispatch_causes WHERE kind='body' ORDER BY admission_serial")==([(1,),(2,),(3,)] if stop=='absent' else [(1,),(2,)])
-    assert invoke(state,'downloads_control',resume)==receipt|dict(replayed=True)
+    assert invoke(state,'downloads_control',resume)==receipt|(dict(applied=False) if resume['scope']=='queue' else dict(replayed=True))
     names=rows(state/'state.db','SELECT retained_names FROM saved_resume_bindings')
     job=output/'.incomplete/batch-job-0'
     assert all(not (job/name).exists() for value, in names for name in json.loads(value))
@@ -591,3 +618,303 @@ def test_actual_cold_completed_retained_cleanup_requires_fresh_public_consent(tm
                 assert rows(state/'state.db','SELECT * FROM direct_dispatch_commands')==immutable
                 assert origin.ledger.response_body_bytes==baseline.response_body_bytes
                 (evidence/'retained-cut-result.json').write_text(json.dumps(dict(cut=cut,original_wait=True,fresh_consent=True,body_inert=True,unknown_preserved=True,checkpoint_immutable=True,claim_immutable=True)))
+
+
+@pytest.mark.parametrize('mode', ['hashless', 'changed', 'sha', 'queue', 'source-same', 'source-changed', 'source-new-url', 'queue-unknown', 'slow-head', 'stalled-head', 'source-slow-head', 'source-stalled-head', 'deadline-head', 'body-changed'])
+def test_sdk_partial_resume_identity_and_global_membership(tmp_path, monkeypatch, sdk_lifecycle, mode):
+    """A fresh consent resumes the original bytes; replay never admits twice."""
+    evidence = Path(tempfile.mkdtemp(prefix='identity-'+mode+'-', dir=os.environ.get('T26_RESUME_RUN', str(tmp_path))))
+    home=evidence/'home'; home.mkdir(mode=0o700); monkeypatch.setenv('HOME',str(home))
+    output=home/'Downloads/Hermes'; output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.02)
+    with tempfile.TemporaryDirectory(prefix='identity17-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        origin=_helpers._origin_type()(payload_size=8*1024*1024)
+        version=['"original-strong"']; heads=[]; requests=[]
+        import threading
+        head_entered=threading.Event(); head_release=threading.Event()
+        response=origin._response_for
+        def respond(endpoint,span):
+            status,headers,body=response(endpoint,span)
+            return status,headers|({'ETag':version[0]} if mode!='queue-unknown' else {}),body
+        origin._response_for=respond
+        handler_type=origin._handler_type
+        def handlers():
+            Handler=handler_type()
+            def head(handler):
+                heads.append(version[0])
+                head_entered.set()
+                if mode.endswith('stalled-head'):
+                    head_release.wait(5)
+                if mode.endswith('slow-head') or mode=='deadline-head':
+                    try:
+                        handler.connection.sendall(b'HTTP/1.1 200 OK\r\nX-Slow: ')
+                        end=time.monotonic()+5
+                        while not head_release.wait(.1) and time.monotonic()<end:
+                            handler.connection.sendall(b'x')
+                    except OSError:pass
+                    handler.close_connection=True
+                    return
+                handler.send_response(200)
+                handler.send_header('ETag',version[0]);handler.send_header('Content-Length',str(len(origin.payload)))
+                handler.end_headers()
+                if mode=='body-changed':version[0]='"late-changed"'
+            Handler.do_HEAD=head
+            get=Handler.do_GET
+            def request(handler):
+                requests.append(dict(range=handler.headers.get('Range'),match=handler.headers.get('If-Match')))
+                if handler.headers.get('If-Match') not in (None,version[0]):
+                    handler.send_response(412);handler.send_header('Content-Length','0');handler.end_headers();return
+                get(handler)
+            Handler.do_GET=request
+            return Handler
+        origin._handler_type=handlers
+        with origin:
+            origin_thread=origin._thread
+            with body_worker(root,origin.url(),evidence) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            digest=hashlib.sha256(origin.payload).hexdigest() if mode in {'sha','queue'} else None
+                            items=[entry(index=i,source_url=origin.url(),expected_sha256=digest) for i in range(4)]
+                            await call('downloads_add',dict(request_id='identity-add',items=items))
+                            await call('downloads_control',targets(['batch-job-0','batch-job-1','batch-job-2'] if mode=='queue' else ['batch-job-0','batch-job-1']))
+                            held=(await call('downloads_query',dict(scope='status',id='batch-job-1')))['record']
+                            await call('downloads_control',dict(scope='job',action='pause',job='batch-job-1',request_id='manual-hold',expected_revision=str(held['revision'])))
+                            await call('downloads_control',dict(scope='queue',action='resume',request_id='identity-run',expected_revision='1'))
+                            partial=output/'.incomplete/batch-job-0/file-0.bin';control=partial.with_name(partial.name+'.aria2')
+                            end=time.monotonic()+15
+                            while not partial.exists() or partial.stat().st_blocks*512<2*1024*1024:
+                                assert process.is_alive() and time.monotonic()<end
+                                await asyncio.sleep(.02)
+                            current=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                            if mode in {'queue','queue-unknown'}:
+                                pause=await call('downloads_control',dict(scope='queue',action='pause',request_id='identity-pause',expected_revision='2'))
+                            else:
+                                pause=await call('downloads_control',dict(scope='job',action='pause',request_id='identity-pause',job='batch-job-0',expected_revision=str(current['revision'])))
+                                await call('downloads_control',dict(scope='queue',action='pause',request_id='global-hold',expected_revision='2'))
+                            end=time.monotonic()+5
+                            while not rows(root/'state.db','SELECT 1 FROM stopped_direct_bodies UNION ALL SELECT 1 FROM stopped_direct_cycles'):
+                                assert time.monotonic()<end,'actual stopped pair must be sealed even without supplied SHA'
+                                await asyncio.sleep(.02)
+                            (evidence/'checkpoint.json').write_text(json.dumps(rows(root/'state.db','SELECT * FROM stopped_direct_bodies')+rows(root/'state.db','SELECT * FROM stopped_direct_cycles')))
+                            originals=[(p.stat().st_ino,hashlib.sha256(p.read_bytes()).hexdigest()) for p in (partial,control)]
+                            before=origin.ledger.response_body_bytes
+                            request_boundary=len(requests)
+                            async def cancel_probe():
+                                end=time.monotonic()+4
+                                while not head_entered.is_set():
+                                    assert time.monotonic()<end
+                                    await asyncio.sleep(.01)
+                                start=time.monotonic()
+                                await call('downloads_query',dict(scope='status',id='batch-job-0'))
+                                assert time.monotonic()-start<1,'HEAD must not block query'
+                                start=time.monotonic()
+                                await call('downloads_control',dict(scope='queue',action='pause',request_id='probe-cancel',expected_revision='3' if mode.startswith('source-') else '4'))
+                                elapsed=time.monotonic()-start
+                                head_release.set()
+                                assert elapsed<1.5,'pause must cancel and JOIN original identity observer'
+                                assert origin.ledger.response_body_bytes==before
+                                for p,(inode,sha) in zip((partial,control),originals):
+                                    assert p.stat().st_ino==inode and hashlib.sha256(p.read_bytes()).hexdigest()==sha
+                                effects=[json.loads(line) for line in (evidence/'scheduler-effects.jsonl').read_text().splitlines()]
+                                births=[row for row in effects if row['kind']=='identity-child-birth']
+                                assert births and all(row['birth'] is not None for row in births)
+                                assert all(any(wait['kind']=='identity-child-original-wait' and wait['pid']==row['pid'] and wait['echild'] and wait['group_absent'] for wait in effects) for row in births)
+                                assert any(row['kind']=='observer-join' and row['name']=='direct-saved-observation' and not row['alive'] for row in effects)
+                            if mode=='changed':version[0]='"replacement-strong"';origin.payload=origin.changed_payload
+                            if mode.startswith('source-'):
+                                if mode=='source-changed':version[0]='"replacement-strong"';origin.payload=origin.changed_payload
+                                replacement=dict(id='batch-job-0',url=origin.url() if mode!='source-new-url' else origin.url('/range?other'),request_id='identity-source',expected_revision=pause['revision'])
+                                accepted=await call('downloads_replace_source',replacement)
+                                if mode in {'source-slow-head','source-stalled-head'}:
+                                    await cancel_probe();return
+                                end=time.monotonic()+8
+                                while True:
+                                    detail=await call('downloads_query',dict(scope='detail',id='batch-job-0'))
+                                    if detail['source_replacement']['status']!='pending':break
+                                    assert time.monotonic()<end
+                                    await asyncio.sleep(.02)
+                                assert detail['source_replacement']['status']==('applied' if mode=='source-same' else 'blocked'),detail
+                                assert await call('downloads_replace_source',replacement)==accepted|dict(replayed=True)
+                                assert origin.ledger.response_body_bytes==before
+                                if mode!='source-same':
+                                    assert detail['source_replacement']['alternative']=='separate_download'
+                                    for p,(inode,sha) in zip((partial,control),originals):assert p.stat().st_ino==inode and hashlib.sha256(p.read_bytes()).hexdigest()==sha
+                                    return
+                            if mode not in {'queue','queue-unknown'}:
+                                resume=dict(scope='job',action='resume',request_id='identity-resume',job='batch-job-0',expected_revision=pause['revision'],expected_worker_epoch='1')
+                                receipt=await call('downloads_control',resume)
+                                assert receipt['results'][0]['outcome']=='existing_authority',receipt
+                                assert await call('downloads_control',resume)==receipt|dict(replayed=True)
+                            assert origin.ledger.response_body_bytes==before
+                            go=dict(scope='queue',action='resume',request_id='identity-go',expected_revision='3')
+                            receipt=await call('downloads_control',go)
+                            assert await call('downloads_control',go)==receipt|dict(applied=False)
+                            if mode in {'slow-head','stalled-head'}:
+                                await cancel_probe();return
+                            probe_started=time.monotonic()
+                            end=probe_started+(4.5 if mode=='deadline-head' else 15)
+                            while True:
+                                status=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                                if status['state'] in {'completed','blocked','needs_link','needs_auth'}:break
+                                assert time.monotonic()<end,('partial did not continue',mode,status)
+                                await asyncio.sleep(.03)
+                            if mode in {'changed','queue-unknown','deadline-head','body-changed'}:
+                                assert status['state']=='blocked',status
+                                detail=await call('downloads_query',dict(scope='detail',id='batch-job-0'))
+                                if mode!='body-changed':assert detail['resume_decision']['alternative']=='separate_download'
+                                if mode=='deadline-head':
+                                    assert time.monotonic()-probe_started<4.5
+                                    head_release.set()
+                                if mode=='body-changed':
+                                    assert requests[request_boundary:] and all(row['match']=='"original-strong"' for row in requests[request_boundary:])
+                                assert not (output/'Other/file-0.bin').exists()
+                                pair=tuple(partial.parent/name for name in paths._SAVED_NAMES) if mode=='body-changed' else (partial,control)
+                                for p,(inode,sha) in zip(pair,originals):
+                                    assert p.stat().st_ino==inode and hashlib.sha256(p.read_bytes()).hexdigest()==sha
+                                assert origin.ledger.response_body_bytes==before,'changed identity must be refused before BODY'
+                            else:
+                                assert status['state']=='completed',status
+                                assert (output/'Other/file-0.bin').read_bytes()==origin.payload
+                                resumed=requests[request_boundary:]
+                                assert any(r['range'] and int(r['range'].split('=')[1].split('-')[0])>0 for r in resumed),resumed
+                                if digest is None:
+                                    assert heads==['"original-strong"']*(2 if mode=='source-same' else 1),heads
+                                    assert resumed and all(r['match']=='"original-strong"' for r in resumed),resumed
+                                bodies=rows(root/'state.db',"SELECT job_id,admission_serial FROM target_dispatch_causes WHERE kind='body' ORDER BY rowid")
+                                assert bodies[:2]==[('batch-job-0',1),('batch-job-0',2)],bodies
+                            for job in ('batch-job-1','batch-job-3'):
+                                assert not rows(root/'state.db',"SELECT 1 FROM target_dispatch_causes WHERE kind='body' AND job_id=?",(job,))
+                            (evidence/'identity-result.json').write_text(json.dumps(dict(mode=mode,originals=originals,heads=heads,synthetic=True)))
+                asyncio.run(exercise())
+            assert not process.is_alive() and process.exitcode==0
+        assert not origin_thread.is_alive()
+
+
+@pytest.mark.parametrize('strong', [True, False])
+def test_sdk_hashless_partial_transient_retry_or_actionable_decision(tmp_path,monkeypatch,sdk_lifecycle,strong):
+    evidence=Path(tempfile.mkdtemp(prefix='hashless-retry-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))))
+    home=evidence/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home))
+    output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    monkeypatch.setattr(_helpers._FIXTURE_MODULE,'_RANGE_PACED_CHUNK_DELAY_SECONDS',.02)
+    with tempfile.TemporaryDirectory(prefix='retry17-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        origin=_helpers._origin_type()(payload_size=8*1024*1024);broken=[True];first=[True]
+        handler_type=origin._handler_type
+        def handlers():
+            Handler=handler_type()
+            def head(handler):
+                handler.send_response(200)
+                if strong:handler.send_header('ETag','"retry-original"')
+                handler.send_header('Content-Length',str(len(origin.payload)));handler.end_headers()
+            Handler.do_HEAD=head;return Handler
+        origin._handler_type=handlers
+        response=origin._response_for
+        def respond(endpoint,span):
+            status,headers,body=response(endpoint,span)
+            return status,headers|({'ETag':'"retry-original"'} if strong else {}),body
+        origin._response_for=respond
+        serve=origin._serve
+        def interrupted(handler):
+            if not broken[0]:return serve(handler)
+            with origin._lock:
+                initial=first[0];first[0]=False
+            span=handler.headers.get('Range')
+            if initial:
+                status,headers,body=respond('range',span)
+                handler.close_connection=True
+                sent=origin._send_response(handler,status,headers,body[:2*1024*1024],content_length=len(body),pace_large_range=True)
+            else:
+                time.sleep(.3)
+                sent=origin._send_response(handler,503,{'Retry-After':'2'},b'')
+            origin._record_request('range',sent,1,span)
+        origin._serve=interrupted
+        with origin:
+            thread=origin._thread
+            with body_worker(root,origin.url(),evidence) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read,write):
+                        async with ClientSession(read,write) as session:
+                            await session.initialize()
+                            async def call(name,args):return result_record(await session.call_tool(name,arguments=args))
+                            await call('downloads_add',dict(request_id='retry-add',items=[entry(source_url=origin.url())]))
+                            await call('downloads_control',targets(['batch-job-0']))
+                            await call('downloads_control',dict(scope='queue',action='resume',request_id='retry-run',expected_revision='1'))
+                            end=time.monotonic()+15
+                            while not rows(root/'state.db','SELECT 1 FROM direct_failures'):
+                                assert time.monotonic()<end
+                                await asyncio.sleep(.02)
+                            failure=rows(root/'state.db','SELECT http_status,state,observation FROM direct_failures')[0]
+                            (evidence/'failure.json').write_text(json.dumps(failure))
+                            assert failure[:2]==(503,'retry_wait'),failure
+                            partial=output/'.incomplete/batch-job-0/file-0.bin';control=partial.with_name(partial.name+'.aria2')
+                            assert partial.exists() and partial.stat().st_blocks*512>0
+                            end=time.monotonic()+5
+                            while not rows(root/'state.db','SELECT 1 FROM stopped_failed_bodies'):
+                                assert time.monotonic()<end,'hashless failure must seal original ranges'
+                                await asyncio.sleep(.02)
+                            originals=[(p.stat().st_ino,hashlib.sha256(p.read_bytes()).hexdigest()) for p in (partial,control)]
+                            broken[0]=False
+                            end=time.monotonic()+20
+                            while True:
+                                status=(await call('downloads_query',dict(scope='status',id='batch-job-0')))['record']
+                                if status['state'] in {'blocked','completed'}:break
+                                assert time.monotonic()<end,('hashless retry stranded',status)
+                                await asyncio.sleep(.03)
+                            if strong:
+                                assert status['state']=='completed',status
+                                assert (output/'Other/file-0.bin').read_bytes()==origin.payload
+                                assert rows(root/'state.db',"SELECT admission_serial FROM target_dispatch_causes WHERE kind='body' ORDER BY rowid")==[(1,),(2,)]
+                            else:
+                                assert status['state']=='blocked',status
+                                detail=await call('downloads_query',dict(scope='detail',id='batch-job-0'))
+                                assert detail['resume_decision']['alternative']=='separate_download'
+                                for p,(inode,sha) in zip((partial,control),originals):assert p.stat().st_ino==inode and hashlib.sha256(p.read_bytes()).hexdigest()==sha
+                                assert rows(root/'state.db',"SELECT count(*) FROM target_dispatch_causes WHERE kind='body'")==[(1,)]
+                            (evidence/'result.json').write_text(json.dumps(dict(strong=strong,status=status,originals=originals,synthetic=True)))
+                asyncio.run(exercise())
+            assert process.exitcode==0 and not process.is_alive()
+        assert not thread.is_alive()
+
+
+def test_sdk_cold_global_resume_authorized_unstarted_only(tmp_path,monkeypatch,sdk_lifecycle):
+    evidence=Path(tempfile.mkdtemp(prefix='cold-authorized-',dir=os.environ.get('T26_RESUME_RUN',str(tmp_path))))
+    home=evidence/'home';home.mkdir(mode=0o700);monkeypatch.setenv('HOME',str(home))
+    output=home/'Downloads/Hermes';output.mkdir(parents=True,mode=0o700)
+    async def invoke(root,name,args):
+        async with stdio_client(parameters(root)) as (read,write):
+            async with ClientSession(read,write) as session:
+                await session.initialize();return result_record(await session.call_tool(name,arguments=args))
+    def call(root,name,args):return asyncio.run(invoke(root,name,args))
+    with tempfile.TemporaryDirectory(prefix='unstarted17-',dir='/private/tmp') as temporary:
+        root=Path(temporary);root.chmod(0o700)
+        with _helpers._origin_type()() as origin:
+            thread=origin._thread
+            with body_worker(root,origin.url(),evidence):
+                call(root,'downloads_add',dict(request_id='cold-add',items=[entry(i,source_url=origin.url()) for i in range(3)]))
+                start=targets(['batch-job-0','batch-job-1'])
+                authorized=call(root,'downloads_control',start)
+                held=call(root,'downloads_query',dict(scope='status',id='batch-job-1'))['record']
+                call(root,'downloads_control',dict(scope='job',action='pause',job='batch-job-1',request_id='cold-manual',expected_revision=str(held['revision'])))
+                assert origin.ledger.request_count==0
+            with body_worker(root,origin.url(),evidence):
+                queue=call(root,'downloads_query',dict(scope='queue'))
+                assert queue['queue_gate']=='paused' and queue['worker_epoch']=='2'
+                assert call(root,'downloads_control',start)==authorized|dict(replayed=True)
+                call(root,'downloads_query',dict(scope='list'))
+                assert origin.ledger.request_count==0
+                resume=dict(scope='queue',action='resume',request_id='cold-global',expected_revision=queue['revision'])
+                receipt=call(root,'downloads_control',resume)
+                end=time.monotonic()+10
+                while not (output/'Other/file-0.bin').exists():
+                    assert time.monotonic()<end,'cold authorized work requires only global resume'
+                    time.sleep(.03)
+                assert (output/'Other/file-0.bin').read_bytes()==origin.payload
+                assert call(root,'downloads_control',resume)==receipt|dict(applied=False)
+                bodies=rows(root/'state.db',"SELECT job_id,admission_serial FROM target_dispatch_causes WHERE kind='body'")
+                assert bodies==[('batch-job-0',1)]
+                assert not (output/'Other/file-1.bin').exists() and not (output/'Other/file-2.bin').exists()
+        assert not thread.is_alive()

@@ -3002,6 +3002,8 @@ class SQLiteStore:
             if audit['generation'] == generation + 1 and audit['kind'] == 'job_paused':
                 if state not in _RECOVERABLE_COLD_START_STATES: raise ValueError('target cold predecessor changed')
                 state = 'paused'; cold_successors += 1
+            elif audit['kind']=='job_resume_blocked' and audit['generation']==generation:
+                state=self._saved_decision_for_audit(connection,job_id,generation,audit['revision'])
             elif audit['kind']=='job_retry_opened' and audit['generation']==generation+1:
                 reopened=self._retry_reopen(connection,audit['event_id'])
                 if (reopened['old_generation'],reopened['old_revision'])!=(generation,revision) or state not in {'blocked','paused'}:raise ValueError('retry head predecessor changed')
@@ -3211,13 +3213,21 @@ class SQLiteStore:
             job_id=job_id, collection_id=self.get_materialized_job(job_id).queue_collection_id,
             generation=fact['generation'], count=1, provenance=dict(kind='job', completion=fact))
 
-    def apply_target_authorize(self, command: TargetAuthorizeCommand) -> TargetAuthorizeResult:
+    def apply_target_authorize(self, command: TargetAuthorizeCommand, *, _queue_transaction=False) -> TargetAuthorizeResult:
         """Seal explicit metadata intent; no execution or filesystem entry point."""
         if type(command) is not TargetAuthorizeCommand: raise ValueError('target_request_invalid')
         connection = self._connection; cache = {}
+        if _queue_transaction and not connection.in_transaction:raise ValueError('queue transaction missing')
+        def commit():
+            if _queue_transaction:connection.execute('RELEASE queue_saved_resume')
+            else:connection.commit()
+        def rollback():
+            if _queue_transaction:
+                connection.execute('ROLLBACK TO queue_saved_resume');connection.execute('RELEASE queue_saved_resume')
+            else:connection.rollback()
         try:
             with self._batch_budget() as deadline:
-                connection.execute('BEGIN IMMEDIATE')
+                connection.execute('SAVEPOINT queue_saved_resume' if _queue_transaction else 'BEGIN IMMEDIATE')
                 try:
                     try:
                         replay = self._match_command_receipt(connection,request_id=command.request_id,
@@ -3228,7 +3238,7 @@ class SQLiteStore:
                         raise
                     if replay:
                         _,result,_ = self._read_target_command(connection,command.request_id,cache)
-                        connection.rollback()
+                        rollback()
                         return TargetAuthorizeResult.from_record({**result.to_record(),'replayed':True})
                     if command.expected_worker_epoch != self._current_worker_epoch(connection): raise ValueError('target_epoch_stale')
                     selector = command.to_record()['selector']
@@ -3367,10 +3377,10 @@ class SQLiteStore:
                             elif member['outcome']=='existing_authority' and member['captured_state']=='completed':
                                 connection.execute('INSERT INTO saved_cleanup_requests VALUES (?,?,?,1)',(command.request_id,member['job_id'],command.expected_worker_epoch))
                     if time.monotonic() >= deadline: raise TimeoutError('target deadline')
-                    connection.commit()
+                    commit()
                     return result
                 except BaseException:
-                    connection.rollback(); raise
+                    rollback(); raise
         except RequestConflictError: raise
         except (TimeoutError,sqlite3.OperationalError) as error:
             if isinstance(error,TimeoutError) or 'interrupt' in str(error) or 'locked' in str(error): raise RuntimeError('target_deadline') from None
@@ -3561,6 +3571,8 @@ class SQLiteStore:
             if kind == 'job_paused' and next_generation == generation + 1:
                 if state not in _RECOVERABLE_COLD_START_STATES: raise ValueError('batch cold predecessor invalid')
                 successors = flags; next_state = 'paused'; direct_lineage = False
+            elif kind=='job_resume_blocked' and next_generation==generation:
+                next_state=self._saved_decision_for_audit(connection,job_id,generation,next_revision);successors=flags
             elif kind=='job_retry_opened' and next_generation==generation+1:
                 reopened=self._retry_reopen(connection,audit)
                 if (reopened['old_generation'],reopened['old_revision'])!=(generation,revision) or state not in {'blocked','paused'}:raise ValueError('retry lifecycle predecessor changed')
@@ -4085,6 +4097,30 @@ class SQLiteStore:
                     if current.state != "paused":
                         self._persist_direct_dispatch_lifecycle(connection,current=current,state="paused",event_kind="job_paused")
                     self._advance_publication_pointer(connection,current,preserve=predecessor and recoverable)
+                if gate=='running':
+                    captures=[]
+                    for candidate in connection.execute("SELECT job_id FROM jobs WHERE state='paused' ORDER BY job_id").fetchall():
+                        job_id=candidate[0];current=self._read_job_control_projection(connection,job_id)
+                        job=self.get_materialized_job(job_id)
+                        if job is None or job.source_kind is not SourceKind.DIRECT or not current.authorized or current.manual_hold:continue
+                        if job.queue_collection_id is not None and connection.execute('SELECT 1 FROM collection_holds WHERE collection_id=?',(job.queue_collection_id,)).fetchone():continue
+                        head=self._capture_target_head(connection,job_id)
+                        checkpoint=self._saved_checkpoint(connection,job_id)
+                        if head is None:continue
+                        if checkpoint is None:
+                            if head.last_admission_serial!=0 or head.intent_status!='inactive':continue
+                        elif checkpoint[0]['stop_kind'] not in {'queue','shutdown','cold','cold_absent'}:continue
+                        budget=self.get_retry_budget(job_id)
+                        if budget is not None and (budget.paused or budget.exhausted):continue
+                        origin=self._read_creation_origin(connection,job_id,{},target=False)
+                        if not self._saved_resume_eligible(connection,origin,current,head):
+                            self._record_saved_decision(connection,job_id)
+                            continue
+                        captures.append((job_id,current.revision))
+                    for job_id,revision in captures:
+                        request='queue-resume:'+hashlib.sha256((request_id+':'+job_id).encode()).hexdigest()
+                        command=TargetAuthorizeCommand(request,self._current_worker_epoch(connection),'resume',dict(kind='jobs',targets=[dict(job=job_id,expected_revision=revision)]))
+                        self.apply_target_authorize(command,_queue_transaction=True)
                 next_revision = current_revision + 1
                 connection.execute(
                     """
@@ -4603,7 +4639,7 @@ class SQLiteStore:
         cache[key] = cause
         return cause
 
-    def _prepare_target_dispatch(self, *, expected_worker_epoch, owner_slot_ready, now):
+    def _prepare_target_dispatch(self, *, expected_worker_epoch, owner_slot_ready, now, _saved_qualifications=None):
         """Select and commit one exact private operation before any engine exists."""
         _require_worker_epoch(expected_worker_epoch,'expected_worker_epoch')
         if type(owner_slot_ready) is not bool: raise TypeError('owner_slot_ready must be boolean')
@@ -4685,6 +4721,10 @@ class SQLiteStore:
                                 drain=connection.execute('SELECT drained FROM saved_resume_bindings WHERE request_id=?',(continuation.request_id,)).fetchone()
                                 if drain is None or drain[0]!=1:continue
                                 self._require_ready_saved_pair(connection,job_id,continuation.request_id)
+                                if origin.kind=='batch' and origin.batch.expected_sha256 is None:
+                                    qualified=None if _saved_qualifications is None else _saved_qualifications.get(job_id)
+                                    if qualified is None or qualified[:2]!=(continuation,self.effective_source(job_id)):
+                                        connection.commit();return continuation
                         else:
                             continuation = None
                         scalars['admission_serial'] = head.last_admission_serial + 1
@@ -6134,7 +6174,9 @@ class SQLiteStore:
             if connection.execute('SELECT 1 FROM target_commands WHERE request_id=?',(request,)).fetchone(): continue
             command=TargetAuthorizeCommand(request,epoch,'resume',dict(kind='jobs',targets=[dict(job=job,expected_revision=failure['revision'])]))
             if self._saved_checkpoint(connection,job,failure['body_request_id']) is not None:
-                return self.apply_target_authorize(command)
+                receipt=self.apply_target_authorize(command)
+                if receipt.to_record()['results'][0]['outcome']=='blocked':self._block_saved_decision(job)
+                return receipt
             from hermes_downloads.paths import _saved_open_chain
             destination=self._saved_destination(job);reservation=self._effective_reservation(connection,job)
             try:
@@ -6146,7 +6188,9 @@ class SQLiteStore:
                         raise ValueError('saved bytes require checkpoint')
                 finally:
                     for fd in reversed(descriptors):os.close(fd)
-            except (OSError,ValueError): continue
+            except (OSError,ValueError):
+                self._block_saved_decision(job)
+                continue
             command=TargetAuthorizeCommand(request,epoch,'resume',dict(kind='jobs',targets=[dict(job=job,expected_revision=failure['revision'])]))
             connection.execute('BEGIN IMMEDIATE')
             try:
@@ -7660,9 +7704,14 @@ class SQLiteStore:
                 if failure is not None and self._read_job_control_projection(self._connection,job).state=='retry_wait':
                     due=datetime.fromtimestamp(_require_counter(failure[0],'retry due')/1000,UTC).isoformat()
                 retry=dict(generation=str(budget.generation),budget_number=str(budget.budget_number),ordinary_attempts=str(budget.ordinary_attempts),paused=budget.paused,exhausted=budget.exhausted,due_at=due)
-            return dict(id=job,source_replacement=source,edit=edit,effective=effective,files=files,collection=collection,retry=retry)
+            detail=dict(id=job,source_replacement=source,edit=edit,effective=effective,files=files,collection=collection,retry=retry)
+            latest=self._target_latest(self._connection,job)
+            if latest['kind']=='job_resume_blocked':
+                self._saved_decision_for_audit(self._connection,job,latest['generation'],latest['revision'])
+                detail['resume_decision']=dict(status='blocked',reason='source_identity_changed_or_unknown',alternative='separate_download')
+            return detail
 
-    def apply_source_replacement(self, request):
+    def apply_source_replacement(self, request, *, _verified_stock=None):
         connection=self._connection;row,command=self._source_request(request)
         current=self._read_job_control_projection(connection,command.id)
         origin=self._read_creation_origin(connection,command.id,{})
@@ -7671,12 +7720,18 @@ class SQLiteStore:
         checkpoint=self._saved_checkpoint(connection,command.id)
         expected=None if origin.kind!='batch' else origin.batch.expected_sha256
         head=self._capture_target_head(connection,command.id)
-        qualified=(expected is not None and row['worker_epoch']==self.worker_epoch() and row['generation']==current.generation
+        # Strong ETags are resource scoped. An unchanged URL can be freshly
+        # verified; a different URL still needs the trusted original digest.
+        stock=None if checkpoint is None else self._checkpoint_stock(connection,checkpoint[0])
+        unchanged=(expected is None and stock is not None and stock.known and stock.strong_validator is not None
+            and stock.total_length is not None and stock.resource_digest is not None and _verified_stock==stock
+            and command.url.encode()==self.effective_source(command.id))
+        qualified=((expected is not None or unchanged) and row['worker_epoch']==self.worker_epoch() and row['generation']==current.generation
             and current.state in {'paused','queued','blocked','needs_link','needs_auth'} and head is not None
             and (head.last_admission_serial==0 or checkpoint is not None))
         connection.execute('BEGIN IMMEDIATE')
         try:
-            if qualified:
+            if qualified and expected is not None:
                 source=None if checkpoint is None else checkpoint[0]['source_request_id'];digest=None if checkpoint is None else checkpoint[0]['checkpoint_digest']
                 values=(request,command.id,current.generation,current.revision,source,digest,expected)
                 connection.execute('INSERT INTO direct_sources VALUES (?,?,?,?,?,?,?,?)',(*values,hashlib.sha256(_batch_canonical(list(values),4096)).hexdigest()))
@@ -9658,7 +9713,7 @@ class SQLiteStore:
         if (receipt is None or receipt.status!='started' or receipt.state!='downloading' or receipt.job!=job_id
             or cause is None or cause['kind']!='body'
             or audit is None or (audit['kind'],audit['job_id'],audit['generation'],audit['revision'])!=(('job_failure' if row['stop_kind']=='failure' else 'job_paused'),job_id,row['generation'],row['revision'])
-            or set(closure)!={'process','returncode','group_absent','observer_joined','gid','completed_length'}
+            or set(closure)-{'stock'}!={'process','returncode','group_absent','observer_joined','gid','completed_length'}
             or closure['group_absent'] is not True
             or (closure['completed_length'] is not None if row['stop_kind']=='cold_absent' else type(closure['completed_length']) is not int or not 0<closure['completed_length']<=facts.payload[2])
             or type(closure['gid']) is not str or re.fullmatch('[0-9a-fA-F]{16}',closure['gid']) is None):
@@ -9703,7 +9758,22 @@ class SQLiteStore:
             elif row['stop_kind']=='edit':
                 self._edit_request(connection,row['pause_request_id'])
             elif row['stop_kind']!='shutdown': raise ValueError('unknown stop provenance')
+        self._checkpoint_stock(connection,row)
         return row,facts
+
+    def _checkpoint_stock(self, connection, row):
+        from hermes_downloads.direct import _StockResult
+        closure=json.loads(row['closure']);value=closure.get('stock')
+        if value is None:return None
+        value=dict(value);value['owner']=tuple(value['owner']) if value.get('owner') is not None else None
+        stock=_StockResult(**value)
+        binding=connection.execute('SELECT owner FROM direct_stock_bindings WHERE body_request_id=?',(row['source_request_id'],)).fetchone()
+        receipt=self._read_direct_dispatch_command(connection,row['source_request_id'])
+        if (binding is None or stock.owner is None or tuple(json.loads(binding[0]))!=stock.owner
+            or stock.owner[:5]!=(row['job_id'],receipt.generation,closure['gid'],row['worker_epoch'],row['source_request_id'])
+            or stock.owner[5]!=hashlib.sha256(json.dumps(closure['process'],sort_keys=True,separators=(',',':')).encode()).hexdigest()):
+            raise ValueError('saved stock identity binding changed')
+        return stock
 
     def seal_stopped_direct_body(self, plan, pause, result, facts, closure, *, stop_kind='pause'):
         connection=self._connection
@@ -9713,7 +9783,7 @@ class SQLiteStore:
             if (current.generation,current.revision,current.state)!=(result.generation,result.revision,result.state) or (current.state!='paused' and stop_kind!='failure'):
                 raise ValueError('stopped checkpoint stale')
             origin=self._read_creation_origin(connection,current.job,{},target=False)
-            if origin.kind!='batch' or origin.batch.expected_sha256 is None: return
+            if origin.kind!='batch': return
             if self._saved_checkpoint(connection,current.job,plan.request_id) is not None: return
             audit=self._target_latest(connection,current.job)['event_id'];epoch=self._current_worker_epoch(connection)
             request=pause.request_id if pause is not None else ('cold:'+str(audit) if stop_kind in {'cold','cold_absent'} else ('failure:'+plan.request_id if stop_kind=='failure' else 'shutdown:'+plan.request_id))
@@ -9771,10 +9841,13 @@ class SQLiteStore:
         from hermes_downloads.paths import _require_saved_pair
         if command is not None and self._fresh_retry(connection,current.job,command.request_id): return True
         if head is not None and head.last_admission_serial==0: return True
-        if origin.kind!='batch' or origin.batch.expected_sha256 is None or head is None or current.state not in {'paused','retry_wait','blocked','needs_auth','needs_link'}: return False
+        if origin.kind!='batch' or head is None or current.state not in {'paused','retry_wait','blocked','needs_auth','needs_link'}: return False
         checkpoint=self._saved_checkpoint(connection,current.job)
         if checkpoint is None: return False
         row,facts=checkpoint
+        if origin.batch.expected_sha256 is None:
+            stock=self._checkpoint_stock(connection,row)
+            if stock is None or not stock.known or stock.strong_validator is None or stock.resource_digest is None or stock.total_length is None:return False
         budget=self.get_retry_budget(current.job)
         if budget is not None and (budget.generation!=current.generation or budget.exhausted): return False
         prior=connection.execute('SELECT 1 FROM saved_direct_continuations WHERE checkpoint_digest=? UNION ALL SELECT 1 FROM saved_direct_cycles WHERE checkpoint_digest=?',(row['checkpoint_digest'],row['checkpoint_digest'])).fetchone()
@@ -9867,9 +9940,13 @@ class SQLiteStore:
             self._require_one_changed_row(connection,'saved phase CAS')
             if phase=='ready': self._require_ready_saved_pair(connection,plan.job_id,plan.request_id,require_drain=False)
 
-    def qualify_saved_drain(self, plan):
-        if self._saved_continuation(self._connection,plan.job_id,plan.request_id)!=plan: raise ValueError('saved drain changed')
-        self._require_ready_saved_pair(self._connection,plan.job_id,plan.request_id,require_drain=False)
+    def qualify_saved_drain(self, plan, *, _existing=False):
+        current=self._read_job_control_projection(self._connection,plan.job_id)
+        if (self._saved_continuation(self._connection,plan.job_id,plan.request_id)!=plan
+            or self.worker_epoch()!=plan.worker_epoch
+            or (current.generation,current.revision,current.state)!=(plan.generation,plan.revision,'queued')):raise ValueError('saved drain changed')
+        self._require_ready_saved_pair(self._connection,plan.job_id,plan.request_id,require_drain=_existing)
+        if _existing:return
         self._connection.execute('UPDATE saved_resume_bindings SET drained=1 WHERE request_id=? AND drained=0',(plan.request_id,))
         self._require_one_changed_row(self._connection,'saved original observation JOIN')
 
@@ -9890,12 +9967,35 @@ class SQLiteStore:
             retained=evidence['retained'],candidates=evidence['candidates'],retained_names=plan.retained_names)
         return row
 
-    def fail_saved_preparation(self, plan, *, pause=True):
+    def _block_saved_decision(self, job_id):
+        connection=self._connection;connection.execute('BEGIN IMMEDIATE')
+        with connection:
+            self._record_saved_decision(connection,job_id)
+
+    def _record_saved_decision(self, connection, job_id):
+        if not connection.in_transaction:raise ValueError('saved decision transaction missing')
+        current=self._read_job_control_projection(connection,job_id)
+        if current.state not in {'queued','retry_wait','paused'}:return
+        self._persist_direct_dispatch_lifecycle(connection,current=current,state='blocked',event_kind='job_resume_blocked')
+
+    def _saved_decision_for_audit(self, connection, job_id, generation, revision):
+        # The decision is bound either to a failed saved preparation or the
+        # original typed retry failure. Both carriers are immutable and fenced.
+        for table in ('saved_direct_continuations','saved_direct_cycles'):
+            if connection.execute(f"SELECT 1 FROM {table} WHERE job_id=? AND generation=? AND revision=? AND phase='failed'",(job_id,generation,revision-1)).fetchone():return 'blocked'
+        if connection.execute("SELECT 1 FROM direct_failures WHERE job_id=? AND generation=? AND revision=? AND state='retry_wait'",(job_id,generation,revision-1)).fetchone():return 'blocked'
+        for table in ('stopped_direct_bodies','stopped_direct_cycles','stopped_control_bodies','stopped_failed_bodies','stopped_absent_bodies'):
+            if connection.execute(f'SELECT 1 FROM {table} WHERE job_id=? AND generation=? AND revision=?',(job_id,generation,revision-1)).fetchone():return 'blocked'
+        if connection.execute('SELECT 1 FROM saved_cold_fences WHERE job_id=? AND generation=? AND revision=?',(job_id,generation,revision-1)).fetchone():return 'blocked'
+        raise ValueError('saved source decision provenance changed')
+
+    def fail_saved_preparation(self, plan, *, pause=True, _identity_decision=False):
         table=self._continuation_table(self._connection,plan.request_id)
         self._connection.execute(f"UPDATE {table} SET phase='failed' WHERE request_id=? AND phase!='admitted'",(plan.request_id,))
         current=self.get_job(plan.job_id)
         if pause and current.state=='queued':
-            self.apply_job_control(job_id=plan.job_id,action='pause',request_id='saved-failed:'+plan.checkpoint_digest,payload_digest=plan.checkpoint_digest,expected_revision=current.revision)
+            if _identity_decision:self._block_saved_decision(plan.job_id)
+            else:self.apply_job_control(job_id=plan.job_id,action='pause',request_id='saved-failed:'+plan.checkpoint_digest,payload_digest=plan.checkpoint_digest,expected_revision=current.revision)
 
     def cold_body_owner(self, record):
         rows=self._connection.execute('SELECT * FROM saved_body_owners WHERE worker_epoch=?',(record.worker_epoch,)).fetchall()

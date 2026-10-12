@@ -6192,3 +6192,21 @@ def test_source_receipt_uses_closed_decimal_signed64_counter(tmp_path,revision):
                     with pytest.raises(ipc.IPCError):ipc.request_source(endpoint,command)
             finally:observer.join(5)
             assert not observer.is_alive() and not errors
+
+
+@pytest.mark.parametrize('decision', [None,
+    dict(status='blocked',reason='source_identity_changed_or_unknown',alternative='separate_download'),
+    {}, dict(status='ready',reason='source_identity_changed_or_unknown',alternative='separate_download'),
+    dict(status='blocked',reason=True,alternative='separate_download'),
+    dict(status='blocked',reason='source_identity_changed_or_unknown',alternative='separate_download',url='private')])
+def test_source_detail_resume_decision_is_closed(short_socket_root, decision):
+    endpoint=short_socket_root/'decision.sock'
+    detail=dict(id='job',source_replacement=None,edit=None,effective=None,files=None,collection=None,retry=None)
+    if decision is not None:detail['resume_decision']=decision
+    with closing(ipc.HealthServer(endpoint,health=lambda:ipc.WorkerHealth(1,'paused'),
+            query_detail=lambda identifier,deadline:detail)) as server:
+        valid=decision is None or decision==dict(status='blocked',reason='source_identity_changed_or_unknown',alternative='separate_download')
+        if valid:
+            assert _serve_one(server,lambda:ipc.request_source(endpoint,id='job'))==detail
+        else:
+            with pytest.raises(ipc.IPCError):_serve_one(server,lambda:ipc.request_source(endpoint,id='job'))

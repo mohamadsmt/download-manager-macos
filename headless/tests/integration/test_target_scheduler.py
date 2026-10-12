@@ -11,7 +11,7 @@ import threading
 import time
 
 import pytest
-from hermes_downloads import ipc, worker
+from hermes_downloads import ipc, worker, processes
 from hermes_downloads.store import SQLiteStore, _DirectDispatchPlan
 from test_add_batch import canonical, entry, envelope, exchange
 from test_target_authority import authorize, select_jobs, target
@@ -208,6 +208,25 @@ def _scheduler_worker(state, ready, shutdown, stopped, results, origin, evidence
             os.chmod(ledger,0o600)
             stream.write(json.dumps(dict(kind=kind,monotonic=time.monotonic(),**values))+'\n')
             stream.flush()
+    # Identity-only helpers remain owned by the original saved observer.
+    probe_popen=direct.subprocess.Popen
+    def observed_probe(argv,*args,**kwargs):
+        child=probe_popen(argv,*args,**kwargs)
+        if isinstance(argv,(tuple,list)) and '-c' in argv and any('_read_saved_source' in str(arg) for arg in argv):
+            identity=processes.capture_process_birth(processes.EngineIdentity(child.pid,child.pid,time.monotonic_ns(),'0'*64))
+            record('identity-child-birth',pid=child.pid,birth=None if identity is None else identity.to_record())
+            original_wait=child.wait
+            def wait(*a,**kw):
+                code=original_wait(*a,**kw)
+                try:os.waitpid(child.pid,os.WNOHANG);reaped=False
+                except ChildProcessError:reaped=True
+                try:os.killpg(child.pid,0);gone=False
+                except ProcessLookupError:gone=True
+                record('identity-child-original-wait',pid=child.pid,code=code,echild=reaped,group_absent=gone)
+                return code
+            child.wait=wait
+        return child
+    direct.subprocess.Popen=observed_probe
     if private_start is None:
         run=worker.run_worker
         def observed_run(*args,**kwargs):
@@ -374,8 +393,8 @@ def _scheduler_worker(state, ready, shutdown, stopped, results, origin, evidence
     direct.DirectAria2Controller.add_paused = observed_add
     if barrier=='saved-drained':
         original_drain=SQLiteStore.qualify_saved_drain
-        def hold_drained(self,plan):
-            original_drain(self,plan)
+        def hold_drained(self,plan,**kwargs):
+            original_drain(self,plan,**kwargs)
             record('actual-saved-observation-drained',request_id=plan.request_id)
             entered.set()
             assert release.wait(12), 'finite drained-ready crash barrier expired'

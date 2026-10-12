@@ -281,6 +281,8 @@ def test_real_body_start_containment_retains_bytes_and_global_blocks_next(tmp_pa
     with tempfile.TemporaryDirectory(prefix='mcp10-body-', dir='/private/tmp') as temporary:
         root = Path(temporary); root.chmod(0o700)
         with _helpers._origin_type()(payload_size=8*1024*1024) as origin_server:
+            response=origin_server._response_for
+            origin_server._response_for=lambda endpoint,span: (lambda status,headers,body:(status,headers|{'ETag':'"control-original"'},body))(*response(endpoint,span))
             origin_thread = origin_server._thread
             with body_worker(root, origin_server.url(), ledger) as process:
                 async def exercise():
@@ -338,9 +340,11 @@ def test_real_body_start_containment_retains_bytes_and_global_blocks_next(tmp_pa
                             effects = [json.loads(line) for line in (ledger/'scheduler-effects.jsonl').read_text().splitlines()]
                             assert any(row['kind']=='observer-join' and not row['alive'] and row['monotonic']<=received for row in effects)
                             if action=='pause':
-                                unsupported = await call('downloads_control',dict(scope='job',action='resume',job='batch-job-0',
+                                await call('downloads_control',dict(scope='queue',action='pause',request_id='hashless-global-hold',expected_revision='2'))
+                                supported = await call('downloads_control',dict(scope='job',action='resume',job='batch-job-0',
                                     request_id='hashless-resume',expected_revision=contained['revision'],expected_worker_epoch='1'))
-                                assert unsupported['results'][0]['reason']=='incompatible_authority'
+                                assert supported['results'][0]['outcome']=='existing_authority'
+                                assert supported['results'][0]['held_by']==['global']
                                 assert partial.read_bytes()==retained
                             replay = await call('downloads_control', request)
                             assert replay == authorization | dict(replayed=True)

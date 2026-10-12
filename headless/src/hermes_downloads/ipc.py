@@ -2132,7 +2132,12 @@ def request_source(socket_path, command=None, *, id=None):
                 raw=value['revision']
                 if type(raw) is not str or not re.fullmatch(r'0|[1-9][0-9]{0,18}',raw) or int(raw)>_MAX_COUNTER:raise ValueError('invalid source counter')
             else:
-                if set(value)!={'id','source_replacement','edit','effective','files','collection','retry'} or value['id']!=id:raise ValueError('invalid detail')
+                fields={'id','source_replacement','edit','effective','files','collection','retry'}
+                if set(value) not in (fields,fields|{'resume_decision'}) or value['id']!=id:raise ValueError('invalid detail')
+                if 'resume_decision' in value:
+                    decision=value['resume_decision']
+                    expected=dict(status='blocked',reason='source_identity_changed_or_unknown',alternative='separate_download')
+                    if type(decision) is not dict or set(decision)!=set(expected) or any(type(decision[k]) is not str or decision[k]!=v for k,v in expected.items()):raise ValueError('invalid resume decision')
                 collection=value['collection'];retry=value['retry']
                 if collection is not None:
                     if type(collection) is not dict or set(collection)!={'id','held','revision'} or type(collection['held']) is not bool:raise ValueError('invalid collection detail')

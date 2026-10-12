@@ -23,10 +23,12 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from typing import Any, Final, cast
+from urllib.parse import urlsplit
 
 from hermes_downloads.models import Admission
 from hermes_downloads.network import SourceURL
@@ -249,13 +251,116 @@ class _StockCapture:
             if self._unknown or not self.eof or not heads: return _StockResult(False)
             failures = [head for head in heads if head[0]>=400]
             selected = failures or heads
-            if len({head[:2] for head in selected})!=1: return _StockResult(False)
+            if len({head[:2] for head in selected})!=1 and (failures or any(head[0] not in {200,206} or head[1] is not None for head in selected)): return _StockResult(False)
             status,retry = selected[0][:2]
             resources = {head[2] for head in selected}
             resource = next(iter(resources)) if len(resources)==1 else None
-            identities = {head[2:] for head in heads}
-            validator,total = (heads[0][3:] if not failures and len(identities)==1 else (None,None))
+            successful = [head for head in heads if head[0] in {200,206}]
+            identities = {head[2:] for head in successful}
+            validator,total = (successful[0][3:] if successful and len(identities)==1 else (None,None))
+            if successful and len(identities)==1: resource=successful[0][2]
             return _StockResult(True,status,retry,resource,validator,total,len(heads))
+
+
+def _read_saved_source(source: SourceURL, original: _StockResult) -> str:
+    """Explicit saved consent: HEAD only, before touching the retained pair.
+
+    Compare the actual stock response's resource, strong ETag and length. No
+    ambient credentials/proxy, redirect guessing, or response BODY is used.
+    """
+    if (type(original) is not _StockResult or not original.known
+        or original.resource_digest is None or original.strong_validator is None
+        or original.total_length is None):
+        raise _SavedSourceIdentityError('saved source identity unknown; separate download required')
+    _require_source(source)
+    parts = urlsplit(source.raw_url.decode('utf-8'))
+    target = parts.path or '/'
+    if parts.query: target += '?' + parts.query
+    resource = hashlib.sha256(parts.netloc.encode('ascii')+b'\0'+target.encode('ascii')).hexdigest()
+    if resource != original.resource_digest:
+        raise _SavedSourceIdentityError('saved source resource changed; separate download required')
+    connection_type = http.client.HTTPSConnection if parts.scheme == 'https' else http.client.HTTPConnection
+    connection = connection_type(parts.hostname, parts.port, timeout=3)
+    response = None
+    try:
+        connection.request('HEAD', target, headers={'Accept-Encoding':'identity'})
+        response = connection.getresponse()
+        headers = response.getheaders()
+        def single(name):
+            values = [v for k,v in headers if k.lower()==name]
+            return values[0] if len(values)==1 else None
+        etag = single('etag'); length = single('content-length')
+        encoding = single('content-encoding')
+        if (response.status != 200 or etag is None
+            or len(etag)>2048 or re.fullmatch(r'"[\x21\x23-\x7e]*"',etag) is None
+            or hashlib.sha256(etag.encode('ascii')).hexdigest()!=original.strong_validator
+            or length is None or re.fullmatch('[0-9]{1,19}',length) is None
+            or int(length)!=original.total_length or encoding not in (None,'identity')):
+            raise _SavedSourceIdentityError('saved source identity changed or unknown; separate download required')
+        return etag
+    except (OSError,http.client.HTTPException,UnicodeError,ValueError):
+        raise _SavedSourceIdentityError('saved source identity unavailable; separate download required') from None
+    finally:
+        if response is not None: response.close()
+        connection.close()
+
+
+def _verify_saved_source(source: SourceURL, original: _StockResult, *, cancelled=lambda: False, deadline=None) -> str:
+    """A joined identity-only child bounds DNS, TLS and trickled HEAD together.
+
+    The existing saved observer owns this original Popen. No source is placed
+    in argv or diagnostics; cancellation never leaves a resolver/reader thread.
+    """
+    _require_source(source)
+    if type(original) is not _StockResult: raise TypeError('invalid saved observation')
+    end=min(time.monotonic()+3,deadline) if deadline is not None else time.monotonic()+3
+    if cancelled() or time.monotonic()>=end: raise _SavedSourceIdentityError('saved identity observation cancelled')
+    code="""import json,sys
+from hermes_downloads.direct import _StockResult,_read_saved_source
+from hermes_downloads.network import _parse_source_url
+try:
+    value=json.loads(sys.stdin.buffer.read(16384))
+    etag=_read_saved_source(_parse_source_url(value['source']),_StockResult(**value['stock']))
+    sys.stdout.write(json.dumps(dict(etag=etag)))
+except Exception:
+    raise SystemExit(1)
+"""
+    stock={name:getattr(original,name) for name in ('known','http_status','retry_after_seconds','resource_digest','strong_validator','total_length','contributors')}
+    packet=json.dumps(dict(source=source.raw_url.decode('utf-8'),stock=stock)).encode()
+    argv=(sys.executable,'-I','-B','-c',code)
+    child=subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,env=_filtered_environment(),start_new_session=True,close_fds=True)
+    group=None
+    try:
+        group=_bind_process_group(child)
+        if group is None: raise _SavedSourceIdentityError('saved identity ownership unavailable')
+        identity=capture_process_birth(EngineIdentity(child.pid,group,time.monotonic_ns(),_argv_sha256(argv)))
+        if identity is None:raise _SavedSourceIdentityError('saved identity birth unavailable')
+        first=True
+        while True:
+            if cancelled() or time.monotonic()>=end: raise _SavedSourceIdentityError('saved identity observation ended')
+            try:
+                output,_=child.communicate(packet if first else None,timeout=min(.05,max(.001,end-time.monotonic())))
+                break
+            except subprocess.TimeoutExpired: first=False
+        if child.wait(timeout=max(.001,end-time.monotonic()))!=0 or len(output)>4096:
+            raise _SavedSourceIdentityError('saved source identity unavailable; separate download required')
+        value=json.loads(output)
+        if type(value) is not dict or set(value)!={'etag'} or type(value['etag']) is not str or re.fullmatch(r'"[\x21\x23-\x7e]*"',value['etag']) is None:
+            raise _SavedSourceIdentityError('saved source identity unavailable; separate download required')
+        return value['etag']
+    finally:
+        # Even failed/cancelled probes retain their original wait and group proof.
+        if child.poll() is None:
+            stopped,error=_stop_process(child,group,deadline=time.monotonic()+1)
+            if not stopped or error is not None: raise DirectEngineError('saved identity child closure failed')
+        child.wait(timeout=1)
+        for stream in (child.stdin,child.stdout):
+            if stream is not None:stream.close()
+        if group is not None and _group_exists(group):raise DirectEngineError('saved identity child group remains')
+        try:os.waitpid(child.pid,os.WNOHANG)
+        except ChildProcessError:pass
+        else:raise DirectEngineError('saved identity child not reaped')
 
 
 class DirectEngineError(RuntimeError):
@@ -264,6 +369,10 @@ class DirectEngineError(RuntimeError):
 
 class DirectTransferError(DirectEngineError):
     """aria2 could not produce a hash-verified direct payload."""
+
+
+class _SavedSourceIdentityError(DirectTransferError):
+    """Saved bytes require a fresh source decision before any mutation."""
 
 
 class _StockTerminalError(DirectTransferError):
@@ -583,6 +692,7 @@ class DirectAria2Controller:
         expected_sha256: str | None,
         admission: Admission,
         saved_resume: bool = False,
+        _resume_validator: str | None = None,
     ) -> DirectTransfer:
         """Add one admitted transfer with aria2 paused before any body request."""
 
@@ -604,6 +714,10 @@ class DirectAria2Controller:
             "auto-file-renaming": "false",
             "header": "X-Hermes-Attempt: "+secrets.token_hex(32),
         }
+        if _resume_validator is not None:
+            if not saved_resume or re.fullmatch(r'"[\x21\x23-\x7e]*"',_resume_validator) is None:
+                raise DirectTransferError('invalid saved validator')
+            options['header'] += '\nIf-Match: '+_resume_validator
         if type(saved_resume) is not bool: raise TypeError('invalid saved resume flag')
         if saved_resume:
             if expected_sha256 is not None: raise DirectTransferError('saved transport cannot own checksum')
@@ -627,7 +741,7 @@ class DirectAria2Controller:
             actual = self._rpc('aria2.getOption',[gid])
             if type(actual) is not dict or actual.get('header') not in (options['header'],options['header']+'\n'):
                 raise DirectTransferError('stock attempt tag not confirmed')
-            tag=options['header'].split(': ',1)[1]
+            tag=options['header'].splitlines()[0].split(': ',1)[1]
             self._capture.bind(gid,tag)
             self._stock_tags[gid]=hashlib.sha256(tag.encode()).hexdigest()
             if saved_resume:

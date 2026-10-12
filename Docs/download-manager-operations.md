@@ -39,8 +39,12 @@ It tears down the primary default backend and can interrupt active Desktop turns
 Creation, reconnect, listing and replay do not authorize BODY. A restarted worker
 is globally paused. Explicit queue/collection `start` captures membership in
 transactional cohorts of at most 500; cohort count is not a queue-size limit.
-Queue `resume` lifts only the global gate, and collection `resume` lifts only
-its collection hold. Per-job manual holds survive both. Query `queue` for the
+Fresh queue `resume` lifts the global gate and creates saved continuations for
+eligible work already authorized before a queue stop or cold restart. Its
+revision-fenced transaction captures those jobs through the existing per-job
+control receipts; replay creates no new admission. Add-only jobs, per-job manual
+holds, collection holds and retry holds remain gated. Collection `resume` lifts
+its collection hold. Query `queue` for the
 current worker epoch and gate revision, `status` for the job revision, `detail`
 for effective settings, collection and retry facts, and `control` with the
 request ID for a pending operation's outcome.
@@ -52,9 +56,24 @@ the selected schedule; `preempt` first stops and seals a lower-priority owning
 slot. An active edit or source replacement quiesces its owning slot first.
 Destination successors preserve original creation/reservation facts and the
 original incomplete workspace; completed files are not moved by an edit.
-Unknown saved identity blocks with files preserved and a separate-download
-alternative. A matching trusted original SHA permits an isolated continuation
-candidate and requires that same final digest.
+Saved ranges require the trusted original SHA or a durably sealed, owner-bound
+stock HTTP strong ETag, resource identity and length. Hashless saved consent
+checks an explicit HEAD before retaining/copying the original pair. The saved
+observer owns an identity-only child with a three-second aggregate probe deadline
+and bounded original-child containment/JOIN, including DNS, TLS and slow headers.
+The qualified ETag travels with the exact checkpoint/consent, source, generation
+and worker epoch to admission; stock aria2 receives If-Match without another
+blocking HEAD on the control thread. Source replacement uses the same cancellable
+observation lane. Query and pause remain responsive while it observes. No HEAD or BODY
+is issued by startup, listing, add-only, reconnect or receipt replay. Changed or
+unknown identity preserves the original files and requires a decision; `detail`
+reports `resume_decision` with the separate-download alternative. Due retry
+with unqualified retained bytes becomes blocked rather than waiting forever.
+A strong ETag is resource scoped: unchanged-URL replacement must verify that
+identity; a different URL requires the trusted original SHA. That digest is
+always enforced at final publication. Hashless completion remains transport
+verified. Unsupported or inconclusive HEAD/redirect identity requires a separate
+download; names, URL text and equal size never establish response identity.
 
 `downloads_configure` uses decimal concurrency/connections and global speed in
 **bytes per second**. The default is one active job and stock 4/4 connections.
@@ -84,3 +103,49 @@ invocation remain a stated boundary.
 All of these are author source/fixture contracts, not final A01–A14 acceptance.
 The final default install, independent reviews, numerical cap/disk measurements,
 authorized official direct-file SHA, Desktop toast and Finder gates remain for ROOT.
+
+
+## Opt-in direct-source acceptance
+
+`headless/scripts/live-acceptance.py` defaults to explicit SKIP before reading
+input or starting children. `HERMES_DOWNLOADS_DISABLE_NETWORK=1` overrides
+`--live`. The normal test harness therefore always skips the real-source case;
+its offline contracts and synthetic installed SDK/worker/stock exercises do not
+establish A11, Hermes UI discovery, Desktop notification or A13/A14.
+
+A later authorized run uses isolated Python 3.12 with `-I -B`, `--live`,
+`--input-file`, `--evidence` and `--expected-commit`. Input is a single owner-only
+0600 regular JSON file in a private directory; evidence must be a fresh short
+path under an owner-only 0700 parent, so its private state socket fits Darwin's
+limit. The packet has exactly `url`, `expected_sha256`, `length`, an opaque
+`handle`, and `qualification`. Qualification contains the pinned `aria2_sha256`,
+`trusted_fixed_representation: true`, and `max_response_bytes` equal to length.
+The operator supplies these facts privately for the already authorized fixed
+source; unknown qualification refuses before BODY. Never put that packet,
+URL, digest, state, credentials or evidence in Git.
+
+The runner binds a clean expected commit, sixteen physically distinct equal-hash
+installed modules, all 43 locked distributions, three actual console entrypoints,
+and aria2 1.37.0's binary digest. It discovers all seven tools through the official
+SDK, proves add-only/replay/query are inert, configures and reads back one
+connection/one job, then explicitly authorizes its one fresh target. A private
+observational carrier invokes the byte-verified installed worker console using
+runpy; it records original engine waits, reader EOF and reader/observer joins.
+It does not replace the worker loop or payload engine.
+
+One original 900-second UTC/monotonic deadline includes preflight and all births,
+with sixty seconds reserved for closure. The 256 MiB allowance is a conservative
+trusted HTTP-payload reservation: six chains of up to 21 response heads (aria2
+1.37.0 MAX_REDIRECT=20), each bounded by the trusted representation length plus
+16 KiB receive-buffer slack. This trial admits only one fresh sub-1MiB pair;
+continuation or a second admission refuses before BODY. It qualifies stock
+request options on the paused GID before unpause. A successful trial additionally
+requires a single original GET/200 finite identity response ledger, matching
+source/attempt/owner bindings, no-follow final descriptor and streamed expected
+SHA, immutable creation receipt, and original child/reader/observer closures.
+Reservation is not measured WAN traffic, and file size/progress is not a
+cumulative byte counter. Unknown, redirected, encoded, interrupted or ambiguous
+response evidence cannot produce a qualified PASS. No adversarial wire-cap
+claim, real-source run, default-profile action or Desktop acceptance follows
+from these offline tests. Whole A01–A14 delivery remains OPEN; extraction stays
+RETIRED.

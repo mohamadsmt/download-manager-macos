@@ -170,6 +170,7 @@ class _SavedObservation:
     token: object
     result: object
     failed: bool
+    source_decision: bool = False
 
 
 class _LifecycleEvent(Protocol):
@@ -549,7 +550,7 @@ def _recover_cold_direct_engine(store: SQLiteStore, *, record=None) -> bool:
 class _DirectOwner:
     """One dispatch owns its controller, callbacks, cancellation and cleanup."""
 
-    def __init__(self, store, root, *, blocked=False, before_body=None):
+    def __init__(self, store, root, *, blocked=False, before_body=None, saved_qualifications=None):
         self.store=store
         self.root=root
         self.engine_plan=None
@@ -589,6 +590,7 @@ class _DirectOwner:
         self.saved_phases: Queue = Queue(maxsize=1)
         self.active_saved = None
         self.saved_cancel = threading.Event()
+        self.saved_qualifications = {} if saved_qualifications is None else saved_qualifications
         self.last_body_observer = None
         self.pending_stop=None
         self.before_body=before_body
@@ -692,7 +694,10 @@ class _DirectOwner:
             ack.set()
         self.active_saved = None
         if task is not None and task[0] == 'prepare':
+            self.saved_qualifications.pop(task[1].job_id,None)
             self.store.fail_saved_preparation(task[1],pause=pause)
+        if task is not None and task[0] == 'source':
+            self.store.apply_source_replacement(task[1][0].request_id)
 
     def start_saved(self, kind, token, operation) -> None:
         if not _acquire_direct_observation(): raise IPCError('direct_dispatch_blocked')
@@ -711,8 +716,9 @@ class _DirectOwner:
             try:
                 result = operation(lambda: cancelled() or time.monotonic()>=end,phase)
                 outcome = _SavedObservation(kind,token,result,False)
-            except BaseException:
-                outcome = _SavedObservation(kind,token,None,True)
+            except BaseException as error:
+                from hermes_downloads.direct import _SavedSourceIdentityError
+                outcome = _SavedObservation(kind,token,None,True,isinstance(error,_SavedSourceIdentityError))
             self.observation_results.put_nowait(outcome)
         self.observation_thread = threading.Thread(target=observe_saved,name='direct-saved-observation',daemon=True)
         try: _start_direct_observation(self.observation_thread)
@@ -1106,6 +1112,13 @@ class _DirectOwner:
                 raise ValueError("persisted source bytes changed during validation")
             self.store._require_pending_direct_dispatch_command(self.store._connection,plan,_effect=True)
             continuing = self.saved_body(plan,destination)
+            validator = None
+            if continuing and self.store._read_creation_origin(self.store._connection,plan.job.job_id,{},target=False).batch.expected_sha256 is None:
+                saved=self.store._saved_continuation(self.store._connection,plan.job.job_id)
+                qualification=self.saved_qualifications.pop(saved.job_id,None)
+                if qualification is None or qualification[:2]!=(saved,source.raw_url):
+                    raise ValueError('saved source qualification changed')
+                validator=qualification[2]
             if not continuing: self.require_first_private_body_absent(plan, destination)
             paused_transfer = controller.add_paused(
                 job_id=plan.job.job_id,
@@ -1114,7 +1127,7 @@ class _DirectOwner:
                 destination=destination,
                 expected_sha256=None,
                 admission=plan.admission,
-                **({'saved_resume':True} if continuing else {}),
+                **({'saved_resume':True,'_resume_validator':validator} if continuing else {}),
             )
             if continuing:
                 closure = json.loads(self.store._saved_checkpoint(self.store._connection,plan.job.job_id,self.store._saved_continuation(self.store._connection,plan.job.job_id).source_request_id)[0]['closure'])
@@ -1257,7 +1270,7 @@ class _DirectOwner:
             process=self.direct_controller._process;observer=self.observation_thread or self.last_body_observer
             observed=self.direct_controller.readback(job_id=plan.job.job_id,generation=plan.generation,gid=terminal.gid)
             if cause is not None and cause['kind']=='body' and observed.completed_length>0 and observer is not None:
-                return plan,terminal,process,observer,observed.completed_length
+                return plan,terminal,process,observer,observed.completed_length,self.direct_controller
         except Exception: pass
         return None
 
@@ -1273,13 +1286,17 @@ class _DirectOwner:
 
     def seal_owned_stop(self, context,command,result,stop_kind):
         if context is None:return
-        plan,terminal,process,observer,completed=context
+        plan,terminal,process,observer,completed,controller=context
         if process.returncode is None or observer.is_alive():raise ValueError('original stop unsettled')
         try:os.killpg(terminal.record.identity.process_group_id,0)
         except ProcessLookupError:pass
         else:raise ValueError('original group still present')
         closure=dict(process=terminal.record.identity.to_record(),returncode=process.returncode,
             group_absent=True,observer_joined=True,gid=terminal.gid,completed_length=completed)
+        stock=controller._sealed_stock_result(plan.job.job_id,plan.generation,terminal.gid)
+        if stock.owner is not None:
+            from dataclasses import asdict
+            closure['stock']=asdict(stock)
         token=(plan,command,result,closure,stop_kind)
         if self.pending_stop is not None and self.pending_stop[0]!=token:raise ValueError('pending stop already owned')
         self.pending_stop=(token,self.store._saved_destination(plan.job.job_id))
@@ -1299,7 +1316,7 @@ class _DirectOwner:
     def job_control(self, command: JobControlCommand) -> JobControlResult:
         """Contain the one active body before acknowledging pause/removal."""
         if (self.active_saved is not None and command.action in {'pause','remove'}
-            and command.job == (self.active_saved[1].job_id if self.active_saved[0]=='prepare' else self.active_saved[1][0].job.job_id)
+            and command.job == (self.active_saved[1].job_id if self.active_saved[0]=='prepare' else self.active_saved[1][0].id if self.active_saved[0]=='source' else self.active_saved[1][0].job.job_id)
             and self.store.publication_control_is_current(job_id=command.job,action=command.action,
                 request_id=command.request_id,payload_digest=command.payload_digest,expected_revision=command.expected_revision)):
             self.cancel_saved(pause=False)
@@ -1478,7 +1495,7 @@ class _DirectOwner:
         try:
             self.store.prepare_due_retry(now=datetime.now(UTC))
             prepared = self.store._prepare_target_dispatch(expected_worker_epoch=epoch,
-                owner_slot_ready=ready,now=datetime.now(UTC))
+                owner_slot_ready=ready,now=datetime.now(UTC),_saved_qualifications=self.saved_qualifications)
         except (TypeError,ValueError,RuntimeError,OverflowError):
             self.direct_recovery_blocked = True
             return
@@ -1489,8 +1506,19 @@ class _DirectOwner:
             destination = self.store._saved_destination(prepared.job_id)
             reservation = self.store._effective_reservation(self.store._connection,prepared.job_id)
             checkpoint = self.store._saved_checkpoint(self.store._connection,prepared.job_id,prepared.source_request_id)[1]
+            original=self.store._saved_checkpoint(self.store._connection,prepared.job_id,prepared.source_request_id)[0]
+            stock=self.store._checkpoint_stock(self.store._connection,original)
+            source=validate_source_url(self.store.effective_source(prepared.job_id))
+            expected=self.store._read_creation_origin(self.store._connection,prepared.job_id,{},target=False).batch.expected_sha256
+            existing=self.store._continuation_row(self.store._connection,prepared.job_id,prepared.request_id)['phase']=='ready'
+            if existing:self.store._require_ready_saved_pair(self.store._connection,prepared.job_id,prepared.request_id)
             def prepare_saved(cancelled,phase):
-                return _prepare_saved_pair(destination,reservation,checkpoint,cancelled=cancelled,phase=phase,retained_names=prepared.retained_names)
+                validator=None
+                if expected is None:
+                    from hermes_downloads.direct import _verify_saved_source
+                    validator=_verify_saved_source(source,stock,cancelled=cancelled)
+                facts=None if existing else _prepare_saved_pair(destination,reservation,checkpoint,cancelled=cancelled,phase=phase,retained_names=prepared.retained_names)
+                return facts,source.raw_url,validator,existing
             self.start_saved('prepare',prepared,prepare_saved)
             return
         if type(prepared) is _DirectDispatchPlan:
@@ -1542,7 +1570,11 @@ class _DirectOwner:
                 self.active_saved = None
                 if task == (observation.kind,observation.token) and not self.saved_cancel.is_set() and not observation.failed:
                     try:
-                        if observation.kind=='prepare': self.store.qualify_saved_drain(observation.token)
+                        if observation.kind=='prepare':
+                            self.store.qualify_saved_drain(observation.token,_existing=observation.result[3])
+                            self.saved_qualifications[observation.token.job_id]=(observation.token,observation.result[1],observation.result[2])
+                        if observation.kind=='source':
+                            self.store.apply_source_replacement(observation.token[0].request_id,_verified_stock=observation.result)
                         if observation.kind=='checkpoint':
                             plan,command,result,closure,stop_kind = observation.token
                             self.store.seal_stopped_direct_body(plan,command,result,observation.result,closure,stop_kind=stop_kind)
@@ -1550,7 +1582,9 @@ class _DirectOwner:
                     except Exception:
                         if observation.kind=='prepare': self.store.fail_saved_preparation(observation.token)
                 elif observation.kind=='prepare':
-                    self.store.fail_saved_preparation(observation.token)
+                    self.store.fail_saved_preparation(observation.token,_identity_decision=observation.source_decision)
+                elif observation.kind=='source':
+                    self.store.apply_source_replacement(observation.token[0].request_id)
             elif type(observation) is _CleanupObservation:
                 cleanup = self.active_cleanup
                 if (observation.plan is cleanup and not self.cleanup_cancel.is_set()
@@ -1975,6 +2009,7 @@ def run_worker(
     store: SQLiteStore | None = None
     health_server: HealthServer | None = None
     owners=[]
+    saved_qualifications={}
     legacy_owner=None
     rotation=0
     file_task=None
@@ -2015,7 +2050,7 @@ def run_worker(
             elif _recover_cold_direct_engine(store,record=record):
                 direct_recovery_blocked=True
 
-        legacy_owner=_DirectOwner(store,root,blocked=direct_recovery_blocked)
+        legacy_owner=_DirectOwner(store,root,blocked=direct_recovery_blocked,saved_qualifications=saved_qualifications)
         owners.append(legacy_owner)
 
         def direct_engine_activate(command):
@@ -2031,6 +2066,12 @@ def run_worker(
             return matched[0].job_control(command) if matched else _job_control_from_store(store,command)
 
         def queue_gate(command):
+            if command.gate=='running':
+                for owner in owners:
+                    if owner.active_saved is not None and owner.active_saved[0]=='checkpoint':
+                        owner.observation_thread.join(5)
+                        if owner.observation_thread.is_alive():raise IPCError('direct_dispatch_blocked')
+                        owner.poll_direct_terminal()
             active=[owner for owner in owners if not owner.idle()]
             if len(active)<=1:return (active[0] if active else legacy_owner).queue_gate(command)
             current=store.publication_queue_control_is_current(request_id=command.request_id,payload_digest=command.payload_digest,expected_revision=command.expected_revision)
@@ -2191,7 +2232,25 @@ def run_worker(
                 if live:
                     for owner in live:owner.stop_for_configuration(command,stop_kind='replace_source')
                     continue
-                store.apply_source_replacement(command.request_id)
+                verified=None
+                checkpoint=store._saved_checkpoint(store._connection,command.id)
+                origin=store._read_creation_origin(store._connection,command.id,{},target=False)
+                if origin.kind=='batch' and origin.batch.expected_sha256 is None and checkpoint is not None:
+                    if _direct_observation_busy():continue
+                    owner=next((owner for owner in owners if owner.idle()),None)
+                    if owner is None:
+                        owner=_DirectOwner(store,root,blocked=direct_recovery_blocked,before_body=apply_allocation,saved_qualifications=saved_qualifications)
+                        owners.append(owner)
+                    stock=store._checkpoint_stock(store._connection,checkpoint[0])
+                    source=validate_source_url(command.url)
+                    def verify_source(cancelled,phase,source=source,stock=stock):
+                        from hermes_downloads.direct import _verify_saved_source
+                        _verify_saved_source(source,stock,cancelled=cancelled)
+                        return stock
+                    owner.assigned_job=command.id
+                    owner.start_saved('source',(command,stock),verify_source)
+                    continue
+                store.apply_source_replacement(command.request_id,_verified_stock=verified)
 
         def apply_settings():
             snapshot=store.configuration_snapshot();desired=snapshot['desired']
@@ -2279,7 +2338,7 @@ def run_worker(
                     spare=next((owner for owner in owners if owner.idle()),None)
                     if sum(not owner.idle() for owner in owners)<capacity:
                         if spare is None:
-                            spare=_DirectOwner(store,root,blocked=direct_recovery_blocked,before_body=apply_allocation);owners.append(spare)
+                            spare=_DirectOwner(store,root,blocked=direct_recovery_blocked,before_body=apply_allocation,saved_qualifications=saved_qualifications);owners.append(spare)
                         spare.poll_target_dispatch()
                     rotation=(rotation+1)%len(owners)
                     for owner in owners[rotation:]+owners[:rotation]:owner.poll_direct_terminal()
