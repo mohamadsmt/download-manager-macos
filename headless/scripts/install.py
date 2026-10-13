@@ -86,7 +86,7 @@ class Layout:
     def renderer(self): return self.home / '.hermes/desktop-plugins/hermes-downloads/plugin.js'
     @property
     def evidence(self): return self.home / '.hermes/installations/hermes-downloads'
-    def runtime(self, commit): return self.source / '.artifacts/download-manager/runtime' / commit
+    def runtime(self, commit): return self.state / 'runtime' / commit
     def files(self):
         return {'dashboard/manifest.json': self.backend / 'manifest.json',
                 'dashboard/plugin_api.py': self.backend / 'plugin_api.py',
@@ -674,16 +674,16 @@ def _readiness(layout, expected):
     return record
 
 
-def argv_for(layout, commit, name):
-    runtime = layout.runtime(commit)
+def argv_for(layout, commit, name, *, legacy=False):
+    runtime = (layout.source / '.artifacts/download-manager/runtime' / commit) if legacy else layout.runtime(commit)
     return ['/usr/bin/env', '-u', 'PYTHONPATH', '-u', 'PYTHONHOME', str(runtime / 'bin/python'), '-I', '-B', str(runtime / 'bin' / name)]
 
 
-def wiring(layout, commit):
-    argv = argv_for(layout, commit, 'hermes-downloads-mcp')
+def wiring(layout, commit, *, legacy=False):
+    argv = argv_for(layout, commit, 'hermes-downloads-mcp', legacy=legacy)
     entry = {'command': argv[0], 'args': argv[1:], 'env': {'HERMES_DOWNLOADS_SOCKET': str(layout.socket)},
         'tools': {'include': list(TOOLS)}, 'sampling': {'enabled': False}, 'connect_timeout': 15, 'timeout': 30}
-    worker = argv_for(layout, commit, 'hermes-downloads-worker') + ['--serve', '--state-root', str(layout.state)]
+    worker = argv_for(layout, commit, 'hermes-downloads-worker', legacy=legacy) + ['--serve', '--state-root', str(layout.state)]
     plist = {'Label': LABEL, 'ProgramArguments': worker, 'RunAtLoad': True,
         'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10,
         'WorkingDirectory': str(layout.state), 'EnvironmentVariables': clean_env(layout.home),
@@ -741,18 +741,25 @@ def launchctl(action, layout, argv):
         if b'Could not find service' in err and code == 113: return None
         raise Blocked('SERVICE_OBSERVATION_FAILED')
     text = out.decode('utf-8')
-    path = re.search(r'^\s*path = (.+)$', text, re.M)
+    path = re.search(r'^([ \t]*)path = (.+)$', text, re.M)
     pid = re.search(r'^\s*pid = ([1-9][0-9]*)$', text, re.M)
     arguments = re.search(r'^\s*arguments = \{\n(.*?)^\s*\}', text, re.M | re.S)
-    if path is None or pid is None or arguments is None: raise Blocked('SERVICE_AUTHORITY_UNCERTAIN')
+    states = re.findall(r'^' + re.escape(path[1]) + r'state = (.+)$', text, re.M) if path is not None else []
+    no_pid = not re.search(r'^\s*pid\s*=', text, re.M)
+    stopped = states == ['not running'] and no_pid
+    if path is None or (pid is None and not stopped) or arguments is None: raise Blocked('SERVICE_AUTHORITY_UNCERTAIN')
     observed = [line.strip() for line in arguments[1].splitlines() if line.strip()]
-    return {'label': LABEL, 'domain': domain, 'plist': path[1], 'argv': observed, 'pid': int(pid[1])}
+    return {'label': LABEL, 'domain': domain, 'plist': path[2], 'argv': observed, 'pid': int(pid[1]) if pid is not None else 0}
+
+
+def service_wiring(observed, layout, argv):
+    return (isinstance(observed, dict) and set(observed) == {'label', 'domain', 'plist', 'argv', 'pid'} and
+        observed['label'] == LABEL and observed['domain'] == f'gui/{os.getuid()}' and observed['plist'] == str(layout.plist) and
+        observed['argv'] == argv and type(observed['pid']) is int and observed['pid'] >= 0)
 
 
 def authority(observed, layout, argv):
-    return (isinstance(observed, dict) and set(observed) == {'label', 'domain', 'plist', 'argv', 'pid'} and
-        observed['label'] == LABEL and observed['domain'] == f'gui/{os.getuid()}' and observed['plist'] == str(layout.plist) and
-        observed['argv'] == argv and type(observed['pid']) is int and observed['pid'] > 0)
+    return service_wiring(observed, layout, argv) and observed['pid'] > 0
 
 
 def ipc_readback(layout):
@@ -868,10 +875,28 @@ def apply(layout, plan, executor):
         data['files'][str(layout.plist)] = {'before': None, 'after': installed}
         data['steps'].append('plist'); save_manifest(manifest, data)
         executor('bootstrap', layout, argv); data['steps'].append('bootstrap'); save_manifest(manifest, data)
-        observed = executor('inspect', layout, argv)
-        if not authority(observed, layout, argv): raise Blocked('SERVICE_AUTHORITY_UNCERTAIN')
-        data['service'] = observed; save_manifest(manifest, data)
-        ipc = ipc_readback(layout); data['steps'].append('paused_ipc'); save_manifest(manifest, data)
+        deadline = time.monotonic() + 5
+        while True:
+            observed = executor('inspect', layout, argv)
+            if data['service'] is None:
+                if authority(observed, layout, argv):
+                    data['service'] = observed; save_manifest(manifest, data)
+                elif observed is not None and not (
+                    isinstance(observed, dict) and observed.get('pid') == 0 and
+                    service_wiring(observed, layout, argv)):
+                    raise Blocked('SERVICE_AUTHORITY_UNCERTAIN')
+            elif not authority(observed, layout, argv) or observed != data['service']:
+                raise Blocked('SERVICE_AUTHORITY_UNCERTAIN')
+            if data['service'] is not None:
+                try:
+                    ipc = ipc_readback(layout)
+                    break
+                except Blocked as error:
+                    if str(error) != 'WORKER_CERTIFICATE_MISSING': raise
+            if time.monotonic() >= deadline:
+                raise Blocked('WORKER_CERTIFICATE_MISSING' if data['service'] else 'SERVICE_AUTHORITY_UNCERTAIN')
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        data['steps'].append('paused_ipc'); save_manifest(manifest, data)
         return {'status': 'INSTALLED_WIRING', 'reasons': [], 'commit': commit, 'manifest': str(manifest),
             'renderer_decision': 'NOT_OBSERVED', 'live': 'LIVE_PENDING', 'ipc': ipc}
     except Exception as error:
@@ -881,9 +906,12 @@ def apply(layout, plan, executor):
 
 def rollback(layout, manifest, executor):
     data = read_manifest(manifest)
-    commit = data['commit']; entry, argv, _ = wiring(layout, commit)
+    commit = data['commit']
+    legacy_runtime = layout.source / '.artifacts/download-manager/runtime' / commit
+    if data['runtime'] not in (str(layout.runtime(commit)), str(legacy_runtime)): raise Blocked('MANIFEST_PATH_MISMATCH')
+    entry, argv, _ = wiring(layout, commit, legacy=data['runtime'] == str(legacy_runtime))
     if (data['home'] != str(layout.home) or data['source'] != str(layout.source) or data['state'] != str(layout.state) or
-        data['runtime'] != str(layout.runtime(commit)) or data['entry'] != entry or data['argv'] != argv): raise Blocked('MANIFEST_PATH_MISMATCH')
+        data['entry'] != entry or data['argv'] != argv): raise Blocked('MANIFEST_PATH_MISMATCH')
     allowed = {str(layout.plist), *(str(path) for path in layout.files().values())}
     if set(data['files']) != allowed or data['config_after'] is None: raise Blocked('MANIFEST_INCOMPLETE')
     before, _ = read_file(manifest.parent / 'config-before.yaml')
@@ -894,13 +922,18 @@ def rollback(layout, manifest, executor):
         if set(record) != {'before', 'after'} or record['before'] is not None or snapshot(Path(name)) != record['after']:
             raise Blocked('OWNED_FILE_CHANGED')
     observed = executor('inspect', layout, argv)
-    if not authority(observed, layout, argv) or observed != data['service']: raise Blocked('SERVICE_AUTHORITY_UNCERTAIN')
+    recorded = data['service']
+    stopped_owned = (isinstance(observed, dict) and observed.get('pid') == 0 and
+        service_wiring(observed, layout, argv) and authority(recorded, layout, argv) and
+        all(observed[key] == recorded[key] for key in ('label', 'domain', 'plist', 'argv')) and 'bootstrap' in data['steps'])
+    if not stopped_owned and (not authority(observed, layout, argv) or observed != recorded):
+        raise Blocked('SERVICE_AUTHORITY_UNCERTAIN')
     executor('bootout', layout, argv)
     if executor('inspect', layout, argv) is not None: raise Blocked('SERVICE_EXIT_UNCERTAIN')
     if data['config_before'] is None and restored == b'': remove_exact(layout.config, identity)
     else: atomic_write(layout.config, restored, identity)
     for name, record in data['files'].items(): remove_exact(Path(name), record['after'])
-    return {'status': 'ROLLED_BACK', 'reasons': [], 'commit': commit, 'retained_runtime': str(layout.runtime(commit)), 'live': 'LIVE_PENDING'}
+    return {'status': 'ROLLED_BACK', 'reasons': [], 'commit': commit, 'retained_runtime': data['runtime'], 'live': 'LIVE_PENDING'}
 
 
 def public(record): return {key: value for key, value in record.items() if key != 'bundle'}

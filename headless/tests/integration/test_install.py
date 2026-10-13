@@ -124,7 +124,7 @@ def host_oracle(request, installer, layout, monkeypatch):
         wrapper = actual.source.parent / 'reserve-delayed-git.py'
         wrapper.write_text('import os, sys, time\ntime.sleep(0.2)\n'
             "os.execv('/usr/bin/git', sys.argv[1:])\n")
-    managed = actual.source / '.artifacts/download-manager/runtime'
+    managed = actual.state / 'runtime'
     assert not managed.exists() and not managed.is_symlink()
     assert not list(actual.home.iterdir())
     original_popen = subprocess.Popen
@@ -199,7 +199,8 @@ def host_oracle(request, installer, layout, monkeypatch):
 
 def test_actual_candidate_dry_run_certifies_seven_tools_without_install_effects(installer, host_oracle):
     actual=host_oracle.layout;host_oracle.configure(installer)
-    result=installer.run(actual);host_oracle.observe(result)
+    # Physical readiness and SDK are real; the fixture home owns no live launchd service.
+    result=installer.run(actual, executor=FakeLaunchctl());host_oracle.observe(result)
     if 'PREFLIGHT_TIMEOUT' in result['reasons']:
         assert result['status']=='NOT_READY' and result['reasons']==['PREFLIGHT_TIMEOUT']
         assert result['discovered_tools']==[] and not host_oracle.sdk_argv and host_oracle.children
@@ -496,7 +497,7 @@ def ready_fixture(installer, layout, monkeypatch):
         'discovered_tools': list(installer.TOOLS), 'bundle': bundle, 'parity': {}}
     monkeypatch.setattr(installer, 'readiness', lambda *args: plan)
     def prepare(*args):
-        runtime.mkdir(parents=True, mode=0o700)
+        installer.private_dir(runtime, create=True)
         (runtime / 'bin').mkdir(mode=0o700)
         for name in ['python', 'hermes-downloads-worker', 'hermes-downloads-mcp']:
             (runtime / 'bin' / name).write_text('synthetic fixture')
@@ -1325,3 +1326,163 @@ def test_prepare_runtime_slot_collision_refused_before_uv(installer, tmp_path, m
     assert (identity(sentinel), sentinel.read_bytes()) == sentinel_before
     if kind in ('symlink', 'dangling'): assert os.readlink(runtime) == str(target)
     if kind == 'dangling': assert not target.exists()
+
+
+def test_runtime_location23_fixed_default(installer, layout):
+    assert layout.runtime(BASE) == layout.state / 'runtime' / BASE
+    entry, argv, _ = installer.wiring(layout, BASE)
+    assert str(layout.runtime(BASE) / 'bin/python') in argv
+    assert str(layout.runtime(BASE) / 'bin/python') in entry['args']
+
+
+@pytest.mark.parametrize('state,pid,accepted', [
+    ('not running', '', True), ('running', '', False), ('unknown', '', False),
+    ('', '', False), ('not running', 'pid = invalid\n', False),
+    ('not running', 'pid = 0\n', False)])
+def test_runtime_location23_launchctl_no_pid(installer, layout, monkeypatch, state, pid, accepted):
+    _, argv, _ = installer.wiring(layout, BASE)
+    output = f'path = {layout.plist}\nstate = {state}\n{pid}arguments = {{\n' + '\n'.join(argv) + '\n}\n'
+    monkeypatch.setattr(installer, 'bounded', lambda *args: (0, output.encode(), b''))
+    if accepted:
+        observed = installer.launchctl('inspect', layout, argv)
+        assert observed['pid'] == 0
+        assert not installer.authority(observed, layout, argv)
+    else:
+        with pytest.raises(installer.Blocked): installer.launchctl('inspect', layout, argv)
+
+
+@pytest.mark.parametrize('root_states,nested_state,accepted', [
+    (['not running'], 'active', True),
+    (['running'], 'not running', False),
+    (['unknown'], 'not running', False),
+    ([], 'not running', False),
+    (['not running', 'not running'], 'active', False)])
+def test_runtime_location23_launchctl_nested_states(
+        installer, layout, monkeypatch, root_states, nested_state, accepted):
+    _, argv, _ = installer.wiring(layout, BASE)
+    output = ('synthetic.service = {\n'
+        f'\tpath = {layout.plist}\n'
+        + ''.join(f'\tstate = {state}\n' for state in root_states)
+        + '\targuments = {\n'
+        + ''.join(f'\t\t{arg}\n' for arg in argv)
+        + '\t}\n'
+        + ''.join(f'\t{name} = {{\n\t\tstate = {nested_state}\n\t}}\n'
+            for name in ('resource coalition', 'jetsam coalition'))
+        + '}\n')
+    monkeypatch.setattr(installer, 'bounded', lambda *args: (0, output.encode(), b''))
+    if accepted:
+        observed = installer.launchctl('inspect', layout, argv)
+        assert installer.service_wiring(observed, layout, argv)
+        assert observed['pid'] == 0
+        assert not installer.authority(observed, layout, argv)
+    else:
+        with pytest.raises(installer.Blocked, match='^SERVICE_AUTHORITY_UNCERTAIN$'):
+            installer.launchctl('inspect', layout, argv)
+
+
+@pytest.mark.parametrize('failure', ['delayed', 'timeout', 'health', 'changed'])
+def test_runtime_location23_startup_certification(installer, layout, monkeypatch, failure):
+    ready_fixture(installer, layout, monkeypatch)
+    clock = [0.0]; calls = []
+    monkeypatch.setattr(installer.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(installer.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    launch = FakeLaunchctl()
+    def ipc(actual):
+        calls.append(clock[0])
+        manifest = next(actual.evidence.glob('*/manifest.json'))
+        assert installer.read_manifest(manifest)['service']['pid'] == 12345
+        if failure == 'health': raise installer.Blocked('WORKER_NOT_PAUSED')
+        if failure == 'changed': launch.current = {**launch.current, 'pid': 12346}
+        if failure != 'delayed' or len(calls) < 3: raise installer.Blocked('WORKER_CERTIFICATE_MISSING')
+        return {'queue_gate': 'paused'}
+    monkeypatch.setattr(installer, 'ipc_readback', ipc)
+    result = installer.run(layout, 'apply', BASE, executor=launch)
+    assert result['status'] == ('INSTALLED_WIRING' if failure == 'delayed' else 'INSTALL_FAILED')
+    if failure == 'delayed': assert len(calls) == 3
+    if failure == 'timeout': assert 1 < len(calls) <= 21 and clock[0] <= 5
+    if failure == 'health': assert len(calls) == 1 and result['reasons'] == ['WORKER_NOT_PAUSED']
+    if failure == 'changed': assert len(calls) == 1 and result['reasons'] == ['SERVICE_AUTHORITY_UNCERTAIN']
+    assert launch.actions.count('bootstrap') == 1 and 'bootout' not in launch.actions
+
+
+@pytest.mark.parametrize('change', ['none', 'argv', 'domain', 'plist', 'label', 'live', 'absent', 'unrecorded', 'unknown', 'exit'])
+def test_runtime_location23_legacy_failed_bootstrap_rollback(installer, layout, monkeypatch, change):
+    # Produce authentic old wiring and snapshots using the old fixed layout only.
+    old = layout.source / '.artifacts/download-manager/runtime' / BASE
+    with monkeypatch.context() as legacy:
+        legacy.setattr(installer.Layout, 'runtime', lambda self, commit: self.source / '.artifacts/download-manager/runtime' / commit)
+        ready_fixture(installer, layout, legacy)
+        legacy.setattr(installer, 'ipc_readback', lambda *args: (_ for _ in ()).throw(installer.Blocked('WORKER_CERTIFICATE_MISSING')))
+        legacy.setattr(installer.time, 'sleep', lambda seconds: None)
+        clock = iter(range(100)); legacy.setattr(installer.time, 'monotonic', lambda: next(clock))
+        launch = FakeLaunchctl()
+        result = installer.run(layout, 'apply', BASE, executor=launch)
+    assert result['status'] == 'INSTALL_FAILED'
+    manifest = Path(result['manifest'])
+    (layout.state / 'state.db').write_bytes(b'queue retained')
+    layout.output.mkdir(parents=True); (layout.output / 'payload').write_bytes(b'output retained')
+    layout.config.write_bytes(layout.config.read_bytes() + b'unrelated: retained\n')
+    launch.current = {**launch.current, 'pid': 0}
+    if change == 'argv': launch.current['argv'] = ['foreign']
+    if change == 'domain': launch.current['domain'] = 'gui/foreign'
+    if change == 'plist': launch.current['plist'] = str(layout.home / 'foreign.plist')
+    if change == 'label': launch.current['label'] = 'foreign'
+    if change == 'live': launch.current['pid'] = 54321
+    if change == 'absent': launch.current = None
+    if change == 'unrecorded':
+        data = installer.read_manifest(manifest); data['steps'].remove('bootstrap'); installer.save_manifest(manifest, data)
+    launch.actions.clear()
+    def recovery(action, actual, argv):
+        if change == 'unknown' and action == 'inspect': raise installer.Blocked('SERVICE_AUTHORITY_UNCERTAIN')
+        if change == 'exit' and action == 'bootout':
+            launch.actions.append(action)
+            return None
+        return launch(action, actual, argv)
+    reverted = installer.run(layout, 'rollback', manifest=manifest, executor=recovery)
+    assert reverted['status'] == ('ROLLED_BACK' if change == 'none' else 'ROLLBACK_BLOCKED')
+    assert ('bootout' in launch.actions) == (change in ('none', 'exit'))
+    if change != 'none': assert layout.plist.exists()
+    assert old.is_dir() and (layout.state / 'state.db').read_bytes() == b'queue retained'
+    assert (layout.output / 'payload').read_bytes() == b'output retained'
+    assert b'unrelated: retained' in layout.config.read_bytes()
+
+
+@pytest.mark.parametrize('initial', ['absent', 'stopped'])
+def test_runtime_location23_waits_for_first_positive_pid(installer, layout, monkeypatch, initial):
+    ready_fixture(installer, layout, monkeypatch)
+    clock = [0.0]; monkeypatch.setattr(installer.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(installer.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    launch = FakeLaunchctl(); observations = []
+    def executor(action, actual, argv):
+        result = launch(action, actual, argv)
+        if action == 'inspect' and launch.current:
+            observations.append(clock[0])
+            if clock[0] < 0.5: return None if initial == 'absent' else {**result, 'pid': 0}
+        return result
+    def ipc(actual):
+        assert clock[0] == 0.5
+        assert installer.read_manifest(next(actual.evidence.glob('*/manifest.json')))['service']['pid'] == 12345
+        return {'queue_gate': 'paused'}
+    monkeypatch.setattr(installer, 'ipc_readback', ipc)
+    result = installer.run(layout, 'apply', BASE, executor=executor)
+    assert result['status'] == 'INSTALLED_WIRING'
+    assert observations == [0, 0.25, 0.5]
+
+
+def test_runtime_location23_rejects_arbitrary_manifest_runtime(installer, layout, monkeypatch):
+    ready_fixture(installer, layout, monkeypatch); launch = FakeLaunchctl()
+    result = installer.run(layout, 'apply', BASE, executor=launch)
+    manifest = Path(result['manifest']); data = installer.read_manifest(manifest)
+    data['runtime'] = str(layout.home / 'foreign-runtime'); installer.save_manifest(manifest, data)
+    launch.actions.clear()
+    assert installer.run(layout, 'rollback', manifest=manifest, executor=launch)['status'] == 'ROLLBACK_BLOCKED'
+    assert launch.actions == [] and layout.plist.exists()
+
+
+def test_runtime_location23_symlink_parent_refused_before_creation(installer, layout, monkeypatch):
+    installer.private_dir(layout.state, create=True)
+    target = layout.home / 'foreign'; target.mkdir(mode=0o700)
+    (layout.state / 'runtime').symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(installer.subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('must not create child'))
+    with pytest.raises(installer.Blocked, match='PATH_SYMLINK'): installer.prepare_runtime(layout, BASE)
+    assert not list(target.iterdir())
