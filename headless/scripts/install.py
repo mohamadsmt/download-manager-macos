@@ -684,7 +684,7 @@ def wiring(layout, commit, *, legacy=False):
     entry = {'command': argv[0], 'args': argv[1:], 'env': {'HERMES_DOWNLOADS_SOCKET': str(layout.socket)},
         'tools': {'include': list(TOOLS)}, 'sampling': {'enabled': False}, 'connect_timeout': 15, 'timeout': 30}
     worker = argv_for(layout, commit, 'hermes-downloads-worker', legacy=legacy) + ['--serve', '--state-root', str(layout.state)]
-    plist = {'Label': LABEL, 'ProgramArguments': worker, 'RunAtLoad': True,
+    plist = {'Label': LABEL, 'ProgramArguments': worker, 'RunAtLoad': True, 'Umask': 0o077,
         'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10,
         'WorkingDirectory': str(layout.state), 'EnvironmentVariables': clean_env(layout.home),
         'StandardOutPath': str(layout.state / 'logs/worker.stdout.log'),

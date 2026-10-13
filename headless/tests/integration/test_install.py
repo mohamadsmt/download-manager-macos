@@ -1486,3 +1486,69 @@ def test_runtime_location23_symlink_parent_refused_before_creation(installer, la
     monkeypatch.setattr(installer.subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('must not create child'))
     with pytest.raises(installer.Blocked, match='PATH_SYMLINK'): installer.prepare_runtime(layout, BASE)
     assert not list(target.iterdir())
+
+
+def test_launchagent_umask24_real_worker_certifies_fresh_private_database(installer):
+    from hermes_downloads import ipc, processes
+    from hermes_downloads.endpoint_ownership import preflight
+    import hashlib
+
+    # Match the physical serving lifecycle fixture, with a short private endpoint.
+    with tempfile.TemporaryDirectory(prefix='t24-', dir='/private/tmp') as directory:
+        home = Path(directory); home.chmod(0o700)
+        state = home / 'state'; state.mkdir(mode=0o700)
+        private = SimpleNamespace(home=home, state=state, socket=state / 'worker.sock',
+            runtime=lambda commit: Path(sys.executable).parent.parent)
+        _, argv, raw = installer.wiring(private, BASE)
+        plist = plistlib.loads(raw)
+        assert argv == plist['ProgramArguments']
+        env = {**plist['EnvironmentVariables'], 'HERMES_HOME': str(home / 'hermes'),
+            'HERMES_DOWNLOADS_STATE_ROOT': str(state),
+            'HERMES_DOWNLOADS_OUTPUT_ROOT': str(home / 'output'),
+            'HERMES_DOWNLOADS_DISABLE_NETWORK': '1'}
+        assert 'PYTHONPATH' not in env and 'PYTHONHOME' not in env
+        assert sys.version_info[:2] == (3, 12)
+        child = subprocess.Popen(argv, cwd=plist['WorkingDirectory'], env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True, umask=plist.get('Umask', 0o022))
+        identity = processes.capture_process_birth(processes.EngineIdentity(child.pid, child.pid,
+            time.monotonic_ns(), hashlib.sha256(b'\0'.join(os.fsencode(a) for a in argv)).hexdigest()))
+        try:
+            assert identity is not None and processes.is_current_process_birth(identity)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                assert child.poll() is None, 'physical worker exited before readiness'
+                try:
+                    health = ipc.request_health(private.socket)
+                    break
+                except ipc.IPCError:
+                    time.sleep(0.02)
+            else:
+                pytest.fail('physical worker did not answer health within five seconds')
+            assert health.queue_gate == 'paused' and health.worker_epoch == 1
+            # This assertion is intentionally before the plist-value check: the old
+            # launchd default creates 0644 data even under run-tests' ambient 077.
+            database_mode = (state / 'state.db').stat().st_mode & 0o777
+            certificate = preflight(state)
+            assert database_mode == 0o600
+            assert certificate.record is not None and certificate.socket is not None
+            result = installer.ipc_readback(private)
+            assert result['worker_epoch'] == 1 and result['queue_gate'] == 'paused'
+            assert result['jobs_page'] == {'jobs': [], 'next_cursor': None}
+            assert type(plist['Umask']) is int and plist['Umask'] == 0o077
+        finally:
+            if child.poll() is None:
+                assert identity is not None and processes.is_current_process_birth(identity)
+                os.killpg(child.pid, signal.SIGTERM)
+            child.wait(timeout=5)
+            assert child.returncode == 0  # Worker handles the expected cleanup SIGTERM.
+            with pytest.raises(ChildProcessError): os.waitpid(child.pid, os.WNOHANG)
+            assert processes.reconcile_process_birth(identity) == 'absent'
+            with pytest.raises(ProcessLookupError): os.killpg(child.pid, 0)
+            ledger = os.environ.get('T21A_PROCESS_LOG')
+            if ledger:
+                with open(ledger, 'a') as stream:
+                    stream.write(json.dumps({'kind': 'umask24-real-worker', 'pid': child.pid,
+                        'pgid': child.pid, 'returncode': child.returncode, 'reaped': True,
+                        'waitpid': 'ECHILD', 'group_absent': True,
+                        'cleanup_signal': 'SIGTERM', 'identity': identity.to_record()}) + '\n')
