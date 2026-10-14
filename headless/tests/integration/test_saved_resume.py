@@ -918,3 +918,140 @@ def test_sdk_cold_global_resume_authorized_unstarted_only(tmp_path,monkeypatch,s
                 assert bodies==[('batch-job-0',1)]
                 assert not (output/'Other/file-1.bin').exists() and not (output/'Other/file-2.bin').exists()
         assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("pair", ["intact", "empty", "missing", "changed"])
+def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeypatch, sdk_lifecycle, pair):
+    """Stock aria2 has received bytes before its first complete piece is counted."""
+    import threading
+    from hermes_downloads.direct import _request_recovery_force_shutdown
+    evidence = Path(tempfile.mkdtemp(prefix='early-piece-', dir=os.environ.get('T26_RESUME_RUN', str(tmp_path))))
+    evidence.chmod(0o700)
+    home = evidence/'home'; home.mkdir(mode=0o700)
+    monkeypatch.setenv('HOME', str(home))
+    output = home/'Downloads/Hermes'; output.mkdir(parents=True, mode=0o700)
+    release = threading.Event()
+    received = threading.Event()
+    with tempfile.TemporaryDirectory(prefix='early27-', dir='/private/tmp') as temporary:
+        root = Path(temporary); root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=538364) as origin:
+            send = origin._send_response
+            def gated(handler, status, headers, body, **kwargs):
+                if len(body)>3601 and not release.is_set():
+                    sent = send(handler, status, headers, body[:3601], content_length=len(body))
+                    received.set()
+                    assert release.wait(15), 'bounded early BODY gate expired'
+                    return sent  # The stopped original never receives the remainder.
+                return send(handler, status, headers, body, **kwargs)
+            origin._send_response = gated
+            expected = hashlib.sha256(origin.payload).hexdigest()
+            try:
+                with body_worker(root, origin.url(), evidence) as process:
+                    async def exercise():
+                        async with stdio_client(parameters(root)) as (read, write):
+                            async with ClientSession(read, write) as session:
+                                await session.initialize()
+                                async def call(name, args):
+                                    return result_record(await session.call_tool(name, arguments=args))
+                                await call('downloads_add', dict(request_id='early-add', items=[entry(source_url=origin.url(), expected_sha256=expected)]))
+                                await call('downloads_control', targets(['batch-job-0']))
+                                await call('downloads_control', dict(scope='queue', action='resume', request_id='early-run', expected_revision='1'))
+                                partial = output/'.incomplete/batch-job-0/file-0.bin'
+                                control = partial.with_name(partial.name+'.aria2')
+                                marker = partial.parent/'.hermes-reservation'
+                                end = time.monotonic()+8
+                                while not received.is_set() or not marker.exists():
+                                    assert process.is_alive() and time.monotonic()<end
+                                    await asyncio.sleep(.02)
+                                with closing(SQLiteStore(root/'state.db')) as store:
+                                    engine = next(owner[1] for owner in store._job_engine_owners() if owner[0]=='batch-job-0')
+                                    capability = store._get_direct_engine_recovery_capability(engine)
+                                    gid = store._connection.execute('SELECT gid FROM saved_body_owners').fetchone()[0]
+                                # The server write precedes aria2 consuming its socket buffer.
+                                # Keep the tail gated while allowing the stock receiver to run.
+                                await asyncio.sleep(.3)
+                                assert processes.is_current_process_birth(engine.identity)
+                                completed = _request_recovery_force_shutdown(capability, timeout=1, gid=gid)
+                                assert type(completed) is int and completed==0
+                                proof = dict(completed_length=completed, origin_prefix_sent=3601, original_engine_current=True)
+                                (evidence/'pre-pause.json').write_text(json.dumps(proof))
+                                current = (await call('downloads_query', dict(scope='status', id='batch-job-0')))['record']
+                                pause = await call('downloads_control', dict(scope='job', action='pause', request_id='early-pause', job='batch-job-0', expected_revision=str(current['revision'])))
+                                acknowledged = time.monotonic()
+                                assert pause['status']=='applied' and pause['state']=='paused'
+                                release.set()
+                                assert processes.reconcile_process_birth(engine.identity)=='absent'
+                                with pytest.raises(ProcessLookupError): os.killpg(engine.identity.process_group_id, 0)
+                                assert 0<partial.stat().st_size<len(origin.payload)
+                                assert partial.read_bytes()==origin.payload[:partial.stat().st_size]
+                                assert control.stat().st_size>0 and control.stat().st_mode & 0o777==0o600
+                                proof['stopped_pair_sizes'] = [p.stat().st_size for p in (partial, control)]
+                                (evidence/'pre-pause.json').write_text(json.dumps(proof))
+                                end = time.monotonic()+3
+                                while not rows(root/'state.db', 'SELECT 1 FROM stopped_direct_bodies'):
+                                    assert process.is_alive() and time.monotonic()<end, 'early positive pair checkpoint missing'
+                                    await asyncio.sleep(.02)
+                                with closing(SQLiteStore(root/'state.db')) as store:
+                                    checkpoint, facts = store._saved_checkpoint(store._connection, 'batch-job-0')
+                                    closure = json.loads(checkpoint['closure'])
+                                    assert closure['completed_length']==0 and closure['observer_joined'] is True and closure['group_absent'] is True
+                                    assert closure['process']==engine.identity.to_record()
+                                    assert min(facts.payload[2], facts.control[2])>0
+                                    # Actual original Popen wait and observer join qualify closure.
+                                    births = [json.loads(line) for line in (evidence/f'fixture-{process.pid}.jsonl').read_text().splitlines()]
+                                    assert any(row['kind']=='engine-waitable-child-reaped' and row['identity']==engine.identity.to_record() and row['waitpid']=='ECHILD' for row in births)
+                                    effects = [json.loads(line) for line in (evidence/'scheduler-effects.jsonl').read_text().splitlines()]
+                                    assert any(row['kind']=='observer-join' and not row['alive'] and row['monotonic']<=acknowledged for row in effects)
+                                    destination = store._saved_destination('batch-job-0')
+                                    reservation = store._effective_reservation(store._connection, 'batch-job-0')
+                                    paths._require_saved_pair(destination, reservation, facts)
+                                if pair!='intact':
+                                    if pair=='empty': control.write_bytes(b'')
+                                    elif pair=='missing': control.unlink()
+                                    else: control.write_bytes(control.read_bytes()+b'changed')
+                                    with pytest.raises((ValueError, OSError)):
+                                        paths._require_saved_pair(destination, reservation, facts)
+                                    if pair in {'empty','missing'}:
+                                        with pytest.raises((ValueError, OSError)):
+                                            paths._seal_stopped_pair(destination, reservation)
+                                    rejected = await call('downloads_control', dict(scope='job', action='resume', request_id='early-rejected', job='batch-job-0', expected_revision=pause['revision'], expected_worker_epoch='1'))
+                                    assert rejected['results'][0]['reason']=='incompatible_authority'
+                                    assert rows(root/'state.db', 'SELECT 1 FROM saved_direct_continuations')==[]
+                                    return
+                                resume = await call('downloads_control', dict(scope='job', action='resume', request_id='early-resume', job='batch-job-0', expected_revision=pause['revision'], expected_worker_epoch='1'))
+                                assert resume['results'][0]['outcome']=='existing_authority'
+                                end = time.monotonic()+15
+                                final = output/'Other/file-0.bin'
+                                while not final.exists():
+                                    assert process.is_alive() and time.monotonic()<end
+                                    await asyncio.sleep(.03)
+                                assert hashlib.sha256(final.read_bytes()).hexdigest()==expected
+                                assert final.read_bytes()==origin.payload
+                                (evidence/'result.json').write_text(json.dumps(dict(pair=pair, immutable_sha256=expected, closure=closure)))
+                    asyncio.run(exercise())
+            finally:
+                release.set()
+
+
+@pytest.mark.parametrize('completed', [None, False, True, -1, '0', 1.5, 11])
+def test_stop_capture_rejects_unknown_malformed_or_out_of_range_counter(completed):
+    from types import SimpleNamespace
+    from hermes_downloads.worker import _DirectOwner
+    controller = SimpleNamespace(_process=object(), readback=lambda **kw: SimpleNamespace(completed_length=completed, total_length=10))
+    store = SimpleNamespace(_connection=None, _read_target_dispatch_cause=lambda *args: {'kind':'body'})
+    owner = SimpleNamespace(active_direct_plan=SimpleNamespace(request_id='body', job=SimpleNamespace(job_id='job'), generation=0),
+        active_terminal_plan=SimpleNamespace(gid='0'*16), active_publication=None,
+        store=store, direct_controller=controller, observation_thread=object(), last_body_observer=None)
+    assert _DirectOwner.capture_stopped_body(owner) is None
+
+
+def test_stop_capture_preserves_positive_progress_with_unknown_total():
+    from types import SimpleNamespace
+    from hermes_downloads.worker import _DirectOwner
+    controller = SimpleNamespace(_process=object(), readback=lambda **kw: SimpleNamespace(completed_length=3601, total_length=0))
+    owner = SimpleNamespace(active_direct_plan=SimpleNamespace(request_id='body', job=SimpleNamespace(job_id='job'), generation=0),
+        active_terminal_plan=SimpleNamespace(gid='0'*16), active_publication=None,
+        store=SimpleNamespace(_connection=None, _read_target_dispatch_cause=lambda *args: {'kind':'body'}),
+        direct_controller=controller, observation_thread=object(), last_body_observer=None)
+    captured = _DirectOwner.capture_stopped_body(owner)
+    assert captured is not None and captured[4]==3601

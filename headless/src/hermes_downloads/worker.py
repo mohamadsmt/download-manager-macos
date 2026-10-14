@@ -1269,7 +1269,12 @@ class _DirectOwner:
             cause=self.store._read_target_dispatch_cause(self.store._connection,plan.request_id,{})
             process=self.direct_controller._process;observer=self.observation_thread or self.last_body_observer
             observed=self.direct_controller.readback(job_id=plan.job.job_id,generation=plan.generation,gid=terminal.gid)
-            if cause is not None and cause['kind']=='body' and observed.completed_length>0 and observer is not None:
+            # Stock progress can be zero while a received tail is flushed on stop.
+            # The stopped-pair sealer still requires positive exact owned files.
+            if (cause is not None and cause['kind']=='body' and observer is not None
+                and type(observed.completed_length) is int
+                and observed.completed_length>=0
+                and (observed.total_length==0 or observed.completed_length<=observed.total_length)):
                 return plan,terminal,process,observer,observed.completed_length,self.direct_controller
         except Exception: pass
         return None

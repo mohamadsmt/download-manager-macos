@@ -9716,7 +9716,8 @@ class SQLiteStore:
             or audit is None or (audit['kind'],audit['job_id'],audit['generation'],audit['revision'])!=(('job_failure' if row['stop_kind']=='failure' else 'job_paused'),job_id,row['generation'],row['revision'])
             or set(closure)-{'stock'}!={'process','returncode','group_absent','observer_joined','gid','completed_length'}
             or closure['group_absent'] is not True
-            or (closure['completed_length'] is not None if row['stop_kind']=='cold_absent' else type(closure['completed_length']) is not int or not 0<closure['completed_length']<=facts.payload[2])
+            or min(facts.payload[2],facts.control[2])<=0
+            or (closure['completed_length'] is not None if row['stop_kind']=='cold_absent' else type(closure['completed_length']) is not int or not 0<=closure['completed_length']<=facts.payload[2])
             or type(closure['gid']) is not str or re.fullmatch('[0-9a-fA-F]{16}',closure['gid']) is None):
             raise ValueError('stopped BODY provenance changed')
         ProcessBirthIdentity.from_record(closure['process'])
