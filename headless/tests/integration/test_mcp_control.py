@@ -240,12 +240,50 @@ def test_real_target_reports_manual_collection_and_not_due_holds(private_worker,
     assert scheduled_result['held_by'] == ['global','collection','manual','not_due']
 
 
+def _completed_terminal_worker(*args, entered, release, **kwargs):
+    """Hold real stock observation before acceptance; inject bounded RPC faults."""
+    from dataclasses import replace
+    from hermes_downloads import direct
+    mode = kwargs['barrier']
+    original = direct.DirectAria2Controller.observe_terminal
+    readback = direct.DirectAria2Controller.readback
+    rpc = direct.DirectAria2Controller._rpc
+    clearing = False
+    def observed_rpc(self, method, params, **options):
+        nonlocal clearing
+        if method == 'aria2.changeOption' and params[1].get('max-download-limit') == '0':
+            clearing = True
+            if mode == 'active-failure':
+                # A genuine stock RPC failure while the mapped BODY stays active.
+                return rpc(self, method, ['0000000000000000', params[1]], **options)
+        return rpc(self, method, params, **options)
+    def fresh(self, **identity):
+        result = readback(self, **identity)
+        if clearing and mode.endswith('-unknown'):
+            return replace(result, status='unknown')
+        if clearing and mode.endswith('-unreadable'):
+            raise direct.DirectTransferError('private unreadable readback')
+        return result
+    def held(self, **identity):
+        result = original(self, **identity)
+        if result is not None or mode == 'active-failure':
+            state = readback(self, **identity)
+            assert state.status == ('active' if mode == 'active-failure' else 'complete')
+            entered.set()
+            assert release.wait(8), 'finite terminal barrier expired'
+        return result
+    direct.DirectAria2Controller._rpc = observed_rpc
+    direct.DirectAria2Controller.readback = fresh
+    direct.DirectAria2Controller.observe_terminal = held
+    return _scheduler_worker(*args, entered=entered, release=release, **kwargs)
+
+
 @contextmanager
 def body_worker(root, origin_url, ledger, *, barrier=None, entered=None, release=None, crash=False, recover_socket=False, private_start=True):
     context = multiprocessing.get_context('spawn')
     ready, shutdown, stopped = [context.Event() for _ in range(3)]
     results = context.Queue()
-    process = context.Process(target=_scheduler_worker,
+    process = context.Process(target=_completed_terminal_worker if barrier and (barrier.startswith('terminal-complete') or barrier == 'active-failure') else _scheduler_worker,
         args=(str(root), ready, shutdown, stopped, results, origin_url, str(ledger)),
         kwargs=dict(barrier=barrier,entered=entered,release=release,recover_socket=recover_socket,private_start=private_start))
     process.start()
@@ -261,7 +299,11 @@ def body_worker(root, origin_url, ledger, *, barrier=None, entered=None, release
                 assert process.exitcode == -signal.SIGKILL
             else:
                 assert process.exitcode == 0
-                assert results.get(timeout=3) == ('result', None)
+                result = results.get(timeout=3)
+                if barrier in {'active-failure', 'terminal-complete-unknown', 'terminal-complete-unreadable'}:
+                    assert result == ('error', 'DirectTransferError', 'aria2 did not confirm payload limit')
+                else:
+                    assert result == ('result', None)
         finally:
             try:
                 results.close()
@@ -1031,7 +1073,8 @@ def test_actual_cold_selected_purge_uses_fresh_consent_and_prior_unlink_authorit
                 (directory/'purge-cut-result.json').write_text(json.dumps(dict(cut=cut,original_wait=True,fresh_consent=True,prior_unlink_authority=True,body_inert=True,unknown_preserved=True,synthetic=True)))
 
 
-def test_finalizing_cap_clear_preserves_worker_and_exact_publication(tmp_path, monkeypatch, sdk_lifecycle):
+@pytest.mark.parametrize("barrier", ["prepare", "terminal-complete", "terminal-complete-unknown", "terminal-complete-unreadable", "active-failure"])
+def test_finalizing_cap_clear_preserves_worker_and_exact_publication(tmp_path, monkeypatch, sdk_lifecycle, barrier):
     """Completed BODY is no longer a live bandwidth allocation target."""
     import hashlib
     ledger = Path(tempfile.mkdtemp(prefix='finalizing-cap-', dir=os.environ.get('T26_RESUME_RUN', str(tmp_path))))
@@ -1043,9 +1086,9 @@ def test_finalizing_cap_clear_preserves_worker_and_exact_publication(tmp_path, m
     entered, release = context.Event(), context.Event()
     with tempfile.TemporaryDirectory(prefix='finalizing-cap-', dir='/private/tmp') as temporary:
         root = Path(temporary); root.chmod(0o700)
-        with _helpers._origin_type()(payload_size=1024) as origin:
+        with _helpers._origin_type()(payload_size=8*1024*1024 if barrier == 'active-failure' else 1024) as origin:
             digest = hashlib.sha256(origin.payload).hexdigest()
-            with body_worker(root, origin.url(), ledger, barrier='prepare', entered=entered,
+            with body_worker(root, origin.url(), ledger, barrier=barrier, entered=entered,
                     release=release, private_start=None) as process:
                 async def exercise():
                     async with stdio_client(parameters(root)) as (read, write):
@@ -1062,7 +1105,7 @@ def test_finalizing_cap_clear_preserves_worker_and_exact_publication(tmp_path, m
                                 assert process.is_alive() and time.monotonic()<deadline
                                 await asyncio.sleep(.02)
                             with closing(SQLiteStore(root/'state.db')) as store:
-                                assert store.get_job('batch-job-0').state == 'finalizing'
+                                assert store.get_job('batch-job-0').state == ('downloading' if barrier != 'prepare' else 'finalizing')
                                 assert store.worker_epoch() == 1
                                 causes = store._connection.execute('SELECT count(*) FROM target_dispatch_causes').fetchone()[0]
                                 serial = store._capture_target_head(store._connection, 'batch-job-0').last_admission_serial
@@ -1070,6 +1113,17 @@ def test_finalizing_cap_clear_preserves_worker_and_exact_publication(tmp_path, m
                                 await call('downloads_configure', dict(request_id='unlimited', global_limit_bps=None))
                                 await asyncio.sleep(.25)
                                 errors = [json.loads(line) for line in (ledger/'scheduler-effects.jsonl').read_text().splitlines() if json.loads(line)['kind']=='worker-error-origin']
+                                if barrier in {'active-failure', 'terminal-complete-unknown', 'terminal-complete-unreadable'}:
+                                    release.set()
+                                    deadline = time.monotonic()+3
+                                    while not errors:
+                                        assert time.monotonic()<deadline
+                                        await asyncio.sleep(.02)
+                                        errors = [json.loads(line) for line in (ledger/'scheduler-effects.jsonl').read_text().splitlines() if json.loads(line)['kind']=='worker-error-origin']
+                                    assert 'DirectTransferError: aria2 did not confirm payload limit' in errors[0]['traceback']
+                                    assert 'private unreadable readback' not in errors[0]['traceback']
+                                    assert not (output/'Other/file-0.bin').exists()
+                                    return
                                 assert not errors, errors
                                 assert process.is_alive()
                                 assert (await call('downloads_query', dict(scope='settings')))['status'] == 'applied'
@@ -1087,6 +1141,7 @@ def test_finalizing_cap_clear_preserves_worker_and_exact_publication(tmp_path, m
                                 await asyncio.sleep(.02)
                             assert (output/'Other/file-0.bin').read_bytes() == origin.payload
                             assert hashlib.sha256((output/'Other/file-0.bin').read_bytes()).hexdigest() == digest
+                            assert origin.ledger.response_body_bytes == len(origin.payload)
                             assert await call('downloads_control', targets(['batch-job-0'])) == authorization | dict(replayed=True)
                             with closing(SQLiteStore(root/'state.db')) as store:
                                 assert store.worker_epoch() == 1
@@ -1102,3 +1157,4 @@ def test_finalizing_cap_clear_preserves_worker_and_exact_publication(tmp_path, m
             assert any(row['kind']=='engine-waitable-child-reaped' and row['waitpid']=='ECHILD' and row['reconciliation']=='absent' for row in rows)
             effects = [json.loads(line) for line in (ledger/'scheduler-effects.jsonl').read_text().splitlines()]
             assert any(row['kind']=='observer-join' and not row['alive'] for row in effects)
+            assert sum(row['kind']=='causal-engine-start' for row in effects) == 1

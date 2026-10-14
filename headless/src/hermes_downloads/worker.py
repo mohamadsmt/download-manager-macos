@@ -2128,7 +2128,25 @@ def run_worker(
                 plan=candidate_plan if owner is candidate else owner.active_direct_plan
                 if getattr(owner,'applied_share',object())!=share:
                     owner.direct_controller.set_global_limit(global_limit_bps=share)
-                    owner.direct_controller.set_allocation(job_id=plan.job.job_id,generation=plan.generation,allocation_bps=share)
+                    from hermes_downloads.direct import DirectEngineError, DirectTransferError
+                    try:
+                        owner.direct_controller.set_allocation(job_id=plan.job.job_id,generation=plan.generation,allocation_bps=share)
+                    except DirectTransferError as failure:
+                        # Stock completion can race the option RPC, including
+                        # while terminal verification awaits owner acceptance.
+                        # Only fresh exact completion retires this failed option;
+                        # the normal observer still verifies and finalizes bytes.
+                        terminal=owner.active_terminal_plan
+                        if terminal is None or terminal.dispatch is not plan:
+                            raise
+                        try:
+                            state=owner.direct_controller.readback(job_id=plan.job.job_id,generation=plan.generation,gid=terminal.gid)
+                            store._require_terminal_owner(store._connection,terminal)
+                        except (DirectEngineError, ValueError, TypeError):
+                            raise failure from None
+                        if (state.job_id,state.generation,state.gid,state.partial_path,state.status,state.completed_length) != (
+                            plan.job.job_id,plan.generation,terminal.gid,terminal.partial_path,'complete',state.total_length):
+                            raise failure
                     owner.applied_share=share
             return snapshot,live,shares
 
