@@ -7,7 +7,7 @@ through Hermes alone. Add-only and inspection do not start transfers; direct
 media is ordinary bytes, with no web-video extraction. See the
 [operations and acceptance status](Docs/download-manager-operations.md).
 Delivery remains OPEN for current view-survival-to-completion and ordinary
-Desktop completion paint, plus parent final-document integration/runtime rebind.
+Desktop completion paint (A05 and A13).
 
 The v0.1.0 release targets Apple Silicon Macs and is distributed as an
 unsigned, unnotarized DMG. macOS Gatekeeper may warn or block the downloaded app

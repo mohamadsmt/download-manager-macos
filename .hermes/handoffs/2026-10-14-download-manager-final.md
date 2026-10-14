@@ -21,18 +21,21 @@ Remaining actual acceptance is current-origin view closure with the same worker
 surviving through download completion, and ordinary automatic completion toast
 paint. The current HTTP/origin-close trial was NOT RUN. Its original 900-second
 window expired; unused slots are RETIRED with no extension/reset/refund. Add-only
-exact replay admitted zero BODY. Separately bounded cleanup completed naturally,
-restoring one job/four connections/null cap, paused queue and no engines, with
+exact replay admitted zero BODY and remained queued. Separate cleanup took
+38.252662 seconds inside its original 90s bound and occurred after the original
+trial had expired. It completed naturally, restoring one job/four connections/null
+cap, paused queue and no engines, with
 the same worker and user files/holds retained. Historical actionable replay/dedup
 and explicit Finder/hash passed on 398 source; do not reopen or relabel them as
 current GUI trials. Completion-specific disabled replay was not tested and is
 not an additional required cycle beyond preserved-outbox failure replay.
 
-The parent owns exact documentation-delta reviews, canonical normal integration,
-push/remote readback, final-document-SHA runtime rebind/verify and fresh Hermes
-discovery. Use the resulting commit identity after commit; no self-referential
-SHA or manual manifest rewrite. Current local verification does not certify
-Desktop paint/reveal. No latest-SHA blanket inheritance or whole-project
+Final-document exact documentation-delta reviews, canonical normal integration,
+push/remote readback, exact deployed documentation-commit runtime rebind/verify
+and fresh Hermes discovery are separate parent-owned REQUIRED RECEIPTS. These
+docs do not self-certify their own postcommit deployment. Use the resulting
+commit identity after commit; no self-referential SHA or manual manifest rewrite.
+Current local verification does not certify Desktop paint/reveal. No latest-SHA blanket inheritance or whole-project
 completion claim is warranted.
 
 This author changes only five documentation paths. No product test suite, live

@@ -35,6 +35,8 @@ namespace-race limit retained.
 
 A05 and A13 remain PARTIAL/OPEN as specified in the sole final operations table.
 Historical tests and actual HTTP/hash, actionable replay and Finder evidence do
-not certify a later SHA. Parent final-document reviews/integration/push and exact
-runtime rebind/fresh discovery remain pending. Do not extend expired live budgets,
-install, deploy or run another live test without applicable authorization.
+not certify a later SHA. Final-document exact reviews, integration, push/remote
+readback, runtime rebind/verify and fresh discovery are separate parent-owned
+REQUIRED RECEIPTS. These docs do not self-certify their own postcommit deployment.
+Do not extend expired live budgets, install, deploy or run another live test
+without applicable authorization.

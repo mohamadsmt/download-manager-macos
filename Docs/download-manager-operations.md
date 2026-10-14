@@ -49,11 +49,12 @@ turns and needs separate authorization; installer/verifier never perform it.
 `VERIFIED_LOCAL` does not establish actual Hermes discovery, Desktop paint or
 Finder reveal; those require separate observations. Current implementation
 apply/verify was locally verified. Its canonical push/remote SHA and GitHub GET
-were recorded. Final-document commit integration, normal fast-forward/push and
-remote readback, exact final-document-SHA runtime rebind/verify and fresh Hermes
-discovery remain parent-owned pending work. Do not manually rewrite a manifest
-SHA or waive rebind because this change contains prose. No Swift change or app
-reinstallation is claimed here.
+were recorded. Final-document exact reviews, canonical normal integration,
+fast-forward/push and remote readback, exact deployed documentation-commit runtime
+rebind/verify and fresh Hermes discovery are separate parent-owned REQUIRED RECEIPTS.
+These docs do not self-certify their own postcommit deployment. Do not manually
+rewrite a manifest SHA or waive rebind because this change contains prose. No
+Swift change or app reinstallation is claimed here.
 
 Recovery of owned stale wiring was `RECOVERED_OWNED_STALE_WIRING`, with separately
 guarded owned-service quiescence. It is not supported rollback PASS: the earlier
@@ -137,8 +138,8 @@ No review of this documentation commit is asserted by its author.
 ## Final acceptance table
 
 PASS below is limited to the named source and evidence class. It never inherits
-all historical tests onto S. Whole-project delivery remains OPEN at A05 and A13;
-parent final-document integration and runtime rebind also remain pending.
+all historical tests onto S. Whole-project delivery remains OPEN at A05 and A13.
+Final-document deployment requires the separate parent-owned receipts above.
 
 | Gate | Outcome | Source, evidence class and material limits |
 | --- | --- | --- |
@@ -155,11 +156,12 @@ parent final-document integration and runtime rebind also remain pending.
 | A11 | PASS, historical actual HTTP/hash | H actual authorized official 538364-byte download/hash; C actual 188900-byte HTTP/hash. S recovered existing 188900-byte publication, certified nofollow single-link identity and SHA-256 a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505; no extra BODY, two earlier BODY causes remain historical. S fresh HTTP/origin-close trial NOT RUN. |
 | A12 | PASS, direct scope | H accepted direct duplicate/source-identity fixtures; C actual exact-control replay retained. S add-only exact replay succeeded without BODY. Extraction/quality/audio/subtitle/playlist gates RETIRED. |
 | A13 | PARTIAL/OPEN | C actual actionable 404 remained pending with both renderers OFF; MAIN ON painted it, then PEER ON deduplicated the same event: one claim/one receipt. Ordinary automatic completion paint NOT_OBSERVED. Completion-event-only disabled replay NOT TESTED; preserved-outbox failure replay was proven by the actionable event and needs no additional completion-specific cycle. No exactly-once visual/read guarantee. |
-| A14 | PASS, scoped; final rebind pending | Actual seven MCP tools retained; C explicit reveal/Finder selection/hash passed. S recovery/query/config work passed. Final-document-SHA installation/verification and fresh discovery are parent-owned pending, not completed claims. |
+| A14 | PASS, scoped; separate deployment receipts required | Actual seven MCP tools retained; C explicit reveal/Finder selection/hash passed. S recovery/query/config work passed. Final-document exact reviews, integration, push/remote readback, runtime rebind/verify and fresh discovery are separate parent-owned REQUIRED RECEIPTS. These docs do not self-certify their own postcommit deployment. |
 
 The unused slots of the original 900-second current live window expired and are
-RETIRED, with no extension, reset or refund. Separate cleanup under its original
-90-second budget completed naturally 38.252662 seconds after that expiry.
+RETIRED, with no extension, reset or refund. Separate cleanup took
+38.252662 seconds inside its original 90s bound and occurred after the original
+trial had expired. Cleanup completed naturally.
 Desired/applied settings were both one job/four connections/null cap;
 queue paused, same worker unchanged, no engines. Existing
 user files and historical/manual holds were retained. Publication recovery does

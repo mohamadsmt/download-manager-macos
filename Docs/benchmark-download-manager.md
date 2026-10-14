@@ -371,10 +371,11 @@ certified nofollow single-link final identity and SHA-256
 Recovery added no BODY; its two earlier BODY causes remain historical. The
 current actual HTTP/origin-close trial was NOT RUN; add-only exact replay
 succeeded, zero BODY causes, still queued. Its original 900-second window expired
-and unused slots are RETIRED without extension/reset/refund. Separate cleanup
-completed naturally within its original 90-second budget, 38.252662 seconds
-after expiry, with restored one/four/null settings, queue paused, unchanged
-worker and no engines. No old BODY checkpoint is retro-certified.
+and unused slots are RETIRED without extension/reset/refund. Separate cleanup took
+38.252662 seconds inside its original 90s bound and occurred after the original
+trial had expired. It completed naturally with restored one/four/null settings,
+queue paused, unchanged worker and no engines. No old BODY checkpoint is
+retro-certified.
 
 Fresh current originating-view survival through completion and ordinary automatic
 Desktop completion paint remain OPEN. Historical own-view immediate survival
