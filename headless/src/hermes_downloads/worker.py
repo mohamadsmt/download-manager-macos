@@ -2114,7 +2114,10 @@ def run_worker(
 
         def apply_allocation(candidate=None, candidate_plan=None):
             snapshot=store.configuration_snapshot();desired=snapshot['desired']
-            live=[owner for owner in owners if owner.direct_controller_ready and owner.active_direct_plan is not None]
+            # Finalization retains the engine claim for containment, but its
+            # completed GID no longer accepts per-file bandwidth options.
+            live=[owner for owner in owners if owner.direct_controller_ready
+                and owner.active_direct_plan is not None and owner.active_terminal_plan is not None]
             if candidate is not None and candidate not in live:live.append(candidate)
             from hermes_downloads.bandwidth import allocate
             shares=allocate(global_limit_bps=None if desired['global_limit_bps'] is None else int(desired['global_limit_bps']),item_caps_bps=[None if (cap:=store._effective_settings(store._connection,(candidate_plan if owner is candidate else owner.active_direct_plan).job)['limit_bps']) is None else int(cap) for owner in live])

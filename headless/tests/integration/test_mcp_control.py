@@ -241,13 +241,13 @@ def test_real_target_reports_manual_collection_and_not_due_holds(private_worker,
 
 
 @contextmanager
-def body_worker(root, origin_url, ledger, *, barrier=None, entered=None, release=None, crash=False, recover_socket=False):
+def body_worker(root, origin_url, ledger, *, barrier=None, entered=None, release=None, crash=False, recover_socket=False, private_start=True):
     context = multiprocessing.get_context('spawn')
     ready, shutdown, stopped = [context.Event() for _ in range(3)]
     results = context.Queue()
     process = context.Process(target=_scheduler_worker,
         args=(str(root), ready, shutdown, stopped, results, origin_url, str(ledger)),
-        kwargs=dict(barrier=barrier,entered=entered,release=release,recover_socket=recover_socket))
+        kwargs=dict(barrier=barrier,entered=entered,release=release,recover_socket=recover_socket,private_start=private_start))
     process.start()
     try:
         assert ready.wait(6), 'private scheduler did not become ready'
@@ -1029,3 +1029,76 @@ def test_actual_cold_selected_purge_uses_fresh_consent_and_prior_unlink_authorit
                     assert [tuple(row) for row in store._connection.execute('SELECT * FROM direct_saved_purge WHERE request_id=?',(request['request_id'],))]==preauthorized
                     assert store.get_batch_creation_intent('batch-job-0')==creation
                 (directory/'purge-cut-result.json').write_text(json.dumps(dict(cut=cut,original_wait=True,fresh_consent=True,prior_unlink_authority=True,body_inert=True,unknown_preserved=True,synthetic=True)))
+
+
+def test_finalizing_cap_clear_preserves_worker_and_exact_publication(tmp_path, monkeypatch, sdk_lifecycle):
+    """Completed BODY is no longer a live bandwidth allocation target."""
+    import hashlib
+    ledger = Path(tempfile.mkdtemp(prefix='finalizing-cap-', dir=os.environ.get('T26_RESUME_RUN', str(tmp_path))))
+    ledger.chmod(0o700)
+    home = tmp_path/'home'; home.mkdir(mode=0o700)
+    monkeypatch.setenv('HOME', str(home))
+    output = home/'Downloads/Hermes'; output.mkdir(parents=True, mode=0o700)
+    context = multiprocessing.get_context('spawn')
+    entered, release = context.Event(), context.Event()
+    with tempfile.TemporaryDirectory(prefix='finalizing-cap-', dir='/private/tmp') as temporary:
+        root = Path(temporary); root.chmod(0o700)
+        with _helpers._origin_type()(payload_size=1024) as origin:
+            digest = hashlib.sha256(origin.payload).hexdigest()
+            with body_worker(root, origin.url(), ledger, barrier='prepare', entered=entered,
+                    release=release, private_start=None) as process:
+                async def exercise():
+                    async with stdio_client(parameters(root)) as (read, write):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            async def call(name, args):
+                                return result_record(await session.call_tool(name, arguments=args))
+                            await call('downloads_configure', dict(request_id='finite', concurrency='1', connections='1', global_limit_bps='64'))
+                            await call('downloads_add', dict(request_id='add', items=[entry(source_url=origin.url(), expected_sha256=digest)]))
+                            authorization = await call('downloads_control', targets(['batch-job-0']))
+                            await call('downloads_control', dict(scope='queue', action='resume', request_id='run', expected_revision='1'))
+                            deadline = time.monotonic()+6
+                            while not entered.is_set():
+                                assert process.is_alive() and time.monotonic()<deadline
+                                await asyncio.sleep(.02)
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                assert store.get_job('batch-job-0').state == 'finalizing'
+                                assert store.worker_epoch() == 1
+                                causes = store._connection.execute('SELECT count(*) FROM target_dispatch_causes').fetchone()[0]
+                                serial = store._capture_target_head(store._connection, 'batch-job-0').last_admission_serial
+                            try:
+                                await call('downloads_configure', dict(request_id='unlimited', global_limit_bps=None))
+                                await asyncio.sleep(.25)
+                                errors = [json.loads(line) for line in (ledger/'scheduler-effects.jsonl').read_text().splitlines() if json.loads(line)['kind']=='worker-error-origin']
+                                assert not errors, errors
+                                assert process.is_alive()
+                                assert (await call('downloads_query', dict(scope='settings')))['status'] == 'applied'
+                            finally:
+                                release.set()
+                            deadline = time.monotonic()+6
+                            while not (output/'Other/file-0.bin').exists():
+                                assert process.is_alive() and time.monotonic()<deadline
+                                await asyncio.sleep(.02)
+                            deadline = time.monotonic()+6
+                            while True:
+                                status = await call('downloads_query', dict(scope='status', id='batch-job-0'))
+                                if status['record']['state']=='completed': break
+                                assert process.is_alive() and time.monotonic()<deadline
+                                await asyncio.sleep(.02)
+                            assert (output/'Other/file-0.bin').read_bytes() == origin.payload
+                            assert hashlib.sha256((output/'Other/file-0.bin').read_bytes()).hexdigest() == digest
+                            assert await call('downloads_control', targets(['batch-job-0'])) == authorization | dict(replayed=True)
+                            with closing(SQLiteStore(root/'state.db')) as store:
+                                assert store.worker_epoch() == 1
+                                assert store._connection.execute('SELECT count(*) FROM target_dispatch_causes').fetchone()[0] == causes
+                                assert store._capture_target_head(store._connection, 'batch-job-0').last_admission_serial == serial == 1
+                                assert sum(event.kind=='job_completed' for event in store.list_events()) == 1
+                            assert process.is_alive()
+                try:
+                    asyncio.run(exercise())
+                finally:
+                    release.set()
+            rows = [json.loads(line) for line in (ledger/f'fixture-{process.pid}.jsonl').read_text().splitlines()]
+            assert any(row['kind']=='engine-waitable-child-reaped' and row['waitpid']=='ECHILD' and row['reconciliation']=='absent' for row in rows)
+            effects = [json.loads(line) for line in (ledger/'scheduler-effects.jsonl').read_text().splitlines()]
+            assert any(row['kind']=='observer-join' and not row['alive'] for row in effects)
