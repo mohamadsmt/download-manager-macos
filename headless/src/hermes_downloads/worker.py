@@ -1940,14 +1940,19 @@ class _DirectOwner:
 
     def shutdown(self):
         context=self.capture_stopped_body() if self.active_direct_plan is not None and self.active_terminal_plan is not None and self.active_saved is None and self.active_publication is None else None
-        # Drain checkpoint results through their normal settlement path. Other
-        # saved phases retain cancellation semantics and acknowledge phase waiters.
-        if self.active_saved is not None:
-            self.cancel_saved()
         self.publication_cancel.set()
         self.cleanup_cancel.set()
         closed_owned=self.close_after_observer
         try:
+            # Orderly shutdown retains ownership until the exact checkpoint
+            # observer joins and its result settles through the normal poll path.
+            # Public controls keep cancel_saved's bounded drain semantics.
+            if self.active_saved is not None:
+                if self.active_saved[0]=='checkpoint':
+                    self.observation_thread.join()
+                    self.poll_direct_terminal()
+                else:
+                    self.cancel_saved()
             from hermes_downloads.processes import reconcile_process_birth
             # Orderly exit keeps the lease and process claim through original mutator JOIN.
             if self.direct_controller is not None and (self.direct_record is None

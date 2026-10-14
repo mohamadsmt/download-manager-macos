@@ -926,27 +926,69 @@ def _checkpoint_scheduler_worker(*args, barrier=None, entered=None, **kwargs):
     seal = paths._seal_stopped_pair
     evidence = Path(args[6])
     shutdown = args[2]
+    slow = barrier == 'checkpoint-shutdown-slow'
+    if slow:
+        import threading
+        from hermes_downloads import worker
+        joined, released, lease_released = threading.Event(), threading.Event(), threading.Event()
+        original_join = threading.Thread.join
+        original_release = worker._release_worker_lease
+        original_close = SQLiteStore.close
+        def recorded_close(self):
+            if shutdown.is_set() and threading.current_thread() is threading.main_thread():
+                checkpoint = self._connection.execute('SELECT facts,closure FROM stopped_direct_bodies').fetchall()
+                (evidence/'slow-store-close.json').write_text(json.dumps(dict(checkpoint=[tuple(row) for row in checkpoint], released=released.is_set())))
+            return original_close(self)
+        SQLiteStore.close = recorded_close
+        def recorded_join(self, timeout=None):
+            if self.name == 'direct-saved-observation' and shutdown.is_set():
+                joined.set()
+            return original_join(self, timeout)
+        threading.Thread.join = recorded_join
+        def checked_release(descriptor):
+            checkpoint = rows(Path(args[0])/'state.db', 'SELECT facts,closure FROM stopped_direct_bodies')
+            (evidence/'slow-lease.json').write_text(json.dumps(dict(checkpoint=checkpoint, released=released.is_set())))
+            lease_released.set()
+            return original_release(descriptor)
+        worker._release_worker_lease = checked_release
+        def scheduled_release():
+            assert joined.wait(10), 'shutdown did not join original checkpoint observer'
+            started = time.monotonic()
+            # Start the bounded hold at the actual shutdown join, beyond its 1.5s limit.
+            released.wait(1.75)
+            held = dict(elapsed=time.monotonic()-started, stopped=args[3].is_set(),
+                lease_released=lease_released.is_set())
+            (evidence/'slow-held.json').write_text(json.dumps(held))
+            released.set()
+        releaser = threading.Thread(target=scheduled_release, name='fixture-checkpoint-release')
+        releaser.start()
     def observed(destination, reservation):
         with (evidence/'seal-attempts.jsonl').open('a') as stream:
             stream.write(json.dumps(dict(mode=barrier))+'\n')
-        if barrier == 'checkpoint-shutdown':
+        if barrier in {'checkpoint-shutdown', 'checkpoint-shutdown-slow'}:
             entered.set()
             assert shutdown.wait(10), 'shutdown never reached active checkpoint'
+            if slow: assert released.wait(10), 'bounded checkpoint release missing'
         elif barrier == 'checkpoint-failed':
             control = destination.partial_path.with_name(destination.partial_path.name+'.aria2')
             assert destination.partial_path.stat().st_size == 0 and control.stat().st_size > 0
             control.write_bytes(b'')
         return seal(destination, reservation)
     paths._seal_stopped_pair = observed
-    return _scheduler_worker(*args, **kwargs)
+    try:
+        return _scheduler_worker(*args, **kwargs)
+    finally:
+        if slow:
+            releaser.join(12)
+            assert not releaser.is_alive()
 
 
-@pytest.mark.parametrize("pair", ["intact", "empty", "missing", "changed", "headers", "checkpoint-shutdown", "checkpoint-failed"])
+@pytest.mark.parametrize("pair", ["intact", "empty", "missing", "changed", "headers", "checkpoint-shutdown", "checkpoint-shutdown-slow", "checkpoint-failed"])
 def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeypatch, sdk_lifecycle, pair):
     """Zero RPC progress covers both a received tail and genuinely headers-only BODY."""
     import threading
     from hermes_downloads.direct import _request_recovery_force_shutdown
-    headers_only = pair in {'headers', 'checkpoint-shutdown', 'checkpoint-failed'}
+    headers_only = pair in {'headers', 'checkpoint-shutdown', 'checkpoint-shutdown-slow', 'checkpoint-failed'}
     entered = None
     if pair.startswith('checkpoint-'):
         import multiprocessing
@@ -1020,7 +1062,7 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
                                 assert any(row['kind']=='engine-waitable-child-reaped' and row['identity']==engine.identity.to_record() and row['waitpid']=='ECHILD' for row in births)
                                 effects = [json.loads(line) for line in (evidence/'scheduler-effects.jsonl').read_text().splitlines()]
                                 assert any(row['kind']=='observer-join' and not row['alive'] and row['monotonic']<=acknowledged for row in effects)
-                                if pair == 'checkpoint-shutdown':
+                                if pair in {'checkpoint-shutdown', 'checkpoint-shutdown-slow'}:
                                     assert entered.wait(5), 'checkpoint barrier not entered'
                                     return  # body_worker requests shutdown while the sealer is active.
                                 if pair == 'checkpoint-failed':
@@ -1082,13 +1124,25 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
                                 assert stock[-1]['options']['allow-overwrite']=='false'
                                 (evidence/'result.json').write_text(json.dumps(dict(pair=pair, immutable_sha256=expected, closure=closure)))
                     asyncio.run(exercise())
-                if pair == 'checkpoint-shutdown':
+                if pair in {'checkpoint-shutdown', 'checkpoint-shutdown-slow'}:
                     with closing(SQLiteStore(root/'state.db')) as store:
                         checkpoint, facts = store._saved_checkpoint(store._connection, 'batch-job-0')
                         closure = json.loads(checkpoint['closure'])
                         assert facts.payload[2]==0 and facts.control[2]>0
                         assert closure['completed_length']==0 and closure['observer_joined'] is True and closure['group_absent'] is True
                     assert len((evidence/'seal-attempts.jsonl').read_text().splitlines())==1
+                    if pair == 'checkpoint-shutdown-slow':
+                        with pytest.raises(ChildProcessError): os.waitpid(process.pid, os.WNOHANG)
+                        with pytest.raises(ProcessLookupError): os.killpg(process.pid, 0)
+                        (evidence/'slow-original-exit.json').write_text(json.dumps(dict(
+                            pid=process.pid, exitcode=process.exitcode, waitpid='ECHILD', group_absent=True)))
+                        held = json.loads((evidence/'slow-held.json').read_text())
+                        assert held['elapsed'] >= 1.5 and not held['stopped'] and not held['lease_released']
+                        for name in ('slow-store-close.json', 'slow-lease.json'):
+                            teardown = json.loads((evidence/name).read_text())
+                            assert teardown['released'] and teardown['checkpoint']
+                        effects = [json.loads(line) for line in (evidence/'scheduler-effects.jsonl').read_text().splitlines()]
+                        assert any(row['kind']=='observer-join' and row['name']=='direct-saved-observation' and not row['alive'] for row in effects)
             finally:
                 release.set()
 
