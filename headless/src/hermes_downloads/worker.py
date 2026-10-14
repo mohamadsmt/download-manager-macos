@@ -686,8 +686,16 @@ class _DirectOwner:
         self.marker_unlink_permit = None
 
     def cancel_saved(self, *, pause=True) -> None:
-        self.saved_cancel.set()
         task = self.active_saved
+        if task is not None and task[0] == 'checkpoint':
+            # A stop checkpoint has no ongoing BODY to revoke. Drain its exact
+            # result before another control can release or reuse this owner.
+            self.observation_thread.join(_OBSERVATION_JOIN_SECONDS if self.close_deadline is None else max(0,self.close_deadline-time.monotonic()))
+            if self.observation_thread.is_alive():
+                raise IPCError('direct_dispatch_blocked')
+            self.poll_direct_terminal()
+            return
+        self.saved_cancel.set()
         self.join_owned_observation()
         while not self.saved_phases.empty():
             _,_,_,ack = self.saved_phases.get_nowait()
@@ -1270,7 +1278,7 @@ class _DirectOwner:
             process=self.direct_controller._process;observer=self.observation_thread or self.last_body_observer
             observed=self.direct_controller.readback(job_id=plan.job.job_id,generation=plan.generation,gid=terminal.gid)
             # Stock progress can be zero while a received tail is flushed on stop.
-            # The stopped-pair sealer still requires positive exact owned files.
+            # The sealer requires an exact owned payload and positive stock control.
             if (cause is not None and cause['kind']=='body' and observer is not None
                 and type(observed.completed_length) is int
                 and observed.completed_length>=0
@@ -1573,6 +1581,11 @@ class _DirectOwner:
             if type(observation) is _SavedObservation:
                 task = self.active_saved
                 self.active_saved = None
+                # A stopped pair is one observation, including failure or revocation.
+                # Retrying cannot create authority and would monopolize this owner.
+                if (task == ('checkpoint',observation.token) and self.pending_stop is not None
+                    and self.pending_stop[0] == observation.token):
+                    self.pending_stop = None
                 if task == (observation.kind,observation.token) and not self.saved_cancel.is_set() and not observation.failed:
                     try:
                         if observation.kind=='prepare':
@@ -1583,7 +1596,6 @@ class _DirectOwner:
                         if observation.kind=='checkpoint':
                             plan,command,result,closure,stop_kind = observation.token
                             self.store.seal_stopped_direct_body(plan,command,result,observation.result,closure,stop_kind=stop_kind)
-                            self.pending_stop=None
                     except Exception:
                         if observation.kind=='prepare': self.store.fail_saved_preparation(observation.token)
                 elif observation.kind=='prepare':
@@ -1928,7 +1940,10 @@ class _DirectOwner:
 
     def shutdown(self):
         context=self.capture_stopped_body() if self.active_direct_plan is not None and self.active_terminal_plan is not None and self.active_saved is None and self.active_publication is None else None
-        self.saved_cancel.set()
+        # Drain checkpoint results through their normal settlement path. Other
+        # saved phases retain cancellation semantics and acknowledge phase waiters.
+        if self.active_saved is not None:
+            self.cancel_saved()
         self.publication_cancel.set()
         self.cleanup_cancel.set()
         closed_owned=self.close_after_observer
@@ -2356,7 +2371,9 @@ def run_worker(
                 if file_task is not None:
                     file_task[4].revoke();file_task[2].join();poll_files()
                 for owner in owners:
-                    owner.saved_cancel.set();owner.publication_cancel.set();owner.cleanup_cancel.set()
+                    if owner.active_saved is None or owner.active_saved[0] != 'checkpoint':
+                        owner.saved_cancel.set()
+                    owner.publication_cancel.set();owner.cleanup_cancel.set()
                 for owner in owners:
                     try:owner.shutdown()
                     except BaseException as error:failure=error

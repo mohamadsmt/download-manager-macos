@@ -920,11 +920,39 @@ def test_sdk_cold_global_resume_authorized_unstarted_only(tmp_path,monkeypatch,s
         assert not thread.is_alive()
 
 
-@pytest.mark.parametrize("pair", ["intact", "empty", "missing", "changed"])
+def _checkpoint_scheduler_worker(*args, barrier=None, entered=None, **kwargs):
+    """Fixture-only sealer barrier/fault; retain the real scheduler and stock engine."""
+    from test_target_scheduler import _scheduler_worker
+    seal = paths._seal_stopped_pair
+    evidence = Path(args[6])
+    shutdown = args[2]
+    def observed(destination, reservation):
+        with (evidence/'seal-attempts.jsonl').open('a') as stream:
+            stream.write(json.dumps(dict(mode=barrier))+'\n')
+        if barrier == 'checkpoint-shutdown':
+            entered.set()
+            assert shutdown.wait(10), 'shutdown never reached active checkpoint'
+        elif barrier == 'checkpoint-failed':
+            control = destination.partial_path.with_name(destination.partial_path.name+'.aria2')
+            assert destination.partial_path.stat().st_size == 0 and control.stat().st_size > 0
+            control.write_bytes(b'')
+        return seal(destination, reservation)
+    paths._seal_stopped_pair = observed
+    return _scheduler_worker(*args, **kwargs)
+
+
+@pytest.mark.parametrize("pair", ["intact", "empty", "missing", "changed", "headers", "checkpoint-shutdown", "checkpoint-failed"])
 def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeypatch, sdk_lifecycle, pair):
-    """Stock aria2 has received bytes before its first complete piece is counted."""
+    """Zero RPC progress covers both a received tail and genuinely headers-only BODY."""
     import threading
     from hermes_downloads.direct import _request_recovery_force_shutdown
+    headers_only = pair in {'headers', 'checkpoint-shutdown', 'checkpoint-failed'}
+    entered = None
+    if pair.startswith('checkpoint-'):
+        import multiprocessing
+        import test_mcp_control
+        entered = multiprocessing.get_context('spawn').Event()
+        monkeypatch.setattr(test_mcp_control, '_scheduler_worker', _checkpoint_scheduler_worker)
     evidence = Path(tempfile.mkdtemp(prefix='early-piece-', dir=os.environ.get('T26_RESUME_RUN', str(tmp_path))))
     evidence.chmod(0o700)
     home = evidence/'home'; home.mkdir(mode=0o700)
@@ -938,7 +966,7 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
             send = origin._send_response
             def gated(handler, status, headers, body, **kwargs):
                 if len(body)>3601 and not release.is_set():
-                    sent = send(handler, status, headers, body[:3601], content_length=len(body))
+                    sent = send(handler, status, headers, b'' if headers_only else body[:3601], content_length=len(body))
                     received.set()
                     assert release.wait(15), 'bounded early BODY gate expired'
                     return sent  # The stopped original never receives the remainder.
@@ -946,7 +974,7 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
             origin._send_response = gated
             expected = hashlib.sha256(origin.payload).hexdigest()
             try:
-                with body_worker(root, origin.url(), evidence) as process:
+                with body_worker(root, origin.url(), evidence, barrier=pair if entered is not None else None, entered=entered) as process:
                     async def exercise():
                         async with stdio_client(parameters(root)) as (read, write):
                             async with ClientSession(read, write) as session:
@@ -973,7 +1001,8 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
                                 assert processes.is_current_process_birth(engine.identity)
                                 completed = _request_recovery_force_shutdown(capability, timeout=1, gid=gid)
                                 assert type(completed) is int and completed==0
-                                proof = dict(completed_length=completed, origin_prefix_sent=3601, original_engine_current=True)
+                                if headers_only: assert partial.stat().st_size==0
+                                proof = dict(completed_length=completed, origin_prefix_sent=0 if headers_only else 3601, original_engine_current=True)
                                 (evidence/'pre-pause.json').write_text(json.dumps(proof))
                                 current = (await call('downloads_query', dict(scope='status', id='batch-job-0')))['record']
                                 pause = await call('downloads_control', dict(scope='job', action='pause', request_id='early-pause', job='batch-job-0', expected_revision=str(current['revision'])))
@@ -982,11 +1011,31 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
                                 release.set()
                                 assert processes.reconcile_process_birth(engine.identity)=='absent'
                                 with pytest.raises(ProcessLookupError): os.killpg(engine.identity.process_group_id, 0)
-                                assert 0<partial.stat().st_size<len(origin.payload)
+                                assert partial.stat().st_size==0 if headers_only else 0<partial.stat().st_size<len(origin.payload)
                                 assert partial.read_bytes()==origin.payload[:partial.stat().st_size]
-                                assert control.stat().st_size>0 and control.stat().st_mode & 0o777==0o600
+                                assert (pair=='checkpoint-failed' or control.stat().st_size>0) and control.stat().st_mode & 0o777==0o600
                                 proof['stopped_pair_sizes'] = [p.stat().st_size for p in (partial, control)]
                                 (evidence/'pre-pause.json').write_text(json.dumps(proof))
+                                births = [json.loads(line) for line in (evidence/f'fixture-{process.pid}.jsonl').read_text().splitlines()]
+                                assert any(row['kind']=='engine-waitable-child-reaped' and row['identity']==engine.identity.to_record() and row['waitpid']=='ECHILD' for row in births)
+                                effects = [json.loads(line) for line in (evidence/'scheduler-effects.jsonl').read_text().splitlines()]
+                                assert any(row['kind']=='observer-join' and not row['alive'] and row['monotonic']<=acknowledged for row in effects)
+                                if pair == 'checkpoint-shutdown':
+                                    assert entered.wait(5), 'checkpoint barrier not entered'
+                                    return  # body_worker requests shutdown while the sealer is active.
+                                if pair == 'checkpoint-failed':
+                                    await call('downloads_add', dict(request_id='independent-add', items=[entry(1, source_url=origin.url(), expected_sha256=expected)]))
+                                    await call('downloads_control', targets(['batch-job-1'], request='independent-start'))
+                                    final = output/'Other/file-1.bin'
+                                    end = time.monotonic()+12
+                                    while not final.exists():
+                                        assert process.is_alive() and time.monotonic()<end, 'failed checkpoint starved independent job'
+                                        await asyncio.sleep(.03)
+                                    assert hashlib.sha256(final.read_bytes()).hexdigest()==expected
+                                    assert rows(root/'state.db', 'SELECT 1 FROM stopped_direct_bodies')==[]
+                                    assert rows(root/'state.db', 'SELECT 1 FROM saved_direct_continuations')==[]
+                                    assert len((evidence/'seal-attempts.jsonl').read_text().splitlines())==1
+                                    return
                                 end = time.monotonic()+3
                                 while not rows(root/'state.db', 'SELECT 1 FROM stopped_direct_bodies'):
                                     assert process.is_alive() and time.monotonic()<end, 'early positive pair checkpoint missing'
@@ -996,7 +1045,7 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
                                     closure = json.loads(checkpoint['closure'])
                                     assert closure['completed_length']==0 and closure['observer_joined'] is True and closure['group_absent'] is True
                                     assert closure['process']==engine.identity.to_record()
-                                    assert min(facts.payload[2], facts.control[2])>0
+                                    assert facts.control[2]>0 and (facts.payload[2]==0 if headers_only else facts.payload[2]>0)
                                     # Actual original Popen wait and observer join qualify closure.
                                     births = [json.loads(line) for line in (evidence/f'fixture-{process.pid}.jsonl').read_text().splitlines()]
                                     assert any(row['kind']=='engine-waitable-child-reaped' and row['identity']==engine.identity.to_record() and row['waitpid']=='ECHILD' for row in births)
@@ -1005,7 +1054,7 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
                                     destination = store._saved_destination('batch-job-0')
                                     reservation = store._effective_reservation(store._connection, 'batch-job-0')
                                     paths._require_saved_pair(destination, reservation, facts)
-                                if pair!='intact':
+                                if pair not in {'intact','headers'}:
                                     if pair=='empty': control.write_bytes(b'')
                                     elif pair=='missing': control.unlink()
                                     else: control.write_bytes(control.read_bytes()+b'changed')
@@ -1027,8 +1076,19 @@ def test_early_piece_zero_rpc_pause_preserves_qualified_resume(tmp_path, monkeyp
                                     await asyncio.sleep(.03)
                                 assert hashlib.sha256(final.read_bytes()).hexdigest()==expected
                                 assert final.read_bytes()==origin.payload
+                                effects = [json.loads(line) for line in (evidence/'scheduler-effects.jsonl').read_text().splitlines()]
+                                stock = [row for row in effects if row['kind']=='saved-stock-paused']
+                                assert stock and stock[-1]['gid'] != closure['gid']
+                                assert stock[-1]['options']['allow-overwrite']=='false'
                                 (evidence/'result.json').write_text(json.dumps(dict(pair=pair, immutable_sha256=expected, closure=closure)))
                     asyncio.run(exercise())
+                if pair == 'checkpoint-shutdown':
+                    with closing(SQLiteStore(root/'state.db')) as store:
+                        checkpoint, facts = store._saved_checkpoint(store._connection, 'batch-job-0')
+                        closure = json.loads(checkpoint['closure'])
+                        assert facts.payload[2]==0 and facts.control[2]>0
+                        assert closure['completed_length']==0 and closure['observer_joined'] is True and closure['group_absent'] is True
+                    assert len((evidence/'seal-attempts.jsonl').read_text().splitlines())==1
             finally:
                 release.set()
 

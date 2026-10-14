@@ -2579,7 +2579,7 @@ def _seal_stopped_pair(destination, reservation):
                 raise UnsafePathError('stopped file changed during sync')
         os.fsync(descriptors[3])
         facts = [_saved_visible(descriptors[3], name, fd) for name,fd in zip(names,files)]
-        if facts[0][:2] == facts[1][:2] or min(x[2] for x in facts) <= 0:
+        if facts[0][:2] == facts[1][:2] or facts[0][2] < 0 or facts[1][2] <= 0:
             raise UnsafePathError('stopped pair unavailable')
         result = _StoppedPair(chain,marker,*facts)
         check,_,_ = _saved_open_chain(destination,reservation,result)
