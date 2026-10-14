@@ -1,151 +1,170 @@
-# Default-profile installation operations
+# Hermes direct-download operations
 
-This wiring supports trusted direct-file downloads through Python 3.12, the official MCP SDK and `/opt/homebrew/bin/aria2c`. YouTube and web-video extraction are retired; video helpers are not installation requirements. Hermes remains the control interface; no additional application is installed.
+Hermes is the sole control interface for the headless service. Use trusted,
+user-vetted direct HTTP(S) sources. Direct media files are ordinary bytes;
+legacy literal video rows remain readable, read-only and inert. Extraction,
+ffprobe/playability, quality, audio, subtitle and playlist gates are RETIRED,
+never PASS. The retained Swift release is a separate historical application.
 
-Run the scripts with the independently installed physical Python 3.12 interpreter, clearing `PYTHONPATH`/`PYTHONHOME` and disabling bytecode. From the canonical `/Users/mohamadsmt/Documents/Download Manager` checkout:
+## Installation, verification and recovery
+
+An existing valid, owner-owned private `~/Downloads/Hermes/` output root is a
+prerequisite. There is no missing-root auto-creation or cache fallback promise.
+Use an isolated Python 3.12 non-editable environment with ambient `PYTHONPATH`
+and `PYTHONHOME` cleared. The installer is
+[`headless/scripts/install.py`](../headless/scripts/install.py); its default
+mode is a readiness plan. Applying requires explicit default-profile authority
+and the exact reviewed commit via `--apply --profile default --expected-commit`.
+[`verify-install.py`](../headless/scripts/verify-install.py) checks the exact
+commit, private manifest, physical installed parity, owned service and seven
+schemas. Keep manifests, backups and runtime state outside this public repository.
+These are operator boundaries, not authorization to install or change profiles.
+
+For separately authorized operator work, run the scripts with the physical
+isolated interpreter from the canonical checkout:
 
 ```sh
 env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 headless/.venv/bin/python -I -B headless/scripts/install.py
 env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 headless/.venv/bin/python -I -B headless/scripts/verify-install.py
 ```
 
-The installer defaults to a read-only dry run. `NOT_READY` and nonzero exit mean prerequisites or ownership checks failed. The author candidate contains seven implemented tools and the integration bundle; independent exact-commit reviews and installation prerequisites still govern readiness. Synthetic installer tests do not establish a default installation. `PLAN_READY` means the local plan is ready, not live acceptance. Source must be clean and the exact commit must have independent specification PASS followed by quality/security APPROVED, including backend profile/auth behavior and the renderer SDK contract. Untracked regular, owner-owned, single-link Markdown documents directly under `.hermes/handoffs/` are retained as history and do not count as source changes. Tracked changes, all other untracked paths and linked or nested handoffs still block. Presence and schemas cannot prove runtime behavior.
+`PLAN_READY` is a plan; `INSTALLED_WIRING` is paused local wiring; neither is
+live acceptance. `NOT_READY` or nonzero exit blocks progress. Source cleanliness,
+ordered independent exact-commit reviews and physical source/site/commit parity
+are prerequisites. Installation rejects other profiles, unknown arguments and
+foreign ownership; account home comes from the account database. Existing state,
+history, files and runtimes are retained. The verifier reads only: it never
+repairs, launches or resumes a worker. Installation never resumes downloads.
+Only the downloads MCP entry and owned plugin enablement are config-owned;
+an explicit backend-disabled choice blocks apply. Renderer enablement uses the
+official Desktop toggle/readback, never Chromium storage edits.
 
-After independent review and separately authorized real application, add `--apply --profile default --expected-commit <full-reviewed-HEAD>` to the installer command. Other profiles, root overrides, contradictory modes and unknown arguments are rejected. HOME comes from the current account database, not the process environment. Unit/integration callers use private fixture layouts; they do not change this CLI boundary.
+Supported rollback uses `--rollback` with the exact private manifest and
+`--profile default`. Fresh backup/file/config/service authority checks must pass;
+changed or uncertain ownership blocks it. Retain failure evidence; failed
+installation is not automatic rollback. Unrelated configuration, runtime, state
+and Downloads remain retained. Backend recycling interrupts default Desktop
+turns and needs separate authorization; installer/verifier never perform it.
 
-Installation requires the complete reviewed three-file integration bundle and exact seven closed typed tools: `downloads_add`, `downloads_query`, `downloads_control`, `downloads_edit`, `downloads_replace_source`, `downloads_configure`, `downloads_files`. Direct-file schemas reject media options. Discovery uses official SDK stdio initialization from scratch directories and does not start a worker. Physical runtime checks enumerate every package Python module, compare source/site/commit hashes, and reject editable imports and untrusted entrypoints. The versioned production runtime is under `~/Library/Application Support/HermesDownloadManager/default/runtime/<commit>`, outside the source tree; dry-run acceptance continues to use `headless/.venv`. Existing source-tree runtimes are retained; a foreign occupied path is retained and blocks creation.
+`VERIFIED_LOCAL` does not establish actual Hermes discovery, Desktop paint or
+Finder reveal; those require separate observations. Current implementation
+apply/verify was locally verified. Its canonical push/remote SHA and GitHub GET
+were recorded. Final-document commit integration, normal fast-forward/push and
+remote readback, exact final-document-SHA runtime rebind/verify and fresh Hermes
+discovery remain parent-owned pending work. Do not manually rewrite a manifest
+SHA or waive rebind because this change contains prose. No Swift change or app
+reinstallation is claimed here.
 
-The fixed default state is `~/Library/Application Support/HermesDownloadManager/default`, endpoint `worker.sock`, output `~/Downloads/Hermes`, and LaunchAgent `~/Library/LaunchAgents/com.mohamadsmt.hermes-downloads.default.plist`. The full lexical path must fit Darwin's 103-byte socket bound. Unknown endpoints, nonprivate directories, symlinks, linked/special files and collisions block before installation. State, queues, history, incomplete files and output are retained. Certified service restarts recover paused under the existing T16f service contract; installation never resumes downloads.
+Recovery of owned stale wiring was `RECOVERED_OWNED_STALE_WIRING`, with separately
+guarded owned-service quiescence. It is not supported rollback PASS: the earlier
+supported rollback remains BLOCKED and the original failure stage is unknown.
+Stop on uncertain ownership; do not signal unrelated services, rewrite runtime
+history or retro-certify checkpoints. The failed integration postcondition is
+retained; a later no-op fast-forward/push reconciled the already-applied change
+and checked the current source/history-metadata baseline. No earlier historical
+byte/metadata parity or manual chmod is claimed. A Git-created private checkout
+mode change from 0644 to 0600 was observed; executable status remained false.
 
-Only `mcp_servers.downloads` and membership in `plugins.enabled` are owned config settings. Sampling uses `{enabled: false}`, connect timeout is 15 seconds and call timeout 30 seconds. An explicit backend disabled choice blocks application. Renderer decisions remain `NOT_OBSERVED`: use Desktop's official Capabilities → Plugins toggle and readback. Do not edit Chromium storage or infer renderer enablement from backend configuration.
+## Usage through Hermes
 
-Raw config backup, proposed bytes, a strict ownership manifest and step readbacks live privately under `~/.hermes/installations/hermes-downloads/<run-id>/`. Files are 0600 and managed directories 0700; the LaunchAgent sets `Umask` to decimal 63 (octal 077) so worker and child downloads create owner-private files. Failed steps retain evidence; `INSTALL_FAILED` does not imply automatic rollback. The YAML parser rejects duplicates, anchors/aliases, tags, multiple documents and layouts whose untouched round trip is not byte preserving. Ordinary comments, quotes, ordering, flow styles and unknown values are retained in supported documents. Unsupported formatting blocks replacement rather than normalizing the user's document. Compare/recheck, nofollow reads, atomic replacements and file/directory fsync form an owner-only boundary; they do not defeat every malicious same-account filesystem race.
+The seven tools are `downloads_add`, `downloads_query`, `downloads_control`,
+`downloads_edit`, `downloads_replace_source`, `downloads_configure` and
+`downloads_files`. Add, query, exact replay and cold start grant no BODY authority.
+Explicit selected start and separate queue resume use fresh worker epoch,
+revisions and stable IDs. Poll pending control receipts to durable outcomes;
+manual, collection and retry holds are independent. Queue/collection start
+captures transactional cohorts of at most 500, not a queue-size limit. Query
+queue/status/detail/control for gate, job revision, effective settings and
+request outcome. Edits support priority/order, explicitly zoned schedules,
+destination and per-item cap; schedules persist in UTC and read back in
+Asia/Tehran. Active edits/replacements quiesce first, and completed files are
+not moved. Stock max-tries is one; the host ordinary-attempt budget is five.
+Retry-After is a floor, exhaustion survives restart, and a fresh explicit retry
+opens a new audited budget. HTTP 403 alone proves neither expiry nor login.
+Caps are bytes per second; desired settings and applied readback are separate.
+Null removes a cap; zero
+means WAIT. The normal baseline is one job and four stock connections.
 
-`INSTALLED_WIRING` records file/service wiring and paused local IPC. `VERIFIED_LOCAL` separately confirms current installation ownership, hashes, schema discovery and one redacted IPC page. Neither proves actual Hermes tool registration/calls, direct-file cap/recovery acceptance, Desktop authenticated route, toast visibility, user read or reveal. Reports mark those as `LIVE_PENDING`. After its own successful bootstrap, startup retries use a five-second deadline for a running service and certified paused IPC, retrying only a missing startup certificate; existing independently bounded service/IPC calls can finish beyond that deadline. It records the first positive PID before IPC and refuses a changed PID or wiring; other IPC failures stop immediately. A missing worker is a real failure, never an empty healthy queue. The verifier only reads and never repairs, launches, recycles or resumes.
+- «این لینک‌ها را فقط به صف اضافه کن.» سپس وضعیت و شناسه‌ها را بررسی کنید.
+- «دانلود انتخاب‌شده را شروع کن» و در صورت توقف سراسری، جداگانه «صف را ادامه بده».
+- «کل صف را متوقف کن»؛ تأیید مهار پردازش را از رسید کنترل بخوانید.
+- «سقف سرعت را بردار» یعنی null؛ صفر دانلود را در انتظار نگه می‌دارد.
+- «این مورد را حذف کن» فایل‌ها را نگه می‌دارد. پاک‌سازی فایل فقط برای شناسهٔ
+  انتخاب‌شده با تأیید صریح `confirmed: true` انجام می‌شود.
+- برای لینک تازه از جایگزینی منبع استفاده کنید؛ برای نمایش فایل کامل، عمل
+  صریح نمایش در Finder را انتخاب کنید.
 
-For rollback, add `--rollback <exact-private-manifest> --profile default` to the installer command. Backup hashes and each current object are freshly checked before stopping the exact recorded launchd service. A changed live PID, argv, label/plist, user-owned file or owned config setting blocks rollback. Explicit rollback also supports an old manifest whose runtime is exactly `<source>/.artifacts/download-manager/runtime/<manifest-commit>`; ordinary installation and verification require the new fixed path. A loaded service explicitly observed as `state = not running` without a PID may be stopped only with matching manifest wiring, a recorded bootstrap and valid recorded service authority after all file/config/backup checks. Unknown or absent service observations block rollback. Service absence must be observed after bootout before any owned config/files are removed. Unrelated config edits are preserved through selective removal of the installed patch; an unchanged config can be restored byte for byte. Only unchanged installer-owned integration/plist files are removed. Runtime, state and Downloads roots are retained. Partial failure reports `ROLLBACK_BLOCKED`; retain its evidence and resolve the changed ownership explicitly.
+Saved partial identity requires a trusted original digest for a different URL,
+or qualified same-resource strong-validator/length lineage. Inconclusive identity
+preserves partials and offers a separate download. An isolated Python standard
+library HEAD probe owns saved identity observation; stock aria2 owns BODY and
+qualified If-Match. HEAD is not a stock-aria2 probe.
 
-Backend route mounting requires separately authorized Desktop live acceptance. The supported backend-only operation is:
+No overwrite, traversal/symlink escape, arbitrary argv, automatic execution,
+credential/TLS bypass, full SSRF proxy or system-wide network change is permitted.
+An explicit reveal click freshly certifies file authority; same-account namespace
+races remain a limit. A returned path alone does not prove Finder selection.
 
-```js
-await window.hermesDesktop.recycleBackend('default')
-```
+Durable event IDs and the outbox survive delivery failure and replay. Store/SDK
+receipts do not prove visible paint or reading. Existing behavior polls every
+15 seconds, shows ordinary success toasts for five seconds, and keeps actionable
+and reveal offers persistent. Do not inject events or impersonate the SDK.
+There is no exactly-once visual/read guarantee across crashes.
 
-It tears down the primary default backend and can interrupt active Desktop turns. Installer and verifier never call it. A successful `{ok:true}` proves teardown only: verify old owned backend exit, new owned backend PID/port, authenticated plugin route and renderer profile/source scope afterward. `host.restartGateway` concerns a different gateway and is not this operation. Start a fresh Hermes session or explicitly rediscover MCP, enable/read back the renderer through its official toggle, and record actual direct-file calls, notification paint, user acknowledgement and reveal independently. No installation report completes A01–A14.
+## Evidence identities and limits
 
+Use these full source identities throughout the table:
 
-## Core control contract
+- Historical H: `01c078ba45ad4fd7d8fd449a689c6a38ef0216ad`.
+- Historical C: `398c8c13f49102ea935f612b962d8dd2956f9e5a`.
+- Current S: `5db8c883a6384312c1276d2aa2d505512de9c05b`.
 
-Creation, reconnect, listing and replay do not authorize BODY. A restarted worker
-is globally paused. Explicit queue/collection `start` captures membership in
-transactional cohorts of at most 500; cohort count is not a queue-size limit.
-Fresh queue `resume` lifts the global gate and creates saved continuations for
-eligible work already authorized before a queue stop or cold restart. Its
-revision-fenced transaction captures those jobs through the existing per-job
-control receipts; replay creates no new admission. Add-only jobs, per-job manual
-holds, collection holds and retry holds remain gated. Collection `resume` lifts
-its collection hold. Query `queue` for the
-current worker epoch and gate revision, `status` for the job revision, `detail`
-for effective settings, collection and retry facts, and `control` with the
-request ID for a pending operation's outcome.
+H alone has the historical full 2405 PASS plus one explicit live SKIP. S has
+105 targeted tests passed in 108.09 seconds (wrapper 108.643752/360 seconds),
+with natural zero exit, original wait/reaping, ECHILD and group absence, no
+signals, and unchanged 141 source/16 installed-site files. This is not a fresh
+full suite. Earlier failed/incomplete executions and intermediate quality
+non-approval remain historical failures, not passing evidence.
 
-`downloads_edit` accepts selected IDs and a closed patch for priority, decimal
-order, an explicitly zoned schedule, destination or per-item cap. Schedules
-are stored as UTC and read back in Asia/Tehran. Explicit job `start_now` bypasses
-the selected schedule; `preempt` first stops and seals a lower-priority owning
-slot. An active edit or source replacement quiesces its owning slot first.
-Destination successors preserve original creation/reservation facts and the
-original incomplete workspace; completed files are not moved by an edit.
-Saved ranges require the trusted original SHA or a durably sealed, owner-bound
-stock HTTP strong ETag, resource identity and length. Hashless saved consent
-checks an explicit HEAD before retaining/copying the original pair. The saved
-observer owns an identity-only child with a three-second aggregate probe deadline
-and bounded original-child containment/JOIN, including DNS, TLS and slow headers.
-The qualified ETag travels with the exact checkpoint/consent, source, generation
-and worker epoch to admission; stock aria2 receives If-Match without another
-blocking HEAD on the control thread. Source replacement uses the same cancellable
-observation lane. Query and pause remain responsive while it observes. No HEAD or BODY
-is issued by startup, listing, add-only, reconnect or receipt replay. Changed or
-unknown identity preserves the original files and requires a decision; `detail`
-reports `resume_decision` with the separate-download alternative. Due retry
-with unqualified retained bytes becomes blocked rather than waiting forever.
-A strong ETag is resource scoped: unchanged-URL replacement must verify that
-identity; a different URL requires the trusted original SHA. That digest is
-always enforced at final publication. Hashless completion remains transport
-verified. Unsupported or inconclusive HEAD/redirect identity requires a separate
-download; names, URL text and equal size never establish response identity.
+The C-to-S aggregate received ordered SPEC PASS followed by distinct
+QUALITY/SECURITY APPROVED on exact S. The fix handles obsolete per-file allocation
+RPC failure only after fresh exact completed-stock readback and durable owner
+qualification. Byte/hash/publication/no-overwrite checks still govern; active
+or global faults are not broadly hidden. Synthetic reproduction supports this
+mechanism but cannot recover the unavailable original actual-default traceback.
+No review of this documentation commit is asserted by its author.
 
-`downloads_configure` uses decimal concurrency/connections and global speed in
-**bytes per second**. The default is one active job and stock 4/4 connections.
-Per-item caps use the same units. Null removes a cap; zero means WAIT, never
-aria2's unlimited zero. Desired settings and their revision are separate from
-applied readback. Reductions precede increases, and connection changes use an
-owned stop/restart that preserves saved work and retry counters.
+## Final acceptance table
 
-Stock max-tries is one; the host budget permits at most five ordinary attempts.
-Only typed stock codes and captured framed HTTP facts determine disposition.
-Retry-After is a floor, including values beyond local exponential backoff.
-Due work must still pass global, collection, manual, slot and lineage fences.
-Cold startup preserves exhaustion. A fresh explicit job `retry` opens an
-audited new budget; old replay cannot do so. HTTP 403 alone does not establish
-an expired link or a login requirement.
+PASS below is limited to the named source and evidence class. It never inherits
+all historical tests onto S. Whole-project delivery remains OPEN at A05 and A13;
+parent final-document integration and runtime rebind also remain pending.
 
-`downloads_files` with `action: "purge"` requires `confirmed: true` and explicit
-selected IDs. It deletes only recorded, qualified owned artifacts after
-containment, with durable per-artifact unlink authority and absence readback.
-Unknown sidecars and job directories are retained; pause/remove do not purge.
-`action: "reveal"` certifies a completed path and offers a normal Desktop action.
-The explicit click freshly certifies the request/output before SDK reveal;
-presentation and actual SDK outcome are separate, and uncertain/lost acknowledgements
-do not silently repeat an OS invocation. Same-user namespace races at OS
-invocation remain a stated boundary.
+| Gate | Outcome | Source, evidence class and material limits |
+| --- | --- | --- |
+| A01 | PASS, scoped | H accepted cold-start/read/add-only fixture ledger; C actual-control evidence. S exact add-only replay succeeded, queued with zero BODY causes; no fresh HTTP trial. |
+| A02 | PASS, scoped | H accepted direct pause/containment fixtures; C actual control and numerical boundary ledger: no BODY after pause acknowledgement. S cleanup confirmed paused queue and no engines; no fresh fault matrix. |
+| A03 | PASS, scoped | H accepted authorization/global gate/manual-hold fixtures; C actual-control scope retained. S settings restoration and paused queue confirmed; no new hold/retry matrix. |
+| A04 | PASS, scoped | H accepted order/priority/preemption/schedule/batch/duplicate receipt fixtures; C actual-control scope retained. No new live schedule/preemption matrix on S. |
+| A05 | PARTIAL/OPEN | H accepted crash/reconnect fixtures. C actual own-view close/immediate worker survival passed, but later cap clearing crashed the old worker. S has 105 targeted tests and exact accepted reviews; fresh current originating-view close/survival through completion remains unobserved. |
+| A06 | PASS, scoped | H accepted synthetic Range/fault-origin and bounded-retry evidence; C retained actual-control scope. Not a fresh S live origin-fault matrix. |
+| A07 | PASS, scoped | H accepted direct replacement/validator/digest/incompatible-partial fixtures; C retained actual-control scope. No new S live replacement matrix or blanket expiry inference from 403. |
+| A08 | PASS, qualified historical | H V7 six finite cap windows, at least 30 seconds measurement after at least 10 seconds settling. C changed-boundary numerical evidence retained; no fresh S numerical certification, complete zero/null/join/stall matrix or WAN hard-cap claim. |
+| A09 | PASS, qualified historical | H V7 allocation/merge/owned-cleanup evidence with 50 ms sampling and st_blocks/APFS limits. Sampled allocation is not a certified unique physical peak. No fresh S peak-disk/collision trial. |
+| A10 | PASS, scoped | H accepted destination/Unicode/collision/symlink/traversal/permissions/disk-full fixtures; C actual explicit Finder/path evidence. No new S live filesystem fault matrix. |
+| A11 | PASS, historical actual HTTP/hash | H actual authorized official 538364-byte download/hash; C actual 188900-byte HTTP/hash. S recovered existing 188900-byte publication, certified nofollow single-link identity and SHA-256 a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505; no extra BODY, two earlier BODY causes remain historical. S fresh HTTP/origin-close trial NOT RUN. |
+| A12 | PASS, direct scope | H accepted direct duplicate/source-identity fixtures; C actual exact-control replay retained. S add-only exact replay succeeded without BODY. Extraction/quality/audio/subtitle/playlist gates RETIRED. |
+| A13 | PARTIAL/OPEN | C actual actionable 404 remained pending with both renderers OFF; MAIN ON painted it, then PEER ON deduplicated the same event: one claim/one receipt. Ordinary automatic completion paint NOT_OBSERVED. Completion-event-only disabled replay NOT TESTED; preserved-outbox failure replay was proven by the actionable event and needs no additional completion-specific cycle. No exactly-once visual/read guarantee. |
+| A14 | PASS, scoped; final rebind pending | Actual seven MCP tools retained; C explicit reveal/Finder selection/hash passed. S recovery/query/config work passed. Final-document-SHA installation/verification and fresh discovery are parent-owned pending, not completed claims. |
 
-All of these are author source/fixture contracts, not final A01–A14 acceptance.
-The final default install, independent reviews, numerical cap/disk measurements,
-authorized official direct-file SHA, Desktop toast and Finder gates remain for ROOT.
+The unused slots of the original 900-second current live window expired and are
+RETIRED, with no extension, reset or refund. Separate cleanup under its original
+90-second budget completed naturally 38.252662 seconds after that expiry.
+Desired/applied settings were both one job/four connections/null cap;
+queue paused, same worker unchanged, no engines. Existing
+user files and historical/manual holds were retained. Publication recovery does
+not repair earlier BODY closure/checkpoint evidence. No new live trial is pending
+inside that expired authorization.
 
-
-## Opt-in direct-source acceptance
-
-`headless/scripts/live-acceptance.py` defaults to explicit SKIP before reading
-input or starting children. `HERMES_DOWNLOADS_DISABLE_NETWORK=1` overrides
-`--live`. The normal test harness therefore always skips the real-source case;
-its offline contracts and synthetic installed SDK/worker/stock exercises do not
-establish A11, Hermes UI discovery, Desktop notification or A13/A14.
-
-A later authorized run uses isolated Python 3.12 with `-I -B`, `--live`,
-`--input-file`, `--evidence` and `--expected-commit`. Input is a single owner-only
-0600 regular JSON file in a private directory; evidence must be a fresh short
-path under an owner-only 0700 parent, so its private state socket fits Darwin's
-limit. The packet has exactly `url`, `expected_sha256`, `length`, an opaque
-`handle`, and `qualification`. Qualification contains the pinned `aria2_sha256`,
-`trusted_fixed_representation: true`, and `max_response_bytes` equal to length.
-The operator supplies these facts privately for the already authorized fixed
-source; unknown qualification refuses before BODY. Never put that packet,
-URL, digest, state, credentials or evidence in Git.
-
-The runner binds a clean expected commit, sixteen physically distinct equal-hash
-installed modules, all 43 locked distributions, three actual console entrypoints,
-and aria2 1.37.0's binary digest. It discovers all seven tools through the official
-SDK, proves add-only/replay/query are inert, configures and reads back one
-connection/one job, then explicitly authorizes its one fresh target. A private
-observational carrier invokes the byte-verified installed worker console using
-runpy; it records original engine waits, reader EOF and reader/observer joins.
-It does not replace the worker loop or payload engine.
-
-One original 900-second UTC/monotonic deadline includes preflight and all births,
-with sixty seconds reserved for closure. The 256 MiB allowance is a conservative
-trusted HTTP-payload reservation: six chains of up to 21 response heads (aria2
-1.37.0 MAX_REDIRECT=20), each bounded by the trusted representation length plus
-16 KiB receive-buffer slack. This trial admits only one fresh sub-1MiB pair;
-continuation or a second admission refuses before BODY. It qualifies stock
-request options on the paused GID before unpause. A successful trial additionally
-requires a single original GET/200 finite identity response ledger, matching
-source/attempt/owner bindings, no-follow final descriptor and streamed expected
-SHA, immutable creation receipt, and original child/reader/observer closures.
-Reservation is not measured WAN traffic, and file size/progress is not a
-cumulative byte counter. Unknown, redirected, encoded, interrupted or ambiguous
-response evidence cannot produce a qualified PASS. No adversarial wire-cap
-claim, real-source run, default-profile action or Desktop acceptance follows
-from these offline tests. Whole A01–A14 delivery remains OPEN; extraction stays
-RETIRED.
+See [benchmark qualifications](benchmark-download-manager.md) and the
+[final handoff](../.hermes/handoffs/2026-10-14-download-manager-final.md).

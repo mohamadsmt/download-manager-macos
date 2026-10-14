@@ -328,3 +328,57 @@ for A11. YouTube/`ffprobe`, extracted quality/audio/subtitles and playlist accep
 were retired by the user on 2026-10-03, not passed. A12 retains direct duplicate and
 source-identity checks. Local synthetic media bytes do not satisfy real-source A11.
 See `.hermes/handoffs/2026-10-03-download-manager-direct-only-scope.md`.
+
+
+## Source-bound results recorded 2026-10-14
+
+This appendix qualifies later evidence; it does not replace the runner/schema,
+18 balanced 64 MiB baseline trials, or retained failed evidence above. The
+[operations acceptance table](download-manager-operations.md#final-acceptance-table)
+is the sole final A01–A14 outcome table.
+
+Historical source `01c078ba45ad4fd7d8fd449a689c6a38ef0216ad` has the
+full 2405 PASS plus one explicit live SKIP. Its V7 qualified A08/A09 results use
+six finite windows, at least 30 seconds of measurement and at least 10 seconds
+of settling. Keep successful-send accounting and repeated offsets separate,
+50 ms peak sampling, and st_blocks/APFS limitations. Sampled allocation is not
+a certified unique physical peak. Expected nonzero contained exits and retained
+finalizer diagnostics/inferred cause are not discarded or converted to success.
+The baseline alone still makes none of these worker acceptance claims.
+
+Historical source `398c8c13f49102ea935f612b962d8dd2956f9e5a` has a
+targeted numerical boundary pass: 30.066737 seconds measured after 10.000727
+seconds settling, aggregate ratio 0.8834513701964483, request-to-pause-ACK
+1.820708917 seconds, no BODY after ACK, qualified headers-only empty checkpoint
+and fresh resumed GIDs. It is changed-boundary evidence, not a full
+zero/null/join/stall matrix, fresh peak-disk/collision trial or WAN hard cap.
+The approved pause criterion remains at most five seconds graceful or ten
+seconds force cleanup, with no success before containment; there is no
+two-second criterion.
+
+Current source `5db8c883a6384312c1276d2aa2d505512de9c05b` has 105
+targeted tests passed in 108.09 seconds, not a fresh full 2405-test suite or fresh
+numerical certification. Ordered exact-commit SPEC PASS and distinct
+QUALITY/SECURITY APPROVED cover the C-to-S aggregate described in operations.
+Earlier failed/incomplete runs and the intermediate quality non-approval remain
+failed evidence. Historical suite counts never become latest-SHA blanket claims.
+
+Actual authorized official download/hash PASS remains bound to historical
+01c source (538364 bytes) and 398 source (188900 bytes), using the full identities
+above. Current 5db source recovered existing 188900-byte publication with
+certified nofollow single-link final identity and SHA-256
+`a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505`.
+Recovery added no BODY; its two earlier BODY causes remain historical. The
+current actual HTTP/origin-close trial was NOT RUN; add-only exact replay
+succeeded, zero BODY causes, still queued. Its original 900-second window expired
+and unused slots are RETIRED without extension/reset/refund. Separate cleanup
+completed naturally within its original 90-second budget, 38.252662 seconds
+after expiry, with restored one/four/null settings, queue paused, unchanged
+worker and no engines. No old BODY checkpoint is retro-certified.
+
+Fresh current originating-view survival through completion and ordinary automatic
+Desktop completion paint remain OPEN. Historical own-view immediate survival
+was followed by a later cap-clear worker crash; current targeted tests do not
+replace a fresh observation. Historical actionable replay/dedup and explicit
+Finder selection passed on 398 source; neither is new 5db GUI evidence. This
+prose change runs no product suite and asserts no whole-project completion.
