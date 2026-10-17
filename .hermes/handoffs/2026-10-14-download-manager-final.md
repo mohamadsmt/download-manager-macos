@@ -17,18 +17,52 @@ non-approval and failed/incomplete execution evidence remain historical failures
 The current publication recovery is not a fresh HTTP download, supported rollback
 PASS or retrospective repair of the old BODY checkpoint.
 
-Remaining actual acceptance is current-origin view closure with the same worker
-surviving through download completion, and ordinary automatic completion toast
-paint. The current HTTP/origin-close trial was NOT RUN. Its original 900-second
-window expired; unused slots are RETIRED with no extension/reset/refund. Add-only
-exact replay admitted zero BODY and remained queued. Separate cleanup took
-38.252662 seconds inside its original 90s bound and occurred after the original
-trial had expired. It completed naturally, restoring one job/four connections/null
-cap, paused queue and no engines, with
-the same worker and user files/holds retained. Historical actionable replay/dedup
-and explicit Finder/hash passed on 398 source; do not reopen or relabel them as
-current GUI trials. Completion-specific disabled replay was not tested and is
-not an additional required cycle beyond preserved-outbox failure replay.
+A05 current actual originating-view closure through same-worker completion is
+PASS on deployed documentation source `75e4d45b6d34c1f9b0031e21109bf4b7c221dc62`
+and unchanged implementation above. Three subsequent independently bounded fresh
+official 188900-byte downloads each completed with exactly one BODY cause,
+unchanged worker birth/epoch and certified nofollow single-link final identity and
+SHA-256 `a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505`.
+The first two did not observe originating-view closure or ordinary paint; those
+failed acceptance outcomes remain retained. For the final trial the user closed
+the origin tab while active; fresh accessibility and read-only observations
+confirmed closure and the same live engine/worker/epoch through verified completion.
+The user explicitly reported no ordinary completion toast through completion.
+A13 remains OPEN: store insertion/SDK presentation does not prove visible paint,
+the screenshot/accessibility watch failed and the claimant window remains unknown.
+
+The earlier 900-second zero-BODY add-only authorization expired; unused slots
+remain RETIRED without extension/reset/refund. Separate cleanup completed
+naturally in 38.252662 seconds within its original 90s bound. A subsequent
+independently bounded cold-paused start-only attempt admitted zero BODY and
+retired its unused slot, as expected from the API. Selected start preserves paused
+state: supported individual job resume under existing authority can be needed,
+followed separately by global queue resume. Fresh epochs/revisions/stable request
+IDs and independent manual/collection/retry holds remain mandatory. Baseline is
+one job/four stock connections/null cap; zero is WAIT. All original clocks and
+charged/retired slots remain retained without reset or refund.
+
+The final cap-clear phase made zero MCP calls because its message omitted fulfilled
+prerequisite facts; the download completed naturally under its cap. Later clear
+preparation stopped at the already-completed guard, without a new BODY or product
+failure. Read-only host capture on 2026-10-17 confirmed 10 jobs, six certified
+official finals, 11 cumulative BODY causes, baseline one/four/null, paused queue,
+no engines, same worker and preserved old jobs/holds/payload hashes. The authorized
+ten-minute awake assertion expired naturally, with no renewal or security change.
+Final UI preference restoration remains OPEN: empty search was actually observed,
+but Show all sessions OFF restoration and watched Desktop plugin ON verification
+remain pending because the Mac is locked. A project label is not profile proof.
+
+Historical actionable 404 pending with both renderers OFF, MAIN actual paint,
+PEER deduplication with one claim/receipt and explicit reveal/Finder/hash passed
+on 398 source. No extra completion-specific disabled replay or repeated Finder
+trial is required; there is no exactly-once visual/read guarantee.
+
+Before this update, 75e canonical/main/remote and GitHub GET matched. Exact 75e
+runtime apply/verify, independent 16-module parity and fresh actual Hermes query
+were verified with unchanged 5db implementation. Old supported rollback remains
+BLOCKED; separately guarded controlled owned stopped-wiring recovery restored only
+authorized owner wiring and is not supported rollback PASS.
 
 Final-document exact documentation-delta reviews, canonical normal integration,
 push/remote readback, exact deployed documentation-commit runtime rebind/verify

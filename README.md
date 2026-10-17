@@ -6,8 +6,12 @@ The Hermes headless service manages trusted, user-vetted direct HTTP(S) files
 through Hermes alone. Add-only and inspection do not start transfers; direct
 media is ordinary bytes, with no web-video extraction. See the
 [operations and acceptance status](Docs/download-manager-operations.md).
-Delivery remains OPEN for current view-survival-to-completion and ordinary
-Desktop completion paint (A05 and A13).
+Current originating-view closure and same-worker completion passed (A05) on
+deployed documentation source `75e4d45b6d34c1f9b0031e21109bf4b7c221dc62`
+and unchanged implementation `5db8c883a6384312c1276d2aa2d505512de9c05b`.
+Delivery remains OPEN for ordinary automatic Desktop completion paint (A13)
+and final UI preference restoration, followed by separate parent-owned
+documentation review, integration and deployment receipts.
 
 The v0.1.0 release targets Apple Silicon Macs and is distributed as an
 unsigned, unnotarized DMG. macOS Gatekeeper may warn or block the downloaded app

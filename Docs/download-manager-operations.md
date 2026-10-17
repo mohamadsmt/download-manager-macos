@@ -47,9 +47,11 @@ and Downloads remain retained. Backend recycling interrupts default Desktop
 turns and needs separate authorization; installer/verifier never perform it.
 
 `VERIFIED_LOCAL` does not establish actual Hermes discovery, Desktop paint or
-Finder reveal; those require separate observations. Current implementation
-apply/verify was locally verified. Its canonical push/remote SHA and GitHub GET
-were recorded. Final-document exact reviews, canonical normal integration,
+Finder reveal; those require separate observations. Before this documentation update, documentation source
+`75e4d45b6d34c1f9b0031e21109bf4b7c221dc62` matched canonical main, remote
+and GitHub GET. Exact-source runtime apply/verify, independent 16-module parity
+and a fresh actual Hermes query were verified on that deployed source with
+unchanged implementation S (defined below). Final-document exact reviews, canonical normal integration,
 fast-forward/push and remote readback, exact deployed documentation-commit runtime
 rebind/verify and fresh Hermes discovery are separate parent-owned REQUIRED RECEIPTS.
 These docs do not self-certify their own postcommit deployment. Do not manually
@@ -71,8 +73,10 @@ mode change from 0644 to 0600 was observed; executable status remained false.
 The seven tools are `downloads_add`, `downloads_query`, `downloads_control`,
 `downloads_edit`, `downloads_replace_source`, `downloads_configure` and
 `downloads_files`. Add, query, exact replay and cold start grant no BODY authority.
-Explicit selected start and separate queue resume use fresh worker epoch,
-revisions and stable IDs. Poll pending control receipts to durable outcomes;
+Selected start authorizes a job while preserving its paused state. A cold-paused
+individual job can need explicit supported job resume under its existing authority,
+followed separately by global queue resume; global resume alone does not guarantee
+that such a job starts. Use fresh worker epoch, revisions and stable request IDs. Poll pending control receipts to durable outcomes;
 manual, collection and retry holds are independent. Queue/collection start
 captures transactional cohorts of at most 500, not a queue-size limit. Query
 queue/status/detail/control for gate, job revision, effective settings and
@@ -84,7 +88,7 @@ Retry-After is a floor, exhaustion survives restart, and a fresh explicit retry
 opens a new audited budget. HTTP 403 alone proves neither expiry nor login.
 Caps are bytes per second; desired settings and applied readback are separate.
 Null removes a cap; zero
-means WAIT. The normal baseline is one job and four stock connections.
+means WAIT. The normal baseline is one job, four stock connections and null cap.
 
 - «این لینک‌ها را فقط به صف اضافه کن.» سپس وضعیت و شناسه‌ها را بررسی کنید.
 - «دانلود انتخاب‌شده را شروع کن» و در صورت توقف سراسری، جداگانه «صف را ادامه بده».
@@ -138,35 +142,58 @@ No review of this documentation commit is asserted by its author.
 ## Final acceptance table
 
 PASS below is limited to the named source and evidence class. It never inherits
-all historical tests onto S. Whole-project delivery remains OPEN at A05 and A13.
+all historical tests onto S. A05 current view-close survival through completion is PASS, source-qualified.
+Whole-project delivery remains OPEN for A13 ordinary automatic completion paint
+and final UI preference restoration.
 Final-document deployment requires the separate parent-owned receipts above.
 
 | Gate | Outcome | Source, evidence class and material limits |
 | --- | --- | --- |
-| A01 | PASS, scoped | H accepted cold-start/read/add-only fixture ledger; C actual-control evidence. S exact add-only replay succeeded, queued with zero BODY causes; no fresh HTTP trial. |
+| A01 | PASS, scoped | H accepted cold-start/read/add-only fixture ledger; C actual-control evidence. S exact add-only replay succeeded with zero BODY causes under the historical expired authorization; later independently bounded HTTP trials are described below. |
 | A02 | PASS, scoped | H accepted direct pause/containment fixtures; C actual control and numerical boundary ledger: no BODY after pause acknowledgement. S cleanup confirmed paused queue and no engines; no fresh fault matrix. |
 | A03 | PASS, scoped | H accepted authorization/global gate/manual-hold fixtures; C actual-control scope retained. S settings restoration and paused queue confirmed; no new hold/retry matrix. |
 | A04 | PASS, scoped | H accepted order/priority/preemption/schedule/batch/duplicate receipt fixtures; C actual-control scope retained. No new live schedule/preemption matrix on S. |
-| A05 | PARTIAL/OPEN | H accepted crash/reconnect fixtures. C actual own-view close/immediate worker survival passed, but later cap clearing crashed the old worker. S has 105 targeted tests and exact accepted reviews; fresh current originating-view close/survival through completion remains unobserved. |
+| A05 | PASS, source-qualified actual view-close/completion | H accepted crash/reconnect fixtures. C actual own-view close/immediate worker survival passed, but later cap clearing crashed the old worker. On deployed documentation source 75e4d45b6d34c1f9b0031e21109bf4b7c221dc62 with unchanged S, the user closed the originating tab while active; fresh accessibility and read-only engine observations confirmed its absence and the same live engine/worker/epoch after closure. That worker completed with one BODY cause and qualified final identity/hash. The two preceding fresh downloads did not observe origin closure or paint; those failed acceptance outcomes remain retained. |
 | A06 | PASS, scoped | H accepted synthetic Range/fault-origin and bounded-retry evidence; C retained actual-control scope. Not a fresh S live origin-fault matrix. |
 | A07 | PASS, scoped | H accepted direct replacement/validator/digest/incompatible-partial fixtures; C retained actual-control scope. No new S live replacement matrix or blanket expiry inference from 403. |
 | A08 | PASS, qualified historical | H V7 six finite cap windows, at least 30 seconds measurement after at least 10 seconds settling. C changed-boundary numerical evidence retained; no fresh S numerical certification, complete zero/null/join/stall matrix or WAN hard-cap claim. |
 | A09 | PASS, qualified historical | H V7 allocation/merge/owned-cleanup evidence with 50 ms sampling and st_blocks/APFS limits. Sampled allocation is not a certified unique physical peak. No fresh S peak-disk/collision trial. |
 | A10 | PASS, scoped | H accepted destination/Unicode/collision/symlink/traversal/permissions/disk-full fixtures; C actual explicit Finder/path evidence. No new S live filesystem fault matrix. |
-| A11 | PASS, historical actual HTTP/hash | H actual authorized official 538364-byte download/hash; C actual 188900-byte HTTP/hash. S recovered existing 188900-byte publication, certified nofollow single-link identity and SHA-256 a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505; no extra BODY, two earlier BODY causes remain historical. S fresh HTTP/origin-close trial NOT RUN. |
+| A11 | PASS, source-qualified actual HTTP/hash | H actual authorized official 538364-byte download/hash; C actual 188900-byte HTTP/hash. S recovered existing 188900-byte publication, certified nofollow single-link identity and SHA-256 a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505; no extra BODY, two earlier BODY causes remain historical. Three subsequent independently bounded fresh official 188900-byte downloads on deployed documentation source 75e4d45b6d34c1f9b0031e21109bf4b7c221dc62 and unchanged S each completed with exactly one BODY cause, unchanged worker birth/epoch and the same certified nofollow single-link final identity/hash. These are fresh HTTP evidence, separate from publication-only recovery. |
 | A12 | PASS, direct scope | H accepted direct duplicate/source-identity fixtures; C actual exact-control replay retained. S add-only exact replay succeeded without BODY. Extraction/quality/audio/subtitle/playlist gates RETIRED. |
-| A13 | PARTIAL/OPEN | C actual actionable 404 remained pending with both renderers OFF; MAIN ON painted it, then PEER ON deduplicated the same event: one claim/one receipt. Ordinary automatic completion paint NOT_OBSERVED. Completion-event-only disabled replay NOT TESTED; preserved-outbox failure replay was proven by the actionable event and needs no additional completion-specific cycle. No exactly-once visual/read guarantee. |
+| A13 | PARTIAL/OPEN | C actual actionable 404 remained pending with both renderers OFF; MAIN ON painted it, then PEER ON deduplicated the same event: one claim/one receipt. In the final fresh trial the user explicitly reported no ordinary automatic completion toast through completion. Store insertion and SDK presentation receipts do not prove visible paint; the screenshot/accessibility watch failed and the claimant window remains unknown. Ordinary automatic completion paint remains OPEN. Completion-event-only disabled replay NOT TESTED; preserved-outbox failure replay was proven by the actionable event and needs no additional completion-specific cycle. No exactly-once visual/read guarantee. |
 | A14 | PASS, scoped; separate deployment receipts required | Actual seven MCP tools retained; C explicit reveal/Finder selection/hash passed. S recovery/query/config work passed. Final-document exact reviews, integration, push/remote readback, runtime rebind/verify and fresh discovery are separate parent-owned REQUIRED RECEIPTS. These docs do not self-certify their own postcommit deployment. |
 
-The unused slots of the original 900-second current live window expired and are
-RETIRED, with no extension, reset or refund. Separate cleanup took
-38.252662 seconds inside its original 90s bound and occurred after the original
-trial had expired. Cleanup completed naturally.
-Desired/applied settings were both one job/four connections/null cap;
-queue paused, same worker unchanged, no engines. Existing
-user files and historical/manual holds were retained. Publication recovery does
-not repair earlier BODY closure/checkpoint evidence. No new live trial is pending
-inside that expired authorization.
+The original 900-second authorization expired with zero BODY from add-only replay;
+its unused slots remain RETIRED without extension, reset or refund. Its separate
+cleanup completed naturally in 38.252662 seconds within its original 90s bound.
+This historical zero-BODY result does not describe the later independent trials.
+A later cold-paused start-only attempt admitted zero BODY and retired its unused
+slot: preserving paused state was expected API behavior, not a code bug. The next
+two independent fresh downloads completed but did not observe originating-view
+closure or ordinary paint; those acceptance failures remain retained. The final
+independent trial established A05 as described above, while the user reported no
+ordinary completion toast. No trial clock or charged/retired slot was reset or
+refunded.
+
+The final trial's cap-clear phase made zero MCP calls because its message omitted
+fulfilled prerequisite facts; the cap was not cleared and the file completed
+naturally under it. Subsequent clear preparation stopped at an already-completed
+guard, without a new BODY or product failure. Fresh read-only host capture on
+2026-10-17 confirmed 10 jobs, six certified official finals and 11 cumulative BODY
+causes, desired/applied one job/four stock connections/null cap, a paused queue,
+no engines and the same worker. Old jobs, holds and payload hashes were preserved;
+no earlier BODY checkpoint is retro-certified. The authorized ten-minute awake
+assertion expired naturally without renewal or security change.
+
+Final UI preference restoration remains OPEN. The empty search field was actually
+observed, but Show all sessions OFF restoration and current watched Desktop plugin
+ON verification remain pending because the Mac is explicitly locked. Host state
+is not proof of those UI preferences. The claimant window/profile cause remains
+unknown; a project label does not prove a profile. These follow-ups and the
+separate parent-owned documentation receipts are required before any final
+complete claim. No repeated Finder trial or extra completion-specific disabled
+replay is required.
 
 See [benchmark qualifications](benchmark-download-manager.md) and the
 [final handoff](../.hermes/handoffs/2026-10-14-download-manager-final.md).

@@ -10,10 +10,12 @@ Read [operations](../../../Docs/download-manager-operations.md) and the
 [direct-only amendment](../../handoffs/2026-10-03-download-manager-direct-only-scope.md).
 
 Operate through Hermes alone using the seven documented tools. Add/query/replay
-and cold start grant no BODY authority. Explicit selected start and separate
-queue resume require fresh epoch/revisions/stable IDs; poll pending receipts.
+and cold start grant no BODY authority. Selected start authorizes while preserving paused state. Cold-paused individual
+jobs can need explicit supported job resume under existing authority, followed
+separately by global queue resume; global resume alone does not guarantee start.
+Use fresh epoch/revisions/stable request IDs; poll pending receipts.
 Preserve independent manual/collection/retry holds. Null removes a cap, zero
-means WAIT; baseline is one job/four stock connections. Remove retains bytes;
+means WAIT; baseline is one job/four stock connections/null cap. Remove retains bytes;
 purge requires explicit selected IDs and `confirmed: true`.
 
 Require the existing private owner-owned `~/Downloads/Hermes/` root. Preserve
@@ -33,7 +35,37 @@ receipts. No exactly-once visual/read guarantee exists across crashes. Reveal
 requires explicit click and fresh file certification, with the same-account
 namespace-race limit retained.
 
-A05 and A13 remain PARTIAL/OPEN as specified in the sole final operations table.
+A05 is source-qualified PASS on deployed documentation source
+`75e4d45b6d34c1f9b0031e21109bf4b7c221dc62` and unchanged implementation
+`5db8c883a6384312c1276d2aa2d505512de9c05b`: actual user origin-tab closure
+while active, fresh accessibility/read-only confirmation and same-worker completion
+with one BODY cause and qualified final identity/hash. Three independently bounded
+fresh official 188900-byte downloads each completed with one BODY, unchanged worker
+birth/epoch and nofollow single-link SHA-256
+`a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505`.
+The first two did not observe closure or paint; retain those failed acceptance
+outcomes. The final user observation reported no ordinary completion toast;
+A13 remains OPEN. Store/SDK presentation is not paint, the UI watch failed and
+claimant window/profile cause remains unknown. Historical expired zero-BODY
+add-only authorization and later zero-BODY cold-paused start-only attempt remain
+separate; the latter was expected API behavior and its unused slot was retired.
+Never reset/refund original clocks or charged/retired slots.
+
+Final UI restoration remains OPEN: empty search was observed, but Show all sessions
+OFF restoration and watched Desktop plugin ON verification await an unlocked Mac.
+Read-only host capture confirmed paused queue/no engines, one/four/null baseline,
+same worker and old jobs/holds/payload hashes preserved. The ten-minute awake
+assertion expired naturally without renewal/security change. Historical 398
+pending actionable 404 with renderers OFF, MAIN actual paint, PEER dedup one
+claim/receipt and explicit reveal/Finder/hash remain qualified; no extra disabled
+completion replay or repeated Finder trial is required.
+
+Before this update, exact 75e canonical/main/remote/GitHub GET, runtime apply/verify,
+independent 16-module parity and fresh actual Hermes query were verified. Supported
+rollback remains BLOCKED; controlled owned stopped-wiring recovery restored only
+authorized owner wiring and is not supported rollback PASS. Delivery remains OPEN
+for ordinary paint and final UI restoration, then the separate documentation
+receipts in the sole final operations table.
 Historical tests and actual HTTP/hash, actionable replay and Finder evidence do
 not certify a later SHA. Final-document exact reviews, integration, push/remote
 readback, runtime rebind/verify and fresh discovery are separate parent-owned

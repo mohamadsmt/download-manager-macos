@@ -363,23 +363,60 @@ QUALITY/SECURITY APPROVED cover the C-to-S aggregate described in operations.
 Earlier failed/incomplete runs and the intermediate quality non-approval remain
 failed evidence. Historical suite counts never become latest-SHA blanket claims.
 
-Actual authorized official download/hash PASS remains bound to historical
+Actual authorized official historical download/hash PASS remains bound to
 01c source (538364 bytes) and 398 source (188900 bytes), using the full identities
 above. Current 5db source recovered existing 188900-byte publication with
 certified nofollow single-link final identity and SHA-256
 `a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505`.
-Recovery added no BODY; its two earlier BODY causes remain historical. The
-current actual HTTP/origin-close trial was NOT RUN; add-only exact replay
-succeeded, zero BODY causes, still queued. Its original 900-second window expired
-and unused slots are RETIRED without extension/reset/refund. Separate cleanup took
-38.252662 seconds inside its original 90s bound and occurred after the original
-trial had expired. It completed naturally with restored one/four/null settings,
-queue paused, unchanged worker and no engines. No old BODY checkpoint is
-retro-certified.
+Recovery added no BODY; its two earlier BODY causes remain historical. The earlier
+900-second authorization expired after zero-BODY add-only replay; unused slots
+remain RETIRED without extension/reset/refund. Separate cleanup completed
+naturally in 38.252662 seconds within its original 90s bound. No old BODY
+checkpoint is retro-certified.
 
-Fresh current originating-view survival through completion and ordinary automatic
-Desktop completion paint remain OPEN. Historical own-view immediate survival
-was followed by a later cap-clear worker crash; current targeted tests do not
-replace a fresh observation. Historical actionable replay/dedup and explicit
-Finder selection passed on 398 source; neither is new 5db GUI evidence. This
-prose change runs no product suite and asserts no whole-project completion.
+Subsequently, a separately bounded cold-paused start-only attempt admitted zero
+BODY and retired its unused slot. This was expected API behavior: selected start
+preserves paused state; a supported individual job resume can be needed under
+existing authority, followed separately by global queue resume. Fresh epochs,
+revisions and stable request IDs and independent manual/collection/retry holds
+remain required. Baseline is one job/four stock connections/null cap; zero is WAIT.
+
+Three later independently bounded fresh official 188900-byte downloads each
+completed with exactly one BODY cause, unchanged worker birth/epoch and the
+nofollow single-link final identity/hash above, on deployed documentation source
+`75e4d45b6d34c1f9b0031e21109bf4b7c221dc62` and unchanged implementation
+`5db8c883a6384312c1276d2aa2d505512de9c05b`. The first two did not observe
+originating-view closure or ordinary paint; those failed acceptance outcomes
+remain retained. In the final trial the user closed the origin tab while active;
+fresh accessibility/read-only observations confirmed closure and the same live
+engine/worker/epoch, followed by same-worker verified completion. This establishes
+source-qualified A05 PASS. The user reported no ordinary completion toast through
+completion: A13 remains OPEN. Store/SDK presentation is not visible paint; the
+screenshot/accessibility watch failed and the claimant window remains unknown.
+No original clocks or charged/retired slots were reset or refunded.
+
+The final cap-clear phase made zero MCP calls because its message omitted fulfilled
+prerequisite facts; completion occurred naturally under the cap. Later clear
+preparation found the job already completed and launched nothing: no product
+failure or new BODY. Read-only host capture on 2026-10-17 confirmed 10 jobs,
+six certified official finals, 11 cumulative BODY causes, one/four/null settings,
+paused queue, no engines, the same worker and preserved old jobs/holds/payload
+hashes. The ten-minute awake assertion expired naturally without renewal or
+security change. Empty search was actually observed, but Show all sessions OFF
+restoration and watched Desktop plugin ON verification remain OPEN while the Mac
+is locked. A project label does not prove a profile.
+
+Historical actionable 404 pending with both renderers OFF, MAIN actual paint and
+PEER deduplication with one claim/receipt, plus explicit reveal/Finder/hash, remain
+qualified PASS on 398 source. No extra completion-specific disabled replay or
+repeated Finder trial is required; no exactly-once visual/read guarantee follows.
+Before this update, exact 75e canonical/main/remote and GitHub GET matched; runtime
+apply/verify, independent 16-module parity and fresh actual Hermes query were
+verified. Supported rollback remains BLOCKED; separately guarded controlled owned
+stopped-wiring recovery restored only authorized owner wiring, not supported
+rollback PASS. New documentation exact reviews, integration, push/remote readback,
+runtime rebind/verify and fresh Hermes discovery remain parent-owned required
+receipts; manifests must not be manually rewritten. This prose change runs no
+product suite, full benchmark or fault matrix, claims no WAN hard cap, source fix
+or Swift reinstall, and leaves whole-project delivery OPEN for ordinary completion
+paint and final UI restoration, followed by those documentation receipts.
